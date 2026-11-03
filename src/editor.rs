@@ -36,6 +36,7 @@ mod diagnostics_picker;
 mod display_layout;
 mod edit_batch;
 mod edit_history;
+mod explore_ui;
 mod file_watch;
 mod inline_actions;
 mod inline_agent_outcomes;
@@ -3016,6 +3017,8 @@ pub enum Action {
 
     GoToLine(usize),
     GoToDefinition,
+    /// Code-reading command. The string is a small verb such as `toggle` or `follow`.
+    ExploreCommand(String),
 
     JumpBack,
     JumpForward,
@@ -3752,6 +3755,12 @@ pub struct Editor {
     /// Full-document structural queries, independent from viewport highlighting.
     syntax_textobjects: SyntaxTextObjectService,
     syntax_indentation: crate::syntax_indent::SyntaxIndentation,
+
+    /// Reading tools: symbol follow, skeleton dimming, and the context sidebar.
+    explore: crate::explore::Session,
+    explore_index: Option<explore_ui::ExploreIndexRun>,
+    explore_buffer_parse: Option<explore_ui::ExploreBufferParse>,
+    explore_buffer_parse_next: Option<explore_ui::ExploreBufferSnapshot>,
 
     /// Cached syntax highlight spans per buffer for the most recently parsed
     /// viewport-plus-margin slice.
@@ -5940,6 +5949,10 @@ impl Editor {
             highlighter,
             syntax_textobjects,
             syntax_indentation,
+            explore: crate::explore::Session::default(),
+            explore_index: None,
+            explore_buffer_parse: None,
+            explore_buffer_parse_next: None,
             highlight_cache: HashMap::new(),
             bracket_match_cache: None,
             layout_cache: std::cell::RefCell::new(HashMap::new()),
@@ -7619,11 +7632,15 @@ impl Editor {
         window
             .inner_height()
             .saturating_sub(self.window_content_top(window))
+            .saturating_sub(self.explore_chrome_rows(window))
     }
 
     fn window_content_width(&self, window: &crate::window::Window) -> usize {
         let gutter_width = self.gutter_width_for_window(window);
-        window.inner_width().saturating_sub(gutter_width + 1)
+        window
+            .inner_width()
+            .saturating_sub(gutter_width + 1)
+            .saturating_sub(self.explore_sidebar_columns(window))
     }
 
     fn layout_for_window(&self, window: &crate::window::Window) -> std::sync::Arc<DisplayLayout> {
@@ -14457,6 +14474,7 @@ impl Editor {
         }
         Box::pin(self.drain_agent_pane_effects(runtime)).await?;
         needs_render |= self.service_shell_commands(runtime).await;
+        needs_render |= self.service_explore_background();
         needs_render |= self.service_red_update();
         self.resume_rpc_actions(buffer, runtime).await?;
         self.sync_persistent_notifications();
@@ -18674,6 +18692,15 @@ impl Editor {
         if cmd == "update" {
             return vec![Action::UpdateRed];
         }
+        if cmd == "explore" || cmd.starts_with("explore ") {
+            let argument = cmd.strip_prefix("explore").unwrap_or_default().trim();
+            let command = if argument.is_empty() {
+                "toggle".to_string()
+            } else {
+                argument.to_string()
+            };
+            return vec![Action::ExploreCommand(command)];
+        }
         if cmd == "learn" {
             return vec![Action::OpenLearn];
         }
@@ -22125,126 +22152,37 @@ impl Editor {
     }
 
     #[allow(clippy::double_must_use)]
-    #[async_recursion::async_recursion]
-    async fn execute_action_inner(
+    fn execute_action_inner<'a>(
+        &'a mut self,
+        action: &'a Action,
+        buffer: &'a mut RenderBuffer,
+        runtime: &'a mut Runtime,
+        tracking: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<bool>> + Send + 'a>>
+    {
+        let fut = self.execute_action_inner_body(action, buffer, runtime, tracking);
+        Box::pin(fut)
+    }
+
+    #[allow(clippy::double_must_use)]
+    /// Match arms that run before ex commands.
+    ///
+    /// `Ok(None)` leaves the action for the later group. `Ok(Some((true, quit)))`
+    /// returns immediately. `Ok(Some((false, _)))` means the action ran and the
+    /// shared tail should run.
+    ///
+    /// A shell command re-enters this dispatcher. In a debug build the whole
+    /// match keeps one stack frame, and two of those frames no longer fit in
+    /// the 2 MiB test stack. These arms stay in their own frame.
+    #[inline(never)]
+    async fn dispatch_actions_before_commands(
         &mut self,
         action: &Action,
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
         tracking: bool,
-    ) -> anyhow::Result<bool> {
-        // log!("Action: {action:?}");
-        self.half_page_keeps_screen_row = false;
-        self.set_legacy_message(None);
-        if self.intercept_learn_action(action, buffer, runtime)? {
-            return Ok(false);
-        }
-        if self.current_buffer().directory.is_some()
-            && matches!(
-                action,
-                Action::Save
-                    | Action::ForceSave
-                    | Action::SaveAs(_)
-                    | Action::ForceSaveAs(_)
-                    | Action::SetBufferName(_)
-                    | Action::EnterMode(Mode::Insert)
-                    | Action::SetSyntax(_)
-            )
-        {
-            self.set_legacy_message(Some("Directory buffers are read-only".to_string()));
-            self.render(buffer)?;
-            return Ok(false);
-        }
-        if matches!(
-            action,
-            Action::Save | Action::ForceSave | Action::SaveAs(_) | Action::ForceSaveAs(_)
-        ) && self
-            .tutorial_controller
-            .as_ref()
-            .is_some_and(|tutorial| tutorial.practice_buffer_id == self.current_buffer().id())
-        {
-            self.last_error = Some("the Red tutorial practice buffer cannot be saved".to_string());
-            self.render(buffer)?;
-            return Ok(false);
-        }
-        let sensitive_action = matches!(
-            action,
-            Action::NotifyPlugin(_, _, _) | Action::RunShell(_) | Action::RunShellFilter { .. }
-        ) || matches!(
-            action,
-            Action::CopilotFinishSignIn(_)
-                | Action::CopilotEnableAndSignIn
-                | Action::CopilotCopySignInCode(_)
-                | Action::CopilotRetrySignIn
-                | Action::CopilotDismissSignIn
-                | Action::CopilotRespond { .. }
-        ) || matches!(action, Action::SubmitInlineAssist(_))
-            || matches!(action, Action::StageInlineAssistHandoff { .. })
-            || matches!(action, Action::NotifyPlugins(method, _) if method.starts_with("composer:"));
-        if !sensitive_action {
-            self.actions.push(action.clone());
-        }
-        // The action history is only read back by visual-block replication,
-        // which records absolute indices in `pending_select_action`. Trim the
-        // front when nothing is recording so the history can't grow without
-        // bound over a long session.
-        const MAX_ACTION_HISTORY: usize = 1024;
-        if self.pending_select_action.is_none() && self.actions.len() > MAX_ACTION_HISTORY {
-            let excess = self.actions.len() - MAX_ACTION_HISTORY / 2;
-            self.actions.drain(..excess);
-        }
-
-        let mut add_to_history = tracking;
-        if matches!(
-            action,
-            Action::SplitHorizontal
-                | Action::SplitVertical
-                | Action::SplitHorizontalNewBuffer
-                | Action::SplitVerticalNewBuffer
-                | Action::SplitHorizontalWithFile(_)
-                | Action::SplitVerticalWithFile(_)
-                | Action::CloseWindow
-                | Action::NextWindow
-                | Action::PreviousWindow
-                | Action::MoveWindowUp
-                | Action::MoveWindowDown
-                | Action::MoveWindowLeft
-                | Action::MoveWindowRight
-                | Action::MoveWindowToLeft
-                | Action::MoveWindowToBottom
-                | Action::MoveWindowToTop
-                | Action::MoveWindowToRight
-                | Action::EnterPaneResizeMode
-                | Action::ResizeWindowUp(_)
-                | Action::ResizeWindowDown(_)
-                | Action::ResizeWindowLeft(_)
-                | Action::ResizeWindowRight(_)
-                | Action::BalanceWindows
-                | Action::ResetPanelLayout(_)
-                | Action::MaximizeWindow
-                | Action::OnlyWindow
-        ) && self.clear_pane_zoom()
-        {
-            self.invalidate_terminal_render_state(buffer);
-            self.render(buffer)?;
-        }
-        let action_buffer_id = self.current_buffer().id();
-        let signature_snapshot = self.signature_snapshot();
-        let action_buffer_revision = self.current_buffer().revision();
-        self.lsp_coordinator
-            .ensure_notified_revision(action_buffer_id, action_buffer_revision);
-        let event_snapshot_before_action = self.event_snapshot();
-        let action_cause = Self::action_cause(action);
-        let jump_entry_before_action = self.jump_origin_for_action(action);
-        let picker_handle_before_action = self
-            .current_dialog
-            .as_ref()
-            .and_then(|dialog| dialog.picker_handle());
-        let composer_handle_before_action = self
-            .current_dialog
-            .as_ref()
-            .and_then(|dialog| dialog.composer_handle());
-
+        add_to_history: &mut bool,
+    ) -> anyhow::Result<Option<(bool, bool)>> {
         match action {
             Action::MousePress {
                 column,
@@ -22268,25 +22206,25 @@ impl Editor {
                     .get(&self.current_buffer().id())
                     .and_then(|commands| commands.cancel.clone());
                 if let Some(command) = scratch_command {
-                    add_to_history = false;
+                    *add_to_history = false;
                     self.execute_plugin_command(buffer, runtime, &command)
                         .await?;
                 } else {
                     if *force {
-                        return Ok(true);
+                        return Ok(Some((true, true)));
                     }
                     if self.defer_quit_for_pending_save() {
-                        return Ok(false);
+                        return Ok(Some((true, false)));
                     }
                     let modified_buffers = self.modified_buffers();
                     if modified_buffers.is_empty() {
-                        return Ok(true);
+                        return Ok(Some((true, true)));
                     }
                     self.set_legacy_message(Some(format!(
                         "The following buffers have unwritten changes: {}",
                         modified_buffers.join(", ")
                     )));
-                    return Ok(false);
+                    return Ok(Some((true, false)));
                 }
             }
             Action::MoveUp => {
@@ -22372,14 +22310,14 @@ impl Editor {
             Action::RepeatCharSearch(count) => {
                 let Some((kind, target)) = self.last_character_motion else {
                     self.set_legacy_message(Some("no previous character search".to_string()));
-                    return Ok(false);
+                    return Ok(Some((true, false)));
                 };
                 self.move_to_forward_character(target, *count, kind, buffer)?;
             }
             Action::RepeatCharSearchOpposite(count) => {
                 let Some((kind, target)) = self.last_character_motion else {
                     self.set_legacy_message(Some("no previous character search".to_string()));
-                    return Ok(false);
+                    return Ok(Some((true, false)));
                 };
                 let kind = match kind {
                     ForwardCharacterMotion::Find => ForwardCharacterMotion::FindBackward,
@@ -22418,7 +22356,7 @@ impl Editor {
             }
             Action::MoveToViewportTop(count) | Action::MoveToViewportBottom(count) => {
                 let Some(window) = self.active_window_with_editor_view() else {
-                    return Ok(false);
+                    return Ok(Some((true, false)));
                 };
                 let layout = self.layout_for_window(&window);
                 let mut visible_lines = Vec::new();
@@ -22441,7 +22379,7 @@ impl Editor {
             }
             Action::MoveToViewportMiddle => {
                 let Some(window) = self.active_window_with_editor_view() else {
-                    return Ok(false);
+                    return Ok(Some((true, false)));
                 };
                 let layout = self.layout_for_window(&window);
                 let middle = layout.screen_height().saturating_sub(1) / 2;
@@ -22507,7 +22445,7 @@ impl Editor {
                 self.render_motion_frame(buffer)?;
             }
             Action::EnterSearch(direction) => {
-                add_to_history = false;
+                *add_to_history = false;
                 self.selection = None;
                 self.pending_visual_text_object_scope = None;
                 self.pending_operator = None;
@@ -22516,7 +22454,7 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::RestoreLastVisualSelection => {
-                add_to_history = false;
+                *add_to_history = false;
                 if self.restore_last_visual_selection() {
                     self.render(buffer)?;
                 } else {
@@ -22563,11 +22501,11 @@ impl Editor {
             | Action::ViewInlineAssistAnswer
             | Action::EscalateInlineAssist
             | Action::StageInlineAssistHandoff { .. } => {
-                add_to_history = tracking && Self::records_jump(action);
+                *add_to_history = tracking && Self::records_jump(action);
                 if let std::ops::ControlFlow::Break(quit) =
                     self.execute_inline_action(action, buffer, runtime).await?
                 {
-                    return Ok(quit);
+                    return Ok(Some((true, quit)));
                 }
             }
             Action::OpenAgentAnnotation(id) => {
@@ -22575,15 +22513,15 @@ impl Editor {
                     .await?;
             }
             Action::EnterMode(new_mode) => {
-                add_to_history = false;
+                *add_to_history = false;
                 if self.execute_enter_mode(*new_mode, buffer, runtime).await? {
-                    return Ok(false);
+                    return Ok(Some((true, false)));
                 }
             }
             Action::InsertCharAtCursorPos(c) => {
                 if self.insert_at_multi_cursors(&c.to_string()) {
                     self.publish_multi_cursor_edit(buffer, runtime).await?;
-                    return Ok(false);
+                    return Ok(Some((true, false)));
                 }
                 let completion_dialog_open = self
                     .current_dialog
@@ -23183,7 +23121,7 @@ impl Editor {
                 self.advance_semantic_change_past_history(revision);
             }
             Action::SelectPreviousUndoBranch => {
-                add_to_history = false;
+                *add_to_history = false;
                 let message = self
                     .current_buffer_mut()
                     .undo_history
@@ -23196,7 +23134,7 @@ impl Editor {
                 self.draw_commandline(buffer);
             }
             Action::SelectNextUndoBranch => {
-                add_to_history = false;
+                *add_to_history = false;
                 let message = self
                     .current_buffer_mut()
                     .undo_history
@@ -23209,7 +23147,7 @@ impl Editor {
                 self.draw_commandline(buffer);
             }
             Action::AgentUnsavedEditChoice(choice) => {
-                add_to_history = false;
+                *add_to_history = false;
                 Box::pin(self.resolve_agent_edit_decision(*choice, buffer, runtime)).await?;
             }
             Action::RevertTransaction(transaction_id) => {
@@ -23217,20 +23155,20 @@ impl Editor {
                 Box::pin(self.revert_transaction(transaction_id, buffer, runtime)).await?;
             }
             Action::RepeatLastChange => {
-                add_to_history = false;
+                *add_to_history = false;
                 self.replay_last_semantic_change(buffer, runtime).await?;
             }
             Action::PlayMacro(register) => {
-                add_to_history = false;
+                *add_to_history = false;
                 self.play_macro(*register, buffer, runtime).await?;
             }
             Action::SetMark(mark) => {
-                add_to_history = false;
+                *add_to_history = false;
                 self.set_named_mark(*mark);
             }
             Action::JumpToMark { mark, linewise } => {
                 if *mark == '\'' {
-                    add_to_history = false;
+                    *add_to_history = false;
                     if let Some(entry) = self.active_jump_list().previous_context.clone() {
                         self.remember_previous_context(self.current_jump_entry());
                         self.jump_to_entry(&entry, buffer, runtime).await?;
@@ -23251,7 +23189,7 @@ impl Editor {
                     };
                     let Some(mut anchor) = anchor else {
                         self.set_legacy_message(Some(format!("mark {mark} is not set")));
-                        return Ok(false);
+                        return Ok(Some((true, false)));
                     };
 
                     if let Some(index) = self
@@ -23270,13 +23208,13 @@ impl Editor {
                             self.set_legacy_message(Some(format!(
                                 "marked buffer for {mark} disappeared"
                             )));
-                            return Ok(false);
+                            return Ok(Some((true, false)));
                         };
                         if !Path::new(&file).exists() {
                             self.set_legacy_message(Some(format!(
                                 "marked file for {mark} disappeared"
                             )));
-                            return Ok(false);
+                            return Ok(Some((true, false)));
                         }
                         self.execute_with_tracking(
                             &Action::OpenFile(file),
@@ -23293,7 +23231,7 @@ impl Editor {
                         self.set_legacy_message(Some(format!(
                             "marked buffer for {mark} disappeared"
                         )));
-                        return Ok(false);
+                        return Ok(Some((true, false)));
                     }
 
                     let mut position = anchor.fallback;
@@ -23313,7 +23251,7 @@ impl Editor {
                     Err(error) => {
                         self.set_legacy_message(Some(error.to_string()));
                         self.render(buffer)?;
-                        return Ok(false);
+                        return Ok(Some((true, false)));
                     }
                 };
                 if substitutions.is_empty() && command.suppress_errors {
@@ -23332,12 +23270,12 @@ impl Editor {
                 }
             }
             Action::ConfirmSubstitute(decision) => {
-                add_to_history = false;
+                *add_to_history = false;
                 let Some(mut confirmation) = self.substitute_confirmation.take() else {
                     self.set_legacy_message(Some(
                         "no substitute confirmation is active".to_string(),
                     ));
-                    return Ok(false);
+                    return Ok(Some((true, false)));
                 };
                 match decision {
                     SubstituteDecision::Yes | SubstituteDecision::Last => {
@@ -23379,22 +23317,22 @@ impl Editor {
                 }
             }
             Action::SetMacroRegister { register, keys } => {
-                add_to_history = false;
+                *add_to_history = false;
                 let Some(register) = normalize_macro_register(*register) else {
                     self.set_legacy_message(Some(
                         "macro register must be a letter or digit".to_string(),
                     ));
-                    return Ok(false);
+                    return Ok(Some((true, false)));
                 };
                 if let Err(error) = Self::macro_events_from_notation(keys) {
                     self.set_legacy_message(Some(error.to_string()));
-                    return Ok(false);
+                    return Ok(Some((true, false)));
                 }
                 self.set_register(register, Content::charwise(keys.clone()));
                 self.draw_commandline(buffer);
             }
             Action::PrintRegisters => {
-                add_to_history = false;
+                *add_to_history = false;
                 let mut registers = self
                     .registers
                     .iter()
@@ -23563,14 +23501,14 @@ impl Editor {
             Action::DeletePreviousChar => {
                 if self.delete_before_multi_cursors() {
                     self.publish_multi_cursor_edit(buffer, runtime).await?;
-                    return Ok(false);
+                    return Ok(Some((true, false)));
                 }
                 let completion_dialog_open = self
                     .current_dialog
                     .as_ref()
                     .is_some_and(|dialog| dialog.allows_event_passthrough());
                 if self.cx == 0 && self.buffer_line() == 0 {
-                    return Ok(false);
+                    return Ok(Some((true, false)));
                 }
 
                 let started_transaction = !self.transaction_active();
@@ -23650,7 +23588,7 @@ impl Editor {
                 }
             }
             Action::DumpHistory => {
-                add_to_history = false;
+                *add_to_history = false;
                 self.clean_jump_list();
                 let (entries, index) = {
                     let list = self.active_jump_list();
@@ -23681,15 +23619,15 @@ impl Editor {
                 log!("");
             }
             Action::DumpBuffer => {
-                add_to_history = false;
+                *add_to_history = false;
                 log!("{buffer}", buffer = buffer.dump(false));
             }
             Action::DumpDiagnostics => {
-                add_to_history = false;
+                *add_to_history = false;
                 log!("{diagnostics:#?}", diagnostics = self.diagnostics);
             }
             Action::DumpCapabilities => {
-                add_to_history = false;
+                *add_to_history = false;
                 log!(
                     "client: {}",
                     serde_json::to_string_pretty(&get_client_capabilities("workspace-uri"))?
@@ -23700,11 +23638,11 @@ impl Editor {
                 );
             }
             Action::DoPing => {
-                add_to_history = false;
+                *add_to_history = false;
                 self.lsp.workspace_symbol("").await?;
             }
             Action::ViewLogs => {
-                add_to_history = false;
+                *add_to_history = false;
                 if let Some(log_file) = self.config.log_file.clone() {
                     let path = match normalized_file_path(&log_file) {
                         Ok(path) => path,
@@ -23713,7 +23651,7 @@ impl Editor {
                                 "Failed to open log file: {}",
                                 e
                             )));
-                            return Ok(false);
+                            return Ok(Some((true, false)));
                         }
                     };
                     let log_file = path.to_string_lossy().into_owned();
@@ -23725,7 +23663,7 @@ impl Editor {
                                     "Failed to open log file: {}",
                                     e
                                 )));
-                                return Ok(false);
+                                return Ok(Some((true, false)));
                             }
                         };
                         self.set_current_buffer(buffer, index).await?;
@@ -23746,430 +23684,572 @@ impl Editor {
             | Action::PluginManagerInstall(..)
             | Action::PluginManagerAction(..)
             | Action::PluginManagerFinished { .. } => {
-                add_to_history = false;
+                *add_to_history = false;
                 self.execute_package_action(action, buffer, runtime).await?;
             }
-            Action::Command(cmd) => {
-                if Self::is_shell_ex_command(cmd) {
-                    log!("Handling command: [shell command]");
-                } else {
-                    log!("Handling command: {cmd}");
-                }
-                let actions = self.handle_command(cmd, runtime);
-                // Even a small preferences write can stall on the filesystem.
-                // An accepted quit flushes this history with exit-hook storage,
-                // after terminal restoration. Rejected/failed quits flush here.
-                let deferred_history = if actions
-                    .iter()
-                    .any(|action| matches!(action, Action::Quit(_)))
-                {
-                    self.preferences.record_command_deferred(cmd)
-                } else {
-                    self.record_command_history(cmd);
-                    false
-                };
-                let result = self.execute_command_actions(actions, buffer, runtime).await;
-                if deferred_history && !matches!(result, Ok(true)) {
-                    self.flush_command_history();
-                }
-                if result? {
-                    return Ok(true);
-                }
-                self.render(buffer)?;
-            }
-            Action::BufferDo {
-                command,
-                start,
-                end,
-            } => {
-                self.execute_buffer_do(command, *start, *end, buffer, runtime)
-                    .await?;
-            }
-            Action::PluginCommand(cmd) => {
-                let demo = match (
-                    self.tutorial_controller
-                        .as_ref()
-                        .and_then(TutorialController::lesson),
-                    cmd.as_str(),
-                ) {
-                    (Some(TutorialLesson::Git), "GitDashboard") => Some(TutorialDemoKind::Git),
-                    (Some(TutorialLesson::Agent), "Agent" | "AgentOpen") => {
-                        Some(TutorialDemoKind::Agent)
-                    }
-                    _ => None,
-                };
-                if let Some(kind) = demo {
-                    self.release_current_dialog_callbacks(runtime);
-                    self.current_dialog = Some(Box::new(TutorialDemoPanel::new(self, kind)));
-                    self.render(buffer)?;
-                } else {
-                    self.execute_plugin_command(buffer, runtime, cmd).await?;
-                }
-            }
-            Action::GoToLine(line) => {
-                self.go_to_line(*line, buffer, runtime, GoToLinePosition::Center)
-                    .await?
-            }
-            Action::GoToDefinition => {
-                if let Some(file) = self.current_buffer().file.clone() {
-                    let position = self.cursor_lsp_position();
-                    self.ensure_current_buffer_lsp_opened().await?;
-                    let request_id = self
-                        .lsp
-                        .goto_definition(&file, position.character, position.line)
-                        .await?;
-                    self.pending_definition_requests.insert(request_id);
-                } else {
-                    self.set_routine_warning(Some("No definition found".to_string()));
-                    self.draw_commandline(buffer);
-                }
-            }
-            Action::Hover => {
-                if let Some(file) = self.current_buffer().file.clone() {
-                    let position = self.cursor_lsp_position();
-                    self.ensure_current_buffer_lsp_opened().await?;
-                    self.lsp
-                        .hover(&file, position.character, position.line)
-                        .await?;
-                }
-            }
-            Action::ShowLineDiagnostics => {
-                if let Some(diagnostics) = self.diagnostics_for_current_line() {
-                    let popup = DiagnosticInfo::new(self, diagnostics);
-                    self.release_current_dialog_callbacks(runtime);
-                    self.current_dialog = Some(Box::new(popup));
-                    self.render(buffer)?;
-                } else {
-                    self.set_routine_warning(Some(
-                        "No diagnostics on the current line".to_string(),
-                    ));
-                    self.draw_commandline(buffer);
-                }
-            }
-            Action::NextDiagnostic | Action::PreviousDiagnostic => {
-                let forward = matches!(action, Action::NextDiagnostic);
-                if let Some(target) = self.diagnostic_navigation_target(forward) {
-                    self.execute_with_tracking(
-                        &Action::MoveTo(target.character, target.line + 1),
-                        buffer,
-                        runtime,
-                        false,
-                    )
-                    .await?;
-                } else {
-                    self.set_navigation_boundary_warning("valid diagnostics");
-                }
-            }
-            Action::ExecuteLspCommand(command) => {
-                self.execute_lsp_command(command, None).await?;
-            }
-            Action::FormatDocument => {
-                self.format_document_action(buffer, runtime).await?;
-            }
-            Action::CodeAction => {
-                if let Some(file) = self.current_buffer().file.clone() {
-                    let Some(uri) = self.current_buffer().uri()? else {
-                        return Ok(false);
-                    };
-                    let position = self.cursor_lsp_position();
-                    let range = Range {
-                        start: position,
-                        end: position,
-                    };
-                    let pending = PendingLspEdit {
-                        buffer_id: self.current_buffer().id(),
-                        revision: self.current_buffer().revision(),
-                        uri: uri.clone(),
-                    };
-                    let revisions = self.open_buffer_revision_snapshot();
-                    self.release_current_dialog_callbacks(runtime);
-                    self.clear_pending_code_action_requests();
-                    self.current_dialog = Some(Box::new(self.code_action_loading_picker()));
-                    self.render(buffer)?;
+            _ => return Ok(None),
+        }
+        Ok(Some((false, false)))
+    }
 
-                    let request: anyhow::Result<Vec<i64>> = async {
-                        self.ensure_current_buffer_lsp_opened().await?;
-                        let diagnostics = self
-                            .lsp
-                            .request_sources_for_file(&file, "textDocument/codeAction")
-                            .into_iter()
-                            .map(|source| {
-                                let diagnostics = self
-                                    .diagnostic_reports
-                                    .for_producer(&uri, &source)
-                                    .into_iter()
-                                    .filter(|diagnostic| {
-                                        let start = (
-                                            diagnostic.range.start.line,
-                                            diagnostic.range.start.character,
-                                        );
-                                        let end = (
-                                            diagnostic.range.end.line,
-                                            diagnostic.range.end.character,
-                                        );
-                                        let cursor = (position.line, position.character);
-                                        start <= cursor && cursor <= end
-                                    })
-                                    .collect();
-                                (source, diagnostics)
-                            })
-                            .collect();
-                        Ok(self.lsp.code_actions(&file, range, diagnostics).await?)
-                    }
-                    .await;
-                    let request_ids = match request {
-                        Ok(request_ids) => request_ids,
-                        Err(error) => {
-                            self.current_dialog = None;
-                            self.render(buffer)?;
-                            return Err(error);
-                        }
-                    };
-                    if let Some(&request_id) = request_ids.first() {
-                        self.pending_code_action_request = Some(request_id);
-                        self.pending_code_action_requests = request_ids.iter().copied().collect();
-                        for request_id in request_ids {
-                            self.pending_lsp_edit_requests
-                                .insert(request_id, pending.clone());
-                            self.pending_lsp_revision_snapshots
-                                .insert(request_id, revisions.clone());
-                        }
+    async fn execute_action_inner_body(
+        &mut self,
+        action: &Action,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+        tracking: bool,
+    ) -> anyhow::Result<bool> {
+        // log!("Action: {action:?}");
+        self.half_page_keeps_screen_row = false;
+        self.set_legacy_message(None);
+        if self.intercept_learn_action(action, buffer, runtime)? {
+            return Ok(false);
+        }
+        if self.current_buffer().directory.is_some()
+            && matches!(
+                action,
+                Action::Save
+                    | Action::ForceSave
+                    | Action::SaveAs(_)
+                    | Action::ForceSaveAs(_)
+                    | Action::SetBufferName(_)
+                    | Action::EnterMode(Mode::Insert)
+                    | Action::SetSyntax(_)
+            )
+        {
+            self.set_legacy_message(Some("Directory buffers are read-only".to_string()));
+            self.render(buffer)?;
+            return Ok(false);
+        }
+        if matches!(
+            action,
+            Action::Save | Action::ForceSave | Action::SaveAs(_) | Action::ForceSaveAs(_)
+        ) && self
+            .tutorial_controller
+            .as_ref()
+            .is_some_and(|tutorial| tutorial.practice_buffer_id == self.current_buffer().id())
+        {
+            self.last_error = Some("the Red tutorial practice buffer cannot be saved".to_string());
+            self.render(buffer)?;
+            return Ok(false);
+        }
+        let sensitive_action = matches!(
+            action,
+            Action::NotifyPlugin(_, _, _) | Action::RunShell(_) | Action::RunShellFilter { .. }
+        ) || matches!(
+            action,
+            Action::CopilotFinishSignIn(_)
+                | Action::CopilotEnableAndSignIn
+                | Action::CopilotCopySignInCode(_)
+                | Action::CopilotRetrySignIn
+                | Action::CopilotDismissSignIn
+                | Action::CopilotRespond { .. }
+        ) || matches!(action, Action::SubmitInlineAssist(_))
+            || matches!(action, Action::StageInlineAssistHandoff { .. })
+            || matches!(action, Action::NotifyPlugins(method, _) if method.starts_with("composer:"));
+        if !sensitive_action {
+            self.actions.push(action.clone());
+        }
+        // The action history is only read back by visual-block replication,
+        // which records absolute indices in `pending_select_action`. Trim the
+        // front when nothing is recording so the history can't grow without
+        // bound over a long session.
+        const MAX_ACTION_HISTORY: usize = 1024;
+        if self.pending_select_action.is_none() && self.actions.len() > MAX_ACTION_HISTORY {
+            let excess = self.actions.len() - MAX_ACTION_HISTORY / 2;
+            self.actions.drain(..excess);
+        }
+
+        let mut add_to_history = tracking;
+        if matches!(
+            action,
+            Action::SplitHorizontal
+                | Action::SplitVertical
+                | Action::SplitHorizontalNewBuffer
+                | Action::SplitVerticalNewBuffer
+                | Action::SplitHorizontalWithFile(_)
+                | Action::SplitVerticalWithFile(_)
+                | Action::CloseWindow
+                | Action::NextWindow
+                | Action::PreviousWindow
+                | Action::MoveWindowUp
+                | Action::MoveWindowDown
+                | Action::MoveWindowLeft
+                | Action::MoveWindowRight
+                | Action::MoveWindowToLeft
+                | Action::MoveWindowToBottom
+                | Action::MoveWindowToTop
+                | Action::MoveWindowToRight
+                | Action::EnterPaneResizeMode
+                | Action::ResizeWindowUp(_)
+                | Action::ResizeWindowDown(_)
+                | Action::ResizeWindowLeft(_)
+                | Action::ResizeWindowRight(_)
+                | Action::BalanceWindows
+                | Action::ResetPanelLayout(_)
+                | Action::MaximizeWindow
+                | Action::OnlyWindow
+        ) && self.clear_pane_zoom()
+        {
+            self.invalidate_terminal_render_state(buffer);
+            self.render(buffer)?;
+        }
+        let action_buffer_id = self.current_buffer().id();
+        let signature_snapshot = self.signature_snapshot();
+        let action_buffer_revision = self.current_buffer().revision();
+        self.lsp_coordinator
+            .ensure_notified_revision(action_buffer_id, action_buffer_revision);
+        let event_snapshot_before_action = self.event_snapshot();
+        let action_cause = Self::action_cause(action);
+        let jump_entry_before_action = self.jump_origin_for_action(action);
+        let picker_handle_before_action = self
+            .current_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.picker_handle());
+        let composer_handle_before_action = self
+            .current_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.composer_handle());
+
+        match self
+            .dispatch_actions_before_commands(
+                action,
+                buffer,
+                runtime,
+                tracking,
+                &mut add_to_history,
+            )
+            .await?
+        {
+            Some((true, quit)) => return Ok(quit),
+            Some((false, _)) => {}
+            None => match action {
+                Action::Command(cmd) => {
+                    if Self::is_shell_ex_command(cmd) {
+                        log!("Handling command: [shell command]");
                     } else {
-                        self.current_dialog = None;
-                        self.set_legacy_message(Some(
-                            "no language server is available for this file".to_string(),
+                        log!("Handling command: {cmd}");
+                    }
+                    let actions = self.handle_command(cmd, runtime);
+                    // Even a small preferences write can stall on the filesystem.
+                    // An accepted quit flushes this history with exit-hook storage,
+                    // after terminal restoration. Rejected/failed quits flush here.
+                    let deferred_history = if actions
+                        .iter()
+                        .any(|action| matches!(action, Action::Quit(_)))
+                    {
+                        self.preferences.record_command_deferred(cmd)
+                    } else {
+                        self.record_command_history(cmd);
+                        false
+                    };
+                    let result = self.execute_command_actions(actions, buffer, runtime).await;
+                    if deferred_history && !matches!(result, Ok(true)) {
+                        self.flush_command_history();
+                    }
+                    if result? {
+                        return Ok(true);
+                    }
+                    self.render(buffer)?;
+                }
+                Action::BufferDo {
+                    command,
+                    start,
+                    end,
+                } => {
+                    self.execute_buffer_do(command, *start, *end, buffer, runtime)
+                        .await?;
+                }
+                Action::PluginCommand(cmd) => {
+                    let demo = match (
+                        self.tutorial_controller
+                            .as_ref()
+                            .and_then(TutorialController::lesson),
+                        cmd.as_str(),
+                    ) {
+                        (Some(TutorialLesson::Git), "GitDashboard") => Some(TutorialDemoKind::Git),
+                        (Some(TutorialLesson::Agent), "Agent" | "AgentOpen") => {
+                            Some(TutorialDemoKind::Agent)
+                        }
+                        _ => None,
+                    };
+                    if let Some(kind) = demo {
+                        self.release_current_dialog_callbacks(runtime);
+                        self.current_dialog = Some(Box::new(TutorialDemoPanel::new(self, kind)));
+                        self.render(buffer)?;
+                    } else {
+                        self.execute_plugin_command(buffer, runtime, cmd).await?;
+                    }
+                }
+                Action::GoToLine(line) => {
+                    self.go_to_line(*line, buffer, runtime, GoToLinePosition::Center)
+                        .await?
+                }
+                Action::ExploreCommand(command) => {
+                    add_to_history = false;
+                    // Box the future so it is not stored in execute's state machine.
+                    self.explore_command(command, buffer, runtime).await?;
+                }
+                Action::GoToDefinition => {
+                    if let Some(file) = self.current_buffer().file.clone() {
+                        let position = self.cursor_lsp_position();
+                        self.ensure_current_buffer_lsp_opened().await?;
+                        let request_id = self
+                            .lsp
+                            .goto_definition(&file, position.character, position.line)
+                            .await?;
+                        self.pending_definition_requests.insert(request_id);
+                    } else {
+                        self.set_routine_warning(Some("No definition found".to_string()));
+                        self.draw_commandline(buffer);
+                    }
+                }
+                Action::Hover => {
+                    if let Some(file) = self.current_buffer().file.clone() {
+                        let position = self.cursor_lsp_position();
+                        self.ensure_current_buffer_lsp_opened().await?;
+                        self.lsp
+                            .hover(&file, position.character, position.line)
+                            .await?;
+                    }
+                }
+                Action::ShowLineDiagnostics => {
+                    if let Some(diagnostics) = self.diagnostics_for_current_line() {
+                        let popup = DiagnosticInfo::new(self, diagnostics);
+                        self.release_current_dialog_callbacks(runtime);
+                        self.current_dialog = Some(Box::new(popup));
+                        self.render(buffer)?;
+                    } else {
+                        self.set_routine_warning(Some(
+                            "No diagnostics on the current line".to_string(),
                         ));
+                        self.draw_commandline(buffer);
+                    }
+                }
+                Action::NextDiagnostic | Action::PreviousDiagnostic => {
+                    let forward = matches!(action, Action::NextDiagnostic);
+                    if let Some(target) = self.diagnostic_navigation_target(forward) {
+                        self.execute_with_tracking(
+                            &Action::MoveTo(target.character, target.line + 1),
+                            buffer,
+                            runtime,
+                            false,
+                        )
+                        .await?;
+                    } else {
+                        self.set_navigation_boundary_warning("valid diagnostics");
+                    }
+                }
+                Action::ExecuteLspCommand(command) => {
+                    self.execute_lsp_command(command, None).await?;
+                }
+                Action::FormatDocument => {
+                    self.format_document_action(buffer, runtime).await?;
+                }
+                Action::CodeAction => {
+                    if let Some(file) = self.current_buffer().file.clone() {
+                        let Some(uri) = self.current_buffer().uri()? else {
+                            return Ok(false);
+                        };
+                        let position = self.cursor_lsp_position();
+                        let range = Range {
+                            start: position,
+                            end: position,
+                        };
+                        let pending = PendingLspEdit {
+                            buffer_id: self.current_buffer().id(),
+                            revision: self.current_buffer().revision(),
+                            uri: uri.clone(),
+                        };
+                        let revisions = self.open_buffer_revision_snapshot();
+                        self.release_current_dialog_callbacks(runtime);
+                        self.clear_pending_code_action_requests();
+                        self.current_dialog = Some(Box::new(self.code_action_loading_picker()));
+                        self.render(buffer)?;
+
+                        let request: anyhow::Result<Vec<i64>> = async {
+                            self.ensure_current_buffer_lsp_opened().await?;
+                            let diagnostics = self
+                                .lsp
+                                .request_sources_for_file(&file, "textDocument/codeAction")
+                                .into_iter()
+                                .map(|source| {
+                                    let diagnostics = self
+                                        .diagnostic_reports
+                                        .for_producer(&uri, &source)
+                                        .into_iter()
+                                        .filter(|diagnostic| {
+                                            let start = (
+                                                diagnostic.range.start.line,
+                                                diagnostic.range.start.character,
+                                            );
+                                            let end = (
+                                                diagnostic.range.end.line,
+                                                diagnostic.range.end.character,
+                                            );
+                                            let cursor = (position.line, position.character);
+                                            start <= cursor && cursor <= end
+                                        })
+                                        .collect();
+                                    (source, diagnostics)
+                                })
+                                .collect();
+                            Ok(self.lsp.code_actions(&file, range, diagnostics).await?)
+                        }
+                        .await;
+                        let request_ids = match request {
+                            Ok(request_ids) => request_ids,
+                            Err(error) => {
+                                self.current_dialog = None;
+                                self.render(buffer)?;
+                                return Err(error);
+                            }
+                        };
+                        if let Some(&request_id) = request_ids.first() {
+                            self.pending_code_action_request = Some(request_id);
+                            self.pending_code_action_requests =
+                                request_ids.iter().copied().collect();
+                            for request_id in request_ids {
+                                self.pending_lsp_edit_requests
+                                    .insert(request_id, pending.clone());
+                                self.pending_lsp_revision_snapshots
+                                    .insert(request_id, revisions.clone());
+                            }
+                        } else {
+                            self.current_dialog = None;
+                            self.set_legacy_message(Some(
+                                "no language server is available for this file".to_string(),
+                            ));
+                            self.render(buffer)?;
+                        }
+                    }
+                }
+                Action::SignatureHelp => {
+                    if self.invoke_signature_help().await? {
                         self.render(buffer)?;
                     }
                 }
-            }
-            Action::SignatureHelp => {
-                if self.invoke_signature_help().await? {
-                    self.render(buffer)?;
-                }
-            }
-            Action::StartRename => {
-                if self.current_buffer().file.is_some() {
-                    let initial = self.symbol_under_cursor();
-                    self.current_dialog = Some(Box::new(InputPrompt::new(
-                        self,
-                        "Rename symbol",
-                        initial,
-                        Action::RenameSymbol,
-                    )));
-                    self.render(buffer)?;
-                }
-            }
-            Action::RenameSymbol(new_name) => {
-                if let Some(file) = self.current_buffer().file.clone() {
-                    let Some(uri) = self.current_buffer().uri()? else {
-                        return Ok(false);
-                    };
-                    let position = self.cursor_lsp_position();
-                    let pending = PendingLspEdit {
-                        buffer_id: self.current_buffer().id(),
-                        revision: self.current_buffer().revision(),
-                        uri,
-                    };
-                    let revisions = self.open_buffer_revision_snapshot();
-                    self.ensure_current_buffer_lsp_opened().await?;
-                    let request_id = self
-                        .lsp
-                        .rename(&file, position.character, position.line, new_name)
-                        .await?;
-                    if request_id > 0 {
-                        self.pending_lsp_edit_requests.insert(request_id, pending);
-                        self.pending_lsp_revision_snapshots
-                            .insert(request_id, revisions);
-                    } else {
-                        self.set_legacy_message(Some(
-                            "no language server is available for this file".to_string(),
-                        ));
+                Action::StartRename => {
+                    if self.current_buffer().file.is_some() {
+                        let initial = self.symbol_under_cursor();
+                        self.current_dialog = Some(Box::new(InputPrompt::new(
+                            self,
+                            "Rename symbol",
+                            initial,
+                            Action::RenameSymbol,
+                        )));
+                        self.render(buffer)?;
                     }
                 }
-            }
-            Action::ApplyLspWorkspaceEdit {
-                documents,
-                expected_revisions,
-                command,
-                label,
-                source,
-            } => {
-                let operations = documents
-                    .iter()
-                    .cloned()
-                    .map(|edit| LspWorkspaceEditOperation::Document { edit })
-                    .collect::<Vec<_>>();
-                self.apply_lsp_workspace_edit(
-                    &operations,
+                Action::RenameSymbol(new_name) => {
+                    if let Some(file) = self.current_buffer().file.clone() {
+                        let Some(uri) = self.current_buffer().uri()? else {
+                            return Ok(false);
+                        };
+                        let position = self.cursor_lsp_position();
+                        let pending = PendingLspEdit {
+                            buffer_id: self.current_buffer().id(),
+                            revision: self.current_buffer().revision(),
+                            uri,
+                        };
+                        let revisions = self.open_buffer_revision_snapshot();
+                        self.ensure_current_buffer_lsp_opened().await?;
+                        let request_id = self
+                            .lsp
+                            .rename(&file, position.character, position.line, new_name)
+                            .await?;
+                        if request_id > 0 {
+                            self.pending_lsp_edit_requests.insert(request_id, pending);
+                            self.pending_lsp_revision_snapshots
+                                .insert(request_id, revisions);
+                        } else {
+                            self.set_legacy_message(Some(
+                                "no language server is available for this file".to_string(),
+                            ));
+                        }
+                    }
+                }
+                Action::ApplyLspWorkspaceEdit {
+                    documents,
                     expected_revisions,
-                    command.as_deref(),
+                    command,
                     label,
-                    None,
-                    None,
-                    None,
-                    None,
-                    source.as_ref(),
-                    buffer,
-                    runtime,
-                )
-                .await?;
-            }
-            Action::ApplyLspWorkspaceEditOperations {
-                operations,
-                expected_revisions,
-                command,
-                label,
-                response,
-                save_after_uri,
-                save_as,
-                save_previous_file,
-                source,
-            } => {
-                self.apply_lsp_workspace_edit(
-                    operations,
-                    expected_revisions,
-                    command.as_deref(),
-                    label,
-                    response.as_deref(),
-                    save_after_uri.as_deref(),
-                    save_as.as_deref(),
-                    save_previous_file.clone(),
-                    source.as_ref(),
-                    buffer,
-                    runtime,
-                )
-                .await?;
-            }
-            Action::CompleteLspFormatSave {
-                buffer_id,
-                uri,
-                save_as,
-                previous_file,
-                warning,
-            } => {
-                self.complete_lsp_format_save(
-                    *buffer_id,
-                    uri,
-                    save_as.as_deref(),
-                    previous_file.clone(),
-                    warning.as_deref(),
-                    runtime,
-                )
-                .await?;
-            }
-            Action::RetryLspFormatSave {
-                buffer_id,
-                uri,
-                save_as,
-                previous_file,
-            } => {
-                self.retry_lsp_format_save(
-                    *buffer_id,
-                    uri,
-                    save_as.clone(),
-                    previous_file.clone(),
-                    runtime,
-                )
-                .await?;
-            }
-            Action::RestoreLspFormatSave {
-                buffer_id,
-                uri,
-                previous_file,
-                warning,
-            } => {
-                self.restore_lsp_format_save_identity(*buffer_id, uri, previous_file.clone())
-                    .await;
-                self.set_legacy_message(Some(warning.clone()));
-            }
-            Action::RespondLspWorkspaceEdit {
-                request,
-                applied,
-                failure_reason,
-            } => {
-                self.lsp
-                    .respond_workspace_edit(request, *applied, failure_reason.as_deref())
-                    .await?;
-            }
-            Action::MoveTo(x, y) => {
-                self.go_to_line(*y, buffer, runtime, GoToLinePosition::Center)
-                    .await?;
-                self.cx = std::cmp::min(*x, self.line_length().saturating_sub(1));
-                self.check_bounds();
-                self.render(buffer)?;
-            }
-            Action::MoveToFilePos(file, x, y) => {
-                if self.current_buffer().file != Some(file.clone()) {
-                    self.execute_with_tracking(
-                        &Action::OpenFile(file.clone()),
+                    source,
+                } => {
+                    let operations = documents
+                        .iter()
+                        .cloned()
+                        .map(|edit| LspWorkspaceEditOperation::Document { edit })
+                        .collect::<Vec<_>>();
+                    self.apply_lsp_workspace_edit(
+                        &operations,
+                        expected_revisions,
+                        command.as_deref(),
+                        label,
+                        None,
+                        None,
+                        None,
+                        None,
+                        source.as_ref(),
                         buffer,
                         runtime,
-                        false,
                     )
                     .await?;
                 }
-
-                self.execute_with_tracking(&Action::MoveTo(*x, *y), buffer, runtime, false)
+                Action::ApplyLspWorkspaceEditOperations {
+                    operations,
+                    expected_revisions,
+                    command,
+                    label,
+                    response,
+                    save_after_uri,
+                    save_as,
+                    save_previous_file,
+                    source,
+                } => {
+                    self.apply_lsp_workspace_edit(
+                        operations,
+                        expected_revisions,
+                        command.as_deref(),
+                        label,
+                        response.as_deref(),
+                        save_after_uri.as_deref(),
+                        save_as.as_deref(),
+                        save_previous_file.clone(),
+                        source.as_ref(),
+                        buffer,
+                        runtime,
+                    )
                     .await?;
-            }
-            Action::FollowLink | Action::FollowLinkInSplit => {
-                self.sync_to_window();
-                let opening = if matches!(action, Action::FollowLinkInSplit) {
-                    markdown_links::LinkOpening::Split
-                } else {
-                    markdown_links::LinkOpening::Default
-                };
-                // Routed opens own the destination's history, even when focus moves there.
-                add_to_history &= opening == markdown_links::LinkOpening::Default
-                    && self.markdown_link_destination().is_none();
-                if let Err(error) = self.follow_markdown_link(opening, buffer, runtime).await {
-                    add_to_history = false;
-                    self.set_legacy_message(Some(error.to_string()));
+                }
+                Action::CompleteLspFormatSave {
+                    buffer_id,
+                    uri,
+                    save_as,
+                    previous_file,
+                    warning,
+                } => {
+                    self.complete_lsp_format_save(
+                        *buffer_id,
+                        uri,
+                        save_as.as_deref(),
+                        previous_file.clone(),
+                        warning.as_deref(),
+                        runtime,
+                    )
+                    .await?;
+                }
+                Action::RetryLspFormatSave {
+                    buffer_id,
+                    uri,
+                    save_as,
+                    previous_file,
+                } => {
+                    self.retry_lsp_format_save(
+                        *buffer_id,
+                        uri,
+                        save_as.clone(),
+                        previous_file.clone(),
+                        runtime,
+                    )
+                    .await?;
+                }
+                Action::RestoreLspFormatSave {
+                    buffer_id,
+                    uri,
+                    previous_file,
+                    warning,
+                } => {
+                    self.restore_lsp_format_save_identity(*buffer_id, uri, previous_file.clone())
+                        .await;
+                    self.set_legacy_message(Some(warning.clone()));
+                }
+                Action::RespondLspWorkspaceEdit {
+                    request,
+                    applied,
+                    failure_reason,
+                } => {
+                    self.lsp
+                        .respond_workspace_edit(request, *applied, failure_reason.as_deref())
+                        .await?;
+                }
+                Action::MoveTo(x, y) => {
+                    self.go_to_line(*y, buffer, runtime, GoToLinePosition::Center)
+                        .await?;
+                    self.cx = std::cmp::min(*x, self.line_length().saturating_sub(1));
+                    self.check_bounds();
                     self.render(buffer)?;
                 }
-            }
-            Action::ClearLinkDestination => {
-                if let Some(source) = self.window_manager.active_stable_window_id() {
-                    self.markdown_link_destinations.remove(&source);
-                }
-                self.render(buffer)?;
-            }
-            Action::OpenExternalUrl(url) => {
-                let lowercase = url.to_ascii_lowercase();
-                if !lowercase.starts_with("https://")
-                    && !lowercase.starts_with("http://")
-                    && !lowercase.starts_with("mailto:")
-                {
-                    self.set_legacy_message(Some(
-                        "Only HTTP, HTTPS and mailto links can be opened".to_string(),
-                    ));
-                    return Ok(false);
-                }
-                match open_external_url(url) {
-                    Ok(mut child) => {
-                        tokio::spawn(async move {
-                            let _ = child.wait().await;
-                        });
+                Action::MoveToFilePos(file, x, y) => {
+                    if self.current_buffer().file != Some(file.clone()) {
+                        self.execute_with_tracking(
+                            &Action::OpenFile(file.clone()),
+                            buffer,
+                            runtime,
+                            false,
+                        )
+                        .await?;
                     }
-                    Err(error) => {
-                        self.set_legacy_message(Some(format!("Unable to open link: {error}")));
+
+                    self.execute_with_tracking(&Action::MoveTo(*x, *y), buffer, runtime, false)
+                        .await?;
+                }
+                Action::FollowLink | Action::FollowLinkInSplit => {
+                    self.sync_to_window();
+                    let opening = if matches!(action, Action::FollowLinkInSplit) {
+                        markdown_links::LinkOpening::Split
+                    } else {
+                        markdown_links::LinkOpening::Default
+                    };
+                    // Routed opens own the destination's history, even when focus moves there.
+                    add_to_history &= opening == markdown_links::LinkOpening::Default
+                        && self.markdown_link_destination().is_none();
+                    if let Err(error) = self.follow_markdown_link(opening, buffer, runtime).await {
+                        add_to_history = false;
+                        self.set_legacy_message(Some(error.to_string()));
+                        self.render(buffer)?;
+                    }
+                }
+                Action::ClearLinkDestination => {
+                    if let Some(source) = self.window_manager.active_stable_window_id() {
+                        self.markdown_link_destinations.remove(&source);
+                    }
+                    self.render(buffer)?;
+                }
+                Action::OpenExternalUrl(url) => {
+                    let lowercase = url.to_ascii_lowercase();
+                    if !lowercase.starts_with("https://")
+                        && !lowercase.starts_with("http://")
+                        && !lowercase.starts_with("mailto:")
+                    {
+                        self.set_legacy_message(Some(
+                            "Only HTTP, HTTPS and mailto links can be opened".to_string(),
+                        ));
                         return Ok(false);
                     }
-                }
-            }
-            Action::OpenLocation(location, target) => {
-                let (buffer_index, added_buffer, path) =
-                    match self.load_or_reuse_path_buffer(&location.path).await {
-                        Ok(opened) => opened,
+                    match open_external_url(url) {
+                        Ok(mut child) => {
+                            tokio::spawn(async move {
+                                let _ = child.wait().await;
+                            });
+                        }
                         Err(error) => {
-                            self.set_legacy_message(Some(error.to_string()));
+                            self.set_legacy_message(Some(format!("Unable to open link: {error}")));
                             return Ok(false);
                         }
-                    };
+                    }
+                }
+                Action::OpenLocation(location, target) => {
+                    let (buffer_index, added_buffer, path) =
+                        match self.load_or_reuse_path_buffer(&location.path).await {
+                            Ok(opened) => opened,
+                            Err(error) => {
+                                self.set_legacy_message(Some(error.to_string()));
+                                return Ok(false);
+                            }
+                        };
 
-                let opened =
-                    match target {
+                    let opened = match target {
                         plugin::OpenLocationTarget::Current => {
                             self.set_current_buffer(buffer, buffer_index).await?;
                             true
@@ -24179,1207 +24259,1223 @@ impl Editor {
                         plugin::OpenLocationTarget::Vertical => self
                             .update_window_layout(|windows| windows.split_vertical(buffer_index)),
                     };
-                if !opened {
-                    if added_buffer {
-                        self.buffer_manager.pop_buffer();
-                    }
-                    self.set_legacy_message(Some(
-                        "Unable to open location in requested target".to_string(),
-                    ));
-                    return Ok(false);
-                }
-
-                if added_buffer && self.current_buffer().file.is_some() {
-                    self.plugin_registry
-                        .notify(
-                            runtime,
-                            "file:opened",
-                            json!({ "file": path, "buffer_index": buffer_index }),
-                        )
-                        .await?;
-                }
-
-                let target_line = location
-                    .line
-                    .min(self.current_buffer().len().saturating_sub(1));
-                let target_column = self
-                    .current_buffer()
-                    .get(target_line)
-                    .map(|line| {
-                        let line = line.trim_end_matches('\n');
-                        match location.column_encoding {
-                            plugin::LocationColumnEncoding::Utf8Byte => {
-                                crate::unicode_utils::byte_to_grapheme(line, location.column)
-                            }
-                            plugin::LocationColumnEncoding::Utf16 => {
-                                utf16_to_grapheme(line, location.column)
-                            }
+                    if !opened {
+                        if added_buffer {
+                            self.buffer_manager.pop_buffer();
                         }
-                    })
-                    .unwrap_or_default();
-                self.execute_with_tracking(
-                    &Action::MoveTo(target_column, target_line + 1),
-                    buffer,
-                    runtime,
-                    /*tracking*/ false,
-                )
-                .await?;
-            }
-            Action::SetCursor(x, y) => {
-                let target_y = (*y).min(self.last_navigable_line());
-
-                if target_y < self.vtop {
-                    self.vtop = target_y;
-                } else if target_y >= self.vtop + self.vheight().max(1) {
-                    self.vtop = target_y.saturating_sub(self.vheight().saturating_sub(1));
-                }
-
-                self.cy = target_y.saturating_sub(self.vtop);
-                self.cx = *x;
-                self.check_bounds();
-                self.refresh_cursor_goal();
-                self.sync_to_window();
-                self.ensure_current_buffer_lsp_opened().await?;
-                self.render(buffer)?;
-            }
-            Action::ScrollUp => {
-                let scroll_lines = self.config.mouse_scroll_lines.unwrap_or(3);
-                if self.active_has_markdown_tables() || self.active_has_markdown_images() {
-                    self.scroll_markdown_viewport(false, scroll_lines);
-                    self.sync_to_window();
-                    self.render_motion_frame(buffer)?;
-                } else {
-                    let old_vtop = self.vtop;
-                    self.vtop = self.vtop.saturating_sub(scroll_lines);
-                    let scrolled_lines = old_vtop - self.vtop;
-                    if scrolled_lines > 0 {
-                        let viewport_height = self.vheight().max(1);
-                        let scrolloff = self
-                            .config
-                            .scrolloff
-                            .unwrap_or(0)
-                            .min(viewport_height.saturating_sub(1));
-                        let max_cy = viewport_height.saturating_sub(scrolloff).saturating_sub(1);
-                        self.cy = self.cy.saturating_add(scrolled_lines).min(max_cy);
-                        self.skipcol = 0;
-                        self.clamp_cursor_to_scrolled_viewport();
-                        self.sync_to_window();
-                        self.render_motion_frame(buffer)?;
-                    }
-                }
-            }
-            Action::ScrollDown => {
-                let scroll_lines = self.config.mouse_scroll_lines.unwrap_or(3);
-                if self.active_has_markdown_tables() || self.active_has_markdown_images() {
-                    self.scroll_markdown_viewport(true, scroll_lines);
-                    self.sync_to_window();
-                    self.render_motion_frame(buffer)?;
-                } else {
-                    let viewport_height = self.vheight().max(1);
-                    let last_line = self.last_navigable_line();
-                    let max_vtop =
-                        if self.wrap || self.has_inline_comments(self.current_buffer().id()) {
-                            last_line
-                        } else {
-                            last_line.saturating_sub(viewport_height.saturating_sub(1))
-                        };
-                    let old_vtop = self.vtop;
-                    let new_vtop = self.vtop.saturating_add(scroll_lines).min(max_vtop);
-                    let scrolled_lines = new_vtop.saturating_sub(old_vtop);
-                    if scrolled_lines > 0 {
-                        self.vtop = new_vtop;
-                        let scrolloff = self
-                            .config
-                            .scrolloff
-                            .unwrap_or(0)
-                            .min(viewport_height.saturating_sub(1));
-                        self.cy = self.cy.saturating_sub(scrolled_lines).max(scrolloff);
-                        self.skipcol = 0;
-                        self.clamp_cursor_to_scrolled_viewport();
-                        self.sync_to_window();
-                        self.render_motion_frame(buffer)?;
-                    }
-                }
-            }
-            Action::ScrollViewLeft => {
-                if !self.wrap {
-                    self.vleft = self.vleft.saturating_sub(self.sidescroll());
-                    self.render(buffer)?;
-                }
-            }
-            Action::ScrollViewRight => {
-                if !self.wrap {
-                    self.vleft = self.vleft.saturating_add(self.sidescroll());
-                    self.render(buffer)?;
-                }
-            }
-            Action::ScrollViewHalfPageLeft => {
-                if !self.wrap {
-                    self.vleft = self.vleft.saturating_sub(self.active_content_width() / 2);
-                    self.render(buffer)?;
-                }
-            }
-            Action::ScrollViewHalfPageRight => {
-                if !self.wrap {
-                    self.vleft = self.vleft.saturating_add(self.active_content_width() / 2);
-                    self.render(buffer)?;
-                }
-            }
-            Action::ScrollCursorToViewStart => {
-                if !self.wrap {
-                    let display_col = self.current_cursor_display_col();
-                    self.vleft = display_col;
-                    self.render(buffer)?;
-                }
-            }
-            Action::ScrollCursorToViewEnd => {
-                if !self.wrap {
-                    let display_col = self.current_cursor_display_col();
-                    self.vleft =
-                        display_col.saturating_sub(self.active_content_width().saturating_sub(1));
-                    self.render(buffer)?;
-                }
-            }
-            Action::ToggleWrap => {
-                self.wrap = !self.wrap;
-                self.vleft = 0;
-                self.skipcol = 0;
-                self.render(buffer)?;
-            }
-            Action::ToggleMarkdownTables => {
-                let enabled = self
-                    .window_manager
-                    .active_window()
-                    .is_some_and(|window| self.markdown_tables_enabled(window));
-                if let Some(window) = self.window_manager.active_window_mut() {
-                    window.markdown_tables = Some(!enabled);
-                }
-                self.vleft = 0;
-                self.skipcol = 0;
-                self.render(buffer)?;
-            }
-            Action::ToggleMarkdownConceal => {
-                // Keep this arm tiny. `execute_action_inner` is already near the
-                // 2MB test-thread stack limit when a command re-enters it.
-                self.toggle_markdown_conceal();
-                self.render(buffer)?;
-            }
-            Action::SetWrap(wrap) => {
-                self.wrap = *wrap;
-                self.vleft = 0;
-                self.skipcol = 0;
-                self.render(buffer)?;
-            }
-            Action::SetRelativeLineNumbers(enabled) => {
-                self.config.relative_line_numbers = Some(*enabled);
-                self.render(buffer)?;
-            }
-            Action::MoveToNextWord => {
-                let line = self.buffer_line();
-                let char_cx = self.next_word_search_char_on_line(self.cx, line);
-                let next_word = self.current_buffer().find_next_word((char_cx, line));
-
-                if let Some((x, y)) = next_word {
-                    self.cx = self.char_to_grapheme_on_line(x, y);
-                    if self.is_within_viewport(y) {
-                        self.cy = y - self.vtop;
-                    } else {
-                        self.go_to_line(y + 1, buffer, runtime, GoToLinePosition::Top)
-                            .await?;
-                    }
-                    self.finish_cursor_motion(buffer, false)?;
-                }
-            }
-            Action::MoveToPreviousWord => {
-                let line = self.buffer_line();
-                let char_cx = self.grapheme_to_char_on_line(self.cx, line);
-                let previous_word = self.current_buffer().find_prev_word((char_cx, line));
-
-                if let Some((x, y)) = previous_word {
-                    self.cx = self.char_to_grapheme_on_line(x, y);
-                    if self.is_within_viewport(y) {
-                        self.cy = y - self.vtop;
-                    } else {
-                        self.go_to_line(y + 1, buffer, runtime, GoToLinePosition::Top)
-                            .await?;
-                    }
-                    self.finish_cursor_motion(buffer, false)?;
-                }
-            }
-            Action::MoveToNextBigWord
-            | Action::MoveToNextWordEnd
-            | Action::MoveToPreviousWordEnd
-            | Action::MoveToNextBigWordEnd
-            | Action::MoveToPreviousBigWord
-            | Action::MoveToPreviousBigWordEnd => {
-                let (backward, end, big_word) = match action {
-                    Action::MoveToNextBigWord => (false, false, true),
-                    Action::MoveToNextWordEnd => (false, true, false),
-                    Action::MoveToPreviousWordEnd => (true, true, false),
-                    Action::MoveToNextBigWordEnd => (false, true, true),
-                    Action::MoveToPreviousBigWord => (true, false, true),
-                    Action::MoveToPreviousBigWordEnd => (true, true, true),
-                    _ => unreachable!(),
-                };
-                if let Some(target) = self.word_motion_target(1, backward, end, big_word) {
-                    self.move_to_text_position(target);
-                    self.finish_cursor_motion(buffer, false)?;
-                }
-            }
-            Action::MoveToNextParagraph
-            | Action::MoveToPreviousParagraph
-            | Action::MoveToNextSentence
-            | Action::MoveToPreviousSentence => {
-                let resolver =
-                    MotionResolver::new(self.current_buffer(), self.cursor_text_position());
-                let target = match action {
-                    Action::MoveToNextParagraph => resolver.paragraph_target(1, false),
-                    Action::MoveToPreviousParagraph => resolver.paragraph_target(1, true),
-                    Action::MoveToNextSentence => resolver.sentence_target(1, false),
-                    Action::MoveToPreviousSentence => resolver.sentence_target(1, true),
-                    _ => unreachable!(),
-                };
-                if let Some(target) = target {
-                    self.move_to_text_position(target);
-                    self.finish_cursor_motion(buffer, false)?;
-                }
-            }
-            Action::MoveToNextCall
-            | Action::MoveToPreviousCall
-            | Action::MoveToNextFunction
-            | Action::MoveToPreviousFunction
-            | Action::MoveToNextClass
-            | Action::MoveToPreviousClass => {
-                let (kind, backward, label) = match action {
-                    Action::MoveToNextCall => (SyntaxObjectKind::Call, false, "function calls"),
-                    Action::MoveToPreviousCall => (SyntaxObjectKind::Call, true, "function calls"),
-                    Action::MoveToNextFunction => (SyntaxObjectKind::Function, false, "functions"),
-                    Action::MoveToPreviousFunction => {
-                        (SyntaxObjectKind::Function, true, "functions")
-                    }
-                    Action::MoveToNextClass => (SyntaxObjectKind::Class, false, "classes"),
-                    Action::MoveToPreviousClass => (SyntaxObjectKind::Class, true, "classes"),
-                    _ => unreachable!(),
-                };
-                if let Some(position) = self.syntax_motion_target(kind, backward, 1) {
-                    self.move_to_text_position(position);
-                    self.finish_cursor_motion(buffer, false)?;
-                } else if self.last_error.is_none() {
-                    self.set_navigation_boundary_warning(label);
-                }
-            }
-            Action::MoveToFilePercent(percent) => {
-                let percent = (*percent).clamp(1, 100);
-                let line_count = self.current_buffer().navigable_line_count();
-                let line = (percent * line_count).div_ceil(100);
-                self.go_to_line(line, buffer, runtime, GoToLinePosition::Center)
-                    .await?;
-                self.move_to_first_non_blank_on_current_line();
-                self.finish_cursor_motion(buffer, false)?;
-            }
-            Action::MatchitForward => {
-                self.move_to_matchit_motion(MatchDirection::Forward, buffer)?;
-            }
-            Action::MatchitBackward => {
-                self.move_to_matchit_motion(MatchDirection::Backward, buffer)?;
-            }
-            Action::MatchitPreviousUnmatched => {
-                self.move_to_unmatched_matchit_group(MatchDirection::Backward, buffer)?;
-            }
-            Action::MatchitNextUnmatched => {
-                self.move_to_unmatched_matchit_group(MatchDirection::Forward, buffer)?;
-            }
-            Action::MatchitSelectAround => {
-                if let Some(range) = self.matchit_select_around_range() {
-                    if self.select_text_range(range) {
-                        self.render(buffer)?;
-                    }
-                } else {
-                    self.set_legacy_message(Some("text object not found".to_string()));
-                }
-            }
-            Action::MoveLineToViewportBottom => {
-                let line = self.buffer_line();
-                let viewport_height = self.vheight().max(1);
-                if line > self.vtop + viewport_height {
-                    self.vtop = line.saturating_sub(viewport_height - 1);
-                    self.cy = viewport_height - 1;
-                    self.render(buffer)?;
-                }
-            }
-            Action::InsertTab => {
-                let indentation = self.indentation();
-                let cx = self.cx;
-                let line = self.buffer_line();
-                let contents = self.current_line_contents().unwrap_or_default();
-                let contents = contents.trim_end_matches(&['\r', '\n'][..]);
-                let current_column =
-                    grapheme_to_column_with_tabs(contents, cx, indentation.tab_width.max(1));
-                let stop = indentation.soft_tab_stop.max(1);
-                let target_column = (current_column / stop + 1) * stop;
-                let inserted_columns = target_column - current_column;
-                let inserted = if indentation.expand_tab {
-                    " ".repeat(inserted_columns)
-                } else {
-                    "\t".to_string()
-                };
-                let char_cx = self.grapheme_to_char_on_line(cx, line);
-                let started_transaction = !self.transaction_active();
-                if started_transaction {
-                    self.begin_transaction("insert tab");
-                }
-                self.replace_range(
-                    TextRange::insertion(TextPosition::new(line, char_cx)),
-                    &inserted,
-                );
-                self.generated_indent = None;
-                self.notify_change(runtime).await?;
-                self.cx += grapheme_len(&inserted);
-                self.refresh_cursor_goal();
-                if started_transaction {
-                    self.commit_transaction(self.cursor_snapshot());
-                }
-                self.render_edited_window_rows(buffer)?;
-            }
-            Action::Save => {
-                if !self.save_action(buffer, runtime).await? {
-                    return Ok(false);
-                }
-                self.sync_inline_change_summaries();
-                self.render(buffer)?;
-            }
-            Action::ForceSave => {
-                if !self.force_save_action(buffer, runtime).await? {
-                    return Ok(false);
-                }
-                self.sync_inline_change_summaries();
-                self.render(buffer)?;
-            }
-            Action::SaveAll => {
-                self.execute_write_all(buffer, runtime, /*force*/ false)
-                    .await?;
-            }
-            Action::ForceSaveAll => {
-                self.execute_write_all(buffer, runtime, /*force*/ true)
-                    .await?;
-            }
-            Action::SaveAs(new_file_name) => {
-                if !self.save_as_action(new_file_name, buffer, runtime).await? {
-                    return Ok(false);
-                }
-                self.sync_inline_change_summaries();
-                self.render(buffer)?;
-            }
-            Action::ForceSaveAs(new_file_name) => {
-                if !self
-                    .force_save_as_action(new_file_name, buffer, runtime)
-                    .await?
-                {
-                    return Ok(false);
-                }
-                self.sync_inline_change_summaries();
-                self.render(buffer)?;
-            }
-            Action::CompareFileOnDisk => {
-                let opened = self.open_disk_conflict_dialog(runtime);
-                self.render(buffer)?;
-                if !opened {
-                    return Ok(false);
-                }
-            }
-            Action::CommitSearch => {
-                add_to_history = false;
-                let Some(session) = self.active_search.clone() else {
-                    return Ok(false);
-                };
-                if session.draft.is_empty() {
-                    self.active_search = None;
-                    self.mode = Mode::Normal;
-                    self.render(buffer)?;
-                } else {
-                    self.record_search_history(&session.draft);
-                    let matches = match self.search_matches(&session.draft) {
-                        Ok(matches) => matches,
-                        Err(err) => {
-                            self.finish_search_with_error(session, err.to_string());
-                            self.render(buffer)?;
-                            return Ok(false);
-                        }
-                    };
-                    let Some(match_) = self.search_match_in_direction(
-                        &matches,
-                        &session.origin,
-                        session.direction,
-                        self.config.search.wrapscan,
-                    ) else {
-                        let error = Self::pattern_not_found_message(&session.draft);
-                        self.finish_search_without_match(session, error);
-                        self.render(buffer)?;
-                        return Ok(false);
-                    };
-                    let wrapped = self.config.search.wrapscan
-                        && self.search_match_wrapped(match_, &session.origin, session.direction);
-
-                    self.search_term = session.draft;
-                    self.search_direction = session.direction;
-                    self.search_highlights_suppressed = false;
-                    self.active_search = None;
-                    self.mode = Mode::Normal;
-                    if wrapped {
-                        self.set_search_wrap_warning(session.direction);
-                    } else {
-                        self.set_legacy_message(None);
-                    }
-                    self.move_to_search_match(match_);
-                    self.save_to_history(session.jump_origin);
-                    self.render(buffer)?;
-                    self.notify_search_highlighted(runtime, "CommitSearch")
-                        .await?;
-                }
-            }
-            Action::CancelSearch => {
-                add_to_history = false;
-                self.cancel_active_search();
-                self.render(buffer)?;
-            }
-            Action::FindPrevious => {
-                if self.active_search.is_some() {
-                    add_to_history = false;
-                }
-                let persistent_search = self.active_search.is_none();
-                if self.execute_search_direction(SearchDirection::Backward, buffer)?
-                    && persistent_search
-                {
-                    self.notify_search_highlighted(runtime, "FindPrevious")
-                        .await?;
-                }
-            }
-            Action::FindNext => {
-                if self.active_search.is_some() {
-                    add_to_history = false;
-                }
-                let persistent_search = self.active_search.is_none();
-                if self.execute_search_direction(SearchDirection::Forward, buffer)?
-                    && persistent_search
-                {
-                    self.notify_search_highlighted(runtime, "FindNext").await?;
-                }
-            }
-            Action::RepeatSearch => {
-                if self.execute_search_direction(self.search_direction, buffer)? {
-                    self.notify_search_highlighted(runtime, "RepeatSearch")
-                        .await?;
-                }
-            }
-            Action::RepeatSearchOpposite => {
-                if self.execute_search_direction(self.search_direction.opposite(), buffer)? {
-                    self.notify_search_highlighted(runtime, "RepeatSearchOpposite")
-                        .await?;
-                }
-            }
-            Action::ClearSearchHighlight => {
-                self.search_highlights_suppressed = true;
-                self.active_search = None;
-                self.render(buffer)?;
-                self.notify_search_cleared(runtime).await?;
-            }
-            Action::SearchWordUnderCursor => {
-                if let Some(search_term) = self.word_under_cursor() {
-                    self.search_term = search_term;
-                    self.search_direction = SearchDirection::Forward;
-                    self.search_highlights_suppressed = false;
-                    if self.execute_search_direction(SearchDirection::Forward, buffer)? {
-                        self.notify_search_highlighted(runtime, "SearchWordUnderCursor")
-                            .await?;
-                    }
-                }
-            }
-            Action::SelectNextOccurrence
-            | Action::AddCursorUp
-            | Action::AddCursorDown
-            | Action::ToggleMultiCursorExtendMode
-            | Action::ExtendMultiSelectionLeft
-            | Action::ExtendMultiSelectionRight
-            | Action::ExtendMultiSelectionWordForward
-            | Action::ExtendMultiSelectionWordEnd
-            | Action::ExtendMultiSelectionLineStart
-            | Action::ExtendMultiSelectionLineEnd
-            | Action::InvertMultiSelection
-            | Action::SelectPreviousOccurrence
-            | Action::SkipMultiSelection
-            | Action::RemoveActiveMultiSelection
-            | Action::ChangeMultiSelection
-            | Action::InsertAtMultiSelectionStart
-            | Action::AppendAtMultiSelectionEnd
-            | Action::DeleteMultiSelection
-            | Action::DeleteMultiSelectionBlackHole
-            | Action::PasteAfterMultiSelection
-            | Action::PasteBeforeMultiSelection
-            | Action::YankMultiSelection
-            | Action::ClearMultiSelection => {
-                add_to_history = false;
-                self.execute_multi_cursor_action(action, buffer, runtime)
-                    .await?;
-            }
-            Action::DeleteWord => {
-                if let Some(range) = self.word_motion_range(1, false, false) {
-                    self.begin_transaction("delete word");
-                    self.replace_range(range, "");
-                    self.commit_transaction(self.cursor_snapshot());
-                }
-
-                self.notify_change(runtime).await?;
-                self.render_edited_window_rows(buffer)?;
-            }
-            Action::NextBuffer => {
-                let new_index =
-                    if self.buffer_manager.active_index() < self.buffer_manager.len() - 1 {
-                        self.buffer_manager.active_index() + 1
-                    } else {
-                        0
-                    };
-                self.set_current_buffer(buffer, new_index).await?;
-            }
-            Action::PreviousBuffer => {
-                let new_index = if self.buffer_manager.active_index() > 0 {
-                    self.buffer_manager.active_index() - 1
-                } else {
-                    self.buffer_manager.len() - 1
-                };
-                self.set_current_buffer(buffer, new_index).await?;
-            }
-            Action::AlternateBuffer => {
-                if let Some(index) = self.buffer_manager.alternate_index() {
-                    self.set_current_buffer(buffer, index).await?;
-                }
-            }
-            Action::ListBuffers
-            | Action::NewBuffer
-            | Action::OpenBufferById(_)
-            | Action::OpenBuffer(_)
-            | Action::SetBufferName(_)
-            | Action::SplitHorizontalNewBuffer
-            | Action::SplitVerticalNewBuffer => {
-                if matches!(action, Action::ListBuffers) {
-                    add_to_history = false;
-                }
-                if !self.execute_buffer_action(action, buffer).await? {
-                    return Ok(false);
-                }
-            }
-            Action::DeleteBuffer(force) => {
-                self.delete_current_buffer(buffer, *force).await?;
-            }
-            Action::OpenFile(path) => {
-                let (index, added_buffer, path) = match self.load_or_reuse_path_buffer(path).await {
-                    Ok(opened) => opened,
-                    Err(e) => {
-                        self.set_legacy_message(Some(e.to_string()));
+                        self.set_legacy_message(Some(
+                            "Unable to open location in requested target".to_string(),
+                        ));
                         return Ok(false);
                     }
-                };
-                self.set_current_buffer(buffer, index).await?;
-                if added_buffer && self.current_buffer().file.is_some() {
-                    // Notify plugins about file open
-                    let open_info = serde_json::json!({
-                        "file": path,
-                        "buffer_index": index
-                    });
-                    self.plugin_registry
-                        .notify(runtime, "file:opened", open_info)
-                        .await?;
-                }
-                self.render(buffer)?;
-            }
-            Action::ReloadFile(force) => {
-                if self.current_buffer().directory.is_some() {
-                    if let Err(error) = self.current_buffer_mut().refresh_directory() {
-                        self.set_legacy_message(Some(format!("Cannot refresh directory: {error}")));
-                    }
-                    self.check_bounds();
-                    self.sync_to_window();
-                    self.render(buffer)?;
-                    return Ok(false);
-                }
-                if self.current_buffer().is_dirty() && !force {
-                    self.set_legacy_message(Some(
-                        "E37: No write since last change (add ! to override)".to_string(),
-                    ));
-                    self.render(buffer)?;
-                    return Ok(false);
-                }
 
-                match self.current_buffer().read_backing_file() {
-                    Ok((file, contents)) => {
-                        let byte_count = contents.len();
-                        let end = self.current_buffer().char_idx_to_position(usize::MAX);
-                        self.begin_transaction("reload file");
-                        self.replace_range(TextRange::new(TextPosition::new(0, 0), end), &contents);
-                        self.current_buffer_mut().file = Some(file.clone());
-                        self.check_bounds();
-                        self.sync_to_window();
-                        self.commit_transaction(self.cursor_snapshot());
-                        self.current_buffer_mut().mark_saved();
-                        let id = self.current_buffer().id();
-                        self.resolve_external_file_notification(id);
-                        self.resolve_buffer_issues(id);
-                        self.set_legacy_message(Some(format!(
-                            "{file:?} {}L, {}B read",
-                            self.current_buffer().len(),
-                            byte_count
-                        )));
-                        self.render(buffer)?;
+                    if added_buffer && self.current_buffer().file.is_some() {
+                        self.plugin_registry
+                            .notify(
+                                runtime,
+                                "file:opened",
+                                json!({ "file": path, "buffer_index": buffer_index }),
+                            )
+                            .await?;
                     }
-                    Err(e) => {
-                        self.set_legacy_message(Some(e.to_string()));
-                        self.render(buffer)?;
-                        return Ok(false);
-                    }
-                }
-                self.notify_change(runtime).await?;
-            }
-            Action::FilePicker => {
-                self.release_current_dialog_callbacks(runtime);
-                self.current_dialog =
-                    Some(Box::new(FilePicker::new(self, std::env::current_dir()?)?));
-            }
-            Action::KeyboardShortcuts => {
-                self.open_keyboard_shortcuts(Some(runtime), None);
-                self.render(buffer)?;
-            }
-            Action::CommandPalette => {
-                let commands = self.plugin_registry.registered_commands(runtime);
-                let entries = command_palette::entries(&self.config.keys, &commands);
-                let actions = entries
-                    .iter()
-                    .map(|entry| (entry.id.clone(), entry.action.clone()))
-                    .collect::<HashMap<_, _>>();
-                let items = command_palette::picker_items(&entries);
-                let mut picker = Picker::builder()
-                    .title("Commands")
-                    .structured_items(items)
-                    .filter_action(command_palette::filter_score)
-                    .placeholder("Type a command, keymap, or :command")
-                    .select_action(move |item| {
-                        actions.get(&item).cloned().unwrap_or_else(|| {
-                            Action::Print("command is no longer available".to_string())
+
+                    let target_line = location
+                        .line
+                        .min(self.current_buffer().len().saturating_sub(1));
+                    let target_column = self
+                        .current_buffer()
+                        .get(target_line)
+                        .map(|line| {
+                            let line = line.trim_end_matches('\n');
+                            match location.column_encoding {
+                                plugin::LocationColumnEncoding::Utf8Byte => {
+                                    crate::unicode_utils::byte_to_grapheme(line, location.column)
+                                }
+                                plugin::LocationColumnEncoding::Utf16 => {
+                                    utf16_to_grapheme(line, location.column)
+                                }
+                            }
                         })
-                    });
-                if self.learn_session.is_none() {
-                    picker = picker.history_key("command-palette");
-                }
-                let picker = picker.build(self);
-                self.release_current_dialog_callbacks(runtime);
-                self.current_dialog = Some(Box::new(picker));
-                self.render(buffer)?;
-            }
-            Action::OpenSyntaxPicker => {
-                let items = ["auto", "off"]
-                    .into_iter()
-                    .chain(self.highlighter.language_ids())
-                    .map(str::to_string)
-                    .collect();
-                let picker = Picker::builder()
-                    .title("Syntax")
-                    .items(items)
-                    .placeholder("Select a syntax or choose auto/off")
-                    .select_action(Action::SetSyntax)
-                    .build(self);
-                self.release_current_dialog_callbacks(runtime);
-                self.current_dialog = Some(Box::new(picker));
-                self.render(buffer)?;
-            }
-            Action::SetSyntax(syntax) => {
-                let syntax = syntax.trim();
-                let (selection, label) = match syntax.to_ascii_lowercase().as_str() {
-                    "auto" => (SyntaxSelection::Auto, "auto".to_string()),
-                    "off" => (SyntaxSelection::Off, "off".to_string()),
-                    _ => {
-                        let Some(language_id) = self.highlighter.language_id_for_name(syntax)
-                        else {
-                            self.set_legacy_message(Some(format!(
-                                "unknown syntax {syntax:?} (try :syntax)"
-                            )));
-                            self.render(buffer)?;
-                            return Ok(false);
-                        };
-                        (
-                            SyntaxSelection::Language(language_id.to_string()),
-                            language_id.to_string(),
-                        )
-                    }
-                };
-                self.current_buffer_mut().set_syntax_selection(selection);
-                self.highlight_cache
-                    .remove(&self.buffer_manager.active_index());
-                self.syntax_textobjects
-                    .invalidate(self.current_buffer().id());
-                self.bracket_match_cache = None;
-                self.force_full_redraw = true;
-                self.set_legacy_message(Some(format!("syntax: {label}")));
-                self.render(buffer)?;
-            }
-            Action::OpenWhatsNew => {
-                if self
-                    .current_dialog
-                    .as_ref()
-                    .is_some_and(|dialog| dialog.shortcut_context() == "Welcome to Red")
-                {
-                    self.finish_welcome();
-                }
-                self.release_current_dialog_callbacks(runtime);
-                if self.open_whats_new_panel() {
-                    self.render(buffer)?;
-                    self.mark_whats_new_presented();
-                } else {
-                    self.set_legacy_message(Some(
-                        "terminal is too small for release notes".to_string(),
-                    ));
-                    self.render(buffer)?;
-                }
-            }
-            Action::UpdateRed => {
-                self.start_red_update();
-            }
-            Action::OpenLearn => {
-                if self.tutorial_controller.is_some() {
-                    self.finish_tutorial(/*completed*/ false, buffer, runtime)
-                        .await?;
-                }
-                self.finish_learn_lesson(buffer, runtime)?;
-                self.open_learn_hub(runtime);
-                self.render(buffer)?;
-            }
-            Action::StartLearnLesson => {
-                self.start_learn_lesson(self.next_learn_lesson(), buffer, runtime)
-                    .await?;
-            }
-            Action::StartLearnLessonAt(id) => {
-                if let Some(lesson) = crate::learn::Lesson::from_id(id) {
-                    self.start_learn_lesson(lesson, buffer, runtime).await?;
-                } else {
-                    self.set_legacy_message(Some("that lesson is not available yet".into()));
-                    self.render(buffer)?;
-                }
-            }
-            Action::RestartLearnLesson => {
-                self.restart_learn_lesson(buffer, runtime).await?;
-            }
-            Action::FinishLearnLesson => {
-                self.continue_learn_lesson(buffer, runtime).await?;
-            }
-            Action::ExitLearnLesson => {
-                self.finish_learn_lesson(buffer, runtime)?;
-            }
-            Action::OpenStatuslineManager => {
-                self.release_current_dialog_callbacks(runtime);
-                self.current_dialog = Some(Box::new(StatuslineLayoutPanel::new(self)));
-                self.render(buffer)?;
-            }
-            Action::OpenWelcome => {
-                self.release_current_dialog_callbacks(runtime);
-                if !self.open_welcome_panel() {
-                    self.last_error = Some("terminal is too small for the welcome screen".into());
-                }
-                self.render(buffer)?;
-            }
-            Action::DismissWelcome => {
-                self.finish_welcome();
-                self.release_current_dialog_callbacks(runtime);
-                self.current_dialog = None;
-                self.render(buffer)?;
-            }
-            Action::StartTutorial(track) => {
-                self.start_tutorial(TutorialProgress::new(*track), buffer, runtime)
-                    .await?;
-            }
-            Action::ResumeTutorial => {
-                let progress = self
-                    .preferences
-                    .tutorial_progress()
-                    .cloned()
-                    .filter(|progress| !progress.completed)
-                    .unwrap_or_else(|| TutorialProgress::new(TutorialTrack::Guided));
-                self.start_tutorial(progress, buffer, runtime).await?;
-            }
-            Action::AdvanceTutorial => {
-                if let Some(tutorial) = &mut self.tutorial_controller {
-                    let completed = tutorial.advance() == TutorialObservation::Completed;
-                    self.persist_tutorial_progress();
-                    if completed {
-                        self.finish_tutorial(/*completed*/ true, buffer, runtime)
-                            .await?;
-                    } else {
-                        self.current_dialog = None;
-                        self.mode = Mode::Normal;
-                        self.render(buffer)?;
-                    }
-                }
-            }
-            Action::ExitTutorial => {
-                self.finish_tutorial(/*completed*/ false, buffer, runtime)
-                    .await?;
-            }
-            Action::DismissTutorialDemo | Action::RejectTutorialProposal => {
-                self.release_current_dialog_callbacks(runtime);
-                self.current_dialog = None;
-                self.render(buffer)?;
-            }
-            Action::AcceptTutorialProposal => {
-                self.release_current_dialog_callbacks(runtime);
-                self.current_dialog = None;
-                self.accept_tutorial_proposal(buffer, runtime).await?;
-                self.render(buffer)?;
-            }
-            Action::CreateStarterConfig => {
-                match crate::onboarding::create_starter_config(&Config::config_dir()) {
-                    Ok(path) => {
-                        self.last_error = Some(format!("starter config: {}", path.display()))
-                    }
-                    Err(error) => {
-                        self.last_error = Some(format!("could not create config: {error}"))
-                    }
-                }
-                self.render(buffer)?;
-            }
-            Action::OpenDiagnosticsPicker => {
-                self.release_current_dialog_callbacks(runtime);
-                self.open_diagnostics_picker(diagnostics_picker::DiagnosticFilter::All);
-                self.render(buffer)?;
-            }
-            Action::OpenErrorDiagnosticsPicker => {
-                self.release_current_dialog_callbacks(runtime);
-                self.open_diagnostics_picker(diagnostics_picker::DiagnosticFilter::Errors);
-                self.render(buffer)?;
-            }
-            Action::PreviewStatuslineLayout(statusline) => {
-                add_to_history = false;
-                self.config.statusline = statusline.clone();
-                self.force_full_redraw = true;
-                self.render(buffer)?;
-            }
-            Action::SaveStatuslineLayout(statusline) => {
-                add_to_history = false;
-                match Config::persist_statusline(statusline) {
-                    Ok(()) => {
-                        self.config.statusline = statusline.clone();
-                        self.current_dialog = None;
-                        self.resolve_issue(
-                            &crate::notification::NotificationSource::Editor,
-                            "status-line-layout",
-                        );
-                        self.set_quiet_message(Some("saved status-line layout".to_string()));
-                    }
-                    Err(error) => {
-                        self.set_legacy_message(Some(format!(
-                            "could not save status-line layout: {error}"
-                        )));
-                    }
-                }
-                self.force_full_redraw = true;
-                self.render(buffer)?;
-            }
-            Action::CancelStatuslineLayout(statusline) => {
-                add_to_history = false;
-                self.config.statusline = statusline.clone();
-                self.current_dialog = None;
-                self.set_legacy_message(None);
-                self.force_full_redraw = true;
-                self.render(buffer)?;
-            }
-            Action::ConfigDiagnostics => {
-                self.release_current_dialog_callbacks(runtime);
-                self.open_config_diagnostics();
-                self.render(buffer)?;
-            }
-            Action::PluginStatus => {
-                self.release_current_dialog_callbacks(runtime);
-                self.open_plugin_status();
-                self.render(buffer)?;
-            }
-            Action::ReloadLanguages => {
-                match self.reload_languages().await {
-                    Ok(count) => {
-                        self.set_legacy_message(Some(format!(
-                            "reloaded {count} configured language{}",
-                            if count == 1 { "" } else { "s" }
-                        )));
-                    }
-                    Err(error) => {
-                        self.report_issue("languages".into(), format!("Language reload failed: {error:#}. Fix configuration and retry :languages reload."));
-                    }
-                }
-                self.render(buffer)?;
-            }
-            Action::ShowDialog => {
-                self.render(buffer)?;
-            }
-            Action::CloseDialog => {
-                if self.message_browser.is_some() {
-                    if self
-                        .current_dialog
-                        .as_ref()
-                        .is_some_and(|dialog| dialog.is_message_history())
-                    {
-                        self.close_messages();
-                    } else {
-                        self.release_current_dialog_callbacks(runtime);
-                        self.refresh_message_browser();
-                    }
-                    self.render(buffer)?;
-                    return Ok(false);
-                }
-                if self.inline_history_browser.is_some() {
-                    self.handle_inline_history_action(
-                        &crate::inline_history::HistoryAction::Close,
+                        .unwrap_or_default();
+                    self.execute_with_tracking(
+                        &Action::MoveTo(target_column, target_line + 1),
                         buffer,
                         runtime,
+                        /*tracking*/ false,
                     )
                     .await?;
-                    return Ok(false);
                 }
-                if self
-                    .current_dialog
-                    .as_ref()
-                    .is_some_and(|dialog| dialog.picker_id() == Some(CODE_ACTION_PICKER_ID))
-                {
-                    self.clear_pending_code_action_requests();
+                Action::SetCursor(x, y) => {
+                    let target_y = (*y).min(self.last_navigable_line());
+
+                    if target_y < self.vtop {
+                        self.vtop = target_y;
+                    } else if target_y >= self.vtop + self.vheight().max(1) {
+                        self.vtop = target_y.saturating_sub(self.vheight().saturating_sub(1));
+                    }
+
+                    self.cy = target_y.saturating_sub(self.vtop);
+                    self.cx = *x;
+                    self.check_bounds();
+                    self.refresh_cursor_goal();
+                    self.sync_to_window();
+                    self.ensure_current_buffer_lsp_opened().await?;
+                    self.render(buffer)?;
                 }
-                self.release_current_dialog_callbacks(runtime);
-                self.current_dialog = None;
-                self.completion_snapshot = None;
-                self.render(buffer)?;
-            }
-            Action::OpenInlineHistory | Action::OpenInlineActivity => {
-                add_to_history = false;
-                self.open_inline_history(buffer, runtime).await?;
-            }
-            Action::InlineHistoryAction(action) => {
-                add_to_history = tracking
-                    && matches!(
-                        action,
-                        crate::inline_history::HistoryAction::FollowFile { .. }
-                            | crate::inline_history::HistoryAction::Jump
-                            | crate::inline_history::HistoryAction::ShowAnnotations
-                    );
-                self.handle_inline_history_action(action, buffer, runtime)
-                    .await?;
-            }
-            Action::RestoreInlineAssistAnnotations => {
-                add_to_history = false;
-                if let Some(request) = self.inline_assist.as_ref().and_then(|assist| {
-                    self.inline_annotations_request(
-                        &assist.annotation_group_id,
-                        assist.result_request_id.as_deref(),
-                    )
-                }) {
-                    self.show_inline_history_annotations(&request, buffer, runtime)
+                Action::ScrollUp => {
+                    let scroll_lines = self.config.mouse_scroll_lines.unwrap_or(3);
+                    if self.active_has_markdown_tables() || self.active_has_markdown_images() {
+                        self.scroll_markdown_viewport(false, scroll_lines);
+                        self.sync_to_window();
+                        self.render_motion_frame(buffer)?;
+                    } else {
+                        let old_vtop = self.vtop;
+                        self.vtop = self.vtop.saturating_sub(scroll_lines);
+                        let scrolled_lines = old_vtop - self.vtop;
+                        if scrolled_lines > 0 {
+                            let viewport_height = self.vheight().max(1);
+                            let scrolloff = self
+                                .config
+                                .scrolloff
+                                .unwrap_or(0)
+                                .min(viewport_height.saturating_sub(1));
+                            let max_cy =
+                                viewport_height.saturating_sub(scrolloff).saturating_sub(1);
+                            self.cy = self.cy.saturating_add(scrolled_lines).min(max_cy);
+                            self.skipcol = 0;
+                            self.clamp_cursor_to_scrolled_viewport();
+                            self.sync_to_window();
+                            self.render_motion_frame(buffer)?;
+                        }
+                    }
+                }
+                Action::ScrollDown => {
+                    let scroll_lines = self.config.mouse_scroll_lines.unwrap_or(3);
+                    if self.active_has_markdown_tables() || self.active_has_markdown_images() {
+                        self.scroll_markdown_viewport(true, scroll_lines);
+                        self.sync_to_window();
+                        self.render_motion_frame(buffer)?;
+                    } else {
+                        let viewport_height = self.vheight().max(1);
+                        let last_line = self.last_navigable_line();
+                        let max_vtop =
+                            if self.wrap || self.has_inline_comments(self.current_buffer().id()) {
+                                last_line
+                            } else {
+                                last_line.saturating_sub(viewport_height.saturating_sub(1))
+                            };
+                        let old_vtop = self.vtop;
+                        let new_vtop = self.vtop.saturating_add(scroll_lines).min(max_vtop);
+                        let scrolled_lines = new_vtop.saturating_sub(old_vtop);
+                        if scrolled_lines > 0 {
+                            self.vtop = new_vtop;
+                            let scrolloff = self
+                                .config
+                                .scrolloff
+                                .unwrap_or(0)
+                                .min(viewport_height.saturating_sub(1));
+                            self.cy = self.cy.saturating_sub(scrolled_lines).max(scrolloff);
+                            self.skipcol = 0;
+                            self.clamp_cursor_to_scrolled_viewport();
+                            self.sync_to_window();
+                            self.render_motion_frame(buffer)?;
+                        }
+                    }
+                }
+                Action::ScrollViewLeft => {
+                    if !self.wrap {
+                        self.vleft = self.vleft.saturating_sub(self.sidescroll());
+                        self.render(buffer)?;
+                    }
+                }
+                Action::ScrollViewRight => {
+                    if !self.wrap {
+                        self.vleft = self.vleft.saturating_add(self.sidescroll());
+                        self.render(buffer)?;
+                    }
+                }
+                Action::ScrollViewHalfPageLeft => {
+                    if !self.wrap {
+                        self.vleft = self.vleft.saturating_sub(self.active_content_width() / 2);
+                        self.render(buffer)?;
+                    }
+                }
+                Action::ScrollViewHalfPageRight => {
+                    if !self.wrap {
+                        self.vleft = self.vleft.saturating_add(self.active_content_width() / 2);
+                        self.render(buffer)?;
+                    }
+                }
+                Action::ScrollCursorToViewStart => {
+                    if !self.wrap {
+                        let display_col = self.current_cursor_display_col();
+                        self.vleft = display_col;
+                        self.render(buffer)?;
+                    }
+                }
+                Action::ScrollCursorToViewEnd => {
+                    if !self.wrap {
+                        let display_col = self.current_cursor_display_col();
+                        self.vleft = display_col
+                            .saturating_sub(self.active_content_width().saturating_sub(1));
+                        self.render(buffer)?;
+                    }
+                }
+                Action::ToggleWrap => {
+                    self.wrap = !self.wrap;
+                    self.vleft = 0;
+                    self.skipcol = 0;
+                    self.render(buffer)?;
+                }
+                Action::ToggleMarkdownTables => {
+                    let enabled = self
+                        .window_manager
+                        .active_window()
+                        .is_some_and(|window| self.markdown_tables_enabled(window));
+                    if let Some(window) = self.window_manager.active_window_mut() {
+                        window.markdown_tables = Some(!enabled);
+                    }
+                    self.vleft = 0;
+                    self.skipcol = 0;
+                    self.render(buffer)?;
+                }
+                Action::ToggleMarkdownConceal => {
+                    // Keep this arm tiny. `execute_action_inner` is already near the
+                    // 2MB test-thread stack limit when a command re-enters it.
+                    self.toggle_markdown_conceal();
+                    self.render(buffer)?;
+                }
+                Action::SetWrap(wrap) => {
+                    self.wrap = *wrap;
+                    self.vleft = 0;
+                    self.skipcol = 0;
+                    self.render(buffer)?;
+                }
+                Action::SetRelativeLineNumbers(enabled) => {
+                    self.config.relative_line_numbers = Some(*enabled);
+                    self.render(buffer)?;
+                }
+                Action::MoveToNextWord => {
+                    let line = self.buffer_line();
+                    let char_cx = self.next_word_search_char_on_line(self.cx, line);
+                    let next_word = self.current_buffer().find_next_word((char_cx, line));
+
+                    if let Some((x, y)) = next_word {
+                        self.cx = self.char_to_grapheme_on_line(x, y);
+                        if self.is_within_viewport(y) {
+                            self.cy = y - self.vtop;
+                        } else {
+                            self.go_to_line(y + 1, buffer, runtime, GoToLinePosition::Top)
+                                .await?;
+                        }
+                        self.finish_cursor_motion(buffer, false)?;
+                    }
+                }
+                Action::MoveToPreviousWord => {
+                    let line = self.buffer_line();
+                    let char_cx = self.grapheme_to_char_on_line(self.cx, line);
+                    let previous_word = self.current_buffer().find_prev_word((char_cx, line));
+
+                    if let Some((x, y)) = previous_word {
+                        self.cx = self.char_to_grapheme_on_line(x, y);
+                        if self.is_within_viewport(y) {
+                            self.cy = y - self.vtop;
+                        } else {
+                            self.go_to_line(y + 1, buffer, runtime, GoToLinePosition::Top)
+                                .await?;
+                        }
+                        self.finish_cursor_motion(buffer, false)?;
+                    }
+                }
+                Action::MoveToNextBigWord
+                | Action::MoveToNextWordEnd
+                | Action::MoveToPreviousWordEnd
+                | Action::MoveToNextBigWordEnd
+                | Action::MoveToPreviousBigWord
+                | Action::MoveToPreviousBigWordEnd => {
+                    let (backward, end, big_word) = match action {
+                        Action::MoveToNextBigWord => (false, false, true),
+                        Action::MoveToNextWordEnd => (false, true, false),
+                        Action::MoveToPreviousWordEnd => (true, true, false),
+                        Action::MoveToNextBigWordEnd => (false, true, true),
+                        Action::MoveToPreviousBigWord => (true, false, true),
+                        Action::MoveToPreviousBigWordEnd => (true, true, true),
+                        _ => unreachable!(),
+                    };
+                    if let Some(target) = self.word_motion_target(1, backward, end, big_word) {
+                        self.move_to_text_position(target);
+                        self.finish_cursor_motion(buffer, false)?;
+                    }
+                }
+                Action::MoveToNextParagraph
+                | Action::MoveToPreviousParagraph
+                | Action::MoveToNextSentence
+                | Action::MoveToPreviousSentence => {
+                    let resolver =
+                        MotionResolver::new(self.current_buffer(), self.cursor_text_position());
+                    let target = match action {
+                        Action::MoveToNextParagraph => resolver.paragraph_target(1, false),
+                        Action::MoveToPreviousParagraph => resolver.paragraph_target(1, true),
+                        Action::MoveToNextSentence => resolver.sentence_target(1, false),
+                        Action::MoveToPreviousSentence => resolver.sentence_target(1, true),
+                        _ => unreachable!(),
+                    };
+                    if let Some(target) = target {
+                        self.move_to_text_position(target);
+                        self.finish_cursor_motion(buffer, false)?;
+                    }
+                }
+                Action::MoveToNextCall
+                | Action::MoveToPreviousCall
+                | Action::MoveToNextFunction
+                | Action::MoveToPreviousFunction
+                | Action::MoveToNextClass
+                | Action::MoveToPreviousClass => {
+                    let (kind, backward, label) = match action {
+                        Action::MoveToNextCall => (SyntaxObjectKind::Call, false, "function calls"),
+                        Action::MoveToPreviousCall => {
+                            (SyntaxObjectKind::Call, true, "function calls")
+                        }
+                        Action::MoveToNextFunction => {
+                            (SyntaxObjectKind::Function, false, "functions")
+                        }
+                        Action::MoveToPreviousFunction => {
+                            (SyntaxObjectKind::Function, true, "functions")
+                        }
+                        Action::MoveToNextClass => (SyntaxObjectKind::Class, false, "classes"),
+                        Action::MoveToPreviousClass => (SyntaxObjectKind::Class, true, "classes"),
+                        _ => unreachable!(),
+                    };
+                    if let Some(position) = self.syntax_motion_target(kind, backward, 1) {
+                        self.move_to_text_position(position);
+                        self.finish_cursor_motion(buffer, false)?;
+                    } else if self.last_error.is_none() {
+                        self.set_navigation_boundary_warning(label);
+                    }
+                }
+                Action::MoveToFilePercent(percent) => {
+                    let percent = (*percent).clamp(1, 100);
+                    let line_count = self.current_buffer().navigable_line_count();
+                    let line = (percent * line_count).div_ceil(100);
+                    self.go_to_line(line, buffer, runtime, GoToLinePosition::Center)
                         .await?;
-                    if let Some(scope) = self
-                        .inline_assist
-                        .as_ref()
-                        .map(|assist| assist.scope.clone())
+                    self.move_to_first_non_blank_on_current_line();
+                    self.finish_cursor_motion(buffer, false)?;
+                }
+                Action::MatchitForward => {
+                    self.move_to_matchit_motion(MatchDirection::Forward, buffer)?;
+                }
+                Action::MatchitBackward => {
+                    self.move_to_matchit_motion(MatchDirection::Backward, buffer)?;
+                }
+                Action::MatchitPreviousUnmatched => {
+                    self.move_to_unmatched_matchit_group(MatchDirection::Backward, buffer)?;
+                }
+                Action::MatchitNextUnmatched => {
+                    self.move_to_unmatched_matchit_group(MatchDirection::Forward, buffer)?;
+                }
+                Action::MatchitSelectAround => {
+                    if let Some(range) = self.matchit_select_around_range() {
+                        if self.select_text_range(range) {
+                            self.render(buffer)?;
+                        }
+                    } else {
+                        self.set_legacy_message(Some("text object not found".to_string()));
+                    }
+                }
+                Action::MoveLineToViewportBottom => {
+                    let line = self.buffer_line();
+                    let viewport_height = self.vheight().max(1);
+                    if line > self.vtop + viewport_height {
+                        self.vtop = line.saturating_sub(viewport_height - 1);
+                        self.cy = viewport_height - 1;
+                        self.render(buffer)?;
+                    }
+                }
+                Action::InsertTab => {
+                    let indentation = self.indentation();
+                    let cx = self.cx;
+                    let line = self.buffer_line();
+                    let contents = self.current_line_contents().unwrap_or_default();
+                    let contents = contents.trim_end_matches(&['\r', '\n'][..]);
+                    let current_column =
+                        grapheme_to_column_with_tabs(contents, cx, indentation.tab_width.max(1));
+                    let stop = indentation.soft_tab_stop.max(1);
+                    let target_column = (current_column / stop + 1) * stop;
+                    let inserted_columns = target_column - current_column;
+                    let inserted = if indentation.expand_tab {
+                        " ".repeat(inserted_columns)
+                    } else {
+                        "\t".to_string()
+                    };
+                    let char_cx = self.grapheme_to_char_on_line(cx, line);
+                    let started_transaction = !self.transaction_active();
+                    if started_transaction {
+                        self.begin_transaction("insert tab");
+                    }
+                    self.replace_range(
+                        TextRange::insertion(TextPosition::new(line, char_cx)),
+                        &inserted,
+                    );
+                    self.generated_indent = None;
+                    self.notify_change(runtime).await?;
+                    self.cx += grapheme_len(&inserted);
+                    self.refresh_cursor_goal();
+                    if started_transaction {
+                        self.commit_transaction(self.cursor_snapshot());
+                    }
+                    self.render_edited_window_rows(buffer)?;
+                }
+                Action::Save => {
+                    if !self.save_action(buffer, runtime).await? {
+                        return Ok(false);
+                    }
+                    self.sync_inline_change_summaries();
+                    self.render(buffer)?;
+                }
+                Action::ForceSave => {
+                    if !self.force_save_action(buffer, runtime).await? {
+                        return Ok(false);
+                    }
+                    self.sync_inline_change_summaries();
+                    self.render(buffer)?;
+                }
+                Action::SaveAll => {
+                    self.execute_write_all(buffer, runtime, /*force*/ false)
+                        .await?;
+                }
+                Action::ForceSaveAll => {
+                    self.execute_write_all(buffer, runtime, /*force*/ true)
+                        .await?;
+                }
+                Action::SaveAs(new_file_name) => {
+                    if !self.save_as_action(new_file_name, buffer, runtime).await? {
+                        return Ok(false);
+                    }
+                    self.sync_inline_change_summaries();
+                    self.render(buffer)?;
+                }
+                Action::ForceSaveAs(new_file_name) => {
+                    if !self
+                        .force_save_as_action(new_file_name, buffer, runtime)
+                        .await?
                     {
-                        self.current_dialog = Some(Box::new(
-                            self.inline_assist_popup(scope, self.inline_assist_result_state()),
-                        ));
+                        return Ok(false);
                     }
-                } else {
-                    self.set_legacy_message(Some(
-                        "no retained annotations for this inline discussion".into(),
-                    ));
+                    self.sync_inline_change_summaries();
+                    self.render(buffer)?;
                 }
-                self.render(buffer)?;
-            }
-            Action::RefreshDiagnostics => {
-                add_to_history = false;
-                self.request_diagnostics().await?;
-                self.render(buffer)?;
-            }
-            Action::Refresh => {
-                add_to_history = false;
-                self.render(buffer)?;
-            }
-            Action::Print(msg) => {
-                self.set_legacy_message(Some(msg.clone()));
-                self.draw_commandline(buffer);
-            }
-            Action::PrintWarning(msg) => {
-                self.set_routine_warning(Some(msg.clone()));
-                self.draw_commandline(buffer);
-            }
-            Action::PublishIssue {
-                owner,
-                key,
-                message,
-                remedy,
-            } => {
-                self.publish_plugin_issue(owner, key, message, remedy);
-                self.render(buffer)?;
-            }
-            Action::ResolveIssue { owner, key } => {
-                self.resolve_plugin_issue(owner, key);
-                self.render(buffer)?;
-            }
-            Action::OpenTasks => {
-                add_to_history = false;
-                self.open_tasks();
-                self.render(buffer)?;
-            }
-            Action::OpenMessages => {
-                add_to_history = false;
-                self.open_messages();
-                self.render(buffer)?;
-            }
-            Action::MessageHistory(action) => {
-                add_to_history = false;
-                self.handle_message_action(action);
-                self.render(buffer)?;
-            }
-            Action::RunShell(command) => {
-                add_to_history = false;
-                if let Err(error) = self.start_shell_command(command) {
-                    self.set_foreground_message(Severity::Error, Some(error.to_string()));
-                }
-                self.render(buffer)?;
-            }
-            Action::RunShellFilter {
-                command,
-                start_line,
-                end_line,
-            } => {
-                add_to_history = false;
-                if let Err(error) = self.start_shell_filter(command, *start_line, *end_line) {
-                    self.set_foreground_message(Severity::Error, Some(error.to_string()));
-                }
-                self.render(buffer)?;
-            }
-            Action::CancelShellCommand => {
-                add_to_history = false;
-                if self.cancel_selected_shell_command() {
-                    self.refresh_message_browser();
-                }
-                self.render(buffer)?;
-            }
-            Action::OpenTextPanelTurnActions => {
-                add_to_history = false;
-                if let Some(target) = self
-                    .panel_manager
-                    .selected_text_turn(usize::from(self.size.0))
-                {
-                    let mut choices = vec![(
-                        "copy-prompt",
-                        "Copy prompt",
-                        Action::CopyTextPanelTurn {
-                            panel_id: target.panel_id.clone(),
-                            prompt_id: target.prompt_id.clone(),
-                            part: plugin::panel::TextPanelTurnPart::Prompt,
-                        },
-                    )];
-                    if target.has_answer {
-                        choices.push((
-                            "copy-answer",
-                            "Copy answer",
-                            Action::CopyTextPanelTurn {
-                                panel_id: target.panel_id.clone(),
-                                prompt_id: target.prompt_id.clone(),
-                                part: plugin::panel::TextPanelTurnPart::Answer,
-                            },
-                        ));
+                Action::CompareFileOnDisk => {
+                    let opened = self.open_disk_conflict_dialog(runtime);
+                    self.render(buffer)?;
+                    if !opened {
+                        return Ok(false);
                     }
-                    if target.can_reuse {
-                        choices.push((
-                            "reuse-prompt",
-                            "Reuse prompt in composer",
-                            Action::ReuseTextPanelPrompt {
-                                panel_id: target.panel_id.clone(),
-                                prompt_id: target.prompt_id.clone(),
-                                expected_draft: None,
-                            },
-                        ));
+                }
+                Action::CommitSearch => {
+                    add_to_history = false;
+                    let Some(session) = self.active_search.clone() else {
+                        return Ok(false);
+                    };
+                    if session.draft.is_empty() {
+                        self.active_search = None;
+                        self.mode = Mode::Normal;
+                        self.render(buffer)?;
+                    } else {
+                        self.record_search_history(&session.draft);
+                        let matches = match self.search_matches(&session.draft) {
+                            Ok(matches) => matches,
+                            Err(err) => {
+                                self.finish_search_with_error(session, err.to_string());
+                                self.render(buffer)?;
+                                return Ok(false);
+                            }
+                        };
+                        let Some(match_) = self.search_match_in_direction(
+                            &matches,
+                            &session.origin,
+                            session.direction,
+                            self.config.search.wrapscan,
+                        ) else {
+                            let error = Self::pattern_not_found_message(&session.draft);
+                            self.finish_search_without_match(session, error);
+                            self.render(buffer)?;
+                            return Ok(false);
+                        };
+                        let wrapped = self.config.search.wrapscan
+                            && self.search_match_wrapped(
+                                match_,
+                                &session.origin,
+                                session.direction,
+                            );
+
+                        self.search_term = session.draft;
+                        self.search_direction = session.direction;
+                        self.search_highlights_suppressed = false;
+                        self.active_search = None;
+                        self.mode = Mode::Normal;
+                        if wrapped {
+                            self.set_search_wrap_warning(session.direction);
+                        } else {
+                            self.set_legacy_message(None);
+                        }
+                        self.move_to_search_match(match_);
+                        self.save_to_history(session.jump_origin);
+                        self.render(buffer)?;
+                        self.notify_search_highlighted(runtime, "CommitSearch")
+                            .await?;
                     }
-                    let actions = choices
+                }
+                Action::CancelSearch => {
+                    add_to_history = false;
+                    self.cancel_active_search();
+                    self.render(buffer)?;
+                }
+                Action::FindPrevious => {
+                    if self.active_search.is_some() {
+                        add_to_history = false;
+                    }
+                    let persistent_search = self.active_search.is_none();
+                    if self.execute_search_direction(SearchDirection::Backward, buffer)?
+                        && persistent_search
+                    {
+                        self.notify_search_highlighted(runtime, "FindPrevious")
+                            .await?;
+                    }
+                }
+                Action::FindNext => {
+                    if self.active_search.is_some() {
+                        add_to_history = false;
+                    }
+                    let persistent_search = self.active_search.is_none();
+                    if self.execute_search_direction(SearchDirection::Forward, buffer)?
+                        && persistent_search
+                    {
+                        self.notify_search_highlighted(runtime, "FindNext").await?;
+                    }
+                }
+                Action::RepeatSearch => {
+                    if self.execute_search_direction(self.search_direction, buffer)? {
+                        self.notify_search_highlighted(runtime, "RepeatSearch")
+                            .await?;
+                    }
+                }
+                Action::RepeatSearchOpposite => {
+                    if self.execute_search_direction(self.search_direction.opposite(), buffer)? {
+                        self.notify_search_highlighted(runtime, "RepeatSearchOpposite")
+                            .await?;
+                    }
+                }
+                Action::ClearSearchHighlight => {
+                    self.search_highlights_suppressed = true;
+                    self.active_search = None;
+                    self.render(buffer)?;
+                    self.notify_search_cleared(runtime).await?;
+                }
+                Action::SearchWordUnderCursor => {
+                    if let Some(search_term) = self.word_under_cursor() {
+                        self.search_term = search_term;
+                        self.search_direction = SearchDirection::Forward;
+                        self.search_highlights_suppressed = false;
+                        if self.execute_search_direction(SearchDirection::Forward, buffer)? {
+                            self.notify_search_highlighted(runtime, "SearchWordUnderCursor")
+                                .await?;
+                        }
+                    }
+                }
+                Action::SelectNextOccurrence
+                | Action::AddCursorUp
+                | Action::AddCursorDown
+                | Action::ToggleMultiCursorExtendMode
+                | Action::ExtendMultiSelectionLeft
+                | Action::ExtendMultiSelectionRight
+                | Action::ExtendMultiSelectionWordForward
+                | Action::ExtendMultiSelectionWordEnd
+                | Action::ExtendMultiSelectionLineStart
+                | Action::ExtendMultiSelectionLineEnd
+                | Action::InvertMultiSelection
+                | Action::SelectPreviousOccurrence
+                | Action::SkipMultiSelection
+                | Action::RemoveActiveMultiSelection
+                | Action::ChangeMultiSelection
+                | Action::InsertAtMultiSelectionStart
+                | Action::AppendAtMultiSelectionEnd
+                | Action::DeleteMultiSelection
+                | Action::DeleteMultiSelectionBlackHole
+                | Action::PasteAfterMultiSelection
+                | Action::PasteBeforeMultiSelection
+                | Action::YankMultiSelection
+                | Action::ClearMultiSelection => {
+                    add_to_history = false;
+                    self.execute_multi_cursor_action(action, buffer, runtime)
+                        .await?;
+                }
+                Action::DeleteWord => {
+                    if let Some(range) = self.word_motion_range(1, false, false) {
+                        self.begin_transaction("delete word");
+                        self.replace_range(range, "");
+                        self.commit_transaction(self.cursor_snapshot());
+                    }
+
+                    self.notify_change(runtime).await?;
+                    self.render_edited_window_rows(buffer)?;
+                }
+                Action::NextBuffer => {
+                    let new_index =
+                        if self.buffer_manager.active_index() < self.buffer_manager.len() - 1 {
+                            self.buffer_manager.active_index() + 1
+                        } else {
+                            0
+                        };
+                    self.set_current_buffer(buffer, new_index).await?;
+                }
+                Action::PreviousBuffer => {
+                    let new_index = if self.buffer_manager.active_index() > 0 {
+                        self.buffer_manager.active_index() - 1
+                    } else {
+                        self.buffer_manager.len() - 1
+                    };
+                    self.set_current_buffer(buffer, new_index).await?;
+                }
+                Action::AlternateBuffer => {
+                    if let Some(index) = self.buffer_manager.alternate_index() {
+                        self.set_current_buffer(buffer, index).await?;
+                    }
+                }
+                Action::ListBuffers
+                | Action::NewBuffer
+                | Action::OpenBufferById(_)
+                | Action::OpenBuffer(_)
+                | Action::SetBufferName(_)
+                | Action::SplitHorizontalNewBuffer
+                | Action::SplitVerticalNewBuffer => {
+                    if matches!(action, Action::ListBuffers) {
+                        add_to_history = false;
+                    }
+                    if !self.execute_buffer_action(action, buffer).await? {
+                        return Ok(false);
+                    }
+                }
+                Action::DeleteBuffer(force) => {
+                    self.delete_current_buffer(buffer, *force).await?;
+                }
+                Action::OpenFile(path) => {
+                    let (index, added_buffer, path) =
+                        match self.load_or_reuse_path_buffer(path).await {
+                            Ok(opened) => opened,
+                            Err(e) => {
+                                self.set_legacy_message(Some(e.to_string()));
+                                return Ok(false);
+                            }
+                        };
+                    self.set_current_buffer(buffer, index).await?;
+                    if added_buffer && self.current_buffer().file.is_some() {
+                        // Notify plugins about file open
+                        let open_info = serde_json::json!({
+                            "file": path,
+                            "buffer_index": index
+                        });
+                        self.plugin_registry
+                            .notify(runtime, "file:opened", open_info)
+                            .await?;
+                    }
+                    self.render(buffer)?;
+                }
+                Action::ReloadFile(force) => {
+                    if self.current_buffer().directory.is_some() {
+                        if let Err(error) = self.current_buffer_mut().refresh_directory() {
+                            self.set_legacy_message(Some(format!(
+                                "Cannot refresh directory: {error}"
+                            )));
+                        }
+                        self.check_bounds();
+                        self.sync_to_window();
+                        self.render(buffer)?;
+                        return Ok(false);
+                    }
+                    if self.current_buffer().is_dirty() && !force {
+                        self.set_legacy_message(Some(
+                            "E37: No write since last change (add ! to override)".to_string(),
+                        ));
+                        self.render(buffer)?;
+                        return Ok(false);
+                    }
+
+                    match self.current_buffer().read_backing_file() {
+                        Ok((file, contents)) => {
+                            let byte_count = contents.len();
+                            let end = self.current_buffer().char_idx_to_position(usize::MAX);
+                            self.begin_transaction("reload file");
+                            self.replace_range(
+                                TextRange::new(TextPosition::new(0, 0), end),
+                                &contents,
+                            );
+                            self.current_buffer_mut().file = Some(file.clone());
+                            self.check_bounds();
+                            self.sync_to_window();
+                            self.commit_transaction(self.cursor_snapshot());
+                            self.current_buffer_mut().mark_saved();
+                            let id = self.current_buffer().id();
+                            self.resolve_external_file_notification(id);
+                            self.resolve_buffer_issues(id);
+                            self.set_legacy_message(Some(format!(
+                                "{file:?} {}L, {}B read",
+                                self.current_buffer().len(),
+                                byte_count
+                            )));
+                            self.render(buffer)?;
+                        }
+                        Err(e) => {
+                            self.set_legacy_message(Some(e.to_string()));
+                            self.render(buffer)?;
+                            return Ok(false);
+                        }
+                    }
+                    self.notify_change(runtime).await?;
+                }
+                Action::FilePicker => {
+                    self.release_current_dialog_callbacks(runtime);
+                    self.current_dialog =
+                        Some(Box::new(FilePicker::new(self, std::env::current_dir()?)?));
+                }
+                Action::KeyboardShortcuts => {
+                    self.open_keyboard_shortcuts(Some(runtime), None);
+                    self.render(buffer)?;
+                }
+                Action::CommandPalette => {
+                    let commands = self.plugin_registry.registered_commands(runtime);
+                    let entries = command_palette::entries(&self.config.keys, &commands);
+                    let actions = entries
                         .iter()
-                        .map(|(id, _, action)| ((*id).to_string(), action.clone()))
+                        .map(|entry| (entry.id.clone(), entry.action.clone()))
                         .collect::<HashMap<_, _>>();
-                    let items = choices
+                    let items = command_palette::picker_items(&entries);
+                    let mut picker = Picker::builder()
+                        .title("Commands")
+                        .structured_items(items)
+                        .filter_action(command_palette::filter_score)
+                        .placeholder("Type a command, keymap, or :command")
+                        .select_action(move |item| {
+                            actions.get(&item).cloned().unwrap_or_else(|| {
+                                Action::Print("command is no longer available".to_string())
+                            })
+                        });
+                    if self.learn_session.is_none() {
+                        picker = picker.history_key("command-palette");
+                    }
+                    let picker = picker.build(self);
+                    self.release_current_dialog_callbacks(runtime);
+                    self.current_dialog = Some(Box::new(picker));
+                    self.render(buffer)?;
+                }
+                Action::OpenSyntaxPicker => {
+                    let items = ["auto", "off"]
                         .into_iter()
-                        .map(|(id, label, _)| PickerItem {
-                            id: id.to_string(),
-                            icon: None,
-                            label: label.to_string(),
-                            kind: None,
-                            annotation: None,
-                            detail: None,
-                            data: Value::Null,
-                            matches: Vec::new(),
-                            detail_matches: Vec::new(),
-                            preview: None,
-                        })
+                        .chain(self.highlighter.language_ids())
+                        .map(str::to_string)
                         .collect();
                     let picker = Picker::builder()
-                        .title("Turn actions")
-                        .structured_items(items)
-                        .placeholder("Choose an action")
-                        .status(format!("Turn {} · {}", target.number, target.preview))
-                        .content_sized(72, 3)
-                        .select_action(move |id| {
-                            actions.get(&id).cloned().unwrap_or_else(|| {
-                                Action::Print("turn action is no longer available".to_string())
-                            })
-                        })
+                        .title("Syntax")
+                        .items(items)
+                        .placeholder("Select a syntax or choose auto/off")
+                        .select_action(Action::SetSyntax)
                         .build(self);
                     self.release_current_dialog_callbacks(runtime);
                     self.current_dialog = Some(Box::new(picker));
-                } else {
-                    self.set_legacy_message(Some("no user prompt selected".to_string()));
+                    self.render(buffer)?;
                 }
-                self.render(buffer)?;
-            }
-            Action::CopyTextPanelTurn {
-                panel_id,
-                prompt_id,
-                part,
-            } => {
-                add_to_history = false;
-                if let Some(text) = self
-                    .panel_manager
-                    .text_turn_for_copy(panel_id, prompt_id, *part)
-                {
-                    self.set_default_register(Content::charwise(text));
-                    self.set_quiet_message(Some(
-                        match part {
-                            plugin::panel::TextPanelTurnPart::Prompt => "prompt copied",
-                            plugin::panel::TextPanelTurnPart::Answer => "answer copied",
+                Action::SetSyntax(syntax) => {
+                    let syntax = syntax.trim();
+                    let (selection, label) = match syntax.to_ascii_lowercase().as_str() {
+                        "auto" => (SyntaxSelection::Auto, "auto".to_string()),
+                        "off" => (SyntaxSelection::Off, "off".to_string()),
+                        _ => {
+                            let Some(language_id) = self.highlighter.language_id_for_name(syntax)
+                            else {
+                                self.set_legacy_message(Some(format!(
+                                    "unknown syntax {syntax:?} (try :syntax)"
+                                )));
+                                self.render(buffer)?;
+                                return Ok(false);
+                            };
+                            (
+                                SyntaxSelection::Language(language_id.to_string()),
+                                language_id.to_string(),
+                            )
                         }
-                        .to_string(),
-                    ));
-                } else {
-                    self.set_legacy_message(Some(
-                        "selected turn text is no longer available".to_string(),
-                    ));
+                    };
+                    self.current_buffer_mut().set_syntax_selection(selection);
+                    self.highlight_cache
+                        .remove(&self.buffer_manager.active_index());
+                    self.syntax_textobjects
+                        .invalidate(self.current_buffer().id());
+                    self.bracket_match_cache = None;
+                    self.force_full_redraw = true;
+                    self.set_legacy_message(Some(format!("syntax: {label}")));
+                    self.render(buffer)?;
                 }
-                self.render(buffer)?;
-            }
-            Action::ReuseTextPanelPrompt {
-                panel_id,
-                prompt_id,
-                expected_draft,
-            } => {
-                add_to_history = false;
-                match self.panel_manager.reuse_text_panel_prompt(
-                    panel_id,
-                    prompt_id,
-                    *expected_draft,
-                ) {
-                    Ok(plugin::panel::TextPanelReuseOutcome::Loaded) => {
-                        self.set_quiet_message(Some(
-                            "prompt loaded for editing; nothing sent".to_string(),
+                Action::OpenWhatsNew => {
+                    if self
+                        .current_dialog
+                        .as_ref()
+                        .is_some_and(|dialog| dialog.shortcut_context() == "Welcome to Red")
+                    {
+                        self.finish_welcome();
+                    }
+                    self.release_current_dialog_callbacks(runtime);
+                    if self.open_whats_new_panel() {
+                        self.render(buffer)?;
+                        self.mark_whats_new_presented();
+                    } else {
+                        self.set_legacy_message(Some(
+                            "terminal is too small for release notes".to_string(),
+                        ));
+                        self.render(buffer)?;
+                    }
+                }
+                Action::UpdateRed => {
+                    self.start_red_update();
+                }
+                Action::OpenLearn => {
+                    if self.tutorial_controller.is_some() {
+                        self.finish_tutorial(/*completed*/ false, buffer, runtime)
+                            .await?;
+                    }
+                    self.finish_learn_lesson(buffer, runtime)?;
+                    self.open_learn_hub(runtime);
+                    self.render(buffer)?;
+                }
+                Action::StartLearnLesson => {
+                    self.start_learn_lesson(self.next_learn_lesson(), buffer, runtime)
+                        .await?;
+                }
+                Action::StartLearnLessonAt(id) => {
+                    if let Some(lesson) = crate::learn::Lesson::from_id(id) {
+                        self.start_learn_lesson(lesson, buffer, runtime).await?;
+                    } else {
+                        self.set_legacy_message(Some("that lesson is not available yet".into()));
+                        self.render(buffer)?;
+                    }
+                }
+                Action::RestartLearnLesson => {
+                    self.restart_learn_lesson(buffer, runtime).await?;
+                }
+                Action::FinishLearnLesson => {
+                    self.continue_learn_lesson(buffer, runtime).await?;
+                }
+                Action::ExitLearnLesson => {
+                    self.finish_learn_lesson(buffer, runtime)?;
+                }
+                Action::OpenStatuslineManager => {
+                    self.release_current_dialog_callbacks(runtime);
+                    self.current_dialog = Some(Box::new(StatuslineLayoutPanel::new(self)));
+                    self.render(buffer)?;
+                }
+                Action::OpenWelcome => {
+                    self.release_current_dialog_callbacks(runtime);
+                    if !self.open_welcome_panel() {
+                        self.last_error =
+                            Some("terminal is too small for the welcome screen".into());
+                    }
+                    self.render(buffer)?;
+                }
+                Action::DismissWelcome => {
+                    self.finish_welcome();
+                    self.release_current_dialog_callbacks(runtime);
+                    self.current_dialog = None;
+                    self.render(buffer)?;
+                }
+                Action::StartTutorial(track) => {
+                    self.start_tutorial(TutorialProgress::new(*track), buffer, runtime)
+                        .await?;
+                }
+                Action::ResumeTutorial => {
+                    let progress = self
+                        .preferences
+                        .tutorial_progress()
+                        .cloned()
+                        .filter(|progress| !progress.completed)
+                        .unwrap_or_else(|| TutorialProgress::new(TutorialTrack::Guided));
+                    self.start_tutorial(progress, buffer, runtime).await?;
+                }
+                Action::AdvanceTutorial => {
+                    if let Some(tutorial) = &mut self.tutorial_controller {
+                        let completed = tutorial.advance() == TutorialObservation::Completed;
+                        self.persist_tutorial_progress();
+                        if completed {
+                            self.finish_tutorial(/*completed*/ true, buffer, runtime)
+                                .await?;
+                        } else {
+                            self.current_dialog = None;
+                            self.mode = Mode::Normal;
+                            self.render(buffer)?;
+                        }
+                    }
+                }
+                Action::ExitTutorial => {
+                    self.finish_tutorial(/*completed*/ false, buffer, runtime)
+                        .await?;
+                }
+                Action::DismissTutorialDemo | Action::RejectTutorialProposal => {
+                    self.release_current_dialog_callbacks(runtime);
+                    self.current_dialog = None;
+                    self.render(buffer)?;
+                }
+                Action::AcceptTutorialProposal => {
+                    self.release_current_dialog_callbacks(runtime);
+                    self.current_dialog = None;
+                    self.accept_tutorial_proposal(buffer, runtime).await?;
+                    self.render(buffer)?;
+                }
+                Action::CreateStarterConfig => {
+                    match crate::onboarding::create_starter_config(&Config::config_dir()) {
+                        Ok(path) => {
+                            self.last_error = Some(format!("starter config: {}", path.display()))
+                        }
+                        Err(error) => {
+                            self.last_error = Some(format!("could not create config: {error}"))
+                        }
+                    }
+                    self.render(buffer)?;
+                }
+                Action::OpenDiagnosticsPicker => {
+                    self.release_current_dialog_callbacks(runtime);
+                    self.open_diagnostics_picker(diagnostics_picker::DiagnosticFilter::All);
+                    self.render(buffer)?;
+                }
+                Action::OpenErrorDiagnosticsPicker => {
+                    self.release_current_dialog_callbacks(runtime);
+                    self.open_diagnostics_picker(diagnostics_picker::DiagnosticFilter::Errors);
+                    self.render(buffer)?;
+                }
+                Action::PreviewStatuslineLayout(statusline) => {
+                    add_to_history = false;
+                    self.config.statusline = statusline.clone();
+                    self.force_full_redraw = true;
+                    self.render(buffer)?;
+                }
+                Action::SaveStatuslineLayout(statusline) => {
+                    add_to_history = false;
+                    match Config::persist_statusline(statusline) {
+                        Ok(()) => {
+                            self.config.statusline = statusline.clone();
+                            self.current_dialog = None;
+                            self.resolve_issue(
+                                &crate::notification::NotificationSource::Editor,
+                                "status-line-layout",
+                            );
+                            self.set_quiet_message(Some("saved status-line layout".to_string()));
+                        }
+                        Err(error) => {
+                            self.set_legacy_message(Some(format!(
+                                "could not save status-line layout: {error}"
+                            )));
+                        }
+                    }
+                    self.force_full_redraw = true;
+                    self.render(buffer)?;
+                }
+                Action::CancelStatuslineLayout(statusline) => {
+                    add_to_history = false;
+                    self.config.statusline = statusline.clone();
+                    self.current_dialog = None;
+                    self.set_legacy_message(None);
+                    self.force_full_redraw = true;
+                    self.render(buffer)?;
+                }
+                Action::ConfigDiagnostics => {
+                    self.release_current_dialog_callbacks(runtime);
+                    self.open_config_diagnostics();
+                    self.render(buffer)?;
+                }
+                Action::PluginStatus => {
+                    self.release_current_dialog_callbacks(runtime);
+                    self.open_plugin_status();
+                    self.render(buffer)?;
+                }
+                Action::ReloadLanguages => {
+                    match self.reload_languages().await {
+                        Ok(count) => {
+                            self.set_legacy_message(Some(format!(
+                                "reloaded {count} configured language{}",
+                                if count == 1 { "" } else { "s" }
+                            )));
+                        }
+                        Err(error) => {
+                            self.report_issue("languages".into(), format!("Language reload failed: {error:#}. Fix configuration and retry :languages reload."));
+                        }
+                    }
+                    self.render(buffer)?;
+                }
+                Action::ShowDialog => {
+                    self.render(buffer)?;
+                }
+                Action::CloseDialog => {
+                    if self.message_browser.is_some() {
+                        if self
+                            .current_dialog
+                            .as_ref()
+                            .is_some_and(|dialog| dialog.is_message_history())
+                        {
+                            self.close_messages();
+                        } else {
+                            self.release_current_dialog_callbacks(runtime);
+                            self.refresh_message_browser();
+                        }
+                        self.render(buffer)?;
+                        return Ok(false);
+                    }
+                    if self.inline_history_browser.is_some() {
+                        self.handle_inline_history_action(
+                            &crate::inline_history::HistoryAction::Close,
+                            buffer,
+                            runtime,
+                        )
+                        .await?;
+                        return Ok(false);
+                    }
+                    if self
+                        .current_dialog
+                        .as_ref()
+                        .is_some_and(|dialog| dialog.picker_id() == Some(CODE_ACTION_PICKER_ID))
+                    {
+                        self.clear_pending_code_action_requests();
+                    }
+                    self.release_current_dialog_callbacks(runtime);
+                    self.current_dialog = None;
+                    self.completion_snapshot = None;
+                    self.render(buffer)?;
+                }
+                Action::OpenInlineHistory | Action::OpenInlineActivity => {
+                    add_to_history = false;
+                    self.open_inline_history(buffer, runtime).await?;
+                }
+                Action::InlineHistoryAction(action) => {
+                    add_to_history = tracking
+                        && matches!(
+                            action,
+                            crate::inline_history::HistoryAction::FollowFile { .. }
+                                | crate::inline_history::HistoryAction::Jump
+                                | crate::inline_history::HistoryAction::ShowAnnotations
+                        );
+                    self.handle_inline_history_action(action, buffer, runtime)
+                        .await?;
+                }
+                Action::RestoreInlineAssistAnnotations => {
+                    add_to_history = false;
+                    if let Some(request) = self.inline_assist.as_ref().and_then(|assist| {
+                        self.inline_annotations_request(
+                            &assist.annotation_group_id,
+                            assist.result_request_id.as_deref(),
+                        )
+                    }) {
+                        self.show_inline_history_annotations(&request, buffer, runtime)
+                            .await?;
+                        if let Some(scope) = self
+                            .inline_assist
+                            .as_ref()
+                            .map(|assist| assist.scope.clone())
+                        {
+                            self.current_dialog = Some(Box::new(
+                                self.inline_assist_popup(scope, self.inline_assist_result_state()),
+                            ));
+                        }
+                    } else {
+                        self.set_legacy_message(Some(
+                            "no retained annotations for this inline discussion".into(),
                         ));
                     }
-                    Ok(plugin::panel::TextPanelReuseOutcome::Confirm(revision)) => {
+                    self.render(buffer)?;
+                }
+                Action::RefreshDiagnostics => {
+                    add_to_history = false;
+                    self.request_diagnostics().await?;
+                    self.render(buffer)?;
+                }
+                Action::Refresh => {
+                    add_to_history = false;
+                    self.render(buffer)?;
+                }
+                Action::Print(msg) => {
+                    self.set_legacy_message(Some(msg.clone()));
+                    self.draw_commandline(buffer);
+                }
+                Action::PrintWarning(msg) => {
+                    self.set_routine_warning(Some(msg.clone()));
+                    self.draw_commandline(buffer);
+                }
+                Action::PublishIssue {
+                    owner,
+                    key,
+                    message,
+                    remedy,
+                } => {
+                    self.publish_plugin_issue(owner, key, message, remedy);
+                    self.render(buffer)?;
+                }
+                Action::ResolveIssue { owner, key } => {
+                    self.resolve_plugin_issue(owner, key);
+                    self.render(buffer)?;
+                }
+                Action::OpenTasks => {
+                    add_to_history = false;
+                    self.open_tasks();
+                    self.render(buffer)?;
+                }
+                Action::OpenMessages => {
+                    add_to_history = false;
+                    self.open_messages();
+                    self.render(buffer)?;
+                }
+                Action::MessageHistory(action) => {
+                    add_to_history = false;
+                    self.handle_message_action(action);
+                    self.render(buffer)?;
+                }
+                Action::RunShell(command) => {
+                    add_to_history = false;
+                    if let Err(error) = self.start_shell_command(command) {
+                        self.set_foreground_message(Severity::Error, Some(error.to_string()));
+                    }
+                    self.render(buffer)?;
+                }
+                Action::RunShellFilter {
+                    command,
+                    start_line,
+                    end_line,
+                } => {
+                    add_to_history = false;
+                    if let Err(error) = self.start_shell_filter(command, *start_line, *end_line) {
+                        self.set_foreground_message(Severity::Error, Some(error.to_string()));
+                    }
+                    self.render(buffer)?;
+                }
+                Action::CancelShellCommand => {
+                    add_to_history = false;
+                    if self.cancel_selected_shell_command() {
+                        self.refresh_message_browser();
+                    }
+                    self.render(buffer)?;
+                }
+                Action::OpenTextPanelTurnActions => {
+                    add_to_history = false;
+                    if let Some(target) = self
+                        .panel_manager
+                        .selected_text_turn(usize::from(self.size.0))
+                    {
+                        let mut choices = vec![(
+                            "copy-prompt",
+                            "Copy prompt",
+                            Action::CopyTextPanelTurn {
+                                panel_id: target.panel_id.clone(),
+                                prompt_id: target.prompt_id.clone(),
+                                part: plugin::panel::TextPanelTurnPart::Prompt,
+                            },
+                        )];
+                        if target.has_answer {
+                            choices.push((
+                                "copy-answer",
+                                "Copy answer",
+                                Action::CopyTextPanelTurn {
+                                    panel_id: target.panel_id.clone(),
+                                    prompt_id: target.prompt_id.clone(),
+                                    part: plugin::panel::TextPanelTurnPart::Answer,
+                                },
+                            ));
+                        }
+                        if target.can_reuse {
+                            choices.push((
+                                "reuse-prompt",
+                                "Reuse prompt in composer",
+                                Action::ReuseTextPanelPrompt {
+                                    panel_id: target.panel_id.clone(),
+                                    prompt_id: target.prompt_id.clone(),
+                                    expected_draft: None,
+                                },
+                            ));
+                        }
+                        let actions = choices
+                            .iter()
+                            .map(|(id, _, action)| ((*id).to_string(), action.clone()))
+                            .collect::<HashMap<_, _>>();
+                        let items = choices
+                            .into_iter()
+                            .map(|(id, label, _)| PickerItem {
+                                id: id.to_string(),
+                                icon: None,
+                                label: label.to_string(),
+                                kind: None,
+                                annotation: None,
+                                detail: None,
+                                data: Value::Null,
+                                matches: Vec::new(),
+                                detail_matches: Vec::new(),
+                                preview: None,
+                            })
+                            .collect();
+                        let picker = Picker::builder()
+                            .title("Turn actions")
+                            .structured_items(items)
+                            .placeholder("Choose an action")
+                            .status(format!("Turn {} · {}", target.number, target.preview))
+                            .content_sized(72, 3)
+                            .select_action(move |id| {
+                                actions.get(&id).cloned().unwrap_or_else(|| {
+                                    Action::Print("turn action is no longer available".to_string())
+                                })
+                            })
+                            .build(self);
                         self.release_current_dialog_callbacks(runtime);
-                        self.current_dialog = Some(Box::new(Confirmation::new_actions(
+                        self.current_dialog = Some(Box::new(picker));
+                    } else {
+                        self.set_legacy_message(Some("no user prompt selected".to_string()));
+                    }
+                    self.render(buffer)?;
+                }
+                Action::CopyTextPanelTurn {
+                    panel_id,
+                    prompt_id,
+                    part,
+                } => {
+                    add_to_history = false;
+                    if let Some(text) = self
+                        .panel_manager
+                        .text_turn_for_copy(panel_id, prompt_id, *part)
+                    {
+                        self.set_default_register(Content::charwise(text));
+                        self.set_quiet_message(Some(
+                            match part {
+                                plugin::panel::TextPanelTurnPart::Prompt => "prompt copied",
+                                plugin::panel::TextPanelTurnPart::Answer => "answer copied",
+                            }
+                            .to_string(),
+                        ));
+                    } else {
+                        self.set_legacy_message(Some(
+                            "selected turn text is no longer available".to_string(),
+                        ));
+                    }
+                    self.render(buffer)?;
+                }
+                Action::ReuseTextPanelPrompt {
+                    panel_id,
+                    prompt_id,
+                    expected_draft,
+                } => {
+                    add_to_history = false;
+                    match self.panel_manager.reuse_text_panel_prompt(
+                        panel_id,
+                        prompt_id,
+                        *expected_draft,
+                    ) {
+                        Ok(plugin::panel::TextPanelReuseOutcome::Loaded) => {
+                            self.set_quiet_message(Some(
+                                "prompt loaded for editing; nothing sent".to_string(),
+                            ));
+                        }
+                        Ok(plugin::panel::TextPanelReuseOutcome::Confirm(revision)) => {
+                            self.release_current_dialog_callbacks(runtime);
+                            self.current_dialog = Some(Box::new(Confirmation::new_actions(
                             self,
                             "Replace unsent draft?",
                             "The composer already contains an unsent draft. Replacing it is one undoable edit; nothing will be sent.",
@@ -25392,674 +25488,691 @@ impl Editor {
                             },
                             Action::Print("current draft kept".to_string()),
                         )));
-                    }
-                    Err(message) => self.set_legacy_message(Some(message.to_string())),
-                }
-                self.render(buffer)?;
-            }
-            Action::OpenPicker(title, items, id) => {
-                let history_key = Self::picker_history_key(title, *id);
-                let mut picker = Picker::new(title.clone(), self, items, *id);
-                if let Some(history_key) = history_key {
-                    let history = self.picker_history(&history_key).to_vec();
-                    picker.set_history(history_key, history);
-                }
-                self.release_current_dialog_callbacks(runtime);
-                self.current_dialog = Some(Box::new(picker));
-                self.render(buffer)?;
-            }
-            Action::OpenLivePicker(title, items, id, options) => {
-                let history_key = Self::picker_history_key(title, *id);
-                let mut picker =
-                    Picker::new_live_with_options(title.clone(), self, items, *id, options.clone());
-                if let Some(history_key) = history_key {
-                    let history = self.picker_history(&history_key).to_vec();
-                    picker.set_history(history_key, history);
-                }
-                self.release_current_dialog_callbacks(runtime);
-                self.current_dialog = Some(Box::new(picker));
-                self.render(buffer)?;
-            }
-            Action::Picked(item, id) => {
-                log!("picked: {item} - {id:?}");
-                if *id == Some(PLUGIN_MANAGER_ACTION_PICKER_ID) {
-                    return self
-                        .execute(&Action::PluginManagerAction(item.clone()), buffer, runtime)
-                        .await;
-                } else if let Some(id) = id {
-                    self.plugin_registry
-                        .notify(
-                            runtime,
-                            &format!("picker:selected:{}", id),
-                            serde_json::Value::String(item.clone()),
-                        )
-                        .await?;
-                }
-            }
-            Action::RecordPickerHistory { key, query } => {
-                add_to_history = false;
-                self.record_picker_history(key, query);
-            }
-            Action::PreviewTheme(theme_name) => {
-                match self.apply_theme(theme_name, false) {
-                    Ok(()) => {
-                        self.refresh_plugin_snapshots(runtime, false, false, true)?;
-                        self.plugin_registry
-                            .notify(
-                                runtime,
-                                "theme:changed",
-                                json!({ "name": theme_name, "persisted": false }),
-                            )
-                            .await?;
-                    }
-                    Err(err) => self.set_legacy_message(Some(err.to_string())),
-                }
-                self.render(buffer)?;
-            }
-            Action::SetTheme(theme_name) => {
-                match self.apply_theme(theme_name, true) {
-                    Ok(()) => {
-                        self.refresh_plugin_snapshots(runtime, false, false, true)?;
-                        self.plugin_registry
-                            .notify(
-                                runtime,
-                                "theme:changed",
-                                json!({ "name": theme_name, "persisted": true }),
-                            )
-                            .await?;
-                    }
-                    Err(err) => self.set_legacy_message(Some(err.to_string())),
-                }
-                self.render(buffer)?;
-            }
-            Action::Suspend => {
-                #[cfg(unix)]
-                {
-                    self.cleanup()?;
-                    let pid = Pid::from_raw(/*raw*/ 0);
-                    signal::kill(pid, Signal::SIGSTOP)?;
-                    terminal::enable_raw_mode()?;
-                    self.terminal_active = true;
-                    self.stdout
-                        .execute(event::EnableMouseCapture)?
-                        .execute(event::EnableFocusChange)?
-                        .execute(event::EnableBracketedPaste)?
-                        .execute(terminal::EnterAlternateScreen)?;
-                    self.keyboard_protocol = crate::keyboard::KeyboardProtocol::start(
-                        &mut self.stdout,
-                        crate::keyboard::KeyboardPreference::Auto,
-                    )?;
-                    self.stdout
-                        .execute(terminal::Clear(terminal::ClearType::All))?;
-                    self.invalidate_terminal_render_state(buffer);
-                    self.render(buffer)?;
-                }
-                #[cfg(not(unix))]
-                {
-                    // Suspend is not supported on Windows
-                    // Just ignore the action
-                }
-            }
-            Action::Yank => {
-                if self.selection.is_some() && self.yank(DEFAULT_REGISTER) {
-                    // self.render(buffer)?;
-                    self.draw_commandline(buffer);
-                }
-            }
-            Action::YankCurrentLine => {
-                if self.yank_current_line() {
-                    self.draw_commandline(buffer);
-                }
-            }
-            Action::YankCurrentLines(count) => {
-                let range = self.current_line_range(*count, true);
-                let text = self.current_buffer().text_in_range(range);
-                if !text.is_empty() {
-                    self.set_default_register(Content::linewise(text));
-                    self.draw_commandline(buffer);
-                }
-            }
-            Action::Delete => {
-                if self.selection.is_some() {
-                    self.begin_transaction("delete selection");
-                    if let Some((x0, y0)) = self.delete_selection() {
-                        let y0 = y0.min(self.last_navigable_line());
-                        if !self.is_within_viewport(y0) {
-                            self.vtop = y0;
                         }
-                        self.cx = x0;
-                        self.cy = y0.saturating_sub(self.vtop);
-                        self.fix_cursor_pos();
+                        Err(message) => self.set_legacy_message(Some(message.to_string())),
                     }
-                    self.commit_transaction(self.cursor_snapshot());
-                    self.selection = None;
-                    self.notify_change(runtime).await?;
                     self.render(buffer)?;
                 }
-            }
-            Action::ChangeSelection => {
-                self.change_selection(buffer, runtime).await?;
-            }
-            Action::Paste | Action::PasteBefore => {
-                log!("pasting selection");
-                let before = self.current_buffer().contents();
-                let pasted = if self.is_visual() && self.selection.is_some() {
-                    self.paste_over_selection(*action == Action::PasteBefore)
-                } else {
-                    self.paste_default(*action == Action::PasteBefore)
-                };
-                if pasted {
-                    self.notify_change(runtime).await?;
-                    self.request_format_on_paste(&before).await;
+                Action::OpenPicker(title, items, id) => {
+                    let history_key = Self::picker_history_key(title, *id);
+                    let mut picker = Picker::new(title.clone(), self, items, *id);
+                    if let Some(history_key) = history_key {
+                        let history = self.picker_history(&history_key).to_vec();
+                        picker.set_history(history_key, history);
+                    }
+                    self.release_current_dialog_callbacks(runtime);
+                    self.current_dialog = Some(Box::new(picker));
                     self.render(buffer)?;
                 }
-            }
-            Action::InsertText { x, y, content } => {
-                self.insert_content_as_transaction(*x, *y, content);
-                self.notify_change(runtime).await?;
-                self.render(buffer)?;
-            }
-            Action::BufferText(value) => {
-                self.buffer_text(value);
-            }
-            Action::InsertBlock => {
-                self.execute_block_action(buffer, runtime, Mode::Insert)
-                    .await?
-            }
-            Action::ClearDiagnostics(uri, lines) => {
-                if let Some(buffer_uri) = self.current_buffer().uri()? {
-                    if buffer_uri == *uri {
-                        log!("clearing diagnostics for {uri}: {lines:?}");
-                        self.clear_diagnostics(buffer, lines);
+                Action::OpenLivePicker(title, items, id, options) => {
+                    let history_key = Self::picker_history_key(title, *id);
+                    let mut picker = Picker::new_live_with_options(
+                        title.clone(),
+                        self,
+                        items,
+                        *id,
+                        options.clone(),
+                    );
+                    if let Some(history_key) = history_key {
+                        let history = self.picker_history(&history_key).to_vec();
+                        picker.set_history(history_key, history);
+                    }
+                    self.release_current_dialog_callbacks(runtime);
+                    self.current_dialog = Some(Box::new(picker));
+                    self.render(buffer)?;
+                }
+                Action::Picked(item, id) => {
+                    log!("picked: {item} - {id:?}");
+                    if *id == Some(PLUGIN_MANAGER_ACTION_PICKER_ID) {
+                        return self
+                            .execute(&Action::PluginManagerAction(item.clone()), buffer, runtime)
+                            .await;
+                    } else if let Some(id) = id {
+                        self.plugin_registry
+                            .notify(
+                                runtime,
+                                &format!("picker:selected:{}", id),
+                                serde_json::Value::String(item.clone()),
+                            )
+                            .await?;
+                    }
+                }
+                Action::RecordPickerHistory { key, query } => {
+                    add_to_history = false;
+                    self.record_picker_history(key, query);
+                }
+                Action::PreviewTheme(theme_name) => {
+                    match self.apply_theme(theme_name, false) {
+                        Ok(()) => {
+                            self.refresh_plugin_snapshots(runtime, false, false, true)?;
+                            self.plugin_registry
+                                .notify(
+                                    runtime,
+                                    "theme:changed",
+                                    json!({ "name": theme_name, "persisted": false }),
+                                )
+                                .await?;
+                        }
+                        Err(err) => self.set_legacy_message(Some(err.to_string())),
+                    }
+                    self.render(buffer)?;
+                }
+                Action::SetTheme(theme_name) => {
+                    match self.apply_theme(theme_name, true) {
+                        Ok(()) => {
+                            self.refresh_plugin_snapshots(runtime, false, false, true)?;
+                            self.plugin_registry
+                                .notify(
+                                    runtime,
+                                    "theme:changed",
+                                    json!({ "name": theme_name, "persisted": true }),
+                                )
+                                .await?;
+                        }
+                        Err(err) => self.set_legacy_message(Some(err.to_string())),
+                    }
+                    self.render(buffer)?;
+                }
+                Action::Suspend => {
+                    #[cfg(unix)]
+                    {
+                        self.cleanup()?;
+                        let pid = Pid::from_raw(/*raw*/ 0);
+                        signal::kill(pid, Signal::SIGSTOP)?;
+                        terminal::enable_raw_mode()?;
+                        self.terminal_active = true;
+                        self.stdout
+                            .execute(event::EnableMouseCapture)?
+                            .execute(event::EnableFocusChange)?
+                            .execute(event::EnableBracketedPaste)?
+                            .execute(terminal::EnterAlternateScreen)?;
+                        self.keyboard_protocol = crate::keyboard::KeyboardProtocol::start(
+                            &mut self.stdout,
+                            crate::keyboard::KeyboardPreference::Auto,
+                        )?;
+                        self.stdout
+                            .execute(terminal::Clear(terminal::ClearType::All))?;
+                        self.invalidate_terminal_render_state(buffer);
+                        self.render(buffer)?;
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        // Suspend is not supported on Windows
+                        // Just ignore the action
+                    }
+                }
+                Action::Yank => {
+                    if self.selection.is_some() && self.yank(DEFAULT_REGISTER) {
+                        // self.render(buffer)?;
+                        self.draw_commandline(buffer);
+                    }
+                }
+                Action::YankCurrentLine => {
+                    if self.yank_current_line() {
+                        self.draw_commandline(buffer);
+                    }
+                }
+                Action::YankCurrentLines(count) => {
+                    let range = self.current_line_range(*count, true);
+                    let text = self.current_buffer().text_in_range(range);
+                    if !text.is_empty() {
+                        self.set_default_register(Content::linewise(text));
+                        self.draw_commandline(buffer);
+                    }
+                }
+                Action::Delete => {
+                    if self.selection.is_some() {
+                        self.begin_transaction("delete selection");
+                        if let Some((x0, y0)) = self.delete_selection() {
+                            let y0 = y0.min(self.last_navigable_line());
+                            if !self.is_within_viewport(y0) {
+                                self.vtop = y0;
+                            }
+                            self.cx = x0;
+                            self.cy = y0.saturating_sub(self.vtop);
+                            self.fix_cursor_pos();
+                        }
+                        self.commit_transaction(self.cursor_snapshot());
+                        self.selection = None;
+                        self.notify_change(runtime).await?;
+                        self.render(buffer)?;
+                    }
+                }
+                Action::ChangeSelection => {
+                    self.change_selection(buffer, runtime).await?;
+                }
+                Action::Paste | Action::PasteBefore => {
+                    log!("pasting selection");
+                    let before = self.current_buffer().contents();
+                    let pasted = if self.is_visual() && self.selection.is_some() {
+                        self.paste_over_selection(*action == Action::PasteBefore)
                     } else {
-                        log!("ignoring diagnostics for {uri}: {lines:?}");
+                        self.paste_default(*action == Action::PasteBefore)
+                    };
+                    if pasted {
+                        self.notify_change(runtime).await?;
+                        self.request_format_on_paste(&before).await;
+                        self.render(buffer)?;
                     }
                 }
+                Action::InsertText { x, y, content } => {
+                    self.insert_content_as_transaction(*x, *y, content);
+                    self.notify_change(runtime).await?;
+                    self.render(buffer)?;
+                }
+                Action::BufferText(value) => {
+                    self.buffer_text(value);
+                }
+                Action::InsertBlock => {
+                    self.execute_block_action(buffer, runtime, Mode::Insert)
+                        .await?
+                }
+                Action::ClearDiagnostics(uri, lines) => {
+                    if let Some(buffer_uri) = self.current_buffer().uri()? {
+                        if buffer_uri == *uri {
+                            log!("clearing diagnostics for {uri}: {lines:?}");
+                            self.clear_diagnostics(buffer, lines);
+                        } else {
+                            log!("ignoring diagnostics for {uri}: {lines:?}");
+                        }
+                    }
 
-                self.draw_diagnostics(buffer);
-            }
-            Action::InsertString(text) => {
-                let line = self.buffer_line();
-                let cx = self.cx;
-                let char_cx = self.grapheme_to_char_on_line(cx, line);
-                let started_transaction = !self.transaction_active();
-                if started_transaction {
-                    self.begin_transaction("insert string");
+                    self.draw_diagnostics(buffer);
                 }
-                let range = self
-                    .take_selected_snippet_range()
-                    .unwrap_or_else(|| TextRange::insertion(TextPosition::new(line, char_cx)));
-                self.replace_range(range, text);
-                self.notify_change(runtime).await?;
-                self.cx += grapheme_len(text);
-                if started_transaction {
-                    self.commit_transaction(self.cursor_snapshot());
-                }
-                self.render_edited_window_rows(buffer)?;
-            }
-            Action::InsertPastedText(text) => {
-                let before = self.current_buffer().contents();
-                if self.insert_at_multi_cursors(text) {
-                    self.publish_multi_cursor_edit(buffer, runtime).await?;
-                    self.request_format_on_paste(&before).await;
-                    return Ok(false);
-                }
-                let line = self.buffer_line();
-                let char_cx = self.grapheme_to_char_on_line(self.cx, line);
-                let start = TextPosition::new(line, char_cx);
-                let end = self.current_buffer().range_for_text(start, text).end;
-                let started_transaction = !self.transaction_active();
-                if started_transaction {
-                    self.begin_transaction("paste");
-                }
-                let range = self
-                    .take_selected_snippet_range()
-                    .unwrap_or_else(|| TextRange::insertion(start));
-                self.replace_range(range, text);
-                self.move_to_insert_text_position(end);
-                if text.contains('\n') {
-                    self.reindent_pasted_lines(line, text);
-                }
-                if started_transaction {
-                    self.commit_transaction(self.cursor_snapshot());
-                }
-                self.notify_change(runtime).await?;
-                self.request_format_on_paste(&before).await;
-                self.render(buffer)?;
-            }
-            Action::RequestCompletion => {
-                if self.request_completion(None).await? {
-                    self.render(buffer)?;
-                }
-            }
-            Action::Copilot(command) => {
-                add_to_history = false;
-                self.handle_copilot_command(command);
-                self.render(buffer)?;
-            }
-            Action::CopilotEnableAndSignIn => {
-                add_to_history = false;
-                self.enable_and_sign_in_copilot();
-                self.render(buffer)?;
-            }
-            Action::RequestInlineCompletion => {
-                add_to_history = false;
-                self.request_inline_completion(false);
-                self.render(buffer)?;
-            }
-            Action::AcceptInlineCompletion => {
-                self.accept_inline_completion(runtime).await?;
-                self.render(buffer)?;
-            }
-            Action::DismissInlineCompletion => {
-                add_to_history = false;
-                self.dismiss_inline_completion();
-                self.render(buffer)?;
-            }
-            Action::CopilotFinishSignIn(command) => {
-                add_to_history = false;
-                self.copilot_control(crate::copilot::Control::FinishSignIn(command.clone()));
-                self.render(buffer)?;
-            }
-            Action::CopilotCopySignInCode(code) => {
-                add_to_history = false;
-                self.copy_copilot_sign_in_code(code);
-                self.render(buffer)?;
-            }
-            Action::CopilotRetrySignIn => {
-                add_to_history = false;
-                self.retry_copilot_sign_in();
-                self.render(buffer)?;
-            }
-            Action::CopilotDismissSignIn => {
-                add_to_history = false;
-                self.inline_completion.sign_in = None;
-            }
-            Action::CopilotRespond { id, result } => {
-                add_to_history = false;
-                self.copilot_control(crate::copilot::Control::Respond {
-                    id: id.clone(),
-                    result: result.clone(),
-                });
-                self.render(buffer)?;
-            }
-            Action::RequestCompletionWithTrigger(trigger_character) => {
-                if self.request_completion(Some(*trigger_character)).await? {
-                    self.render(buffer)?;
-                }
-            }
-            Action::ApplyCompletion {
-                item,
-                commit_character,
-            } => {
-                if !self
-                    .resolve_completion_item(item, *commit_character)
-                    .await?
-                {
-                    self.apply_completion(item, *commit_character, runtime)
-                        .await?;
-                } else {
-                    self.close_completion_popup();
-                    self.completion_snapshot = None;
-                }
-                self.render(buffer)?;
-            }
-            Action::ApplyResolvedCompletion {
-                item,
-                commit_character,
-            } => {
-                self.apply_completion(item, *commit_character, runtime)
-                    .await?;
-                self.render(buffer)?;
-            }
-            Action::NextSnippetPlaceholder | Action::PreviousSnippetPlaceholder => {
-                add_to_history = false;
-                self.navigate_snippet_placeholder(matches!(
-                    action,
-                    Action::PreviousSnippetPlaceholder
-                ));
-                self.render(buffer)?;
-            }
-            Action::DeleteSnippetPlaceholder => {
-                if let Some(range) = self.take_selected_snippet_range() {
+                Action::InsertString(text) => {
+                    let line = self.buffer_line();
+                    let cx = self.cx;
+                    let char_cx = self.grapheme_to_char_on_line(cx, line);
                     let started_transaction = !self.transaction_active();
                     if started_transaction {
-                        self.begin_transaction("delete snippet placeholder");
+                        self.begin_transaction("insert string");
                     }
-                    self.replace_range(range, "");
-                    self.move_to_insert_text_position(range.start);
+                    let range = self
+                        .take_selected_snippet_range()
+                        .unwrap_or_else(|| TextRange::insertion(TextPosition::new(line, char_cx)));
+                    self.replace_range(range, text);
+                    self.notify_change(runtime).await?;
+                    self.cx += grapheme_len(text);
+                    if started_transaction {
+                        self.commit_transaction(self.cursor_snapshot());
+                    }
+                    self.render_edited_window_rows(buffer)?;
+                }
+                Action::InsertPastedText(text) => {
+                    let before = self.current_buffer().contents();
+                    if self.insert_at_multi_cursors(text) {
+                        self.publish_multi_cursor_edit(buffer, runtime).await?;
+                        self.request_format_on_paste(&before).await;
+                        return Ok(false);
+                    }
+                    let line = self.buffer_line();
+                    let char_cx = self.grapheme_to_char_on_line(self.cx, line);
+                    let start = TextPosition::new(line, char_cx);
+                    let end = self.current_buffer().range_for_text(start, text).end;
+                    let started_transaction = !self.transaction_active();
+                    if started_transaction {
+                        self.begin_transaction("paste");
+                    }
+                    let range = self
+                        .take_selected_snippet_range()
+                        .unwrap_or_else(|| TextRange::insertion(start));
+                    self.replace_range(range, text);
+                    self.move_to_insert_text_position(end);
+                    if text.contains('\n') {
+                        self.reindent_pasted_lines(line, text);
+                    }
                     if started_transaction {
                         self.commit_transaction(self.cursor_snapshot());
                     }
                     self.notify_change(runtime).await?;
+                    self.request_format_on_paste(&before).await;
                     self.render(buffer)?;
                 }
-            }
-            Action::ShowProgress(progress) => {
-                add_to_history = false;
-                match progress.token {
-                    ProgressToken::String(ref s) => self.set_legacy_message(Some(s.to_string())),
-                    ProgressToken::Number(_) => {}
-                }
-            }
-            Action::IndentLine => {
-                let indent = self.indentation();
-                let line = self.buffer_line();
-
-                self.begin_transaction("indent line");
-                self.replace_range(
-                    TextRange::insertion(TextPosition::new(line, 0)),
-                    &" ".repeat(indent.shift_width),
-                );
-                self.commit_transaction(self.cursor_snapshot());
-                self.notify_change(runtime).await?;
-                self.render(buffer)?;
-            }
-            Action::IndentSelection(count) => {
-                self.execute_visual_line_shift(
-                    VisualLineShiftDirection::Right,
-                    *count,
-                    buffer,
-                    runtime,
-                )
-                .await?;
-            }
-            Action::UnindentLine => {
-                let spaces = self.current_line_indentation();
-                let chars_to_remove = std::cmp::min(spaces, self.indentation().shift_width);
-                let line = self.buffer_line();
-
-                self.begin_transaction("unindent line");
-                self.replace_range(
-                    TextRange::new(
-                        TextPosition::new(line, 0),
-                        TextPosition::new(line, chars_to_remove),
-                    ),
-                    "",
-                );
-                self.commit_transaction(self.cursor_snapshot());
-                self.notify_change(runtime).await?;
-                self.render(buffer)?;
-            }
-            Action::UnindentSelection(count) => {
-                self.execute_visual_line_shift(
-                    VisualLineShiftDirection::Left,
-                    *count,
-                    buffer,
-                    runtime,
-                )
-                .await?;
-            }
-            Action::JumpBack => {
-                add_to_history = false;
-                if !self.pending_definition_requests.is_empty() {
-                    self.deferred_jump_navigation.push_back(Action::JumpBack);
-                    return Ok(false);
-                }
-                if let Some(entry) = self.jump_back_entry() {
-                    log!("jumping back to {entry:?}");
-                    self.remember_previous_context(self.current_jump_entry());
-                    self.jump_to_entry(&entry, buffer, runtime).await?;
-                } else {
-                    self.set_routine_warning(Some("at start of jump list".to_string()));
-                    self.draw_commandline(buffer);
-                }
-            }
-            Action::JumpForward => {
-                add_to_history = false;
-                if !self.pending_definition_requests.is_empty() {
-                    self.deferred_jump_navigation.push_back(Action::JumpForward);
-                    return Ok(false);
-                }
-                if let Some(entry) = self.jump_forward_entry() {
-                    log!("jumping forward to {entry:?}");
-                    self.remember_previous_context(self.current_jump_entry());
-                    self.jump_to_entry(&entry, buffer, runtime).await?;
-                } else {
-                    self.set_routine_warning(Some("at end of jump list".to_string()));
-                    self.draw_commandline(buffer);
-                }
-            }
-            Action::DumpTimers => {
-                add_to_history = false;
-                use crate::plugin::timer_stats;
-                timer_stats::log_timer_stats();
-            }
-            Action::NotifyPlugins(method, params) => {
-                self.plugin_registry
-                    .notify(runtime, method, params.clone())
-                    .await?;
-            }
-            Action::NotifyPlugin(plugin, method, params) => {
-                self.plugin_registry
-                    .notify_plugin(runtime, plugin, method, params.clone())
-                    .await?;
-            }
-            Action::NotifyPicker(handle, event) => {
-                self.plugin_registry
-                    .notify_picker(runtime, *handle, event.as_ref().clone())
-                    .await?;
-                // A picker selection may enqueue its OpenLocation request from the
-                // callback. Commit that navigation before accepting the next key,
-                // so an immediately typed CTRL-O sees the new jump.
-                self.service_background_before_next_input = true;
-            }
-            Action::NotifyComposer(handle, event) => {
-                self.plugin_registry
-                    .notify_composer(runtime, *handle, event.as_ref().clone())
-                    .await?;
-            }
-            Action::ResolvePluginRequest(request_id, payload) => {
-                self.plugin_registry
-                    .resolve_request(runtime, RequestId::from_raw(*request_id), payload.clone())
-                    .await?;
-            }
-
-            // Window management actions
-            Action::SplitHorizontal => {
-                log!("SplitHorizontal action triggered");
-                let current_buffer = self.buffer_manager.active_index();
-                if self.update_window_layout(|windows| windows.split_horizontal(current_buffer)) {
-                    log!("Window split successful");
-                    self.render(buffer)?;
-                } else {
-                    log!("Window split failed");
-                }
-            }
-            Action::SplitVertical => {
-                log!("SplitVertical action triggered");
-                let current_buffer = self.buffer_manager.active_index();
-                if self.update_window_layout(|windows| windows.split_vertical(current_buffer)) {
-                    log!("Vertical split successful");
-                    self.render(buffer)?;
-                } else {
-                    log!("Vertical split failed");
-                }
-            }
-            Action::SplitHorizontalWithFile(file) => {
-                log!(
-                    "SplitHorizontalWithFile action triggered with file: {}",
-                    file
-                );
-                let (new_buffer_index, added_buffer, _) =
-                    match self.load_or_reuse_path_buffer(file).await {
-                        Ok(opened) => opened,
-                        Err(e) => {
-                            self.set_legacy_message(Some(format!("Failed to open file: {}", e)));
-                            return Ok(false);
-                        }
-                    };
-                if self.update_window_layout(|windows| windows.split_horizontal(new_buffer_index)) {
-                    log!("Window split with file successful");
-                    self.request_diagnostics().await?;
-                    self.render(buffer)?;
-                } else {
-                    log!("Window split failed");
-                    if added_buffer {
-                        self.buffer_manager.pop_buffer();
+                Action::RequestCompletion => {
+                    if self.request_completion(None).await? {
+                        self.render(buffer)?;
                     }
                 }
-            }
-            Action::SplitVerticalWithFile(file) => {
-                log!("SplitVerticalWithFile action triggered with file: {}", file);
-                let (new_buffer_index, added_buffer, _) =
-                    match self.load_or_reuse_path_buffer(file).await {
-                        Ok(opened) => opened,
-                        Err(e) => {
-                            self.set_legacy_message(Some(format!("Failed to open file: {}", e)));
-                            return Ok(false);
-                        }
-                    };
-                if self.update_window_layout(|windows| windows.split_vertical(new_buffer_index)) {
-                    log!("Vertical split with file successful");
-                    self.request_diagnostics().await?;
+                Action::Copilot(command) => {
+                    add_to_history = false;
+                    self.handle_copilot_command(command);
                     self.render(buffer)?;
-                } else {
-                    log!("Vertical split failed");
-                    if added_buffer {
-                        self.buffer_manager.pop_buffer();
+                }
+                Action::CopilotEnableAndSignIn => {
+                    add_to_history = false;
+                    self.enable_and_sign_in_copilot();
+                    self.render(buffer)?;
+                }
+                Action::RequestInlineCompletion => {
+                    add_to_history = false;
+                    self.request_inline_completion(false);
+                    self.render(buffer)?;
+                }
+                Action::AcceptInlineCompletion => {
+                    self.accept_inline_completion(runtime).await?;
+                    self.render(buffer)?;
+                }
+                Action::DismissInlineCompletion => {
+                    add_to_history = false;
+                    self.dismiss_inline_completion();
+                    self.render(buffer)?;
+                }
+                Action::CopilotFinishSignIn(command) => {
+                    add_to_history = false;
+                    self.copilot_control(crate::copilot::Control::FinishSignIn(command.clone()));
+                    self.render(buffer)?;
+                }
+                Action::CopilotCopySignInCode(code) => {
+                    add_to_history = false;
+                    self.copy_copilot_sign_in_code(code);
+                    self.render(buffer)?;
+                }
+                Action::CopilotRetrySignIn => {
+                    add_to_history = false;
+                    self.retry_copilot_sign_in();
+                    self.render(buffer)?;
+                }
+                Action::CopilotDismissSignIn => {
+                    add_to_history = false;
+                    self.inline_completion.sign_in = None;
+                }
+                Action::CopilotRespond { id, result } => {
+                    add_to_history = false;
+                    self.copilot_control(crate::copilot::Control::Respond {
+                        id: id.clone(),
+                        result: result.clone(),
+                    });
+                    self.render(buffer)?;
+                }
+                Action::RequestCompletionWithTrigger(trigger_character) => {
+                    if self.request_completion(Some(*trigger_character)).await? {
+                        self.render(buffer)?;
                     }
                 }
-            }
-            Action::CloseWindow => {
-                if self.update_window_layout(WindowManager::close_window) {
+                Action::ApplyCompletion {
+                    item,
+                    commit_character,
+                } => {
+                    if !self
+                        .resolve_completion_item(item, *commit_character)
+                        .await?
+                    {
+                        self.apply_completion(item, *commit_character, runtime)
+                            .await?;
+                    } else {
+                        self.close_completion_popup();
+                        self.completion_snapshot = None;
+                    }
                     self.render(buffer)?;
                 }
-            }
-            Action::NextWindow => {
-                self.cycle_focus(true, buffer).await?;
-            }
-            Action::PreviousWindow => {
-                self.cycle_focus(false, buffer).await?;
-            }
-            Action::MoveWindowUp => {
-                self.move_window_in_direction(crate::window::Direction::Up, buffer)
+                Action::ApplyResolvedCompletion {
+                    item,
+                    commit_character,
+                } => {
+                    self.apply_completion(item, *commit_character, runtime)
+                        .await?;
+                    self.render(buffer)?;
+                }
+                Action::NextSnippetPlaceholder | Action::PreviousSnippetPlaceholder => {
+                    add_to_history = false;
+                    self.navigate_snippet_placeholder(matches!(
+                        action,
+                        Action::PreviousSnippetPlaceholder
+                    ));
+                    self.render(buffer)?;
+                }
+                Action::DeleteSnippetPlaceholder => {
+                    if let Some(range) = self.take_selected_snippet_range() {
+                        let started_transaction = !self.transaction_active();
+                        if started_transaction {
+                            self.begin_transaction("delete snippet placeholder");
+                        }
+                        self.replace_range(range, "");
+                        self.move_to_insert_text_position(range.start);
+                        if started_transaction {
+                            self.commit_transaction(self.cursor_snapshot());
+                        }
+                        self.notify_change(runtime).await?;
+                        self.render(buffer)?;
+                    }
+                }
+                Action::ShowProgress(progress) => {
+                    add_to_history = false;
+                    match progress.token {
+                        ProgressToken::String(ref s) => {
+                            self.set_legacy_message(Some(s.to_string()))
+                        }
+                        ProgressToken::Number(_) => {}
+                    }
+                }
+                Action::IndentLine => {
+                    let indent = self.indentation();
+                    let line = self.buffer_line();
+
+                    self.begin_transaction("indent line");
+                    self.replace_range(
+                        TextRange::insertion(TextPosition::new(line, 0)),
+                        &" ".repeat(indent.shift_width),
+                    );
+                    self.commit_transaction(self.cursor_snapshot());
+                    self.notify_change(runtime).await?;
+                    self.render(buffer)?;
+                }
+                Action::IndentSelection(count) => {
+                    self.execute_visual_line_shift(
+                        VisualLineShiftDirection::Right,
+                        *count,
+                        buffer,
+                        runtime,
+                    )
                     .await?;
-            }
-            Action::MoveWindowDown => {
-                self.move_window_in_direction(crate::window::Direction::Down, buffer)
+                }
+                Action::UnindentLine => {
+                    let spaces = self.current_line_indentation();
+                    let chars_to_remove = std::cmp::min(spaces, self.indentation().shift_width);
+                    let line = self.buffer_line();
+
+                    self.begin_transaction("unindent line");
+                    self.replace_range(
+                        TextRange::new(
+                            TextPosition::new(line, 0),
+                            TextPosition::new(line, chars_to_remove),
+                        ),
+                        "",
+                    );
+                    self.commit_transaction(self.cursor_snapshot());
+                    self.notify_change(runtime).await?;
+                    self.render(buffer)?;
+                }
+                Action::UnindentSelection(count) => {
+                    self.execute_visual_line_shift(
+                        VisualLineShiftDirection::Left,
+                        *count,
+                        buffer,
+                        runtime,
+                    )
                     .await?;
-            }
-            Action::MoveWindowLeft => {
-                self.move_window_in_direction(crate::window::Direction::Left, buffer)
-                    .await?;
-            }
-            Action::MoveWindowRight => {
-                self.move_window_in_direction(crate::window::Direction::Right, buffer)
-                    .await?;
-            }
-            Action::MoveWindowToLeft => {
-                self.move_focused_window_to_edge(crate::window::Direction::Left, buffer)?;
-            }
-            Action::MoveWindowToBottom => {
-                self.move_focused_window_to_edge(crate::window::Direction::Down, buffer)?;
-            }
-            Action::MoveWindowToTop => {
-                self.move_focused_window_to_edge(crate::window::Direction::Up, buffer)?;
-            }
-            Action::MoveWindowToRight => {
-                self.move_focused_window_to_edge(crate::window::Direction::Right, buffer)?;
-            }
-            Action::EnterPaneResizeMode => {
-                add_to_history = false;
-                self.pane_resize_mode = Some(self.focused_pane_resize_targets());
-                self.render(buffer)?;
-            }
-            Action::ExitPaneResizeMode => {
-                add_to_history = false;
-                self.pane_resize_mode = None;
-                self.render(buffer)?;
-            }
-            Action::MovePaneDividerUp(amount) => {
-                if self.move_captured_pane_divider(crate::window::Direction::Up, *amount) {
-                    self.render(buffer)?;
                 }
-            }
-            Action::MovePaneDividerDown(amount) => {
-                if self.move_captured_pane_divider(crate::window::Direction::Down, *amount) {
-                    self.render(buffer)?;
+                Action::JumpBack => {
+                    add_to_history = false;
+                    if !self.pending_definition_requests.is_empty() {
+                        self.deferred_jump_navigation.push_back(Action::JumpBack);
+                        return Ok(false);
+                    }
+                    if let Some(entry) = self.jump_back_entry() {
+                        log!("jumping back to {entry:?}");
+                        self.remember_previous_context(self.current_jump_entry());
+                        self.jump_to_entry(&entry, buffer, runtime).await?;
+                    } else {
+                        self.set_routine_warning(Some("at start of jump list".to_string()));
+                        self.draw_commandline(buffer);
+                    }
                 }
-            }
-            Action::MovePaneDividerLeft(amount) => {
-                if self.move_captured_pane_divider(crate::window::Direction::Left, *amount) {
-                    self.render(buffer)?;
+                Action::JumpForward => {
+                    add_to_history = false;
+                    if !self.pending_definition_requests.is_empty() {
+                        self.deferred_jump_navigation.push_back(Action::JumpForward);
+                        return Ok(false);
+                    }
+                    if let Some(entry) = self.jump_forward_entry() {
+                        log!("jumping forward to {entry:?}");
+                        self.remember_previous_context(self.current_jump_entry());
+                        self.jump_to_entry(&entry, buffer, runtime).await?;
+                    } else {
+                        self.set_routine_warning(Some("at end of jump list".to_string()));
+                        self.draw_commandline(buffer);
+                    }
                 }
-            }
-            Action::MovePaneDividerRight(amount) => {
-                if self.move_captured_pane_divider(crate::window::Direction::Right, *amount) {
-                    self.render(buffer)?;
+                Action::DumpTimers => {
+                    add_to_history = false;
+                    use crate::plugin::timer_stats;
+                    timer_stats::log_timer_stats();
                 }
-            }
-            Action::ResizeWindowUp(amount) => {
-                if self.resize_window_or_panel(crate::window::Direction::Up, *amount) {
-                    self.render(buffer)?;
-                }
-            }
-            Action::ResizeWindowDown(amount) => {
-                if self.resize_window_or_panel(crate::window::Direction::Down, *amount) {
-                    self.render(buffer)?;
-                }
-            }
-            Action::ResizeWindowLeft(amount) => {
-                if self.resize_window_or_panel(crate::window::Direction::Left, *amount) {
-                    self.render(buffer)?;
-                }
-            }
-            Action::ResizeWindowRight(amount) => {
-                if self.resize_window_or_panel(crate::window::Direction::Right, *amount) {
-                    self.render(buffer)?;
-                }
-            }
-            Action::BalanceWindows => {
-                if self.balance_focused_window_or_panel() {
-                    self.render(buffer)?;
-                }
-            }
-            Action::ResetPanelLayout(panel_id) => {
-                if self.reset_panel_layout_preferences(panel_id.as_deref()) {
-                    self.render(buffer)?;
-                } else if self.last_error.is_some() {
-                    self.draw_commandline(buffer);
-                }
-            }
-            Action::MaximizeWindow => {
-                if self.update_window_layout(WindowManager::maximize_window) {
-                    self.render(buffer)?;
-                }
-            }
-            Action::TogglePaneZoom => {
-                add_to_history = false;
-                if self.workspace_manager.is_active() {
-                    self.workspace_manager.toggle_zoom();
-                } else {
-                    self.toggle_pane_zoom();
-                }
-                self.invalidate_terminal_render_state(buffer);
-                self.render(buffer)?;
-            }
-            Action::OnlyWindow => {
-                let panel_ids = self.panel_manager.hide_all_panels();
-                for panel_id in &panel_ids {
+                Action::NotifyPlugins(method, params) => {
                     self.plugin_registry
-                        .notify(
-                            runtime,
-                            &format!("panel:event:{panel_id}"),
-                            json!({
-                                "panel_id": panel_id,
-                                "action": "close",
-                                "selected_index": 0,
-                                "row": Value::Null,
-                            }),
-                        )
+                        .notify(runtime, method, params.clone())
                         .await?;
                 }
-                let windows_changed = self.update_window_layout(WindowManager::only_window);
-                if windows_changed || !panel_ids.is_empty() {
-                    self.apply_panel_layout();
-                    self.sync_with_window();
+                Action::NotifyPlugin(plugin, method, params) => {
+                    self.plugin_registry
+                        .notify_plugin(runtime, plugin, method, params.clone())
+                        .await?;
+                }
+                Action::NotifyPicker(handle, event) => {
+                    self.plugin_registry
+                        .notify_picker(runtime, *handle, event.as_ref().clone())
+                        .await?;
+                    // A picker selection may enqueue its OpenLocation request from the
+                    // callback. Commit that navigation before accepting the next key,
+                    // so an immediately typed CTRL-O sees the new jump.
+                    self.service_background_before_next_input = true;
+                }
+                Action::NotifyComposer(handle, event) => {
+                    self.plugin_registry
+                        .notify_composer(runtime, *handle, event.as_ref().clone())
+                        .await?;
+                }
+                Action::ResolvePluginRequest(request_id, payload) => {
+                    self.plugin_registry
+                        .resolve_request(runtime, RequestId::from_raw(*request_id), payload.clone())
+                        .await?;
+                }
+
+                // Window management actions
+                Action::SplitHorizontal => {
+                    log!("SplitHorizontal action triggered");
+                    let current_buffer = self.buffer_manager.active_index();
+                    if self.update_window_layout(|windows| windows.split_horizontal(current_buffer))
+                    {
+                        log!("Window split successful");
+                        self.render(buffer)?;
+                    } else {
+                        log!("Window split failed");
+                    }
+                }
+                Action::SplitVertical => {
+                    log!("SplitVertical action triggered");
+                    let current_buffer = self.buffer_manager.active_index();
+                    if self.update_window_layout(|windows| windows.split_vertical(current_buffer)) {
+                        log!("Vertical split successful");
+                        self.render(buffer)?;
+                    } else {
+                        log!("Vertical split failed");
+                    }
+                }
+                Action::SplitHorizontalWithFile(file) => {
+                    log!(
+                        "SplitHorizontalWithFile action triggered with file: {}",
+                        file
+                    );
+                    let (new_buffer_index, added_buffer, _) = match self
+                        .load_or_reuse_path_buffer(file)
+                        .await
+                    {
+                        Ok(opened) => opened,
+                        Err(e) => {
+                            self.set_legacy_message(Some(format!("Failed to open file: {}", e)));
+                            return Ok(false);
+                        }
+                    };
+                    if self
+                        .update_window_layout(|windows| windows.split_horizontal(new_buffer_index))
+                    {
+                        log!("Window split with file successful");
+                        self.request_diagnostics().await?;
+                        self.render(buffer)?;
+                    } else {
+                        log!("Window split failed");
+                        if added_buffer {
+                            self.buffer_manager.pop_buffer();
+                        }
+                    }
+                }
+                Action::SplitVerticalWithFile(file) => {
+                    log!("SplitVerticalWithFile action triggered with file: {}", file);
+                    let (new_buffer_index, added_buffer, _) = match self
+                        .load_or_reuse_path_buffer(file)
+                        .await
+                    {
+                        Ok(opened) => opened,
+                        Err(e) => {
+                            self.set_legacy_message(Some(format!("Failed to open file: {}", e)));
+                            return Ok(false);
+                        }
+                    };
+                    if self.update_window_layout(|windows| windows.split_vertical(new_buffer_index))
+                    {
+                        log!("Vertical split with file successful");
+                        self.request_diagnostics().await?;
+                        self.render(buffer)?;
+                    } else {
+                        log!("Vertical split failed");
+                        if added_buffer {
+                            self.buffer_manager.pop_buffer();
+                        }
+                    }
+                }
+                Action::CloseWindow => {
+                    if self.update_window_layout(WindowManager::close_window) {
+                        self.render(buffer)?;
+                    }
+                }
+                Action::NextWindow => {
+                    self.cycle_focus(true, buffer).await?;
+                }
+                Action::PreviousWindow => {
+                    self.cycle_focus(false, buffer).await?;
+                }
+                Action::MoveWindowUp => {
+                    self.move_window_in_direction(crate::window::Direction::Up, buffer)
+                        .await?;
+                }
+                Action::MoveWindowDown => {
+                    self.move_window_in_direction(crate::window::Direction::Down, buffer)
+                        .await?;
+                }
+                Action::MoveWindowLeft => {
+                    self.move_window_in_direction(crate::window::Direction::Left, buffer)
+                        .await?;
+                }
+                Action::MoveWindowRight => {
+                    self.move_window_in_direction(crate::window::Direction::Right, buffer)
+                        .await?;
+                }
+                Action::MoveWindowToLeft => {
+                    self.move_focused_window_to_edge(crate::window::Direction::Left, buffer)?;
+                }
+                Action::MoveWindowToBottom => {
+                    self.move_focused_window_to_edge(crate::window::Direction::Down, buffer)?;
+                }
+                Action::MoveWindowToTop => {
+                    self.move_focused_window_to_edge(crate::window::Direction::Up, buffer)?;
+                }
+                Action::MoveWindowToRight => {
+                    self.move_focused_window_to_edge(crate::window::Direction::Right, buffer)?;
+                }
+                Action::EnterPaneResizeMode => {
+                    add_to_history = false;
+                    self.pane_resize_mode = Some(self.focused_pane_resize_targets());
                     self.render(buffer)?;
                 }
-            }
+                Action::ExitPaneResizeMode => {
+                    add_to_history = false;
+                    self.pane_resize_mode = None;
+                    self.render(buffer)?;
+                }
+                Action::MovePaneDividerUp(amount) => {
+                    if self.move_captured_pane_divider(crate::window::Direction::Up, *amount) {
+                        self.render(buffer)?;
+                    }
+                }
+                Action::MovePaneDividerDown(amount) => {
+                    if self.move_captured_pane_divider(crate::window::Direction::Down, *amount) {
+                        self.render(buffer)?;
+                    }
+                }
+                Action::MovePaneDividerLeft(amount) => {
+                    if self.move_captured_pane_divider(crate::window::Direction::Left, *amount) {
+                        self.render(buffer)?;
+                    }
+                }
+                Action::MovePaneDividerRight(amount) => {
+                    if self.move_captured_pane_divider(crate::window::Direction::Right, *amount) {
+                        self.render(buffer)?;
+                    }
+                }
+                Action::ResizeWindowUp(amount) => {
+                    if self.resize_window_or_panel(crate::window::Direction::Up, *amount) {
+                        self.render(buffer)?;
+                    }
+                }
+                Action::ResizeWindowDown(amount) => {
+                    if self.resize_window_or_panel(crate::window::Direction::Down, *amount) {
+                        self.render(buffer)?;
+                    }
+                }
+                Action::ResizeWindowLeft(amount) => {
+                    if self.resize_window_or_panel(crate::window::Direction::Left, *amount) {
+                        self.render(buffer)?;
+                    }
+                }
+                Action::ResizeWindowRight(amount) => {
+                    if self.resize_window_or_panel(crate::window::Direction::Right, *amount) {
+                        self.render(buffer)?;
+                    }
+                }
+                Action::BalanceWindows => {
+                    if self.balance_focused_window_or_panel() {
+                        self.render(buffer)?;
+                    }
+                }
+                Action::ResetPanelLayout(panel_id) => {
+                    if self.reset_panel_layout_preferences(panel_id.as_deref()) {
+                        self.render(buffer)?;
+                    } else if self.last_error.is_some() {
+                        self.draw_commandline(buffer);
+                    }
+                }
+                Action::MaximizeWindow => {
+                    if self.update_window_layout(WindowManager::maximize_window) {
+                        self.render(buffer)?;
+                    }
+                }
+                Action::TogglePaneZoom => {
+                    add_to_history = false;
+                    if self.workspace_manager.is_active() {
+                        self.workspace_manager.toggle_zoom();
+                    } else {
+                        self.toggle_pane_zoom();
+                    }
+                    self.invalidate_terminal_render_state(buffer);
+                    self.render(buffer)?;
+                }
+                Action::OnlyWindow => {
+                    let panel_ids = self.panel_manager.hide_all_panels();
+                    for panel_id in &panel_ids {
+                        self.plugin_registry
+                            .notify(
+                                runtime,
+                                &format!("panel:event:{panel_id}"),
+                                json!({
+                                    "panel_id": panel_id,
+                                    "action": "close",
+                                    "selected_index": 0,
+                                    "row": Value::Null,
+                                }),
+                            )
+                            .await?;
+                    }
+                    let windows_changed = self.update_window_layout(WindowManager::only_window);
+                    if windows_changed || !panel_ids.is_empty() {
+                        self.apply_panel_layout();
+                        self.sync_with_window();
+                        self.render(buffer)?;
+                    }
+                }
+                _ => {}
+            },
         }
 
         if let Some(generated) = self.generated_indent {

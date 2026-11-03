@@ -535,7 +535,10 @@ Esc = { EnterMode = "Normal" }
 "w" = { PluginCommand = "LspWorkspaceSymbols" }
 "k" = { PluginCommand = "LspReferences" }
 "d" = "OpenDiagnosticsPicker"
-"e" = "OpenErrorDiagnosticsPicker"
+"D" = "OpenErrorDiagnosticsPicker"
+# Explore. Space e was the error list; that list is now Space D.
+"e" = { "e" = { ExploreCommand = "toggle" }, "f" = { ExploreCommand = "follow" }, "*" = { ExploreCommand = "follow" }, "s" = { ExploreCommand = "skeleton" }, "d" = { ExploreCommand = "definition" }, "t" = { ExploreCommand = "type" }, "j" = { ExploreCommand = "next" }, "k" = { ExploreCommand = "prev" }, "b" = { ExploreCommand = "back" }, "n" = { ExploreCommand = "forward" }, "r" = { ExploreCommand = "refresh" }, "R" = { ExploreCommand = "index" }, "p" = { ExploreCommand = "pr" }, "?" = { ExploreCommand = "help" }, "q" = { ExploreCommand = "close" } }
+"E" = { ExploreCommand = "toggle" }
 "f" = "FormatDocument"
 "." = "CodeAction"
 "r" = "StartRename"

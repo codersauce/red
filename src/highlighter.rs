@@ -353,6 +353,12 @@ impl LanguageRegistry {
         })
     }
 
+    /// Returns the Tree-sitter grammar for one language, when Red has one.
+    pub(crate) fn grammar(&self, id: &str) -> Option<Language> {
+        let definition = self.languages.get(id)?;
+        definition.grammar.as_ref().map(grammar_language)
+    }
+
     /// Returns the grammar and normalized structural queries for one language.
     pub(crate) fn textobject_language(&self, id: &str) -> Option<(Language, String)> {
         let definition = self.languages.get(id)?;

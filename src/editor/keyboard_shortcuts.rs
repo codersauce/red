@@ -86,6 +86,41 @@ impl Editor {
         self.keyboard_shortcuts = Some(KeyboardShortcuts::new(context, current, all));
     }
 
+    /// Opens the shared shortcut dialog on the explore bindings for this mode.
+    pub(super) fn open_explore_shortcuts(&mut self, runtime: Option<&Runtime>) {
+        let commands = runtime
+            .map(Runtime::registered_commands)
+            .unwrap_or_default();
+        let mut all = command_palette::shortcut_entries(&self.config.keys, &commands, None);
+        all.extend(plugin::panel::all_text_panel_shortcuts());
+        all.extend(crate::ui::common_shortcut_entries());
+        let mut current = Vec::new();
+        for mode in [
+            Mode::Normal,
+            Mode::Insert,
+            Mode::Visual,
+            Mode::VisualLine,
+            Mode::VisualBlock,
+            Mode::Command,
+        ] {
+            current.extend(
+                command_palette::shortcut_entries(&self.config.keys, &commands, Some(mode))
+                    .into_iter()
+                    .filter(|entry| {
+                        matches!(
+                            &entry.target,
+                            Some(ShortcutTarget::Editor(action)) if is_explore_binding(action)
+                        )
+                    })
+                    .map(|mut entry| {
+                        entry.group = "Explore".to_string();
+                        entry
+                    }),
+            );
+        }
+        self.keyboard_shortcuts = Some(KeyboardShortcuts::new("Explore".into(), current, all));
+    }
+
     /// Captures help before the underlying surface can consume a key or mouse click.
     pub(super) fn handle_keyboard_shortcuts_event(
         &mut self,
@@ -205,6 +240,18 @@ impl Editor {
         }
         actions.push(Action::Refresh);
         Some(KeyAction::Multiple(actions))
+    }
+}
+
+fn is_explore_binding(action: &KeyAction) -> bool {
+    match action {
+        KeyAction::Single(Action::ExploreCommand(_)) => true,
+        KeyAction::Single(_) => false,
+        KeyAction::Multiple(actions) => actions
+            .iter()
+            .any(|action| matches!(action, Action::ExploreCommand(_))),
+        KeyAction::Repeating(_, action) => is_explore_binding(action),
+        KeyAction::Nested(_) | KeyAction::None => false,
     }
 }
 

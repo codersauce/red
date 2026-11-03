@@ -339,6 +339,14 @@ impl Editor {
             }
             let point =
                 visual_table_point.unwrap_or_else(|| self.mouse_buffer_point(&window, pointer));
+            if self.explore.enabled
+                && window.active
+                && self
+                    .explore_activate_hit(pointer.x, pointer.y, buffer, runtime)
+                    .await?
+            {
+                return Ok(());
+            }
             self.clear_multi_cursor();
             self.execute(&Action::SetCursor(point.x, point.y), buffer, runtime)
                 .await?;
@@ -372,6 +380,21 @@ impl Editor {
                 if let Some(action) = self.directory_open_action() {
                     self.mouse_selection.last_click = None;
                     self.execute(&action, buffer, runtime).await?;
+                    return Ok(());
+                }
+                if self.explore.enabled
+                    && self.buffer_manager[window.buffer_index].directory.is_none()
+                {
+                    self.sync_explore_buffer();
+                    let position = self.cursor_text_position();
+                    let message = self
+                        .explore
+                        .toggle_follow(position.line, position.character);
+                    self.mouse_selection.gesture = None;
+                    if let Ok(message) = message {
+                        self.set_quiet_message(Some(message));
+                    }
+                    self.render(buffer)?;
                     return Ok(());
                 }
             }

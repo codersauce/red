@@ -370,6 +370,7 @@ platform details.
 | Guide | Covers |
 | --- | --- |
 | [Getting started](docs/GETTING_STARTED.md) | Editing, keymaps, LSP, Git, CLI, and troubleshooting |
+| [Code explore](docs/EXPLORE.md) | Reading mode: symbol follow, sidebar, skeleton dimming, review trail |
 | [Husk language server](docs/HUSK_LSP.md) | Husk editor features, external crates, configuration, and safety boundaries |
 | [Language extensions](docs/LANGUAGES.md) | Custom syntax, trusted Tree-sitter grammars, language packs, LSP settings, and live reload |
 | [Vim compatibility](docs/VIM_COMPATIBILITY.md) | Supported behavior and intentional differences |
