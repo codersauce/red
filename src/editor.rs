@@ -99,15 +99,15 @@ use crate::unicode_utils::{
 };
 
 use crossterm::{
-    ExecutableCommand, cursor,
+    cursor,
     event::{
         self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
         MouseEventKind,
     },
-    terminal,
+    terminal, ExecutableCommand,
 };
 use futures::future::BoxFuture;
-use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
+use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 #[cfg(unix)]
 use nix::sys::signal::{self, Signal};
 #[cfg(unix)]
@@ -115,21 +115,21 @@ use nix::unistd::Pid;
 use path_absolutize::Absolutize;
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use unicode_segmentation::UnicodeSegmentation;
 
 pub use render_buffer::RenderBuffer;
 
 use crate::{
     agent_tools::{
-        EditorActionName, EditorOpenTarget, EditorSelectionKind, EditorToolCall, EditorToolHost,
-        EditorToolRequest, MAX_AGENT_READ_BYTES, PendingEditorTool, PendingEditorToolResponse,
-        apply_text_edits, editor_tool_channel, utf16_byte_offset,
+        apply_text_edits, editor_tool_channel, utf16_byte_offset, EditorActionName,
+        EditorOpenTarget, EditorSelectionKind, EditorToolCall, EditorToolHost, EditorToolRequest,
+        PendingEditorTool, PendingEditorToolResponse, MAX_AGENT_READ_BYTES,
     },
     buffer::{Buffer, BufferId, ExternalFileChange, SearchMatch, SyntaxSelection},
     clipboard::{ClipboardProvider, CopyOutcome, DisabledClipboardProvider, SessionClipboard},
     codex::{
-        AgentRuntimePolicy, CodexBridge, CodexCommand, CodexEvent, CodexProcessSpec, start_codex,
+        start_codex, AgentRuntimePolicy, CodexBridge, CodexCommand, CodexEvent, CodexProcessSpec,
     },
     color::Color,
     command,
@@ -142,8 +142,8 @@ use crate::{
     },
     dispatcher::Dispatcher,
     editing::{
-        CharacterMotion as ForwardCharacterMotion, MotionResolver, TextObjectKind, TextObjectScope,
         apply_transactional_replacement, plain_line, reflow_text, text_object_kind_for_key,
+        CharacterMotion as ForwardCharacterMotion, MotionResolver, TextObjectKind, TextObjectScope,
     },
     highlighter::{Highlighter, LanguageRegistry},
     indent::{self, IndentDecision},
@@ -151,17 +151,16 @@ use crate::{
     inline_history::{InlineDisposition, InlineHistory, InlineTurnState},
     log,
     lsp::{
-        Command as LspCommand, CompletionItemKind, CompletionItemLabelDetails, CompletionResponse,
-        CompletionResponseItem, Diagnostic, DiagnosticSeverity, DocumentEdit as LspDocumentEdit,
-        Hover as LspHover, HoverContents, InboundMessage, InlayHint, InsertTextFormat, Location,
-        LspClient, LspRequestSource, MAX_WORKSPACE_EDIT_TOTAL_BYTES, MarkedString, MarkupKind,
-        OpenWorkspaceDocument, ParsedNotification, Position as LspPosition, ProgressParams,
-        ProgressToken, Range, ResponseMessage, ServerCapabilities,
-        ServerRequest as LspServerRequest, TextEdit as LspTextEdit,
-        WorkspaceEditOperation as LspWorkspaceEditOperation, apply_workspace_resource_operations,
-        file_path as lsp_file_path, get_client_capabilities,
+        apply_workspace_resource_operations, file_path as lsp_file_path, get_client_capabilities,
         normalized_file_path as lsp_normalized_file_path, prepare_workspace_edit,
-        text_edit_char_range, workspace_edit_operations,
+        text_edit_char_range, workspace_edit_operations, Command as LspCommand, CompletionItemKind,
+        CompletionItemLabelDetails, CompletionResponse, CompletionResponseItem, Diagnostic,
+        DiagnosticSeverity, DocumentEdit as LspDocumentEdit, Hover as LspHover, HoverContents,
+        InboundMessage, InlayHint, InsertTextFormat, Location, LspClient, LspRequestSource,
+        MarkedString, MarkupKind, OpenWorkspaceDocument, ParsedNotification,
+        Position as LspPosition, ProgressParams, ProgressToken, Range, ResponseMessage,
+        ServerCapabilities, ServerRequest as LspServerRequest, TextEdit as LspTextEdit,
+        WorkspaceEditOperation as LspWorkspaceEditOperation, MAX_WORKSPACE_EDIT_TOTAL_BYTES,
     },
     matchit::{self, MatchDirection, MatchMotion},
     notification::{
@@ -171,16 +170,16 @@ use crate::{
     plugin::{self, ComposerHandle, PickerHandle, PluginRegistry, RequestId, Runtime},
     preferences::{PanelLayoutPreference, PreferencesStore},
     session::{
-        RecoveryDivergence, SESSION_SCHEMA_VERSION, SessionAnchorAffinity, SessionBufferSnapshot,
-        SessionDiskFingerprint, SessionJump, SessionMark, SessionSnapshot, SessionStore,
-        SessionVisualMode, SessionVisualSelection, SessionWindowJumps,
         capture_session_disk_fingerprint, detect_disk_divergence, read_session_disk_contents,
+        RecoveryDivergence, SessionAnchorAffinity, SessionBufferSnapshot, SessionDiskFingerprint,
+        SessionJump, SessionMark, SessionSnapshot, SessionStore, SessionVisualMode,
+        SessionVisualSelection, SessionWindowJumps, SESSION_SCHEMA_VERSION,
     },
     textobjects::{ResolvedTextObject, SyntaxObjectKind, SyntaxTextObjectService},
-    theme::{Style, Theme, parse_vscode_theme, parse_vscode_theme_contents},
+    theme::{parse_vscode_theme, parse_vscode_theme_contents, Style, Theme},
     tutorial::{
-        PRACTICE_CONTENTS, TutorialController, TutorialLesson, TutorialObservation,
-        TutorialProgress, TutorialTrack,
+        TutorialController, TutorialLesson, TutorialObservation, TutorialProgress, TutorialTrack,
+        PRACTICE_CONTENTS,
     },
     ui::{
         AgentComposer, CompletionUI, Component, Confirmation, CopilotSignInDialog,
@@ -200,7 +199,7 @@ use crate::{
 };
 
 use self::display_layout::{
-    BreakIndentOptions, DisplayLayout, LayoutConfig, leading_whitespace_display_width,
+    leading_whitespace_display_width, BreakIndentOptions, DisplayLayout, LayoutConfig,
 };
 
 thread_local! {
@@ -737,7 +736,11 @@ fn native_grammar_consent_message(
         .join("\n");
     Ok(format!(
         "Native Tree-sitter grammars execute inside Red.\n\nPackage: {} v{}\nSource: {} @ {}\n\nVerified SHA-256:\n{}\n\nApproval is limited to these exact catalog-verified bytes.",
-        package.name, package.version, package.repository, package.resolved_commit, digests
+        package.name,
+        package.version,
+        package.repository,
+        package.resolved_commit,
+        digests
     ))
 }
 
@@ -860,7 +863,8 @@ const MIN_EDITOR_WINDOW_WIDTH: usize = 10;
 const MIN_EDITOR_WINDOW_HEIGHT: usize = 7;
 const MIN_DOCKED_PANEL_WIDTH: usize = 12;
 const MIN_DOCKED_PANEL_HEIGHT: usize = 4;
-const SESSION_SNAPSHOT_WARNING: &str = "Crash recovery is not being saved; check free space and permissions or reduce open-buffer size";
+const SESSION_SNAPSHOT_WARNING: &str =
+    "Crash recovery is not being saved; check free space and permissions or reduce open-buffer size";
 
 fn normalize_terminal_paste(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
@@ -10055,7 +10059,10 @@ impl Editor {
                 let (x0, y0, x1, y1): (usize, usize, usize, usize) = selection.into();
                 TextRange::new(
                     TextPosition::new(y0, self.grapheme_to_char_on_line(x0, y0)),
-                    TextPosition::new(y1, self.grapheme_to_char_on_line(x1.saturating_add(1), y1)),
+                    TextPosition::new(
+                        y1,
+                        self.grapheme_to_char_on_line(x1.saturating_add(1), y1),
+                    ),
                 )
             }
             _ => self.current_line_range(1, true),
@@ -10575,7 +10582,7 @@ impl Editor {
             _ => {
                 return Err(format!(
                     "Multiple buffers match {name:?}; use the buffer number"
-                ));
+                ))
             }
         }
 
@@ -13597,16 +13604,12 @@ impl Editor {
                             "startup_session_resumed" => {
                                 json!(self.config.startup_session_resumed)
                             }
-                            "cwd" => json!(
-                                std::env::current_dir()
-                                    .ok()
-                                    .map(|path| path.to_string_lossy().to_string())
-                            ),
-                            "executable" => json!(
-                                std::env::current_exe()
-                                    .ok()
-                                    .map(|path| path.to_string_lossy().to_string())
-                            ),
+                            "cwd" => json!(std::env::current_dir()
+                                .ok()
+                                .map(|path| path.to_string_lossy().to_string())),
+                            "executable" => json!(std::env::current_exe()
+                                .ok()
+                                .map(|path| path.to_string_lossy().to_string())),
                             "keys" => json!(self.config.keys),
                             _ => json!(null),
                         }
@@ -16222,9 +16225,7 @@ impl Editor {
             let warning = if save.save_as.is_some() {
                 format!("invalid LSP formatting edits; Save As cancelled: {error}")
             } else {
-                format!(
-                    "format-on-save unavailable; saved unformatted: invalid LSP formatting edits: {error}"
-                )
+                format!("format-on-save unavailable; saved unformatted: invalid LSP formatting edits: {error}")
             };
             self.set_legacy_message(Some(warning.clone()));
             if save.save_as.is_none() {
@@ -25596,18 +25597,18 @@ impl Editor {
                         Ok(plugin::panel::TextPanelReuseOutcome::Confirm(revision)) => {
                             self.release_current_dialog_callbacks(runtime);
                             self.current_dialog = Some(Box::new(Confirmation::new_actions(
-                                self,
-                                "Replace unsent draft?",
-                                "The composer already contains an unsent draft. Replacing it is one undoable edit; nothing will be sent.",
-                                "Replace draft",
-                                "Keep draft",
-                                Action::ReuseTextPanelPrompt {
-                                    panel_id: panel_id.clone(),
-                                    prompt_id: prompt_id.clone(),
-                                    expected_draft: Some(revision),
-                                },
-                                Action::Print("current draft kept".to_string()),
-                            )));
+                            self,
+                            "Replace unsent draft?",
+                            "The composer already contains an unsent draft. Replacing it is one undoable edit; nothing will be sent.",
+                            "Replace draft",
+                            "Keep draft",
+                            Action::ReuseTextPanelPrompt {
+                                panel_id: panel_id.clone(),
+                                prompt_id: prompt_id.clone(),
+                                expected_draft: Some(revision),
+                            },
+                            Action::Print("current draft kept".to_string()),
+                        )));
                         }
                         Err(message) => self.set_legacy_message(Some(message.to_string())),
                     }
@@ -30542,7 +30543,7 @@ impl Editor {
                 }
             }
             Mode::Normal | Mode::Insert | Mode::Command | Mode::Search | Mode::Select => {
-                return false;
+                return false
             }
         };
 
@@ -31383,12 +31384,7 @@ impl Editor {
             {
                 warning.push_str("; agent transcript could not be persisted");
             }
-            self.report_issue(
-                "recovery-files".into(),
-                format!(
-                    "{warning}. Compare the recovered buffers with disk, then save or discard them."
-                ),
-            );
+            self.report_issue("recovery-files".into(), format!("{warning}. Compare the recovered buffers with disk, then save or discard them."));
         }
         if duplicate_file_count > 0 {
             self.recovery_issue_buffers
@@ -31609,7 +31605,7 @@ impl Editor {
                     Mode::VisualLine => SessionVisualMode::Line,
                     Mode::VisualBlock => SessionVisualMode::Block,
                     Mode::Normal | Mode::Insert | Mode::Command | Mode::Search | Mode::Select => {
-                        return None;
+                        return None
                     }
                 };
                 Some(SessionVisualSelection {
@@ -36358,11 +36354,9 @@ mod test {
             editor.learn_session.as_ref().unwrap().step,
             crate::learn::PracticeStep::Complete
         );
-        assert!(
-            editor
-                .preferences
-                .learn_lesson_completed(crate::learn::FIRST_LESSON_ID)
-        );
+        assert!(editor
+            .preferences
+            .learn_lesson_completed(crate::learn::FIRST_LESSON_ID));
         editor
             .execute(&Action::ExitLearnLesson, &mut buffer, &mut runtime)
             .await
@@ -36370,12 +36364,10 @@ mod test {
         assert_eq!(editor.current_buffer().id(), original_id);
         assert_eq!(editor.current_buffer().contents(), original_text);
         assert_eq!(editor.window_manager.snapshot(), original_windows);
-        assert!(
-            !editor
-                .buffer_manager
-                .iter()
-                .any(|candidate| candidate.id() == practice_id)
-        );
+        assert!(!editor
+            .buffer_manager
+            .iter()
+            .any(|candidate| candidate.id() == practice_id));
     }
 
     #[test]
@@ -36419,11 +36411,9 @@ mod test {
             }
         }
         for number in ["0", "5", "-1", "not-a-number"] {
-            assert!(
-                editor
-                    .handle_command(&format!("learn essentials {number}"), &runtime)
-                    .is_empty()
-            );
+            assert!(editor
+                .handle_command(&format!("learn essentials {number}"), &runtime)
+                .is_empty());
             assert_eq!(
                 editor.last_error.as_deref(),
                 Some("choose an Essentials lesson from 1 to 4")
@@ -36826,11 +36816,9 @@ mod test {
             .await
             .unwrap();
 
-        assert!(
-            render_text_rows(&buffer)
-                .join("\n")
-                .contains("RELEASE NOTES")
-        );
+        assert!(render_text_rows(&buffer)
+            .join("\n")
+            .contains("RELEASE NOTES"));
         let preferences = PreferencesStore::load(&path);
         assert!(preferences.welcome_completed());
         assert_eq!(
@@ -36873,13 +36861,11 @@ mod test {
             .unwrap();
 
         assert!(!forbidden.exists());
-        assert!(
-            editor
-                .last_error
-                .as_deref()
-                .unwrap()
-                .contains("cannot be saved")
-        );
+        assert!(editor
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("cannot be saved"));
 
         editor
             .execute(&Action::ExitTutorial, &mut buffer, &mut runtime)
@@ -36959,11 +36945,9 @@ mod test {
             .unwrap();
 
         assert!(editor.current_dialog.is_some());
-        assert!(
-            render_text_rows(&buffer)
-                .join("\n")
-                .contains("SAFE PRACTICE DIFF")
-        );
+        assert!(render_text_rows(&buffer)
+            .join("\n")
+            .contains("SAFE PRACTICE DIFF"));
 
         editor
             .execute(&Action::DismissTutorialDemo, &mut buffer, &mut runtime)
@@ -37016,12 +37000,10 @@ mod test {
 
         assert!(editor.tutorial_controller.is_none());
         assert_eq!(editor.current_buffer().contents(), original_contents);
-        assert!(
-            editor
-                .preferences
-                .tutorial_progress()
-                .is_some_and(|progress| progress.completed)
-        );
+        assert!(editor
+            .preferences
+            .tutorial_progress()
+            .is_some_and(|progress| progress.completed));
     }
 
     #[test]
@@ -37328,13 +37310,11 @@ mod test {
         assert_eq!(items[0].kind.as_deref(), Some("JSON-RPC + Language"));
         assert!(items[0].annotation.as_deref().unwrap().contains("Custom"));
         assert_eq!(items[1].id, "catalog:go-language");
-        assert!(
-            items[1]
-                .annotation
-                .as_deref()
-                .unwrap()
-                .contains("Custom v9.0.0 installed")
-        );
+        assert!(items[1]
+            .annotation
+            .as_deref()
+            .unwrap()
+            .contains("Custom v9.0.0 installed"));
         assert_eq!(items[2].id, "custom-source");
     }
 
@@ -37358,11 +37338,9 @@ mod test {
         assert_eq!(core.editor.notifications.records().count(), 0);
         let status = core.editor.transient_message.as_ref().unwrap();
         assert_eq!(status.severity, Severity::Warning);
-        assert!(
-            status
-                .text
-                .contains("reader: dropped a GetBufferText result")
-        );
+        assert!(status
+            .text
+            .contains("reader: dropped a GetBufferText result"));
     }
 
     #[tokio::test]
@@ -37474,19 +37452,15 @@ mod test {
         assert_eq!(context["uri"], uri);
         assert_eq!(context["file"], "src.rs");
         assert_eq!(context["range"], json!({"start_line": 2, "end_line": 2}));
-        assert!(
-            context["text"]
-                .as_str()
-                .unwrap()
-                .contains("Context: selection lines 2-2")
-        );
+        assert!(context["text"]
+            .as_str()
+            .unwrap()
+            .contains("Context: selection lines 2-2"));
         assert!(context["text"].as_str().unwrap().contains("selected"));
-        assert!(
-            context["text"]
-                .as_str()
-                .unwrap()
-                .contains("unused selection")
-        );
+        assert!(context["text"]
+            .as_str()
+            .unwrap()
+            .contains("unused selection"));
         assert!(!context["text"].as_str().unwrap().contains("first"));
     }
 
@@ -37561,12 +37535,10 @@ mod test {
 
             assert_eq!(context["included"], false);
             assert!(context["text"].as_str().unwrap().contains("outside"));
-            assert!(
-                !context["text"]
-                    .as_str()
-                    .unwrap()
-                    .contains("linked outside contents")
-            );
+            assert!(!context["text"]
+                .as_str()
+                .unwrap()
+                .contains("linked outside contents"));
         }
     }
 
@@ -37593,12 +37565,10 @@ mod test {
                 .unwrap(),
             Duration::ZERO
         );
-        assert!(
-            editor
-                .dispatch_agent_editor_tool(request.clone(), &mut render_buffer, &mut runtime)
-                .await
-                .is_err()
-        );
+        assert!(editor
+            .dispatch_agent_editor_tool(request.clone(), &mut render_buffer, &mut runtime)
+            .await
+            .is_err());
         assert!(!root.path().join("go").exists());
         let result = editor
             .test_run_agent_editor_tool(request.clone())
@@ -37775,11 +37745,13 @@ mod test {
         let path = root.path().join("document.rs");
         fs::write(&path, "original\n").unwrap();
         let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
-        editor.buffer_manager.replace_buffers(vec![
-            Buffer::load_or_create(Some(path.to_string_lossy().into_owned()))
-                .await
-                .unwrap(),
-        ]);
+        editor
+            .buffer_manager
+            .replace_buffers(vec![Buffer::load_or_create(Some(
+                path.to_string_lossy().into_owned(),
+            ))
+            .await
+            .unwrap()]);
         editor.test_set_agent_root(root.path());
         let request = |call| EditorToolRequest {
             session_id: "external-change".to_string(),
@@ -37807,11 +37779,9 @@ mod test {
 
         assert_eq!(result["applied"], false);
         assert_eq!(result["saved"], false);
-        assert!(
-            result["error"]
-                .as_str()
-                .is_some_and(|error| error.contains("changed on disk"))
-        );
+        assert!(result["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("changed on disk")));
         assert_eq!(fs::read_to_string(&path).unwrap(), "external\n");
         assert_eq!(editor.current_buffer().contents(), "original\n");
         assert!(!editor.current_buffer().is_dirty());
@@ -37892,11 +37862,13 @@ mod test {
         let original: String = (0..40).map(|line| format!("line {line} text\n")).collect();
         fs::write(&path, &original).unwrap();
         let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
-        editor.buffer_manager.replace_buffers(vec![
-            Buffer::load_or_create(Some(path.to_string_lossy().into_owned()))
-                .await
-                .unwrap(),
-        ]);
+        editor
+            .buffer_manager
+            .replace_buffers(vec![Buffer::load_or_create(Some(
+                path.to_string_lossy().into_owned(),
+            ))
+            .await
+            .unwrap()]);
         editor.test_set_agent_root(root.path());
         editor
             .test_execute_production_action(Action::SetCursor(8, 25))
@@ -38014,11 +37986,13 @@ mod test {
         let path = root.join("document.rs");
         fs::write(&path, "one\ntwo\n").unwrap();
         let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
-        editor.buffer_manager.replace_buffers(vec![
-            Buffer::load_or_create(Some(path.to_string_lossy().into_owned()))
-                .await
-                .unwrap(),
-        ]);
+        editor
+            .buffer_manager
+            .replace_buffers(vec![Buffer::load_or_create(Some(
+                path.to_string_lossy().into_owned(),
+            ))
+            .await
+            .unwrap()]);
         editor.test_set_agent_root(root);
         editor.agent_manager.mark_session_active("session-1");
         let (sender, requests) = editor_tool_channel(/*capacity*/ 4);
@@ -38066,12 +38040,10 @@ mod test {
             (kept["ok"].clone(), kept["saved"].clone()),
             (json!(true), json!(false))
         );
-        assert!(
-            kept["message"]
-                .as_str()
-                .unwrap()
-                .contains("left unsaved at the user's request")
-        );
+        assert!(kept["message"]
+            .as_str()
+            .unwrap()
+            .contains("left unsaved at the user's request"));
         assert_eq!(editor.current_buffer().contents(), "human one\nTWO\n");
         assert_eq!(fs::read_to_string(&path).unwrap(), "one\ntwo\n");
 
@@ -38144,13 +38116,11 @@ mod test {
             editor.current_dialog.is_none(),
             "cancel closes the question"
         );
-        assert!(
-            result
-                .await
-                .unwrap()
-                .unwrap_err()
-                .contains("the turn was cancelled")
-        );
+        assert!(result
+            .await
+            .unwrap()
+            .unwrap_err()
+            .contains("the turn was cancelled"));
         assert_eq!(editor.current_buffer().contents(), "human one\ntwo\n");
 
         // A tool call that timed out on the Codex side lets go of its question.
@@ -38174,11 +38144,13 @@ mod test {
         fs::write(&path, &original).unwrap();
         fs::write(&other, "other\n").unwrap();
         let mut editor = test_editor(/*width*/ 100, /*height*/ 30);
-        editor.buffer_manager.replace_buffers(vec![
-            Buffer::load_or_create(Some(other.to_string_lossy().into_owned()))
-                .await
-                .unwrap(),
-        ]);
+        editor
+            .buffer_manager
+            .replace_buffers(vec![Buffer::load_or_create(Some(
+                other.to_string_lossy().into_owned(),
+            ))
+            .await
+            .unwrap()]);
         editor.test_set_agent_root(root.path());
         editor
             .agent_manager
@@ -38357,13 +38329,11 @@ mod test {
 
             assert!(!editor.agent_edit_decisions.is_waiting(), "{close}");
             assert!(editor.current_dialog.is_none(), "{close}");
-            assert!(
-                result
-                    .await
-                    .unwrap()
-                    .unwrap_err()
-                    .contains("edit not applied")
-            );
+            assert!(result
+                .await
+                .unwrap()
+                .unwrap_err()
+                .contains("edit not applied"));
             assert_eq!(editor.current_buffer().contents(), "human one\ntwo\n");
         }
     }
@@ -38464,11 +38434,13 @@ mod test {
         let path = root.path().join("document.rs");
         fs::write(&path, "original\n").unwrap();
         let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
-        editor.buffer_manager.replace_buffers(vec![
-            Buffer::load_or_create(Some(path.to_string_lossy().into_owned()))
-                .await
-                .unwrap(),
-        ]);
+        editor
+            .buffer_manager
+            .replace_buffers(vec![Buffer::load_or_create(Some(
+                path.to_string_lossy().into_owned(),
+            ))
+            .await
+            .unwrap()]);
         editor.test_set_agent_root(root.path());
         let request = |call| EditorToolRequest {
             session_id: "unsaved-human-edit".to_string(),
@@ -38499,11 +38471,9 @@ mod test {
 
         assert_eq!(result["applied"], false);
         assert_eq!(result["saved"], false);
-        assert!(
-            result["error"]
-                .as_str()
-                .is_some_and(|error| error.contains("unsaved editor changes"))
-        );
+        assert!(result["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("unsaved editor changes")));
         assert_eq!(fs::read_to_string(&path).unwrap(), "original\n");
         assert_eq!(editor.current_buffer().contents(), "human original\n");
         assert!(editor.current_buffer().is_dirty());
@@ -38515,11 +38485,13 @@ mod test {
         let path = root.path().join("main.rs");
         fs::write(&path, "one\ntwo\nthree\nfour\nfive\n").unwrap();
         let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
-        editor.buffer_manager.replace_buffers(vec![
-            Buffer::load_or_create(Some(path.to_string_lossy().into_owned()))
-                .await
-                .unwrap(),
-        ]);
+        editor
+            .buffer_manager
+            .replace_buffers(vec![Buffer::load_or_create(Some(
+                path.to_string_lossy().into_owned(),
+            ))
+            .await
+            .unwrap()]);
         editor.test_set_agent_root(root.path());
         let request = |start_line, line_count| EditorToolRequest {
             session_id: "paged-read".to_string(),
@@ -38618,13 +38590,11 @@ mod test {
             .service_background(&mut render_buffer, &mut runtime)
             .await
             .unwrap();
-        assert!(
-            result
-                .await
-                .unwrap()
-                .unwrap_err()
-                .contains("cannot be paged")
-        );
+        assert!(result
+            .await
+            .unwrap()
+            .unwrap_err()
+            .contains("cannot be paged"));
         assert_eq!(editor.current_buffer().id(), first_id);
 
         let (response, result) = tokio::sync::oneshot::channel();
@@ -38778,12 +38748,10 @@ mod test {
             .unwrap();
 
         assert!(editor.current_dialog.is_none());
-        assert!(
-            editor
-                .macro_recording
-                .as_ref()
-                .is_some_and(|recording| recording.events.is_empty())
-        );
+        assert!(editor
+            .macro_recording
+            .as_ref()
+            .is_some_and(|recording| recording.events.is_empty()));
         assert!(editor.last_semantic_change.is_none());
         assert!(editor.picker_history("picker:802").is_empty());
         assert!(!format!("{:?}", editor.actions).contains("include all unsaved changes"));
@@ -39268,12 +39236,10 @@ builtin = "rust"
 
         editor.panel_manager.focus_editor();
         editor.apply_panel_layout();
-        assert!(
-            editor
-                .panel_manager
-                .panel_at_position(59, 5, 60, 20)
-                .is_none()
-        );
+        assert!(editor
+            .panel_manager
+            .panel_at_position(59, 5, 60, 20)
+            .is_none());
         assert_eq!(editor_width(&editor), 60);
         let views = editor
             .pending_panel_events
@@ -39323,11 +39289,9 @@ builtin = "rust"
             key: diagnostics::DEFAULT_PRODUCER.to_string(),
             instance: 99,
         };
-        assert!(
-            editor
-                .add_diagnostics_from(Some(uri), Some(&obsolete), Some(9), &[diagnostic])
-                .is_none()
-        );
+        assert!(editor
+            .add_diagnostics_from(Some(uri), Some(&obsolete), Some(9), &[diagnostic])
+            .is_none());
         assert_eq!(stamp(&editor), accepted);
     }
 
@@ -39526,23 +39490,20 @@ builtin = "rust"
         .unwrap();
         let mut core = DetachedEditorCore::new(editor).await.unwrap();
 
-        assert!(
-            !core
-                .snapshot(None)
-                .lines
-                .iter()
-                .any(|line| line.text.contains("RELEASE NOTES"))
-        );
+        assert!(!core
+            .snapshot(None)
+            .lines
+            .iter()
+            .any(|line| line.text.contains("RELEASE NOTES")));
         assert_eq!(core.editor.preferences.last_seen_version(), None);
 
         assert!(core.prepare_startup_whats_new().unwrap());
         assert_eq!(core.editor.preferences.last_seen_version(), None);
-        assert!(
-            core.snapshot(None)
-                .lines
-                .iter()
-                .any(|line| line.text.contains("RELEASE NOTES"))
-        );
+        assert!(core
+            .snapshot(None)
+            .lines
+            .iter()
+            .any(|line| line.text.contains("RELEASE NOTES")));
         core.mark_whats_new_presented();
 
         assert_eq!(
@@ -40118,18 +40079,14 @@ builtin = "rust"
 
         let delta = core.finish_render().unwrap();
 
-        assert!(
-            delta
-                .lines
-                .iter()
-                .any(|line| line.row == 2 && line.text.starts_with("first"))
-        );
-        assert!(
-            delta
-                .lines
-                .iter()
-                .any(|line| line.row == 4 && line.text.starts_with("second"))
-        );
+        assert!(delta
+            .lines
+            .iter()
+            .any(|line| line.row == 2 && line.text.starts_with("first")));
+        assert!(delta
+            .lines
+            .iter()
+            .any(|line| line.row == 4 && line.text.starts_with("second")));
         drain_plugin_requests();
     }
 
@@ -40163,23 +40120,19 @@ builtin = "rust"
         let mut buffer = RenderBuffer::new(88, 22, &Style::default());
         let mut runtime = Runtime::new();
 
-        assert!(
-            editor
-                .reconcile_observed_terminal_size((44, 21), &mut buffer, &mut runtime)
-                .await
-                .unwrap()
-        );
+        assert!(editor
+            .reconcile_observed_terminal_size((44, 21), &mut buffer, &mut runtime)
+            .await
+            .unwrap());
         assert_eq!(editor.size, (44, 21));
         assert_eq!((buffer.width, buffer.height), (44, 21));
         assert!(render_row(&buffer, buffer.height - 2).contains("1:1"));
 
         let render_generation = editor.render_generation;
-        assert!(
-            !editor
-                .reconcile_observed_terminal_size((44, 21), &mut buffer, &mut runtime)
-                .await
-                .unwrap()
-        );
+        assert!(!editor
+            .reconcile_observed_terminal_size((44, 21), &mut buffer, &mut runtime)
+            .await
+            .unwrap());
         assert_eq!(editor.render_generation, render_generation);
     }
 
@@ -40862,11 +40815,9 @@ builtin = "rust"
 
         assert!(editor.current_dialog.is_some());
         assert_eq!(editor.full_render_count, full_renders + 1);
-        assert!(
-            render_text_rows(&buffer)
-                .join("\n")
-                .contains("Hover after progress")
-        );
+        assert!(render_text_rows(&buffer)
+            .join("\n")
+            .contains("Hover after progress"));
         assert!(editor.lsp.recv_response().await.unwrap().is_none());
     }
 
@@ -41398,12 +41349,10 @@ builtin = "rust"
             })
             .await
             .unwrap();
-        assert!(
-            completed
-                .lines
-                .iter()
-                .any(|line| line.text.contains("large pastehello"))
-        );
+        assert!(completed
+            .lines
+            .iter()
+            .any(|line| line.text.contains("large pastehello")));
 
         core.editor.mode = Mode::Normal;
         core.editor
@@ -41412,12 +41361,10 @@ builtin = "rust"
             .unwrap();
         let undone = core.finish_render().unwrap();
         assert!(undone.lines.iter().any(|line| line.text.contains("hello")));
-        assert!(
-            !undone
-                .lines
-                .iter()
-                .any(|line| line.text.contains("large paste"))
-        );
+        assert!(!undone
+            .lines
+            .iter()
+            .any(|line| line.text.contains("large paste")));
     }
 
     #[tokio::test]
@@ -41443,12 +41390,10 @@ builtin = "rust"
         let delta = core.resize(52, 14).await.unwrap();
 
         assert_eq!(core.editor.last_error.as_deref(), Some("resize observed"));
-        assert!(
-            delta
-                .lines
-                .iter()
-                .any(|line| line.text.contains("resize observed"))
-        );
+        assert!(delta
+            .lines
+            .iter()
+            .any(|line| line.text.contains("resize observed")));
         drain_plugin_requests();
     }
 
@@ -41761,12 +41706,10 @@ builtin = "rust"
         assert_eq!(editor.buffer_manager.len(), 2);
         assert_eq!(editor.current_buffer().file, None);
         assert!(editor.current_buffer().is_dirty());
-        assert!(
-            editor
-                .save_as_action(saved.to_str().unwrap(), &mut render_buffer, &mut runtime)
-                .await
-                .unwrap()
-        );
+        assert!(editor
+            .save_as_action(saved.to_str().unwrap(), &mut render_buffer, &mut runtime)
+            .await
+            .unwrap());
         assert_eq!(std::fs::read_to_string(&saved).unwrap(), "{\"value\":1}\n");
         assert!(!editor.current_buffer().is_dirty());
 
@@ -42598,12 +42541,10 @@ builtin = "rust"
             .unwrap(),
             Value::Null
         );
-        assert!(
-            render_text_rows(&render_buffer)
-                .last()
-                .unwrap()
-                .contains("JSON result copied")
-        );
+        assert!(render_text_rows(&render_buffer)
+            .last()
+            .unwrap()
+            .contains("JSON result copied"));
         let message = editor.transient_message.as_ref().unwrap();
         assert_eq!(message.text, "JSON result copied");
         assert_eq!(message.severity, Severity::Success);
@@ -43449,11 +43390,9 @@ builtin = "rust"
         let dialog = editor.current_dialog.as_mut().unwrap();
         let mut picker_buffer = RenderBuffer::new(100, 8, &Style::default());
         dialog.draw(&mut picker_buffer).unwrap();
-        assert!(
-            render_text_rows(&picker_buffer)
-                .join("\n")
-                .contains("unknown configuration field")
-        );
+        assert!(render_text_rows(&picker_buffer)
+            .join("\n")
+            .contains("unknown configuration field"));
 
         for character in "CFG101 commands".chars() {
             dialog.handle_event(&Event::Key(KeyEvent::new(
@@ -43463,11 +43402,9 @@ builtin = "rust"
         }
         let mut filtered = RenderBuffer::new(100, 8, &Style::default());
         dialog.draw(&mut filtered).unwrap();
-        assert!(
-            render_text_rows(&filtered)
-                .join("\n")
-                .contains("unknown configuration field")
-        );
+        assert!(render_text_rows(&filtered)
+            .join("\n")
+            .contains("unknown configuration field"));
     }
 
     #[tokio::test]
@@ -43485,12 +43422,10 @@ builtin = "rust"
             .await
             .unwrap();
 
-        assert!(
-            render_text_rows(&buffer)
-                .last()
-                .unwrap()
-                .contains("fatal: index.lock already exists")
-        );
+        assert!(render_text_rows(&buffer)
+            .last()
+            .unwrap()
+            .contains("fatal: index.lock already exists"));
         assert_eq!(editor.notifications().records().count(), 0);
         let retained = editor.transient_message.as_ref().unwrap();
         assert_eq!(retained.text, "fatal: index.lock already exists");
@@ -43540,12 +43475,10 @@ builtin = "rust"
             .unwrap();
 
         assert_eq!(editor.last_error.as_deref(), Some("still visible"));
-        assert!(
-            render_text_rows(&buffer)
-                .last()
-                .unwrap()
-                .contains("still visible")
-        );
+        assert!(render_text_rows(&buffer)
+            .last()
+            .unwrap()
+            .contains("still visible"));
         assert_eq!(editor.notifications().records().len(), 0);
     }
 
@@ -43571,12 +43504,10 @@ builtin = "rust"
 
         editor.invalidate_terminal_render_state(&mut buffer);
 
-        assert!(
-            buffer
-                .cells
-                .iter()
-                .all(|cell| cell.text == " " && cell.style == Style::default())
-        );
+        assert!(buffer
+            .cells
+            .iter()
+            .all(|cell| cell.text == " " && cell.style == Style::default()));
         assert_eq!(editor.last_rendered_cursor_position, None);
         assert_eq!(editor.last_rendered_cursor_surface, None);
         assert!(editor.force_full_redraw);
@@ -43595,11 +43526,9 @@ builtin = "rust"
         Editor::restore_terminal_output(&mut output).unwrap();
 
         let restore_sequence = b"\x1b[?1049l\x1b[?25h";
-        assert!(
-            output
-                .windows(restore_sequence.len())
-                .any(|window| window == restore_sequence)
-        );
+        assert!(output
+            .windows(restore_sequence.len())
+            .any(|window| window == restore_sequence));
     }
 
     #[cfg(unix)]
@@ -43688,12 +43617,10 @@ builtin = "rust"
         let mut frame = RenderBuffer::new(80, 24, &Style::default());
         let mut runtime = Runtime::new();
 
-        assert!(
-            editor
-                .execute(&Action::Command("q".into()), &mut frame, &mut runtime)
-                .await
-                .unwrap()
-        );
+        assert!(editor
+            .execute(&Action::Command("q".into()), &mut frame, &mut runtime)
+            .await
+            .unwrap());
         assert_eq!(editor.preferences.command_history(), ["q"]);
         assert!(
             !path.exists(),
@@ -43714,19 +43641,15 @@ builtin = "rust"
         let mut frame = RenderBuffer::new(80, 24, &Style::default());
         let mut runtime = Runtime::new();
 
-        assert!(
-            !editor
-                .execute(&Action::Command("q".into()), &mut frame, &mut runtime)
-                .await
-                .unwrap()
-        );
+        assert!(!editor
+            .execute(&Action::Command("q".into()), &mut frame, &mut runtime)
+            .await
+            .unwrap());
         assert_eq!(PreferencesStore::load(&path).command_history(), ["q"]);
-        assert!(
-            editor
-                .execute(&Action::Command("q!".into()), &mut frame, &mut runtime)
-                .await
-                .unwrap()
-        );
+        assert!(editor
+            .execute(&Action::Command("q!".into()), &mut frame, &mut runtime)
+            .await
+            .unwrap());
         assert_eq!(PreferencesStore::load(&path).command_history(), ["q"]);
 
         editor.finish_interactive(&mut runtime).await.unwrap();
@@ -43836,12 +43759,10 @@ builtin = "rust"
 
         editor.search_matches("hello").unwrap();
 
-        assert!(
-            editor
-                .search_match_history
-                .iter()
-                .all(|entry| entry.pattern != "x")
-        );
+        assert!(editor
+            .search_match_history
+            .iter()
+            .all(|entry| entry.pattern != "x"));
     }
 
     #[test]
@@ -44071,12 +43992,10 @@ builtin = "rust"
             "if true; then echo hello; fi\n".repeat(100)
         );
         editor.buffer_manager[0] = Buffer::new(Some("script".into()), text);
-        assert!(
-            !editor
-                .viewport_highlight_spans(0, 60, 20)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(!editor
+            .viewport_highlight_spans(0, 60, 20)
+            .unwrap()
+            .is_empty());
         assert_eq!(
             editor.highlight_cache[&0].language_id.as_deref(),
             Some("bash")
@@ -44084,12 +44003,10 @@ builtin = "rust"
         assert_eq!(editor.current_language_id().as_deref(), Some("bash"));
         assert!(editor.configured_comment_syntax().is_some());
         editor.current_buffer_mut().insert_str(0, 0, "#");
-        assert!(
-            editor
-                .viewport_highlight_spans(0, 60, 20)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(editor
+            .viewport_highlight_spans(0, 60, 20)
+            .unwrap()
+            .is_empty());
         editor
             .current_buffer_mut()
             .set_syntax_selection(SyntaxSelection::Language("fish".into()));
@@ -44101,12 +44018,10 @@ builtin = "rust"
         editor
             .current_buffer_mut()
             .set_syntax_selection(SyntaxSelection::Off);
-        assert!(
-            editor
-                .viewport_highlight_spans(0, 60, 20)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(editor
+            .viewport_highlight_spans(0, 60, 20)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -44303,18 +44218,14 @@ builtin = "rust"
     #[test]
     fn viewport_highlight_handles_view_past_end_of_buffer() {
         let mut editor = rust_test_editor(5, 120, 22);
-        assert!(
-            editor
-                .viewport_highlight_spans(0, 10, 20)
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            !editor
-                .viewport_highlight_spans(0, 0, 20)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(editor
+            .viewport_highlight_spans(0, 10, 20)
+            .unwrap()
+            .is_empty());
+        assert!(!editor
+            .viewport_highlight_spans(0, 0, 20)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -44329,12 +44240,10 @@ builtin = "rust"
         let mut editor =
             Editor::with_size(lsp, 80, 24, config, Theme::default(), vec![buffer]).unwrap();
 
-        assert!(
-            editor
-                .viewport_highlight_spans(0, 0, 22)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(editor
+            .viewport_highlight_spans(0, 0, 22)
+            .unwrap()
+            .is_empty());
         assert!(!editor.highlight_cache.contains_key(&0));
     }
 
@@ -44357,11 +44266,10 @@ builtin = "rust"
             rows[0]["text"].as_str().unwrap().len(),
             MAX_PLUGIN_VIEWPORT_LINE_CHARS
         );
-        assert!(
-            rows.iter()
-                .skip(1)
-                .all(|row| row["text"].as_str() == Some(""))
-        );
+        assert!(rows
+            .iter()
+            .skip(1)
+            .all(|row| row["text"].as_str() == Some("")));
     }
 
     #[test]
@@ -45544,8 +45452,7 @@ builtin = "rust"
                         })
                         .unwrap_or(column);
                     assert_eq!(
-                        editor
-                            .benchmark_cursor_conversion(column, line, /*word_search*/ false),
+                        editor.benchmark_cursor_conversion(column, line, /*word_search*/ false),
                         expected_reverse,
                         "reverse {contents:?} line={line} column={column}"
                     );
@@ -45994,11 +45901,9 @@ builtin = "rust"
 
         let mut missing = tokio::process::Command::new("red-nonexistent-git-test");
         missing.arg("status");
-        assert!(
-            git_status_output(missing, Duration::from_secs(5))
-                .await
-                .is_err()
-        );
+        assert!(git_status_output(missing, Duration::from_secs(5))
+            .await
+            .is_err());
     }
 
     #[cfg(unix)]
@@ -46065,43 +45970,37 @@ builtin = "rust"
     #[tokio::test]
     async fn git_status_cache_invalidates_worktree_ignored_and_index_changes() {
         let root = tempfile::tempdir().unwrap();
-        assert!(
-            Command::new("git")
-                .args(["init", "--quiet"])
-                .arg(root.path())
-                .status()
-                .unwrap()
-                .success()
-        );
+        assert!(Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(root.path())
+            .status()
+            .unwrap()
+            .success());
         fs::write(root.path().join(".gitignore"), "ignored.log\n").unwrap();
         fs::write(root.path().join("tracked.rs"), "first\n").unwrap();
-        assert!(
-            Command::new("git")
-                .arg("-C")
-                .arg(root.path())
-                .args(["add", ".gitignore", "tracked.rs"])
-                .status()
-                .unwrap()
-                .success()
-        );
-        assert!(
-            Command::new("git")
-                .arg("-C")
-                .arg(root.path())
-                .args([
-                    "-c",
-                    "user.name=Red Test",
-                    "-c",
-                    "user.email=red@example.invalid",
-                    "commit",
-                    "--quiet",
-                    "-m",
-                    "initial",
-                ])
-                .status()
-                .unwrap()
-                .success()
-        );
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(root.path())
+            .args(["add", ".gitignore", "tracked.rs"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(root.path())
+            .args([
+                "-c",
+                "user.name=Red Test",
+                "-c",
+                "user.email=red@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "initial",
+            ])
+            .status()
+            .unwrap()
+            .success());
 
         let path = root.path().to_str().unwrap();
         let initial = git_status_listing(path).await;
@@ -46110,51 +46009,41 @@ builtin = "rust"
         fs::write(root.path().join("tracked.rs"), "changed\n").unwrap();
         let changed = git_status_listing(path).await;
         assert_ne!(changed, initial);
-        assert!(
-            changed["statuses"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|entry| entry["path"] == "tracked.rs" && entry["status"] == "modified")
-        );
+        assert!(changed["statuses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"] == "tracked.rs" && entry["status"] == "modified"));
 
         fs::write(root.path().join("untracked.rs"), "untracked\n").unwrap();
         fs::write(root.path().join("ignored.log"), "ignored\n").unwrap();
         let expanded = git_status_listing(path).await;
-        assert!(
-            expanded["statuses"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|entry| entry["path"] == "untracked.rs")
-        );
-        assert!(
-            expanded["statuses"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|entry| entry["path"] == "ignored.log" && entry["status"] == "ignored")
-        );
+        assert!(expanded["statuses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"] == "untracked.rs"));
+        assert!(expanded["statuses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"] == "ignored.log" && entry["status"] == "ignored"));
 
-        assert!(
-            Command::new("git")
-                .arg("-C")
-                .arg(root.path())
-                .args(["add", "untracked.rs", "tracked.rs"])
-                .status()
-                .unwrap()
-                .success()
-        );
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(root.path())
+            .args(["add", "untracked.rs", "tracked.rs"])
+            .status()
+            .unwrap()
+            .success());
         let staged = git_status_listing(path).await;
         assert_ne!(staged, expanded);
         fs::remove_file(root.path().join("ignored.log")).unwrap();
-        assert!(
-            !git_status_listing(path).await["statuses"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|entry| entry["path"] == "ignored.log")
-        );
+        assert!(!git_status_listing(path).await["statuses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"] == "ignored.log"));
     }
 
     #[test]
@@ -46169,43 +46058,37 @@ builtin = "rust"
     #[tokio::test]
     async fn git_status_listing_discovers_nested_repositories_and_retains_statuses() {
         let root = tempfile::tempdir().unwrap();
-        assert!(
-            Command::new("git")
-                .args(["init", "--quiet"])
-                .arg(root.path())
-                .status()
-                .unwrap()
-                .success()
-        );
+        assert!(Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(root.path())
+            .status()
+            .unwrap()
+            .success());
         fs::write(root.path().join(".gitignore"), "ignored.log\n").unwrap();
         fs::write(root.path().join("tracked.rs"), "first\n").unwrap();
-        assert!(
-            Command::new("git")
-                .arg("-C")
-                .arg(root.path())
-                .args(["add", ".gitignore", "tracked.rs"])
-                .status()
-                .unwrap()
-                .success()
-        );
-        assert!(
-            Command::new("git")
-                .arg("-C")
-                .arg(root.path())
-                .args([
-                    "-c",
-                    "user.name=Red Test",
-                    "-c",
-                    "user.email=red@example.invalid",
-                    "commit",
-                    "--quiet",
-                    "-m",
-                    "initial",
-                ])
-                .status()
-                .unwrap()
-                .success()
-        );
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(root.path())
+            .args(["add", ".gitignore", "tracked.rs"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(root.path())
+            .args([
+                "-c",
+                "user.name=Red Test",
+                "-c",
+                "user.email=red@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "initial",
+            ])
+            .status()
+            .unwrap()
+            .success());
         fs::write(root.path().join("tracked.rs"), "changed\n").unwrap();
         fs::write(root.path().join("ignored.log"), "ignored\n").unwrap();
         let nested = root.path().join("packages/inner/src");
@@ -46231,51 +46114,43 @@ builtin = "rust"
 
         let linked_parent = tempfile::tempdir().unwrap();
         let linked = linked_parent.path().join("linked");
-        assert!(
-            Command::new("git")
-                .arg("-C")
-                .arg(root.path())
-                .args(["worktree", "add", "--quiet", "--detach"])
-                .arg(&linked)
-                .status()
-                .unwrap()
-                .success()
-        );
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(root.path())
+            .args(["worktree", "add", "--quiet", "--detach"])
+            .arg(&linked)
+            .status()
+            .unwrap()
+            .success());
         fs::write(linked.join("linked.rs"), "linked source\n").unwrap();
         let linked_listing = git_status_listing(linked.join("linked.rs").to_str().unwrap()).await;
         assert_eq!(
             linked_listing["root"],
             normalize_plugin_path(linked.canonicalize().unwrap().to_string_lossy().as_ref())
         );
-        assert!(
-            linked_listing["statuses"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|entry| entry["path"] == "linked.rs")
-        );
+        assert!(linked_listing["statuses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"] == "linked.rs"));
 
         let inner = root.path().join("packages/inner");
-        assert!(
-            Command::new("git")
-                .args(["init", "--quiet"])
-                .arg(&inner)
-                .status()
-                .unwrap()
-                .success()
-        );
+        assert!(Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&inner)
+            .status()
+            .unwrap()
+            .success());
         let nested_listing = git_status_listing(source.to_str().unwrap()).await;
         assert_eq!(
             nested_listing["root"],
             normalize_plugin_path(inner.canonicalize().unwrap().to_string_lossy().as_ref())
         );
-        assert!(
-            nested_listing["statuses"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|entry| entry["path"] == "src/")
-        );
+        assert!(nested_listing["statuses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"] == "src/"));
     }
 
     #[cfg(unix)]
@@ -46287,14 +46162,12 @@ builtin = "rust"
         let first = root.path().join("first");
         let second = root.path().join("second");
         for repository in [&first, &second] {
-            assert!(
-                Command::new("git")
-                    .args(["init", "--quiet"])
-                    .arg(repository)
-                    .status()
-                    .unwrap()
-                    .success()
-            );
+            assert!(Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(repository)
+                .status()
+                .unwrap()
+                .success());
             fs::write(repository.join("untracked.rs"), "source\n").unwrap();
         }
         let alias = root.path().join("active");
@@ -46316,13 +46189,11 @@ builtin = "rust"
                 .to_string_lossy()
                 .into_owned()
         );
-        assert!(
-            second_listing["statuses"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|entry| entry["path"] == "untracked.rs")
-        );
+        assert!(second_listing["statuses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"] == "untracked.rs"));
     }
 
     fn test_home_dir() -> PathBuf {
@@ -46492,11 +46363,9 @@ builtin = "rust"
             )),
         });
 
-        assert!(
-            editor
-                .handle_lsp_message(&response, Some("textDocument/completion".to_string()))
-                .is_none()
-        );
+        assert!(editor
+            .handle_lsp_message(&response, Some("textDocument/completion".to_string()))
+            .is_none());
         assert!(editor.current_dialog.is_none());
     }
 
@@ -46996,11 +46865,9 @@ builtin = "rust"
                 serde_json::json!({ "position": { "line": 0, "character": 9 } }),
             )),
         });
-        assert!(
-            editor
-                .handle_lsp_message(&late_response, Some("textDocument/completion".to_string()))
-                .is_none()
-        );
+        assert!(editor
+            .handle_lsp_message(&late_response, Some("textDocument/completion".to_string()))
+            .is_none());
         assert!(editor.current_dialog.is_none());
     }
 
@@ -47167,11 +47034,9 @@ builtin = "rust"
             )),
         });
 
-        assert!(
-            editor
-                .handle_lsp_message(&response, Some("textDocument/completion".to_string()))
-                .is_none()
-        );
+        assert!(editor
+            .handle_lsp_message(&response, Some("textDocument/completion".to_string()))
+            .is_none());
 
         let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
         let mut runtime = Runtime::new();
@@ -47228,11 +47093,9 @@ builtin = "rust"
             )),
         });
 
-        assert!(
-            editor
-                .handle_lsp_message(&response, Some("textDocument/completion".to_string()))
-                .is_none()
-        );
+        assert!(editor
+            .handle_lsp_message(&response, Some("textDocument/completion".to_string()))
+            .is_none());
         assert!(editor.current_dialog.is_none());
     }
 
@@ -47365,12 +47228,10 @@ builtin = "rust"
             .unwrap();
 
         assert_eq!(editor.current_buffer().contents(), "torch.manx");
-        assert!(
-            editor
-                .last_error
-                .as_deref()
-                .is_some_and(|error| error.contains("stale"))
-        );
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("stale")));
         assert!(editor.current_dialog.is_none());
     }
 
@@ -47729,28 +47590,22 @@ builtin = "rust"
         editor
             .current_buffer_mut()
             .replace_range_raw(TextRange::insertion(TextPosition::new(0, 0)), "// edit\n");
-        assert!(
-            editor
-                .plugin_document_symbols_payload(&response, &pending)
-                .is_err()
-        );
+        assert!(editor
+            .plugin_document_symbols_payload(&response, &pending)
+            .is_err());
         let renamed = pending_document_symbols(&editor, 0);
         editor.current_buffer_mut().file =
             Some(file.with_extension("ts").to_string_lossy().into_owned());
-        assert!(
-            editor
-                .plugin_document_symbols_payload(&response, &renamed)
-                .is_err()
-        );
+        assert!(editor
+            .plugin_document_symbols_payload(&response, &renamed)
+            .is_err());
         editor.buffer_manager.replace_buffers(vec![Buffer::new(
             Some(file.to_string_lossy().into_owned()),
             "fn main() {}".into(),
         )]);
-        assert!(
-            editor
-                .plugin_document_symbols_payload(&response, &pending)
-                .is_err()
-        );
+        assert!(editor
+            .plugin_document_symbols_payload(&response, &pending)
+            .is_err());
     }
 
     #[tokio::test]
@@ -48187,12 +48042,10 @@ builtin = "rust"
         let action = editor.handle_lsp_message(&message, Some("textDocument/hover".to_string()));
 
         assert!(action.is_none());
-        assert!(
-            editor
-                .last_error
-                .as_deref()
-                .is_some_and(|error| error.contains("timed out"))
-        );
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("timed out")));
     }
 
     #[test]
@@ -49030,11 +48883,9 @@ builtin = "rust"
 
         assert!(!result.restored);
         assert_eq!(result.skipped_files.len(), 1);
-        assert!(
-            result.skipped_files[0]
-                .reason
-                .contains("dirty buffer is no longer open")
-        );
+        assert!(result.skipped_files[0]
+            .reason
+            .contains("dirty buffer is no longer open"));
         assert_eq!(editor.current_buffer().id(), buffer_id);
         assert_eq!(editor.current_buffer().contents(), "current\n");
     }
@@ -49121,12 +48972,10 @@ builtin = "rust"
             restored.buffer_manager[0].file.as_deref(),
             absolute.to_str()
         );
-        assert!(
-            result
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("Collapsed duplicate saved buffer"))
-        );
+        assert!(result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Collapsed duplicate saved buffer")));
     }
 
     #[cfg(unix)]
@@ -49362,12 +49211,10 @@ builtin = "rust"
 
         assert!(action.is_none());
         assert_eq!(editor.buffer_manager[0].contents(), "dirty value");
-        assert!(
-            editor
-                .last_error
-                .as_deref()
-                .is_some_and(|error| error.contains("stale"))
-        );
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("stale")));
     }
 
     #[test]
@@ -49590,11 +49437,9 @@ while True:
             .unwrap()
             .draw(&mut loading)
             .unwrap();
-        assert!(
-            render_text_rows(&loading)
-                .join("\n")
-                .contains("Fetching available code actions...")
-        );
+        assert!(render_text_rows(&loading)
+            .join("\n")
+            .contains("Fetching available code actions..."));
         let message = InboundMessage::Message(ResponseMessage {
             id: 43,
             result: serde_json::json!([{
@@ -49734,14 +49579,12 @@ while True:
             })
         };
 
-        assert!(
-            editor
-                .handle_lsp_message(
-                    &response(43, "typescript", "TypeScript fix"),
-                    Some("textDocument/codeAction".to_string()),
-                )
-                .is_none()
-        );
+        assert!(editor
+            .handle_lsp_message(
+                &response(43, "typescript", "TypeScript fix"),
+                Some("textDocument/codeAction".to_string()),
+            )
+            .is_none());
         let action = editor.handle_lsp_message(
             &response(44, "eslint", "ESLint fix"),
             Some("textDocument/codeAction".to_string()),
@@ -49806,11 +49649,9 @@ while True:
             )),
         });
 
-        assert!(
-            editor
-                .handle_lsp_message(&response, Some("textDocument/codeAction".to_string()))
-                .is_none()
-        );
+        assert!(editor
+            .handle_lsp_message(&response, Some("textDocument/codeAction".to_string()))
+            .is_none());
         let action = editor.handle_lsp_message(
             &InboundMessage::RequestError {
                 id: 44,
@@ -49827,11 +49668,9 @@ while True:
             .unwrap()
             .draw(&mut rendered)
             .unwrap();
-        assert!(
-            render_text_rows(&rendered)
-                .join("\n")
-                .contains("TypeScript fix")
-        );
+        assert!(render_text_rows(&rendered)
+            .join("\n")
+            .contains("TypeScript fix"));
         assert!(editor.pending_lsp_edit_requests.is_empty());
     }
 
@@ -49853,17 +49692,15 @@ while True:
         editor.pending_code_action_requests = HashSet::from([43, 44]);
         editor.current_dialog = Some(Box::new(editor.code_action_loading_picker()));
 
-        assert!(
-            editor
-                .handle_lsp_message(
-                    &InboundMessage::RequestError {
-                        id: 43,
-                        error: crate::lsp::LspError::RequestTimeout(Duration::from_secs(30)),
-                    },
-                    Some("textDocument/codeAction".to_string()),
-                )
-                .is_none()
-        );
+        assert!(editor
+            .handle_lsp_message(
+                &InboundMessage::RequestError {
+                    id: 43,
+                    error: crate::lsp::LspError::RequestTimeout(Duration::from_secs(30)),
+                },
+                Some("textDocument/codeAction".to_string()),
+            )
+            .is_none());
         let action = editor.handle_lsp_message(
             &InboundMessage::Message(ResponseMessage {
                 id: 44,
@@ -49887,11 +49724,9 @@ while True:
             .unwrap()
             .draw(&mut rendered)
             .unwrap();
-        assert!(
-            render_text_rows(&rendered)
-                .join("\n")
-                .contains("ESLint fix")
-        );
+        assert!(render_text_rows(&rendered)
+            .join("\n")
+            .contains("ESLint fix"));
     }
 
     #[tokio::test]
@@ -49945,11 +49780,9 @@ while True:
             )),
         });
 
-        assert!(
-            editor
-                .handle_lsp_message(&message, Some("textDocument/codeAction".to_string()))
-                .is_none()
-        );
+        assert!(editor
+            .handle_lsp_message(&message, Some("textDocument/codeAction".to_string()))
+            .is_none());
         assert!(editor.current_dialog.is_none());
         assert!(editor.pending_lsp_edit_requests.is_empty());
     }
@@ -50221,12 +50054,10 @@ while True:
 
         assert_eq!(editor.buffer_manager[0].contents(), "first");
         assert_eq!(editor.buffer_manager[1].contents(), "👋 second");
-        assert!(
-            editor
-                .last_error
-                .as_deref()
-                .is_some_and(|error| error.contains("UTF-16"))
-        );
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("UTF-16")));
 
         editor.set_legacy_message(None);
         editor
@@ -50256,12 +50087,10 @@ while True:
 
         assert_eq!(editor.buffer_manager[0].contents(), "first");
         assert_eq!(editor.buffer_manager[1].contents(), "👋 second");
-        assert!(
-            editor
-                .last_error
-                .as_deref()
-                .is_some_and(|error| error.contains("overlap"))
-        );
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("overlap")));
 
         editor.set_legacy_message(None);
         editor.buffer_manager[1]
@@ -50290,12 +50119,10 @@ while True:
 
         assert_eq!(editor.buffer_manager[0].contents(), "first");
         assert_eq!(editor.buffer_manager[1].contents(), "dirty 👋 second");
-        assert!(
-            editor
-                .last_error
-                .as_deref()
-                .is_some_and(|error| error.contains("stale"))
-        );
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("stale")));
     }
 
     #[tokio::test]
@@ -50324,12 +50151,10 @@ while True:
             .unwrap();
 
         assert_eq!(editor.buffer_manager[0].contents(), "value");
-        assert!(
-            editor
-                .last_error
-                .as_deref()
-                .is_some_and(|error| error.contains("version is stale"))
-        );
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("version is stale")));
     }
 
     fn workspace_lsp_test_editor(root: &Path, path: &Path, contents: &str) -> Editor {
@@ -50439,18 +50264,14 @@ while True:
             )),
         });
 
-        assert!(
-            editor
-                .handle_lsp_message(&response, Some("textDocument/rename".to_string()))
-                .is_none()
-        );
+        assert!(editor
+            .handle_lsp_message(&response, Some("textDocument/rename".to_string()))
+            .is_none());
         assert_eq!(editor.buffer_manager[0].contents(), "dirty old_name");
-        assert!(
-            editor
-                .last_error
-                .as_deref()
-                .is_some_and(|error| error.contains("stale"))
-        );
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("stale")));
     }
 
     #[test]
@@ -50492,18 +50313,14 @@ while True:
             )),
         });
 
-        assert!(
-            editor
-                .handle_lsp_message(&response, Some("textDocument/rename".to_string()))
-                .is_none()
-        );
+        assert!(editor
+            .handle_lsp_message(&response, Some("textDocument/rename".to_string()))
+            .is_none());
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "target");
-        assert!(
-            editor
-                .last_error
-                .as_deref()
-                .is_some_and(|error| error.contains("outside its originating workspace"))
-        );
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("outside its originating workspace")));
     }
 
     #[test]
@@ -50599,12 +50416,10 @@ while True:
 
         assert_eq!(editor.buffer_manager[0].contents(), "let source = 1;");
         assert_eq!(editor.buffer_manager[1].contents(), "dirty let source = 2;");
-        assert!(
-            editor
-                .last_error
-                .as_deref()
-                .is_some_and(|error| error.contains("stale"))
-        );
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("stale")));
         assert!(editor.pending_lsp_revision_snapshots.is_empty());
     }
 
@@ -50797,12 +50612,10 @@ while True:
         assert_eq!(editor.buffer_manager.len(), 1);
         assert_eq!(editor.buffer_manager[0].contents(), "unsaved contents\n");
         assert!(editor.buffer_manager[0].is_dirty());
-        assert!(
-            editor
-                .last_error
-                .as_deref()
-                .is_some_and(|error| error.contains("no-follow filesystem support"))
-        );
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("no-follow filesystem support")));
 
         editor.set_legacy_message(None);
         let operations = workspace_edit_operations(&serde_json::json!({
@@ -50836,12 +50649,10 @@ while True:
         );
         assert_eq!(editor.buffer_manager[0].contents(), "unsaved contents\n");
         assert!(editor.buffer_manager[0].is_dirty());
-        assert!(
-            editor
-                .last_error
-                .as_deref()
-                .is_some_and(|error| error.contains("no-follow filesystem support"))
-        );
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("no-follow filesystem support")));
     }
 
     #[tokio::test]
@@ -50941,12 +50752,10 @@ while True:
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "external\n");
         assert_eq!(editor.buffer_manager[0].contents(), "value\n");
         assert!(editor.buffer_manager[0].is_dirty());
-        assert!(
-            editor
-                .last_error
-                .as_deref()
-                .is_some_and(|error| error.contains("changed on disk"))
-        );
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("changed on disk")));
         assert!(editor.pending_lsp_edit_requests.is_empty());
         assert!(editor.pending_lsp_format_saves.is_empty());
     }
@@ -51306,12 +51115,10 @@ while True:
         std::fs::write(&release, "release").unwrap();
 
         assert_eq!(disk_before_release, "value   \n");
-        assert!(
-            editor
-                .last_error
-                .as_deref()
-                .is_some_and(|error| error.contains("already pending"))
-        );
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("already pending")));
         complete_delayed_format_save(&mut editor, &path, "value\n").await;
 
         let uri = crate::lsp::file_uri(&path).unwrap();
@@ -51428,12 +51235,10 @@ while True:
             complete_delayed_format_save(&mut editor, &second, "value\n").await;
 
             assert!(editor.take_deferred_quit(), "{command} never quit");
-            assert!(
-                editor
-                    .buffer_manager
-                    .iter()
-                    .all(|buffer| !buffer.is_dirty())
-            );
+            assert!(editor
+                .buffer_manager
+                .iter()
+                .all(|buffer| !buffer.is_dirty()));
         }
     }
 
@@ -51457,12 +51262,10 @@ while True:
 
         assert!(!editor.take_deferred_quit());
         assert!(editor.buffer_manager.iter().any(Buffer::is_dirty));
-        assert!(
-            editor
-                .last_error
-                .as_deref()
-                .is_some_and(|message| message.contains("quit cancelled"))
-        );
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("quit cancelled")));
     }
 
     #[cfg(unix)]
@@ -51523,12 +51326,10 @@ while True:
         assert!(editor.buffer_manager[0].contents().starts_with('x'));
         assert!(editor.buffer_manager[0].is_dirty());
         assert!(editor.pending_lsp_format_saves.is_empty());
-        assert!(
-            editor
-                .last_error
-                .as_deref()
-                .is_some_and(|error| error.contains("stale"))
-        );
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("stale")));
     }
 
     #[cfg(unix)]
@@ -51655,12 +51456,10 @@ while True:
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "disk target\n");
         assert!(editor.pending_lsp_edit_requests.is_empty());
         assert!(editor.pending_lsp_format_saves.is_empty());
-        assert!(
-            editor
-                .last_error
-                .as_deref()
-                .is_some_and(|error| error.contains("destination is already open"))
-        );
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("destination is already open")));
     }
 
     #[cfg(unix)]
@@ -52007,20 +51806,16 @@ while True:
                 editor.current_buffer().file.as_deref(),
                 Some(source_file.as_str())
             );
-            assert!(
-                editor
-                    .current_buffer()
-                    .contents()
-                    .contains("unsaved source")
-            );
+            assert!(editor
+                .current_buffer()
+                .contents()
+                .contains("unsaved source"));
             assert!(editor.pending_lsp_edit_requests.is_empty());
             assert!(editor.pending_lsp_format_saves.is_empty());
-            assert!(
-                editor
-                    .last_error
-                    .as_deref()
-                    .is_some_and(|error| error.contains("Save As cancelled"))
-            );
+            assert!(editor
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("Save As cancelled")));
         }
     }
 
@@ -52155,12 +51950,10 @@ while True:
             assert!(editor.pending_lsp_revision_snapshots.is_empty());
             assert_eq!(editor.pending_code_action_request, None);
             assert!(editor.current_dialog.is_none());
-            assert!(
-                editor
-                    .last_error
-                    .as_deref()
-                    .is_some_and(|error| error.contains("no language server"))
-            );
+            assert!(editor
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("no language server")));
         }
     }
 
@@ -52201,20 +51994,16 @@ while True:
             )),
         });
 
-        assert!(
-            editor
-                .handle_lsp_message(&response, Some("textDocument/formatting".to_string()))
-                .is_none()
-        );
+        assert!(editor
+            .handle_lsp_message(&response, Some("textDocument/formatting".to_string()))
+            .is_none());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "value\n");
         assert_eq!(editor.buffer_manager[0].contents(), "dirty value\n");
         assert!(editor.pending_lsp_format_saves.is_empty());
-        assert!(
-            editor
-                .last_error
-                .as_deref()
-                .is_some_and(|error| error.contains("stale"))
-        );
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("stale")));
     }
 
     #[test]
@@ -52251,11 +52040,9 @@ while True:
             request: None,
         });
 
-        assert!(
-            editor
-                .handle_lsp_message(&message, Some("textDocument/formatting".to_string()))
-                .is_none()
-        );
+        assert!(editor
+            .handle_lsp_message(&message, Some("textDocument/formatting".to_string()))
+            .is_none());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "disk value\n");
         assert_eq!(editor.buffer_manager[0].contents(), "unsaved value\n");
         assert!(editor.pending_lsp_edit_requests.is_empty());
@@ -52430,11 +52217,9 @@ while True:
             .await
             .unwrap();
 
-        assert!(
-            collect_print_requests()
-                .iter()
-                .any(|message| message == "cursor:MoveToNextWord:0,0->6,0:Normal")
-        );
+        assert!(collect_print_requests()
+            .iter()
+            .any(|message| message == "cursor:MoveToNextWord:0,0->6,0:Normal"));
     }
 
     #[tokio::test]
@@ -52489,11 +52274,9 @@ while True:
             .await
             .unwrap();
         let prints = collect_print_requests();
-        assert!(
-            prints
-                .iter()
-                .any(|message| message == "search:SearchWordUnderCursor:alpha:Forward")
-        );
+        assert!(prints
+            .iter()
+            .any(|message| message == "search:SearchWordUnderCursor:alpha:Forward"));
 
         editor
             .execute(
@@ -52534,11 +52317,9 @@ while True:
             .await
             .unwrap();
 
-        assert!(
-            collect_print_requests()
-                .iter()
-                .any(|message| message == "mode:CancelSearch:Search->Normal")
-        );
+        assert!(collect_print_requests()
+            .iter()
+            .any(|message| message == "mode:CancelSearch:Search->Normal"));
     }
 
     #[tokio::test]
@@ -52647,12 +52428,10 @@ while True:
             .unwrap();
 
         assert_eq!(editor.current_buffer().contents(), "int player = 1;\n");
-        assert!(
-            !editor
-                .last_error
-                .as_deref()
-                .is_some_and(|error| { error.contains("duplicate open buffers") })
-        );
+        assert!(!editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| { error.contains("duplicate open buffers") }));
     }
 
     #[tokio::test]
@@ -52700,13 +52479,11 @@ while True:
 
         assert_eq!(editor.buffer_manager.len(), 2);
         assert_eq!(editor.test_window_count(), 3);
-        assert!(
-            editor
-                .window_manager
-                .windows()
-                .iter()
-                .all(|window| window.buffer_index == 1)
-        );
+        assert!(editor
+            .window_manager
+            .windows()
+            .iter()
+            .all(|window| window.buffer_index == 1));
     }
 
     #[tokio::test]
@@ -52769,12 +52546,10 @@ while True:
         }
         assert!(!root.path().join("copy").exists());
         assert!(!root.path().join("forced").exists());
-        assert!(
-            editor
-                .current_buffer_mut()
-                .save_as(root.path().join("direct").to_str().unwrap())
-                .is_err()
-        );
+        assert!(editor
+            .current_buffer_mut()
+            .save_as(root.path().join("direct").to_str().unwrap())
+            .is_err());
         assert_eq!(editor.current_buffer().id(), root_id);
 
         let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -52810,11 +52585,9 @@ while True:
             editor.gutter_width() > 0,
             "file line numbers must remain enabled"
         );
-        assert!(
-            render_text_rows(&frame)
-                .iter()
-                .any(|row| row.contains("1 file content"))
-        );
+        assert!(render_text_rows(&frame)
+            .iter()
+            .any(|row| row.contains("1 file content")));
 
         editor
             .execute(
@@ -53014,13 +52787,11 @@ while True:
             Some(duplicate.to_string_lossy().into_owned()),
             "fn other() {}\n".to_string(),
         ));
-        assert!(
-            editor
-                .resolve_text_panel_file_path("app_server_session.rs")
-                .unwrap_err()
-                .to_string()
-                .contains("multiple open files")
-        );
+        assert!(editor
+            .resolve_text_panel_file_path("app_server_session.rs")
+            .unwrap_err()
+            .to_string()
+            .contains("multiple open files"));
 
         editor.buffer_manager.set_active_index(1);
         assert_eq!(
@@ -53479,14 +53250,12 @@ while True:
             },
         );
         assert!(editor.test_focus_text_panel_composer("agent-conversation"));
-        assert!(
-            editor
-                .handle_panel_event(
-                    &Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-                    None,
-                )
-                .is_some()
-        );
+        assert!(editor
+            .handle_panel_event(
+                &Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                None,
+            )
+            .is_some());
         assert_eq!(
             editor.panel_manager.focused_text_panel_cursor_mode(),
             Some(Mode::Normal)
