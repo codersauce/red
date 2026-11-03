@@ -95,6 +95,12 @@ pub(crate) fn draw_keymap_hints(
     let outer_height = rows + 2;
     let x = buffer.width.saturating_sub(outer_width + 1);
     let y = buffer.height.saturating_sub(2).saturating_sub(outer_height);
+    buffer.note_overlay(super::geometry::ScreenRect {
+        x,
+        y,
+        width: outer_width,
+        height: outer_height,
+    });
     let title = truncate_display_width(&title, inner_width.saturating_sub(2));
     let dialog = Dialog::new(
         Some(title),
@@ -110,7 +116,8 @@ pub(crate) fn draw_keymap_hints(
     .with_title_style(&theme.ui_style.popup_title);
     dialog.draw(buffer)?;
 
-    let item_style = &theme.ui_style.picker_item;
+    let popup_bg = theme.concrete_popup_bg();
+    let item_style = theme.ui_style.picker_item.with_concrete_bg(popup_bg);
     let key_semantic = theme
         .colors
         .get("peekViewResult.lineForeground")
@@ -134,13 +141,13 @@ pub(crate) fn draw_keymap_hints(
         })
         .or_else(|| theme.get_style("string.other.link"))
         .unwrap_or_else(|| theme.ui_style.picker_prompt.clone());
-    let key_style = foreground_style(item_style, &key_semantic);
-    let label_style = foreground_style(item_style, &label_semantic);
+    let key_style = foreground_style(&item_style, &key_semantic).with_concrete_bg(popup_bg);
+    let label_style = foreground_style(&item_style, &label_semantic).with_concrete_bg(popup_bg);
     let mut group_style = label_style.clone();
     group_style.bold |= theme.ui_style.popup_title.bold;
     let blank_row = " ".repeat(inner_width);
     for row in 0..rows {
-        buffer.set_text(x + 1, y + 1 + row, &blank_row, item_style);
+        buffer.set_text(x + 1, y + 1 + row, &blank_row, &item_style);
     }
 
     for (index, hint) in hints.iter().take(visible).enumerate() {
@@ -528,5 +535,37 @@ mod tests {
         assert_eq!(buffer.cells.len(), 24 * 8);
         assert!(buffer.cells.iter().any(|cell| cell.c == '┌'));
         assert!(buffer.cells.iter().any(|cell| cell.c == '└'));
+    }
+
+    #[test]
+    fn keymap_popup_cells_stay_opaque_when_the_theme_background_is_unset() {
+        let mut theme = Theme::default();
+        theme.style.bg = None;
+        theme.ui_style.popup.bg = None;
+        theme.ui_style.popup_border.bg = None;
+        theme.ui_style.popup_title.bg = None;
+        theme.ui_style.picker_item.bg = None;
+        theme.ui_style.muted.bg = None;
+        theme.ui_style.picker_prompt.bg = None;
+        let hints = vec![KeymapHint {
+            key: "g".to_string(),
+            label: "Goto".to_string(),
+            is_group: false,
+        }];
+        let mut buffer = RenderBuffer::new(40, 12, &Style::default());
+        draw_keymap_hints(&mut buffer, &theme, "g", &hints).unwrap();
+        assert!(!buffer.overlay_rects.is_empty());
+        for rect in &buffer.overlay_rects {
+            for y in rect.y..rect.y + rect.height {
+                for x in rect.x..rect.x + rect.width.min(buffer.width - rect.x) {
+                    let cell = &buffer.cells[y * buffer.width + x];
+                    assert!(
+                        matches!(cell.style.bg, Some(Color::Rgb { .. })),
+                        "popup cell {x},{y} background {:?} is transparent to a z=-1 image",
+                        cell.style.bg
+                    );
+                }
+            }
+        }
     }
 }

@@ -124,6 +124,23 @@ pub fn parse_rgb(s: &str) -> anyhow::Result<Color> {
     }
 }
 
+/// Resolves a style color to an opaque RGB value.
+///
+/// Kitty draws `z=-1` images through cells whose background is the terminal
+/// default. `None` and translucent values become a concrete RGB so a popup
+/// cell cannot stay transparent.
+pub fn concrete_rgb(color: Option<Color>, fallback: Color) -> Color {
+    let fallback = match fallback {
+        Color::Rgb { r, g, b } => Color::Rgb { r, g, b },
+        Color::Rgba { .. } => blend_color(fallback, Color::Rgb { r: 0, g: 0, b: 0 }),
+    };
+    match color {
+        Some(Color::Rgb { r, g, b }) => Color::Rgb { r, g, b },
+        Some(color @ Color::Rgba { .. }) => blend_color(color, fallback),
+        None => fallback,
+    }
+}
+
 pub fn blend_color(foreground: Color, background: Color) -> Color {
     let background = match background {
         Color::Rgba { r, g, b, a } => {

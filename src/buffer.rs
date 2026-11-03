@@ -102,6 +102,12 @@ impl BufferId {
     pub fn as_u64(self) -> u64 {
         self.0
     }
+
+    /// Stable map key for tests that do not need a live buffer.
+    #[cfg(test)]
+    pub(crate) fn from_test_id(id: u64) -> Self {
+        Self(id)
+    }
 }
 
 /// Half-open regular-expression match in zero-based line and scalar coordinates.

@@ -314,7 +314,8 @@ impl super::Editor {
             .is_some_and(|range| range.contains(&line))
             || self
                 .markdown_reveal_range(&window)
-                .is_some_and(|range| range.contains(&line));
+                .is_some_and(|range| range.contains(&line))
+            || self.image_line_is_raw(line);
         if revealed {
             return Concealment::default();
         }

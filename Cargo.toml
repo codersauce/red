@@ -90,6 +90,7 @@ husk-runtime.workspace = true
 husk-semantic.workspace = true
 include_dir = "0.7.4"
 ignore = "0.4.25"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
 json_comments = "0.2.2"
 lazy_static = "1.5.0"
 libloading = "0.8.9"
@@ -141,6 +142,9 @@ uuid = { version = "1.12.0", features = ["v4", "v5"] }
 base64 = "0.22.1"
 blake2 = "0.10.6"
 ed25519-dalek = "2.1.1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.9.4"

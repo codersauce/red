@@ -36,6 +36,16 @@ markdown_tables = true
 # concealed syntax show that line's raw text. Tables keep their own grid.
 markdown_conceal = true
 
+# Draw standalone Markdown images inline in Normal mode. "auto" queries the
+# terminal (Kitty graphics, then Sixel) and falls back through Unicode
+# half-blocks to a text placeholder. Force "kitty", "iterm2", "sixel", or
+# "halfblocks", or set "off" to keep the placeholder only. The cursor line,
+# and Insert mode on that line, show the raw Markdown again.
+markdown_images = "auto"
+
+# Most screen rows reserved for one inline image.
+markdown_image_max_height = 16
+
 # Keep focus in the Markdown source when a link opens in its remembered split.
 # Set to "target" to focus the destination. Config changes apply on restart.
 markdown_link_split_focus = "source"
