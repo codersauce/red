@@ -198,6 +198,12 @@ impl Component for Dialog {
         if self.border_style != BorderStyle::None {
             width = width.saturating_add(2);
         }
+        buffer.note_overlay(super::geometry::ScreenRect {
+            x: self.x,
+            y: self.y,
+            width,
+            height,
+        });
 
         // Draw the dialog box
         buffer.fill_rect(self.x, self.y, width, height, ' ', &self.style, &self.theme);

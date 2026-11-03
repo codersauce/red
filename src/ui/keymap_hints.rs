@@ -95,6 +95,12 @@ pub(crate) fn draw_keymap_hints(
     let outer_height = rows + 2;
     let x = buffer.width.saturating_sub(outer_width + 1);
     let y = buffer.height.saturating_sub(2).saturating_sub(outer_height);
+    buffer.note_overlay(super::geometry::ScreenRect {
+        x,
+        y,
+        width: outer_width,
+        height: outer_height,
+    });
     let title = truncate_display_width(&title, inner_width.saturating_sub(2));
     let dialog = Dialog::new(
         Some(title),

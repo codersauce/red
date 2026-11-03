@@ -202,6 +202,19 @@ struct PendingDraw {
     payload: String,
 }
 
+struct StagedImage {
+    id: u32,
+    x: u16,
+    y: u16,
+    cols: u16,
+    rows: u16,
+    signature: u64,
+    protocol: GraphicsProtocol,
+    payload: String,
+    /// Cell fingerprint taken immediately after the image was painted, before overlays.
+    cells: u64,
+}
+
 /// Rendered image rows, plus image lines that must stay raw source.
 pub(super) struct ImageLayout {
     pub rows: BTreeMap<usize, Vec<LineSegment>>,
@@ -229,8 +242,10 @@ pub(super) struct ImageRuntime {
     tx: mpsc::Sender<(String, Result<Vec<u8>, String>)>,
     rx: mpsc::Receiver<(String, Result<Vec<u8>, String>)>,
     paints: HashMap<(BufferId, usize), Paint>,
+    staged: Vec<StagedImage>,
     pending: Vec<PendingDraw>,
     placed: HashMap<u32, Placement>,
+    visible_ids: Vec<u32>,
     ids: HashMap<(BufferId, usize), u32>,
     next_id: u32,
     frame_open: bool,
@@ -250,8 +265,10 @@ impl ImageRuntime {
             tx,
             rx,
             paints: HashMap::new(),
+            staged: Vec::new(),
             pending: Vec::new(),
             placed: HashMap::new(),
+            visible_ids: Vec::new(),
             ids: HashMap::new(),
             next_id: 0,
             frame_open: false,
@@ -389,12 +406,50 @@ impl ImageRuntime {
     }
 
     pub(super) fn begin_frame(&mut self) {
+        self.staged.clear();
         self.pending.clear();
         self.frame_open = true;
     }
 
-    fn queue_graphics(&mut self, draw: PendingDraw) {
-        self.pending.push(draw);
+    fn stage_graphics(&mut self, image: StagedImage) {
+        self.staged.push(image);
+    }
+
+    /// Queues graphics that no overlay has covered. Returns whether that set changed.
+    pub(super) fn commit_visible(&mut self, buffer: &crate::editor::RenderBuffer) -> bool {
+        if !self.frame_open {
+            return false;
+        }
+        let staged = std::mem::take(&mut self.staged);
+        let mut visible = Vec::new();
+        for image in staged {
+            let rect = crate::ui::ScreenRect {
+                x: usize::from(image.x),
+                y: usize::from(image.y),
+                width: usize::from(image.cols),
+                height: usize::from(image.rows),
+            };
+            let covered = hash_region(buffer, rect) != image.cells
+                || image_hidden_by_overlays(rect, &buffer.overlay_rects);
+            if covered {
+                continue;
+            }
+            visible.push(image.id);
+            self.pending.push(PendingDraw {
+                id: image.id,
+                x: image.x,
+                y: image.y,
+                cols: image.cols,
+                rows: image.rows,
+                signature: image.signature,
+                protocol: image.protocol,
+                payload: image.payload,
+            });
+        }
+        visible.sort_unstable();
+        let changed = visible != self.visible_ids;
+        self.visible_ids = visible;
+        changed
     }
 
     pub(super) fn graphics_payload(&mut self, force: bool) -> String {
@@ -1021,6 +1076,57 @@ pub(super) fn decode_image_bytes(bytes: &[u8]) -> Result<DecodedImage, String> {
     })
 }
 
+/// True when `image` shares any cell with a floating surface.
+pub(super) fn image_hidden_by_overlays(
+    image: crate::ui::ScreenRect,
+    overlays: &[crate::ui::ScreenRect],
+) -> bool {
+    overlays
+        .iter()
+        .any(|overlay| rects_overlap(image, *overlay))
+}
+
+fn rects_overlap(left: crate::ui::ScreenRect, right: crate::ui::ScreenRect) -> bool {
+    left.width > 0
+        && left.height > 0
+        && right.width > 0
+        && right.height > 0
+        && left.x < right.x.saturating_add(right.width)
+        && right.x < left.x.saturating_add(left.width)
+        && left.y < right.y.saturating_add(right.height)
+        && right.y < left.y.saturating_add(left.height)
+}
+
+fn hash_region(buffer: &crate::editor::RenderBuffer, rect: crate::ui::ScreenRect) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    for y in rect.y..rect.y.saturating_add(rect.height) {
+        for x in rect.x..rect.x.saturating_add(rect.width) {
+            let cell = buffer
+                .cells
+                .get(y.saturating_mul(buffer.width).saturating_add(x));
+            match cell {
+                Some(cell) => {
+                    cell.text.hash(&mut hasher);
+                    hash_color(cell.style.fg, &mut hasher);
+                    hash_color(cell.style.bg, &mut hasher);
+                }
+                None => 0u8.hash(&mut hasher),
+            }
+        }
+    }
+    hasher.finish()
+}
+
+fn hash_color(color: Option<Color>, hasher: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    match color {
+        Some(Color::Rgb { r, g, b } | Color::Rgba { r, g, b, .. }) => (r, g, b).hash(hasher),
+        None => 0u8.hash(hasher),
+    }
+}
+
 pub(super) fn kitty_transmit(id: u32, image: &DecodedImage, cols: u16, rows: u16) -> String {
     let (width, height, rgba) = scale_rgba(
         image,
@@ -1029,7 +1135,7 @@ pub(super) fn kitty_transmit(id: u32, image: &DecodedImage, cols: u16, rows: u16
     );
     let payload = base64::engine::general_purpose::STANDARD.encode(&rgba);
     chunk_kitty(
-        &format!("a=T,f=32,s={width},v={height},i={id},c={cols},r={rows},q=2,t=d"),
+        &format!("a=T,f=32,s={width},v={height},i={id},c={cols},r={rows},q=2,t=d,z=-1"),
         &payload,
     )
 }
@@ -1343,6 +1449,18 @@ impl super::Editor {
         self.markdown_images.borrow_mut().graphics_payload(force)
     }
 
+    pub(super) fn commit_markdown_image_visibility(
+        &mut self,
+        buffer: &crate::editor::RenderBuffer,
+    ) {
+        if self.markdown_images.borrow_mut().commit_visible(buffer) {
+            // Sixel and iTerm2 have no delete command. Rewriting every cell
+            // clears the previous pixels before the popup is shown, and again
+            // when the image is placed back.
+            self.force_full_redraw = true;
+        }
+    }
+
     pub(super) fn write_markdown_graphics(&mut self, force: bool) -> anyhow::Result<()> {
         let payload = self.markdown_graphics_payload(force);
         if payload.is_empty() {
@@ -1358,7 +1476,7 @@ impl super::Editor {
 
     pub(super) fn paint_markdown_image_segment(
         &self,
-        buffer: &mut super::RenderBuffer,
+        buffer: &mut crate::editor::RenderBuffer,
         window: &crate::window::Window,
         segment: &LineSegment,
         origin_x: usize,
@@ -1465,7 +1583,13 @@ impl super::Editor {
                         GraphicsProtocol::Sixel => sixel_transmit(&image, span.cols, span.rows),
                     };
                     if !payload.is_empty() {
-                        runtime.queue_graphics(PendingDraw {
+                        let rect = crate::ui::ScreenRect {
+                            x: origin_x,
+                            y: origin_y,
+                            width: usize::from(span.cols),
+                            height: usize::from(span.rows),
+                        };
+                        runtime.stage_graphics(StagedImage {
                             id,
                             x: u16::try_from(origin_x).unwrap_or(u16::MAX),
                             y: u16::try_from(origin_y).unwrap_or(u16::MAX),
@@ -1474,6 +1598,7 @@ impl super::Editor {
                             signature: image_signature(&image, span.cols, span.rows, protocol),
                             protocol,
                             payload,
+                            cells: hash_region(buffer, rect),
                         });
                     }
                 }
@@ -1781,6 +1906,7 @@ mod tests {
         let kitty = kitty_transmit(7, &image, 1, 1);
         assert!(kitty.contains("i=7"));
         assert!(kitty.contains("f=32"));
+        assert!(kitty.contains("z=-1"));
         assert!(kitty.starts_with("\u{1b}_G"));
         assert!(kitty.contains("/wAA/w==") || kitty.contains("/wAA/w"));
         assert!(kitty_delete(7).contains("a=d"));
@@ -1969,6 +2095,196 @@ mod tests {
         let screen = frame_text(&frame);
         assert!(screen.contains("![swatch]"), "{screen}");
         assert!(!screen.contains('▀'), "{screen}");
+    }
+
+    #[test]
+    fn overlay_rects_hide_an_intersecting_image_and_ignore_the_rest() {
+        use crate::ui::ScreenRect;
+        let image = ScreenRect {
+            x: 4,
+            y: 2,
+            width: 20,
+            height: 8,
+        };
+        let popup = ScreenRect {
+            x: 18,
+            y: 8,
+            width: 12,
+            height: 4,
+        };
+        let elsewhere = ScreenRect {
+            x: 0,
+            y: 20,
+            width: 6,
+            height: 3,
+        };
+        let touching = ScreenRect {
+            x: 24,
+            y: 2,
+            width: 4,
+            height: 2,
+        };
+        assert!(image_hidden_by_overlays(image, &[elsewhere, popup]));
+        assert!(!image_hidden_by_overlays(image, &[elsewhere, touching]));
+        assert!(!image_hidden_by_overlays(
+            ScreenRect {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 4,
+            },
+            &[image]
+        ));
+    }
+
+    #[test]
+    fn covered_graphics_are_removed_and_restored_when_the_overlay_closes() {
+        use crate::theme::Style;
+        let mut runtime = ImageRuntime::new();
+        let mut buffer = crate::editor::RenderBuffer::new(20, 8, &Style::default());
+        let rect = crate::ui::ScreenRect {
+            x: 2,
+            y: 1,
+            width: 4,
+            height: 2,
+        };
+        let stage = |buffer: &crate::editor::RenderBuffer| StagedImage {
+            id: 3,
+            x: 2,
+            y: 1,
+            cols: 4,
+            rows: 2,
+            signature: 9,
+            protocol: GraphicsProtocol::Kitty,
+            payload: "PLACE".to_string(),
+            cells: hash_region(buffer, rect),
+        };
+
+        runtime.begin_frame();
+        runtime.stage_graphics(stage(&buffer));
+        assert!(runtime.commit_visible(&buffer));
+        let shown = runtime.graphics_payload(false);
+        assert!(shown.contains("PLACE"));
+        assert!(!shown.contains("a=d"));
+
+        buffer.set_text(
+            3,
+            2,
+            "popup",
+            &Style {
+                fg: Some(Color::Rgb { r: 1, g: 2, b: 3 }),
+                ..Style::default()
+            },
+        );
+        buffer.note_overlay(crate::ui::ScreenRect {
+            x: 3,
+            y: 2,
+            width: 5,
+            height: 1,
+        });
+        runtime.begin_frame();
+        runtime.stage_graphics(stage(&buffer));
+        // The fingerprint above includes the popup. Stage the pre-popup hash
+        // so the cell change and the overlay rect both hide the image.
+        runtime.staged[0].cells = runtime.staged[0].cells.wrapping_add(1);
+        assert!(runtime.commit_visible(&buffer));
+        let hidden = runtime.graphics_payload(false);
+        assert!(!hidden.contains("PLACE"));
+        assert!(hidden.contains("a=d"));
+
+        buffer = crate::editor::RenderBuffer::new(20, 8, &Style::default());
+        runtime.begin_frame();
+        runtime.stage_graphics(stage(&buffer));
+        assert!(runtime.commit_visible(&buffer));
+        let restored = runtime.graphics_payload(false);
+        assert!(restored.contains("PLACE"));
+    }
+
+    #[test]
+    fn keymap_popup_covers_halfblocks_and_the_image_returns() {
+        use std::collections::HashMap;
+
+        use crate::{
+            buffer::Buffer,
+            config::{Config, KeyAction},
+            editor::render_buffer::RenderBuffer,
+            theme::{Style, Theme},
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("swatch.png");
+        let mut rgba = vec![0u8; 8 * 40 * 4];
+        for (index, pixel) in rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            pixel[usize::from(index % 2 == 0)] = 220;
+            pixel[3] = 255;
+        }
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&rgba, 8, 40, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        std::fs::write(&path, &png).unwrap();
+
+        let mut config: Config = toml::from_str(include_str!("../../default_config.toml")).unwrap();
+        config.lsp.servers.clear();
+        config.clipboard.enabled = false;
+        config.scrolloff = Some(0);
+        config.markdown_images = MarkdownImagesMode::Halfblocks;
+        config.markdown_image_max_height = 14;
+        let source = format!("![swatch]({})\nnotes\n", path.display());
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let mut editor = crate::editor::Editor::with_size(
+            lsp,
+            80,
+            18,
+            config,
+            Theme::default(),
+            vec![Buffer::new(
+                Some(dir.path().join("notes.md").display().to_string()),
+                source,
+            )],
+        )
+        .unwrap();
+        editor.test_disable_terminal_output();
+        editor.cy = 1;
+        let mut frame = RenderBuffer::new(80, 18, &Style::default());
+        editor.render(&mut frame).unwrap();
+        let screen = frame_text(&frame);
+        assert!(screen.contains('▀'), "{screen}");
+        assert!(!screen.contains("keymaps"), "{screen}");
+
+        editor.keymap_hint_prefix = vec!["g".to_string()];
+        editor.waiting_key_action = Some(KeyAction::Nested(HashMap::from([(
+            "j".to_string(),
+            KeyAction::Single(crate::editor::Action::MoveScreenLineDown),
+        )])));
+        editor.keymap_hints_visible = true;
+        editor.render(&mut frame).unwrap();
+        let screen = frame_text(&frame);
+        assert!(
+            screen.contains("g · keymaps"),
+            "popup should paint over the image cells: {screen}"
+        );
+        assert!(
+            image_hidden_by_overlays(
+                crate::ui::ScreenRect {
+                    x: 0,
+                    y: 0,
+                    width: frame.width,
+                    height: frame.height,
+                },
+                &frame.overlay_rects,
+            ),
+            "the keymap popup should count as an overlay"
+        );
+        assert!(screen.contains('▀'), "{screen}");
+
+        editor.keymap_hints_visible = false;
+        editor.waiting_key_action = None;
+        editor.keymap_hint_prefix.clear();
+        editor.render(&mut frame).unwrap();
+        let screen = frame_text(&frame);
+        assert!(!screen.contains("keymaps"), "{screen}");
+        assert!(screen.contains('▀'), "{screen}");
     }
 
     fn frame_text(frame: &crate::editor::RenderBuffer) -> String {

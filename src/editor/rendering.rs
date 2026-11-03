@@ -1503,6 +1503,7 @@ impl Editor {
         self.begin_markdown_image_frame();
 
         buffer.shortcut_help_regions.clear();
+        buffer.overlay_rects.clear();
         let _span = super::perf::PerfSpan::start("render:full");
         #[cfg(test)]
         {
@@ -1617,6 +1618,10 @@ impl Editor {
         self.last_rendered_cursor_position = cursor_position;
         drop(overlays_span);
 
+        // Graphics are emitted after cells. Drop any image a popup has covered
+        // so the placement cannot hide that popup, and rewrite the frame when
+        // the set of visible images changes.
+        self.commit_markdown_image_visibility(buffer);
         // Flush changes to terminal
         let diff_span = super::perf::PerfSpan::start("render:diff+flush");
         let changes = self.render_buffer_changes(buffer);
@@ -1737,6 +1742,7 @@ impl Editor {
         all_windows: bool,
     ) -> anyhow::Result<()> {
         self.begin_markdown_image_frame();
+        buffer.overlay_rects.clear();
         self.update_gutter_width();
         self.fix_cursor_pos();
         self.sync_to_window();
@@ -1758,6 +1764,7 @@ impl Editor {
         self.render_cursor_cell(buffer, cursor_position);
         self.last_rendered_cursor_position = cursor_position;
 
+        self.commit_markdown_image_visibility(buffer);
         let changes = self.render_buffer_changes(buffer);
         self.render_diff(&changes)?;
         self.commit_render_buffer_changes(&changes);

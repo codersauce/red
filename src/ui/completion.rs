@@ -710,6 +710,14 @@ impl Component for CompletionUI {
     }
 
     fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        if self.visible && self.width > 0 && self.visible_rows > 0 {
+            buffer.note_overlay(super::geometry::ScreenRect {
+                x: self.x,
+                y: self.y,
+                width: self.width,
+                height: self.visible_rows.saturating_add(2),
+            });
+        }
         for (x, y, text, style) in self.render_completion() {
             buffer.set_text(x, y, &text, &style);
         }
