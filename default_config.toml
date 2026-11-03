@@ -381,8 +381,14 @@ Esc = { EnterMode = "Normal" }
 "L" = { MoveToViewportBottom = 1 }
 "Ctrl-b" = "PageUp"
 "Ctrl-f" = "PageDown"
+# Ctrl-u / Ctrl-d scroll half the window. A count sets that window's scroll
+# distance, and later plain Ctrl-u / Ctrl-d presses reuse it until the window
+# height changes. Ctrl-y scrolls the view up one line. Alt-e scrolls the view
+# down one line because Ctrl-e toggles the file tree. Both take a count.
 "Ctrl-u" = { HalfPageUp = 0 }
 "Ctrl-d" = { HalfPageDown = 0 }
+"Ctrl-y" = { ScrollLineUp = 0 }
+"Alt-e" = { ScrollLineDown = 0 }
 "Ctrl-o" = "JumpBack"
 "Ctrl-i" = "JumpForward"
 "Tab" = "JumpForward"

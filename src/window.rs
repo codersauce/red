@@ -171,6 +171,15 @@ pub struct Window {
     /// Cursor y position (line) within the viewport
     pub cy: usize,
 
+    /// Remembered `Ctrl-D`/`Ctrl-U` distance. `None` means half the window height.
+    ///
+    /// A count sets this. It stays in effect only while `scroll_height` matches
+    /// the window's content height, which is how a resize returns to half a page.
+    pub scroll_lines: Option<u16>,
+
+    /// Content height `scroll_lines` was chosen for.
+    pub scroll_height: u16,
+
     /// Display-column goal used when moving vertically.
     pub(crate) cursor_goal: CursorGoal,
 
@@ -226,6 +235,8 @@ impl Window {
             markdown_conceal: None,
             cx: 0,
             cy: 0,
+            scroll_lines: None,
+            scroll_height: 0,
             cursor_goal: CursorGoal::default(),
             active: false,
             vx: 0,
@@ -966,6 +977,12 @@ pub enum SplitSnapshot {
         cx: usize,
         /// Cursor row relative to `vtop`.
         cy: usize,
+        /// Remembered Ctrl-D/Ctrl-U distance. Absent uses half the window height.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scroll_lines: Option<u16>,
+        /// Content height `scroll_lines` was chosen for.
+        #[serde(default, skip_serializing_if = "u16_is_zero")]
+        scroll_height: u16,
         /// Legacy viewport x offset.
         vx: usize,
     },
@@ -991,6 +1008,10 @@ pub enum SplitSnapshot {
 
 fn default_wrap() -> bool {
     true
+}
+
+fn u16_is_zero(value: &u16) -> bool {
+    *value == 0
 }
 
 /// Serializable window tree plus the active tree-order index.
@@ -1146,6 +1167,8 @@ impl Split {
                 wrap: window.wrap,
                 cx: window.cx,
                 cy: window.cy,
+                scroll_lines: window.scroll_lines,
+                scroll_height: window.scroll_height,
                 vx: window.vx,
             },
             Split::Horizontal { top, bottom, ratio } => SplitSnapshot::Horizontal {
@@ -1171,6 +1194,8 @@ impl Split {
                 wrap,
                 cx,
                 cy,
+                scroll_lines,
+                scroll_height,
                 vx,
             } => {
                 let mapped_buffer = *buffer_map.get(buffer_index)?;
@@ -1181,6 +1206,8 @@ impl Split {
                 window.wrap = *wrap;
                 window.cx = *cx;
                 window.cy = *cy;
+                window.scroll_lines = *scroll_lines;
+                window.scroll_height = *scroll_height;
                 window.vx = *vx;
                 Some(Split::Window(window))
             }

@@ -12902,6 +12902,202 @@ async fn vim_half_page_keys_move_the_cursor_by_half_a_viewport() {
     assert_eq!(harness.buffer_line(), 0);
 }
 
+fn numbered_buffer(lines: usize) -> Buffer {
+    let contents = (0..lines)
+        .map(|line| format!("line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Buffer::new(None, contents)
+}
+
+async fn press_key(harness: &mut EditorHarness, code: KeyCode, modifiers: KeyModifiers) {
+    harness
+        .execute_event(Event::Key(KeyEvent::new(code, modifiers)))
+        .await
+        .unwrap();
+}
+
+async fn ctrl(harness: &mut EditorHarness, key: char) {
+    press_key(harness, KeyCode::Char(key), KeyModifiers::CONTROL).await;
+}
+
+async fn alt(harness: &mut EditorHarness, key: char) {
+    press_key(harness, KeyCode::Char(key), KeyModifiers::ALT).await;
+}
+
+#[tokio::test]
+async fn counted_half_page_remembers_the_scroll_distance() {
+    let mut harness =
+        EditorHarness::with_config_and_size(numbered_buffer(80), default_key_config(), 80, 12);
+    harness.set_viewport_cursor(0, 0, 4);
+
+    press_key(&mut harness, KeyCode::Char('5'), KeyModifiers::NONE).await;
+    ctrl(&mut harness, 'd').await;
+
+    assert_eq!(harness.editor.test_half_page_scroll(), Some(5));
+    assert_eq!(harness.buffer_line(), 9);
+    assert_eq!(harness.viewport_top(), 5, "screen row stays 4");
+
+    ctrl(&mut harness, 'd').await;
+    assert_eq!(harness.buffer_line(), 14);
+    assert_eq!(harness.viewport_top(), 10);
+    assert_eq!(harness.editor.test_half_page_scroll(), Some(5));
+
+    ctrl(&mut harness, 'u').await;
+    assert_eq!(harness.buffer_line(), 9);
+    assert_eq!(harness.viewport_top(), 5);
+}
+
+#[tokio::test]
+async fn half_page_down_near_the_end_moves_to_the_last_line() {
+    let mut harness =
+        EditorHarness::with_config_and_size(numbered_buffer(40), default_key_config(), 80, 12);
+    for _ in 0..36 {
+        press_key(&mut harness, KeyCode::Char('j'), KeyModifiers::NONE).await;
+    }
+    assert_eq!(harness.buffer_line(), 36);
+    let top = harness.viewport_top();
+
+    ctrl(&mut harness, 'd').await;
+
+    assert_eq!(harness.buffer_line(), 39);
+    assert_eq!(harness.viewport_top(), top);
+}
+
+#[tokio::test]
+async fn resizing_the_window_forgets_a_counted_scroll_distance() {
+    let mut harness =
+        EditorHarness::with_config_and_size(numbered_buffer(80), default_key_config(), 80, 22);
+    press_key(&mut harness, KeyCode::Char('4'), KeyModifiers::NONE).await;
+    ctrl(&mut harness, 'd').await;
+    assert_eq!(harness.editor.test_half_page_scroll(), Some(4));
+    assert_eq!(harness.buffer_line(), 4);
+
+    harness.execute_event(Event::Resize(80, 12)).await.unwrap();
+    let before = harness.buffer_line();
+    ctrl(&mut harness, 'd').await;
+
+    assert_eq!(harness.buffer_line(), before + 5);
+    assert_eq!(harness.editor.test_half_page_scroll(), None);
+}
+
+#[tokio::test]
+async fn ctrl_y_and_alt_e_scroll_the_view_with_and_without_a_count() {
+    let mut harness =
+        EditorHarness::with_config_and_size(numbered_buffer(80), default_key_config(), 80, 12);
+    // Row 3 is the top scrolloff boundary, so the setup itself does not scroll.
+    harness.set_viewport_cursor(20, 0, 3);
+    assert_eq!(harness.buffer_line(), 23);
+
+    ctrl(&mut harness, 'y').await;
+    assert_eq!(harness.buffer_line(), 23);
+    assert_eq!(harness.viewport_top(), 19);
+
+    press_key(&mut harness, KeyCode::Char('2'), KeyModifiers::NONE).await;
+    ctrl(&mut harness, 'y').await;
+    assert_eq!(harness.buffer_line(), 23);
+    assert_eq!(harness.viewport_top(), 17);
+
+    // One more line would push the cursor through the bottom scrolloff margin.
+    harness.set_viewport_cursor(20, 0, 6);
+    ctrl(&mut harness, 'y').await;
+    assert_eq!(harness.buffer_line(), 25);
+    assert_eq!(harness.viewport_top(), 19);
+    assert_eq!(harness.buffer_line() - harness.viewport_top(), 6);
+
+    harness.set_viewport_cursor(0, 0, 5);
+    alt(&mut harness, 'e').await;
+    assert_eq!(harness.buffer_line(), 5);
+    assert_eq!(harness.viewport_top(), 1);
+
+    harness.set_viewport_cursor(0, 0, 5);
+    press_key(&mut harness, KeyCode::Char('4'), KeyModifiers::NONE).await;
+    alt(&mut harness, 'e').await;
+    assert_eq!(harness.viewport_top(), 4);
+    assert_eq!(harness.buffer_line(), 7);
+    assert_eq!(harness.buffer_line() - harness.viewport_top(), 3);
+}
+
+#[tokio::test]
+async fn scroll_line_down_can_be_remapped_and_ctrl_e_stays_the_file_tree() {
+    let config = default_key_config();
+    assert!(matches!(
+        config.keys.normal.get("Ctrl-e"),
+        Some(KeyAction::Single(Action::PluginCommand(name))) if name == "NeoTree"
+    ));
+    assert!(matches!(
+        config.keys.normal.get("Ctrl-y"),
+        Some(KeyAction::Single(Action::ScrollLineUp(0)))
+    ));
+    assert!(matches!(
+        config.keys.normal.get("Alt-e"),
+        Some(KeyAction::Single(Action::ScrollLineDown(0)))
+    ));
+
+    let mut config = config;
+    config.keys.normal.insert(
+        "Ctrl-x".to_string(),
+        KeyAction::Single(Action::ScrollLineDown(0)),
+    );
+    let mut harness = EditorHarness::with_config_and_size(numbered_buffer(40), config, 80, 12);
+    harness.set_viewport_cursor(0, 0, 5);
+
+    press_key(&mut harness, KeyCode::Char('2'), KeyModifiers::NONE).await;
+    ctrl(&mut harness, 'x').await;
+
+    assert_eq!(harness.buffer_line(), 5);
+    assert_eq!(harness.viewport_top(), 2);
+}
+
+#[tokio::test]
+async fn half_page_counts_wrapped_continuations_as_screen_rows() {
+    let long = "w".repeat(4000);
+    let rest = (0..20)
+        .map(|line| format!("line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut harness = EditorHarness::with_config_and_size(
+        Buffer::new(None, format!("{long}\n{rest}")),
+        default_key_config(),
+        40,
+        16,
+    );
+
+    press_key(&mut harness, KeyCode::Char('2'), KeyModifiers::NONE).await;
+    ctrl(&mut harness, 'd').await;
+
+    assert_eq!(harness.buffer_line(), 0);
+    assert!(harness.skipcol() > 0);
+    assert_eq!(harness.editor.test_half_page_scroll(), Some(2));
+    let first_skip = harness.skipcol();
+
+    ctrl(&mut harness, 'd').await;
+    assert_eq!(harness.buffer_line(), 0);
+    assert!(harness.skipcol() > first_skip);
+
+    ctrl(&mut harness, 'u').await;
+    assert_eq!(harness.buffer_line(), 0);
+    assert_eq!(harness.skipcol(), first_skip);
+}
+
+#[tokio::test]
+async fn nowrap_half_page_still_remembers_a_count() {
+    let mut config = default_key_config();
+    config.wrap = Some(false);
+    let mut harness = EditorHarness::with_config_and_size(numbered_buffer(80), config, 80, 12);
+    harness.set_viewport_cursor(0, 0, 0);
+
+    press_key(&mut harness, KeyCode::Char('3'), KeyModifiers::NONE).await;
+    ctrl(&mut harness, 'd').await;
+    assert_eq!(harness.buffer_line(), 3);
+    assert_eq!(harness.viewport_top(), 3);
+    assert_eq!(harness.editor.test_half_page_scroll(), Some(3));
+
+    ctrl(&mut harness, 'u').await;
+    assert_eq!(harness.buffer_line(), 0);
+    assert_eq!(harness.viewport_top(), 0);
+}
+
 #[tokio::test]
 async fn structural_text_objects_support_inner_outer_and_linewise_operators() {
     let contents = "fn first() {\n    alpha();\n    beta();\n}\nfn second() {}\n";

@@ -75,7 +75,14 @@ and intentional differences precisely.
   `,` repeats in the opposite direction.
 - `0`, `^`, and `$` move to the beginning, first non-blank, and end of a line.
 - `gg` and `G` move to the first and last line.
-- `Ctrl-b`/`Ctrl-f` page up and down; `Ctrl-u`/`Ctrl-d` move half a page.
+- `Ctrl-b`/`Ctrl-f` page up and down. `Ctrl-u`/`Ctrl-d` scroll half a window.
+  A count, as in `5 Ctrl-d`, sets that window's scroll distance so the next
+  plain `Ctrl-d` or `Ctrl-u` reuses it. The cursor moves the same number of
+  lines and keeps its screen row until the start or end of the file.
+- `Ctrl-y` scrolls the view up one line and `Alt-e` scrolls it down, without
+  moving the cursor until it would leave the screen. Both take a count.
+  `Ctrl-e` still toggles the file tree. Remap either action in `[keys.normal]`
+  as `ScrollLineUp` or `ScrollLineDown`.
 - `zz` centers the current line.
 - `%` jumps to a matching bracket. `g%`, `[%`, and `]%` provide related
   matching-bracket motions.

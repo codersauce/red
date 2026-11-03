@@ -2920,6 +2920,12 @@ pub enum Action {
     PageUp,
     HalfPageDown(u16),
     HalfPageUp(u16),
+    /// Scrolls the view up by `[count]` lines (default 1) and leaves the cursor
+    /// in place until it would leave the screen.
+    ScrollLineUp(u16),
+    /// Scrolls the view down by `[count]` lines (default 1). `Ctrl-E` stays the
+    /// file tree; the default binding is `Alt-e`.
+    ScrollLineDown(u16),
     ScrollUp,
     ScrollDown,
     ScrollViewLeft,
@@ -3877,6 +3883,10 @@ pub struct Editor {
 
     /// Cursor y position (line)
     cy: usize,
+
+    /// `Ctrl-D`/`Ctrl-U` already placed the cursor. Skip the scrolloff pull so
+    /// the cursor keeps its screen row through the post-action bounds check.
+    half_page_keeps_screen_row: bool,
 
     /// Display-column goal used when moving vertically.
     cursor_goal: CursorGoal,
@@ -5934,6 +5944,7 @@ impl Editor {
             wrap,
             cx: 0,
             cy: 0,
+            half_page_keeps_screen_row: false,
             cursor_goal: CursorGoal::default(),
             prev_highlight_y: None,
             vx,
@@ -8649,6 +8660,195 @@ impl Editor {
         self.move_to_display_col_on_current_line(column);
     }
 
+    /// Soft-wrapped continuations are screen rows. Red does not fold, so a
+    /// count never skips a closed fold; every buffer line still participates.
+    fn viewport_uses_screen_lines(&self) -> bool {
+        self.wrap
+            || self.has_inline_comments(self.current_buffer().id())
+            || self.active_has_markdown_tables()
+    }
+
+    /// Distance for `Ctrl-D` and `Ctrl-U`. A positive count becomes the
+    /// window's scroll amount, clamped to the content height. Later plain
+    /// presses reuse it until the height changes, which restores half a page.
+    fn half_page_distance(&mut self, count: u16) -> usize {
+        let height = self.vheight().max(1);
+        let half = (height / 2).max(1);
+        let Some(window) = self.window_manager.active_window_mut() else {
+            return if count == 0 {
+                half
+            } else {
+                usize::from(count).clamp(1, height)
+            };
+        };
+        let height_mark = u16::try_from(height).unwrap_or(u16::MAX);
+        if window.scroll_height != height_mark {
+            window.scroll_lines = None;
+            window.scroll_height = height_mark;
+        }
+        if count == 0 {
+            return window
+                .scroll_lines
+                .map(|lines| usize::from(lines).clamp(1, height))
+                .unwrap_or(half);
+        }
+        let distance = usize::from(count).clamp(1, height);
+        window.scroll_lines = u16::try_from(distance).ok();
+        window.scroll_height = height_mark;
+        distance
+    }
+
+    fn half_page_can_scroll_down(&self) -> bool {
+        let Some(window) = self.active_window_with_editor_view() else {
+            return false;
+        };
+        let layout = self.layout_for_window(&window);
+        let height = self.vheight().max(1);
+        if layout.screen_height() < height {
+            return false;
+        }
+        let last = self.last_navigable_line();
+        !layout
+            .rows
+            .iter()
+            .any(|segment| segment.line == last && segment.last_segment)
+    }
+
+    fn scroll_half_page(&mut self, down: bool, count: u16) {
+        let distance = self.half_page_distance(count);
+        self.half_page_keeps_screen_row = true;
+        if self.viewport_uses_screen_lines() {
+            self.scroll_half_page_screen_lines(down, distance);
+        } else {
+            self.scroll_half_page_buffer_lines(down, distance);
+        }
+    }
+
+    fn scroll_half_page_buffer_lines(&mut self, down: bool, distance: usize) {
+        let last_line = self.last_navigable_line();
+        if down {
+            let target_line = self.buffer_line().saturating_add(distance).min(last_line);
+            let max_vtop = last_line.saturating_sub(self.vheight().saturating_sub(1));
+            self.vtop = self.vtop.saturating_add(distance).min(max_vtop);
+            self.cy = target_line.saturating_sub(self.vtop);
+        } else {
+            let target_line = self.buffer_line().saturating_sub(distance);
+            self.vtop = self.vtop.saturating_sub(distance);
+            self.cy = target_line.saturating_sub(self.vtop);
+        }
+        self.skipcol = 0;
+    }
+
+    fn scroll_half_page_screen_lines(&mut self, down: bool, distance: usize) {
+        let start_line = self.buffer_line();
+        let start_col = self.current_cursor_display_col();
+        let width = self.active_content_width().max(1);
+        let delta = if down {
+            isize::try_from(distance).unwrap_or(isize::MAX)
+        } else {
+            -isize::try_from(distance).unwrap_or(isize::MAX)
+        };
+        let Some(target) =
+            self.wrapped_screen_line_target(start_line, start_col, delta, width, true)
+        else {
+            return;
+        };
+
+        for _ in 0..distance {
+            let moved = if down {
+                if !self.half_page_can_scroll_down() {
+                    break;
+                }
+                self.scroll_wrapped_viewport_down_one_screen_line()
+            } else {
+                self.scroll_wrapped_viewport_up_one_screen_line()
+            };
+            if !moved {
+                break;
+            }
+        }
+
+        self.cy = target.line.saturating_sub(self.vtop);
+        self.move_to_display_col_on_current_line(target.display_col);
+        self.cursor_goal = CursorGoal::ScreenCol {
+            screen_col: target.screen_col,
+            display_col: self.current_cursor_display_col(),
+        };
+        self.keep_half_page_cursor_visible();
+    }
+
+    fn keep_half_page_cursor_visible(&mut self) {
+        let line = self.buffer_line();
+        let column = self.current_cursor_display_col();
+        for _ in 0..self.vheight().saturating_add(4).max(1) {
+            if self.visible_cursor_segment(line, column) {
+                self.cy = line.saturating_sub(self.vtop);
+                return;
+            }
+            let moved = if line < self.vtop {
+                self.scroll_wrapped_viewport_up_one_screen_line()
+            } else if !self.half_page_can_scroll_down() {
+                false
+            } else {
+                self.scroll_wrapped_viewport_down_one_screen_line()
+            };
+            if !moved {
+                break;
+            }
+            self.cy = line.saturating_sub(self.vtop);
+        }
+    }
+
+    /// Scrolls the viewport by `lines` and leaves the cursor on its buffer
+    /// position until that position would leave the scrolloff margin.
+    fn scroll_view_lines(&mut self, down: bool, lines: usize) {
+        let lines = lines.max(1);
+        if self.viewport_uses_screen_lines() {
+            let cursor_line = self.buffer_line();
+            for _ in 0..lines {
+                let moved = if down {
+                    self.scroll_wrapped_viewport_down_one_screen_line()
+                } else {
+                    self.scroll_wrapped_viewport_up_one_screen_line()
+                };
+                self.cy = cursor_line.saturating_sub(self.vtop);
+                if !moved {
+                    break;
+                }
+            }
+            self.clamp_cursor_to_scrolled_viewport();
+            return;
+        }
+
+        let viewport_height = self.vheight().max(1);
+        let scrolloff = self
+            .config
+            .scrolloff
+            .unwrap_or(0)
+            .min(viewport_height.saturating_sub(1));
+        if down {
+            let last_line = self.last_navigable_line();
+            let max_vtop = last_line.saturating_sub(viewport_height.saturating_sub(1));
+            let old_vtop = self.vtop;
+            let new_vtop = self.vtop.saturating_add(lines).min(max_vtop);
+            let scrolled_lines = new_vtop.saturating_sub(old_vtop);
+            if scrolled_lines > 0 {
+                self.vtop = new_vtop;
+                self.cy = self.cy.saturating_sub(scrolled_lines).max(scrolloff);
+                self.skipcol = 0;
+            }
+        } else {
+            let old_vtop = self.vtop;
+            self.vtop = self.vtop.saturating_sub(lines);
+            let scrolled_lines = old_vtop - self.vtop;
+            if scrolled_lines > 0 {
+                let max_cy = viewport_height.saturating_sub(scrolloff).saturating_sub(1);
+                self.cy = self.cy.saturating_add(scrolled_lines).min(max_cy);
+                self.skipcol = 0;
+            }
+        }
+    }
+
     fn scroll_wrapped_viewport_down_one_screen_line(&mut self) -> bool {
         if !self.wrap
             && !self.has_inline_comments(self.current_buffer().id())
@@ -8875,6 +9075,7 @@ impl Editor {
         display_col: usize,
         delta: isize,
         width: usize,
+        clamp_at_boundary: bool,
     ) -> Option<ScreenLineTarget> {
         let segments = self.wrapped_line_segments_for_width(line_index, width);
         let current_index = segments
@@ -8930,6 +9131,10 @@ impl Editor {
 
                 remaining = remaining.saturating_sub(available_after + 1);
                 if line >= self.last_navigable_line() {
+                    if clamp_at_boundary {
+                        let target = segments.last()?;
+                        return Some(target_position(target));
+                    }
                     return Some(unchanged);
                 }
                 line += 1;
@@ -8957,6 +9162,11 @@ impl Editor {
 
             remaining = remaining.saturating_sub(index + 1);
             let Some(previous_line) = line.checked_sub(1) else {
+                if clamp_at_boundary {
+                    let segments = self.wrapped_line_segments_for_width(line, width);
+                    let target = segments.first()?;
+                    return Some(target_position(target));
+                }
                 return Some(unchanged);
             };
             line = previous_line;
@@ -9038,7 +9248,7 @@ impl Editor {
         let width = self.active_content_width();
         if self.wrap {
             if let Some(target) =
-                self.wrapped_screen_line_target(line_index, display_col, delta, width)
+                self.wrapped_screen_line_target(line_index, display_col, delta, width, false)
             {
                 if target.line < self.vtop {
                     self.vtop = target.line;
@@ -9441,7 +9651,7 @@ impl Editor {
                         })
                     })
             });
-        if scrolloff > 0 && !has_display_row_margin {
+        if !self.half_page_keeps_screen_row && scrolloff > 0 && !has_display_row_margin {
             let top_scrolloff = scrolloff.min(buffer_line);
             let bottom_scrolloff = scrolloff.min(last_line.saturating_sub(buffer_line));
             let mut scrolloff_vtop = self.vtop;
@@ -14888,7 +15098,13 @@ impl Editor {
 
     fn action_is_navigation(action: &Action) -> bool {
         Self::action_is_pure_motion(action)
-            || matches!(action, Action::ScrollUp | Action::ScrollDown)
+            || matches!(
+                action,
+                Action::ScrollUp
+                    | Action::ScrollDown
+                    | Action::ScrollLineUp(_)
+                    | Action::ScrollLineDown(_)
+            )
     }
 
     fn action_is_pure_motion(action: &Action) -> bool {
@@ -21804,6 +22020,7 @@ impl Editor {
         tracking: bool,
     ) -> anyhow::Result<bool> {
         // log!("Action: {action:?}");
+        self.half_page_keeps_screen_row = false;
         self.set_legacy_message(None);
         if self.intercept_learn_action(action, buffer, runtime)? {
             return Ok(false);
@@ -22154,35 +22371,18 @@ impl Editor {
                 self.apply_cursor_goal_to_current_line();
                 self.render(buffer)?;
             }
-            Action::HalfPageUp(count) => {
-                let distance = if *count == 0 {
-                    self.vheight().max(1) / 2
-                } else {
-                    usize::from(*count)
-                };
-                let target_line = self.buffer_line().saturating_sub(distance);
-                self.vtop = self.vtop.saturating_sub(distance);
-                self.cy = target_line.saturating_sub(self.vtop);
+            Action::HalfPageUp(count) | Action::HalfPageDown(count) => {
+                let down = matches!(action, Action::HalfPageDown(_));
+                self.scroll_half_page(down, *count);
                 self.apply_cursor_goal_to_current_line();
                 self.render(buffer)?;
             }
-            Action::HalfPageDown(count) => {
-                let distance = if *count == 0 {
-                    self.vheight().max(1) / 2
-                } else {
-                    usize::from(*count)
-                };
-                let target_line = self
-                    .buffer_line()
-                    .saturating_add(distance)
-                    .min(self.last_navigable_line());
-                let max_vtop = self
-                    .last_navigable_line()
-                    .saturating_sub(self.vheight().saturating_sub(1));
-                self.vtop = self.vtop.saturating_add(distance).min(max_vtop);
-                self.cy = target_line.saturating_sub(self.vtop);
-                self.apply_cursor_goal_to_current_line();
-                self.render(buffer)?;
+            Action::ScrollLineUp(count) | Action::ScrollLineDown(count) => {
+                let down = matches!(action, Action::ScrollLineDown(_));
+                let lines = if *count == 0 { 1 } else { usize::from(*count) };
+                self.scroll_view_lines(down, lines);
+                self.sync_to_window();
+                self.render_motion_frame(buffer)?;
             }
             Action::EnterSearch(direction) => {
                 add_to_history = false;
@@ -25845,6 +26045,7 @@ impl Editor {
         self.observe_tutorial_action(action, buffer, runtime)
             .await?;
 
+        self.half_page_keeps_screen_row = false;
         Ok(false)
     }
 
@@ -29139,6 +29340,12 @@ impl Editor {
                     }
                     KeyAction::Single(Action::HalfPageUp(_)) => {
                         KeyAction::Single(Action::HalfPageUp(count))
+                    }
+                    KeyAction::Single(Action::ScrollLineDown(_)) => {
+                        KeyAction::Single(Action::ScrollLineDown(count))
+                    }
+                    KeyAction::Single(Action::ScrollLineUp(_)) => {
+                        KeyAction::Single(Action::ScrollLineUp(count))
                     }
                     KeyAction::Single(Action::StartLowercaseOperator(_)) => {
                         KeyAction::Single(Action::StartLowercaseOperator(count))
@@ -35076,6 +35283,13 @@ impl Editor {
     #[doc(hidden)]
     pub fn test_vtop(&self) -> usize {
         self.vtop
+    }
+
+    #[doc(hidden)]
+    pub fn test_half_page_scroll(&self) -> Option<u16> {
+        self.window_manager
+            .active_window()
+            .and_then(|window| window.scroll_lines)
     }
 
     #[doc(hidden)]
