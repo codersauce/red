@@ -191,6 +191,10 @@ pub struct Window {
 
     /// Cursor locations remembered for CTRL-O/CTRL-I navigation in this window.
     pub(crate) jump_list: Box<JumpList>,
+
+    /// Inclusive selection set. Under the Vim model this is one 1-width range
+    /// kept in sync with `cx` / `cy`. The Helix model treats it as the cursor.
+    pub(crate) selection: crate::felix::Selection,
 }
 
 /// One edit-tracked destination in a window's jumplist.
@@ -241,6 +245,7 @@ impl Window {
             active: false,
             vx: 0,
             jump_list: Box::default(),
+            selection: crate::felix::Selection::default(),
         }
     }
 
@@ -985,6 +990,10 @@ pub enum SplitSnapshot {
         scroll_height: u16,
         /// Legacy viewport x offset.
         vx: usize,
+        /// Helix selection. Absent snapshots restore a cursor at scalar 0 and
+        /// the Vim model resyncs it from `cx` / `cy` on the next edit.
+        #[serde(default)]
+        selection: crate::felix::Selection,
     },
     /// Top-and-bottom child snapshots.
     Horizontal {
@@ -1170,6 +1179,7 @@ impl Split {
                 scroll_lines: window.scroll_lines,
                 scroll_height: window.scroll_height,
                 vx: window.vx,
+                selection: window.selection.clone(),
             },
             Split::Horizontal { top, bottom, ratio } => SplitSnapshot::Horizontal {
                 ratio: *ratio,
@@ -1197,6 +1207,7 @@ impl Split {
                 scroll_lines,
                 scroll_height,
                 vx,
+                selection,
             } => {
                 let mapped_buffer = *buffer_map.get(buffer_index)?;
                 let mut window = Window::new(mapped_buffer, Point::new(0, 0), (0, 0));
@@ -1209,6 +1220,7 @@ impl Split {
                 window.scroll_lines = *scroll_lines;
                 window.scroll_height = *scroll_height;
                 window.vx = *vx;
+                window.selection = selection.clone();
                 Some(Split::Window(window))
             }
             SplitSnapshot::Horizontal { top, bottom, ratio } => Some(Split::Horizontal {

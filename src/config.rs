@@ -392,6 +392,38 @@ pub struct Config {
     /// Whether startup already restored a core-owned recovery snapshot.
     #[serde(default, skip_serializing)]
     pub startup_session_resumed: bool,
+    /// Key grammar. `helix` is experimental and read when the editor starts.
+    #[serde(default)]
+    pub editing_model: EditingModel,
+    /// Helix keymap overrides. Empty means the built-in felix defaults.
+    /// Vim `[keys.*]` tables are not consulted while Helix is active.
+    #[serde(default)]
+    pub helix_keys: HelixKeys,
+}
+
+/// Which key grammar the editor uses. The Vim grammar stays the default.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EditingModel {
+    #[default]
+    Vim,
+    /// Experimental selection-first grammar implemented by the `felix` module.
+    Helix,
+}
+
+/// Optional overrides for the experimental Helix keymap.
+///
+/// Leaves replace built-in bindings. Nested tables merge the same way as
+/// `[keys.*]`. A string that names a felix command, such as
+/// `"move_next_word_start"`, is accepted alongside a Red action name.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+pub struct HelixKeys {
+    #[serde(default)]
+    pub normal: HashMap<String, KeyAction>,
+    #[serde(default)]
+    pub select: HashMap<String, KeyAction>,
+    #[serde(default)]
+    pub insert: HashMap<String, KeyAction>,
 }
 
 /// Optional Codex extension categories that Red may expose to Agent sessions.
@@ -2211,6 +2243,8 @@ fn known_top_level_field(field: &str) -> bool {
             | "diagnostics"
             | "show_diagnostics"
             | "window_borders_ascii"
+            | "editing_model"
+            | "helix_keys"
     )
 }
 
@@ -2328,7 +2362,7 @@ fn known_schema_path(path: &[String]) -> bool {
     let parts = path.iter().map(String::as_str).collect::<Vec<_>>();
     match parts.as_slice() {
         [field] => known_top_level_field(field),
-        ["keys", ..] | ["plugin_config", ..] => true,
+        ["keys", ..] | ["plugin_config", ..] | ["helix_keys", ..] => true,
         ["plugins", _] => true,
         ["plugin_permissions", _] | ["plugin_permissions", _, "process" | "inherit_env"] => true,
         ["agent", field] => matches!(

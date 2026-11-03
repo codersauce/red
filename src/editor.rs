@@ -6460,6 +6460,10 @@ impl Editor {
 
     /// Synchronizes the active window with the editor's state
     fn sync_to_window(&mut self) {
+        // The Vim model keeps a 1-width selection beside the cursor. The
+        // Helix model owns the selection and updates the cursor from it.
+        let vim_selection = (self.config.editing_model != crate::config::EditingModel::Helix)
+            .then(|| crate::felix::Selection::cursor(self.cursor_char_index()));
         if let Some(window) = self.window_manager.active_window_mut() {
             window.buffer_index = self.buffer_manager.active_index();
             window.vtop = self.vtop;
@@ -6470,6 +6474,9 @@ impl Editor {
             window.cy = self.cy;
             window.cursor_goal = self.cursor_goal;
             window.vx = self.vx;
+            if let Some(selection) = vim_selection {
+                window.selection = selection;
+            }
         }
         self.reconcile_markdown_link_destinations();
     }
@@ -21056,6 +21063,11 @@ impl Editor {
     fn cursor_text_position(&self) -> TextPosition {
         let line = self.buffer_line();
         TextPosition::new(line, self.grapheme_to_char_on_line(self.cx, line))
+    }
+
+    fn cursor_char_index(&self) -> usize {
+        self.current_buffer()
+            .position_to_char_idx(self.cursor_text_position())
     }
 
     fn cursor_lsp_position(&self) -> crate::lsp::Position {
@@ -35665,6 +35677,20 @@ impl Editor {
     #[doc(hidden)]
     pub fn test_is_waiting_for_key_sequence(&self) -> bool {
         self.is_waiting_for_key_sequence()
+    }
+
+    #[doc(hidden)]
+    pub fn test_felix_selection(&self) -> (usize, usize, usize) {
+        let selection = self
+            .window_manager
+            .active_window()
+            .map(|window| window.selection.clone())
+            .unwrap_or_default();
+        (
+            selection.primary().anchor,
+            selection.primary().head,
+            selection.len(),
+        )
     }
 
     #[doc(hidden)]

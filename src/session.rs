@@ -2321,6 +2321,7 @@ mod tests {
                     scroll_lines: None,
                     scroll_height: 0,
                     vx: 0,
+                    selection: crate::felix::Selection::default(),
                 },
             },
             panels: PanelManagerSnapshot::default(),
