@@ -2196,6 +2196,7 @@ impl Editor {
                 content_width,
             );
         }
+        self.seal_markdown_image_fingerprints(buffer);
 
         Ok(())
     }
@@ -2906,6 +2907,8 @@ impl Editor {
                 content_width,
             );
         }
+
+        self.seal_markdown_image_fingerprints(buffer);
 
         for comment in &layout.inline_comments {
             self.render_inline_comment_row_in_window(buffer, window, comment);

@@ -639,6 +639,20 @@ pub struct UiStyle {
     pub deprecated: Style,
 }
 
+impl Theme {
+    /// Popup background as an opaque RGB value, never the terminal default.
+    pub(crate) fn concrete_popup_bg(&self) -> Color {
+        crate::color::concrete_rgb(
+            self.ui_style.popup.bg.or(self.style.bg),
+            Color::Rgb {
+                r: 32,
+                g: 32,
+                b: 36,
+            },
+        )
+    }
+}
+
 impl Default for UiStyle {
     fn default() -> Self {
         let popup = Style {
@@ -728,6 +742,11 @@ impl Style {
 
     pub fn with_bg(&self, bg: Option<Color>) -> Style {
         Style { bg, ..self.clone() }
+    }
+
+    /// Copies this style with an opaque RGB background.
+    pub fn with_concrete_bg(&self, fallback: Color) -> Style {
+        self.with_bg(Some(crate::color::concrete_rgb(self.bg, fallback)))
     }
 
     pub fn inverted(&self) -> Style {

@@ -675,6 +675,18 @@ impl CompletionUI {
             ));
         }
 
+        let popup_bg = crate::color::concrete_rgb(
+            self.styles.popup.bg,
+            crate::color::Color::Rgb {
+                r: 32,
+                g: 32,
+                b: 36,
+            },
+        );
+        for (_, _, _, style) in &mut output {
+            *style = style.with_concrete_bg(popup_bg);
+        }
+
         output
     }
 }

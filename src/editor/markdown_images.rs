@@ -65,6 +65,8 @@ pub(super) struct TerminalHints {
     pub vscode: bool,
     pub sixel_term: bool,
     pub tmux: bool,
+    pub herdr: bool,
+    pub zellij: bool,
     pub truecolor: bool,
 }
 
@@ -93,6 +95,13 @@ impl TerminalHints {
             || var("WT_SESSION").is_some()
             || var("WT_PROFILE_ID").is_some();
         let tmux = var("TMUX").is_some();
+        // Herdr sanitizes TERM_PROGRAM but panes keep HERDR_ENV=1. A leaked
+        // GHOSTTY_RESOURCES_DIR must not override that and select Kitty.
+        let herdr =
+            var("HERDR_ENV").as_deref() == Some("1") || equals_ignore_ascii(&term_program, "herdr");
+        let zellij = var("ZELLIJ").is_some()
+            || var("ZELLIJ_SESSION_NAME").is_some()
+            || equals_ignore_ascii(&term_program, "zellij");
         let known_truecolor =
             kitty || wezterm || ghostty || konsole || iterm || vscode || sixel_term;
         let truecolor = known_truecolor
@@ -112,8 +121,16 @@ impl TerminalHints {
             vscode,
             sixel_term,
             tmux,
+            herdr,
+            zellij,
             truecolor,
         }
+    }
+
+    /// Herdr, tmux, and zellij can display a Kitty placement, but deletes and
+    /// moves are not reliable. Auto mode uses half-blocks there instead.
+    fn unreliable_graphics(&self) -> bool {
+        self.tmux || self.herdr || self.zellij
     }
 
     fn prefer_kitty(&self) -> bool {
@@ -181,7 +198,7 @@ struct ParsedBuffer {
     lines: BTreeMap<usize, ImageRef>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Placement {
     x: u16,
     y: u16,
@@ -189,6 +206,7 @@ struct Placement {
     rows: u16,
     signature: u64,
     protocol: GraphicsProtocol,
+    source: Option<KittySourceRect>,
 }
 
 struct PendingDraw {
@@ -200,6 +218,7 @@ struct PendingDraw {
     signature: u64,
     protocol: GraphicsProtocol,
     payload: String,
+    source: Option<KittySourceRect>,
 }
 
 struct StagedImage {
@@ -207,12 +226,31 @@ struct StagedImage {
     x: u16,
     y: u16,
     cols: u16,
+    /// Visible rows. This is the full image when nothing is clipped.
     rows: u16,
+    total_rows: u16,
+    first_index: u16,
+    /// How many of this image's rows have been painted in the current frame.
+    painted: u16,
     signature: u64,
     protocol: GraphicsProtocol,
     payload: String,
-    /// Cell fingerprint taken immediately after the image was painted, before overlays.
-    cells: u64,
+    source: Option<KittySourceRect>,
+    decoded: Option<Arc<DecodedImage>>,
+    /// Cell fingerprint taken after every image row is painted, before overlays.
+    cells: Option<u64>,
+}
+
+struct ObservedGraphics {
+    id: u32,
+    x: u16,
+    y: u16,
+    cols: u16,
+    total_rows: u16,
+    index: u16,
+    signature: u64,
+    protocol: GraphicsProtocol,
+    image: Arc<DecodedImage>,
 }
 
 /// Rendered image rows, plus image lines that must stay raw source.
@@ -411,8 +449,103 @@ impl ImageRuntime {
         self.frame_open = true;
     }
 
+    #[cfg(test)]
     fn stage_graphics(&mut self, image: StagedImage) {
         self.staged.push(image);
+    }
+
+    fn observe_graphics_row(&mut self, row: ObservedGraphics) {
+        if !self.frame_open {
+            return;
+        }
+        if let Some(existing) = self.staged.iter_mut().find(|image| image.id == row.id) {
+            if row.index < existing.first_index {
+                existing.x = row.x;
+                existing.y = row.y;
+                existing.first_index = row.index;
+            }
+            existing.painted = existing.painted.saturating_add(1);
+            return;
+        }
+        self.staged.push(StagedImage {
+            id: row.id,
+            x: row.x,
+            y: row.y,
+            cols: row.cols,
+            rows: row.total_rows,
+            total_rows: row.total_rows,
+            first_index: row.index,
+            painted: 1,
+            signature: row.signature,
+            protocol: row.protocol,
+            payload: String::new(),
+            source: None,
+            decoded: Some(row.image),
+            cells: None,
+        });
+    }
+
+    /// Hashes each image after its visible rows exist, and builds a cropped
+    /// Kitty payload when the block does not fit in the viewport.
+    pub(super) fn seal_fingerprints(&mut self, buffer: &crate::editor::RenderBuffer) {
+        if !self.frame_open {
+            return;
+        }
+        self.staged.retain(|image| {
+            if image.decoded.is_none() {
+                return true;
+            }
+            if image.protocol == GraphicsProtocol::Kitty {
+                return image.painted > 0;
+            }
+            image.first_index == 0 && image.painted == image.total_rows
+        });
+        for image in &mut self.staged {
+            if let Some(decoded) = image.decoded.clone() {
+                let visible = image.painted.max(1);
+                match image.protocol {
+                    GraphicsProtocol::Kitty => {
+                        let (pixel_w, pixel_h) = fitted_size(
+                            decoded.width,
+                            decoded.height,
+                            u32::from(image.cols).saturating_mul(4).max(1),
+                            u32::from(image.total_rows).saturating_mul(8).max(1),
+                        );
+                        image.source = kitty_source_rect(
+                            pixel_w,
+                            pixel_h,
+                            image.total_rows,
+                            image.first_index,
+                            visible,
+                        );
+                        image.rows = visible;
+                        image.payload = kitty_transmit_placed(
+                            image.id,
+                            &decoded,
+                            image.cols,
+                            image.total_rows,
+                            visible,
+                            image.source,
+                        );
+                    }
+                    GraphicsProtocol::Iterm2 => {
+                        image.payload = iterm_transmit(&decoded, image.cols, image.total_rows);
+                    }
+                    GraphicsProtocol::Sixel => {
+                        image.payload = sixel_transmit(&decoded, image.cols, image.total_rows);
+                    }
+                }
+            }
+            if image.cells.is_none() && image.painted > 0 && image.painted >= image.rows {
+                let rect = crate::ui::ScreenRect {
+                    x: usize::from(image.x),
+                    y: usize::from(image.y),
+                    width: usize::from(image.cols),
+                    height: usize::from(image.rows.max(1)),
+                };
+                image.cells = Some(hash_region(buffer, rect));
+            }
+        }
     }
 
     /// Queues graphics that no overlay has covered. Returns whether that set changed.
@@ -429,7 +562,9 @@ impl ImageRuntime {
                 width: usize::from(image.cols),
                 height: usize::from(image.rows),
             };
-            let covered = hash_region(buffer, rect) != image.cells
+            let covered = image
+                .cells
+                .is_some_and(|cells| hash_region(buffer, rect) != cells)
                 || image_hidden_by_overlays(rect, &buffer.overlay_rects);
             if covered {
                 continue;
@@ -444,6 +579,7 @@ impl ImageRuntime {
                 signature: image.signature,
                 protocol: image.protocol,
                 payload: image.payload,
+                source: image.source,
             });
         }
         visible.sort_unstable();
@@ -458,36 +594,56 @@ impl ImageRuntime {
         }
         self.frame_open = false;
         let pending = std::mem::take(&mut self.pending);
-        if force {
-            self.placed.clear();
-        }
         let mut out = String::new();
-        if force
-            && pending
-                .iter()
-                .any(|draw| draw.protocol == GraphicsProtocol::Kitty)
-        {
-            out.push_str(&wrap_protocol(self.hints.tmux, &kitty_delete_all()));
+        // A forced redraw used to drop `placed` before emitting deletes, so the
+        // ids were gone and the last image stayed on screen forever.
+        if force {
+            for (id, placed) in &self.placed {
+                if placed.protocol == GraphicsProtocol::Kitty {
+                    out.push_str(&wrap_protocol(self.hints.tmux, &kitty_delete(*id)));
+                }
+            }
+            self.placed.clear();
         }
         let mut next = HashMap::new();
         for draw in &pending {
-            let unchanged = self.placed.get(&draw.id).is_some_and(|placed| {
+            let previous = self.placed.get(&draw.id).copied();
+            let unchanged = previous.is_some_and(|placed| {
                 placed.x == draw.x
                     && placed.y == draw.y
                     && placed.cols == draw.cols
                     && placed.rows == draw.rows
                     && placed.signature == draw.signature
                     && placed.protocol == draw.protocol
+                    && placed.source == draw.source
             });
             if unchanged && !force {
-                next.insert(draw.id, self.placed[&draw.id]);
+                if let Some(placed) = previous {
+                    next.insert(draw.id, placed);
+                }
                 continue;
             }
-            if draw.protocol == GraphicsProtocol::Kitty && self.placed.contains_key(&draw.id) {
-                out.push_str(&wrap_protocol(self.hints.tmux, &kitty_delete(draw.id)));
+            let can_move = !force
+                && previous.is_some_and(|placed| {
+                    placed.protocol == GraphicsProtocol::Kitty
+                        && draw.protocol == GraphicsProtocol::Kitty
+                        && placed.signature == draw.signature
+                });
+            if can_move {
+                out.push_str(&format!("\u{1b}[{};{}H", draw.y + 1, draw.x + 1));
+                out.push_str(&wrap_protocol(
+                    self.hints.tmux,
+                    &kitty_place(draw.id, draw.cols, draw.rows, draw.source),
+                ));
+            } else {
+                if !force
+                    && previous.is_some_and(|placed| placed.protocol == GraphicsProtocol::Kitty)
+                {
+                    out.push_str(&wrap_protocol(self.hints.tmux, &kitty_delete(draw.id)));
+                }
+                out.push_str(&format!("\u{1b}[{};{}H", draw.y + 1, draw.x + 1));
+                out.push_str(&wrap_protocol(self.hints.tmux, &draw.payload));
             }
-            out.push_str(&format!("\u{1b}[{};{}H", draw.y + 1, draw.x + 1));
-            out.push_str(&wrap_protocol(self.hints.tmux, &draw.payload));
             next.insert(
                 draw.id,
                 Placement {
@@ -497,6 +653,7 @@ impl ImageRuntime {
                     rows: draw.rows,
                     signature: draw.signature,
                     protocol: draw.protocol,
+                    source: draw.source,
                 },
             );
         }
@@ -627,14 +784,33 @@ async fn fetch_remote(url: &str) -> Result<Vec<u8>, String> {
     if !response.status().is_success() {
         return Err(format!("http {}", response.status()));
     }
-    let bytes = response
-        .bytes()
+    read_bounded_body(response, MAX_IMAGE_BYTES).await
+}
+
+/// Reads the body in chunks and stops as soon as it passes `max_bytes`.
+async fn read_bounded_body(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|_| "download failed".to_string())?;
-    if bytes.len() > MAX_IMAGE_BYTES {
-        return Err("too large".to_string());
+        .map_err(|_| "download failed".to_string())?
+    {
+        if !append_bounded(&mut bytes, &chunk, max_bytes) {
+            return Err("too large".to_string());
+        }
     }
-    Ok(bytes.to_vec())
+    Ok(bytes)
+}
+
+fn append_bounded(bytes: &mut Vec<u8>, chunk: &[u8], max_bytes: usize) -> bool {
+    if bytes.len().saturating_add(chunk.len()) > max_bytes {
+        return false;
+    }
+    bytes.extend_from_slice(chunk);
+    true
 }
 
 pub(super) fn choose_presentation(
@@ -651,7 +827,7 @@ pub(super) fn choose_presentation(
         MarkdownImagesMode::Auto => {
             if let Some(protocol) = detected_graphics(hints, probe) {
                 ImagePresentation::Graphics(protocol)
-            } else if hints.truecolor || probe.kitty {
+            } else if hints.truecolor || (probe.kitty && !hints.unreliable_graphics()) {
                 ImagePresentation::Halfblocks
             } else {
                 ImagePresentation::Placeholder
@@ -660,20 +836,25 @@ pub(super) fn choose_presentation(
     }
 }
 
-/// Kitty, then iTerm2, then Sixel. Inside tmux, environment hints are ignored
-/// unless a wrapped query was answered, because passthrough may be disabled.
+/// Kitty, then iTerm2, then Sixel.
+///
+/// Herdr, tmux, and zellij are excluded. They may paint a placement, but a
+/// later delete or move often never reaches the outer terminal, which leaves
+/// the image stranded on screen.
 pub(super) fn detected_graphics(hints: &TerminalHints, probe: Probe) -> Option<GraphicsProtocol> {
+    if hints.unreliable_graphics() {
+        return None;
+    }
     if probe.kitty {
         return Some(GraphicsProtocol::Kitty);
     }
-    let env_ok = !hints.tmux || probe.sixel;
-    if env_ok && hints.prefer_kitty() {
+    if hints.prefer_kitty() {
         return Some(GraphicsProtocol::Kitty);
     }
-    if env_ok && hints.prefer_iterm() {
+    if hints.prefer_iterm() {
         return Some(GraphicsProtocol::Iterm2);
     }
-    if probe.sixel || (env_ok && hints.prefer_sixel()) {
+    if probe.sixel || hints.prefer_sixel() {
         return Some(GraphicsProtocol::Sixel);
     }
     None
@@ -1127,17 +1308,92 @@ fn hash_color(color: Option<Color>, hasher: &mut impl std::hash::Hasher) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct KittySourceRect {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
+#[cfg(test)]
 pub(super) fn kitty_transmit(id: u32, image: &DecodedImage, cols: u16, rows: u16) -> String {
+    kitty_transmit_placed(id, image, cols, rows, rows, None)
+}
+
+fn kitty_transmit_placed(
+    id: u32,
+    image: &DecodedImage,
+    cols: u16,
+    total_rows: u16,
+    visible_rows: u16,
+    source: Option<KittySourceRect>,
+) -> String {
     let (width, height, rgba) = scale_rgba(
         image,
         u32::from(cols).saturating_mul(4).max(1),
-        u32::from(rows).saturating_mul(8).max(1),
+        u32::from(total_rows).saturating_mul(8).max(1),
     );
     let payload = base64::engine::general_purpose::STANDARD.encode(&rgba);
-    chunk_kitty(
-        &format!("a=T,f=32,s={width},v={height},i={id},c={cols},r={rows},q=2,t=d,z=-1"),
-        &payload,
-    )
+    let mut control = format!("a=T,f=32,s={width},v={height},i={id},p={id}");
+    if let Some(source) = source {
+        control.push_str(&format!(
+            ",x={},y={},w={},h={}",
+            source.x, source.y, source.w, source.h
+        ));
+    }
+    control.push_str(&format!(",c={cols},r={visible_rows},q=2,t=d,z=-1"));
+    chunk_kitty(&control, &payload)
+}
+
+/// Source rectangle for the visible slice of an image, in transmitted pixels.
+///
+/// `None` means the whole image is on screen and no crop is required.
+pub(super) fn kitty_source_rect(
+    pixel_w: u32,
+    pixel_h: u32,
+    total_rows: u16,
+    first_index: u16,
+    visible_rows: u16,
+) -> Option<KittySourceRect> {
+    if total_rows == 0 || visible_rows == 0 || pixel_h == 0 {
+        return None;
+    }
+    if first_index == 0 && visible_rows >= total_rows {
+        return None;
+    }
+    let total = u32::from(total_rows);
+    let start = u32::from(first_index.min(total_rows));
+    let end = u32::from(first_index.saturating_add(visible_rows).min(total_rows));
+    let y = start.saturating_mul(pixel_h) / total;
+    let bottom = end.saturating_mul(pixel_h) / total;
+    let h = bottom
+        .saturating_sub(y)
+        .max(1)
+        .min(pixel_h.saturating_sub(y).max(1));
+    Some(KittySourceRect {
+        x: 0,
+        y,
+        w: pixel_w.max(1),
+        h,
+    })
+}
+
+pub(super) fn kitty_place(
+    id: u32,
+    cols: u16,
+    rows: u16,
+    source: Option<KittySourceRect>,
+) -> String {
+    let mut control = format!("a=p,i={id},p={id}");
+    if let Some(source) = source {
+        control.push_str(&format!(
+            ",x={},y={},w={},h={}",
+            source.x, source.y, source.w, source.h
+        ));
+    }
+    control.push_str(&format!(",c={cols},r={rows},q=2,z=-1"));
+    format!("\u{1b}_G{control}\u{1b}\\")
 }
 
 fn chunk_kitty(control: &str, payload: &str) -> String {
@@ -1203,23 +1459,25 @@ pub(super) fn sixel_transmit(image: &DecodedImage, cols: u16, rows: u16) -> Stri
     encode_sixel(&rgba, width as usize, height as usize)
 }
 
-fn scale_rgba(image: &DecodedImage, max_w: u32, max_h: u32) -> (u32, u32, Vec<u8>) {
+fn fitted_size(src_w: u32, src_h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
     let max_w = max_w.clamp(1, 800);
     let max_h = max_h.clamp(1, 800);
-    let width = image.width.min(max_w).max(1);
-    let height = image.height.min(max_h).max(1);
+    let width = src_w.min(max_w).max(1);
+    let height = src_h.min(max_h).max(1);
     // Fit inside the cap while keeping the source aspect ratio.
-    let (width, height) = if image.width as u64 * u64::from(height)
-        > image.height as u64 * u64::from(width)
-    {
-        let height = ((u64::from(width) * u64::from(image.height)) / u64::from(image.width).max(1))
+    if u64::from(src_w) * u64::from(height) > u64::from(src_h) * u64::from(width) {
+        let height = ((u64::from(width) * u64::from(src_h)) / u64::from(src_w).max(1))
             .clamp(1, u64::from(max_h)) as u32;
         (width, height)
     } else {
-        let width = ((u64::from(height) * u64::from(image.width)) / u64::from(image.height).max(1))
+        let width = ((u64::from(height) * u64::from(src_w)) / u64::from(src_h).max(1))
             .clamp(1, u64::from(max_w)) as u32;
         (width, height)
-    };
+    }
+}
+
+fn scale_rgba(image: &DecodedImage, max_w: u32, max_h: u32) -> (u32, u32, Vec<u8>) {
+    let (width, height) = fitted_size(image.width, image.height, max_w, max_h);
     let mut rgba = vec![0u8; (width * height * 4) as usize];
     for y in 0..height {
         for x in 0..width {
@@ -1442,6 +1700,10 @@ impl super::Editor {
         self.markdown_images.borrow_mut().begin_frame();
     }
 
+    pub(super) fn seal_markdown_image_fingerprints(&self, buffer: &crate::editor::RenderBuffer) {
+        self.markdown_images.borrow_mut().seal_fingerprints(buffer);
+    }
+
     pub(super) fn markdown_graphics_payload(&self, force: bool) -> String {
         if !self.terminal_output_enabled {
             return String::new();
@@ -1569,40 +1831,24 @@ impl super::Editor {
                 );
             }
         }
-        if span.index == 0 {
-            if let ImagePresentation::Graphics(protocol) = presentation {
-                let fits =
-                    segment.row + usize::from(span.rows) <= self.window_content_height(window);
-                if fits {
-                    let buffer_id = self.buffer_manager[window.buffer_index].id();
-                    let mut runtime = self.markdown_images.borrow_mut();
-                    let id = runtime.id_for(buffer_id, segment.line);
-                    let payload = match protocol {
-                        GraphicsProtocol::Kitty => kitty_transmit(id, &image, span.cols, span.rows),
-                        GraphicsProtocol::Iterm2 => iterm_transmit(&image, span.cols, span.rows),
-                        GraphicsProtocol::Sixel => sixel_transmit(&image, span.cols, span.rows),
-                    };
-                    if !payload.is_empty() {
-                        let rect = crate::ui::ScreenRect {
-                            x: origin_x,
-                            y: origin_y,
-                            width: usize::from(span.cols),
-                            height: usize::from(span.rows),
-                        };
-                        runtime.stage_graphics(StagedImage {
-                            id,
-                            x: u16::try_from(origin_x).unwrap_or(u16::MAX),
-                            y: u16::try_from(origin_y).unwrap_or(u16::MAX),
-                            cols: span.cols,
-                            rows: span.rows,
-                            signature: image_signature(&image, span.cols, span.rows, protocol),
-                            protocol,
-                            payload,
-                            cells: hash_region(buffer, rect),
-                        });
-                    }
-                }
-            }
+        if let ImagePresentation::Graphics(protocol) = presentation {
+            let (Ok(x), Ok(y)) = (u16::try_from(origin_x), u16::try_from(origin_y)) else {
+                return true;
+            };
+            let buffer_id = self.buffer_manager[window.buffer_index].id();
+            let mut runtime = self.markdown_images.borrow_mut();
+            let id = runtime.id_for(buffer_id, segment.line);
+            runtime.observe_graphics_row(ObservedGraphics {
+                id,
+                x,
+                y,
+                cols: span.cols,
+                total_rows: span.rows,
+                index: span.index,
+                signature: image_signature(&image, span.cols, span.rows, protocol),
+                protocol,
+                image: Arc::clone(&image),
+            });
         }
         true
     }
@@ -1830,7 +2076,18 @@ mod tests {
                     sixel: false
                 }
             ),
-            Some(GraphicsProtocol::Kitty)
+            None
+        );
+        assert_eq!(
+            choose_presentation(
+                MarkdownImagesMode::Auto,
+                &kitty_tmux,
+                Probe {
+                    kitty: true,
+                    sixel: false
+                }
+            ),
+            ImagePresentation::Halfblocks
         );
         let wrapped = tmux_passthrough(KITTY_GRAPHICS_QUERY);
         assert!(wrapped.starts_with("\u{1b}Ptmux;\u{1b}"));
@@ -2154,10 +2411,15 @@ mod tests {
             y: 1,
             cols: 4,
             rows: 2,
+            total_rows: 2,
+            first_index: 0,
+            painted: 2,
             signature: 9,
             protocol: GraphicsProtocol::Kitty,
             payload: "PLACE".to_string(),
-            cells: hash_region(buffer, rect),
+            source: None,
+            decoded: None,
+            cells: Some(hash_region(buffer, rect)),
         };
 
         runtime.begin_frame();
@@ -2186,7 +2448,7 @@ mod tests {
         runtime.stage_graphics(stage(&buffer));
         // The fingerprint above includes the popup. Stage the pre-popup hash
         // so the cell change and the overlay rect both hide the image.
-        runtime.staged[0].cells = runtime.staged[0].cells.wrapping_add(1);
+        runtime.staged[0].cells = runtime.staged[0].cells.map(|cells| cells.wrapping_add(1));
         assert!(runtime.commit_visible(&buffer));
         let hidden = runtime.graphics_payload(false);
         assert!(!hidden.contains("PLACE"));
@@ -2198,6 +2460,272 @@ mod tests {
         assert!(runtime.commit_visible(&buffer));
         let restored = runtime.graphics_payload(false);
         assert!(restored.contains("PLACE"));
+    }
+
+    fn place_kitty(
+        runtime: &mut ImageRuntime,
+        buffer: &crate::editor::RenderBuffer,
+        id: u32,
+        y: u16,
+    ) {
+        runtime.begin_frame();
+        runtime.stage_graphics(StagedImage {
+            id,
+            x: 2,
+            y,
+            cols: 4,
+            rows: 2,
+            total_rows: 2,
+            first_index: 0,
+            painted: 2,
+            signature: 9,
+            protocol: GraphicsProtocol::Kitty,
+            payload: "PLACE".to_string(),
+            source: None,
+            decoded: None,
+            cells: Some(hash_region(
+                buffer,
+                crate::ui::ScreenRect {
+                    x: 2,
+                    y: usize::from(y),
+                    width: 4,
+                    height: 2,
+                },
+            )),
+        });
+        runtime.commit_visible(buffer);
+    }
+
+    #[test]
+    fn forced_redraw_deletes_kitty_ids_before_forgetting_them() {
+        use crate::theme::Style;
+        let mut runtime = ImageRuntime::new();
+        let buffer = crate::editor::RenderBuffer::new(20, 12, &Style::default());
+        place_kitty(&mut runtime, &buffer, 7, 4);
+        let shown = runtime.graphics_payload(false);
+        assert!(shown.contains("PLACE"), "{shown}");
+        assert!(!shown.contains("a=d"), "{shown}");
+
+        // PageDown takes the image off the staged set and asks for a full
+        // redraw. The delete has to go out before `placed` is cleared.
+        runtime.begin_frame();
+        assert!(runtime.commit_visible(&buffer));
+        let deleted = runtime.graphics_payload(true);
+        assert!(deleted.contains("a=d"), "{deleted}");
+        assert!(deleted.contains("i=7"), "{deleted}");
+        assert!(!deleted.contains("PLACE"), "{deleted}");
+        assert!(runtime.placed.is_empty());
+    }
+
+    #[test]
+    fn scroll_deletes_a_placement_that_left_the_screen_and_moves_one_that_stayed() {
+        use crate::theme::Style;
+        let mut runtime = ImageRuntime::new();
+        let buffer = crate::editor::RenderBuffer::new(20, 20, &Style::default());
+        place_kitty(&mut runtime, &buffer, 4, 3);
+        let _ = runtime.graphics_payload(false);
+
+        runtime.begin_frame();
+        assert!(runtime.commit_visible(&buffer));
+        let gone = runtime.graphics_payload(false);
+        assert!(gone.contains("a=d"), "{gone}");
+        assert!(gone.contains("i=4"), "{gone}");
+        assert!(!gone.contains("PLACE"), "{gone}");
+
+        place_kitty(&mut runtime, &buffer, 4, 3);
+        let _ = runtime.graphics_payload(false);
+        place_kitty(&mut runtime, &buffer, 4, 9);
+        let moved = runtime.graphics_payload(false);
+        assert!(moved.contains("a=p"), "{moved}");
+        assert!(moved.contains("i=4"), "{moved}");
+        assert!(moved.contains("\u{1b}[10;3H"), "{moved}");
+        assert!(!moved.contains("PLACE"), "{moved}");
+    }
+
+    #[test]
+    fn tmux_passthrough_wraps_stale_placement_deletes() {
+        use crate::theme::Style;
+        let mut runtime = ImageRuntime::new();
+        runtime.hints.tmux = true;
+        let buffer = crate::editor::RenderBuffer::new(20, 12, &Style::default());
+        place_kitty(&mut runtime, &buffer, 5, 2);
+        let _ = runtime.graphics_payload(false);
+
+        runtime.begin_frame();
+        runtime.commit_visible(&buffer);
+        let deleted = runtime.graphics_payload(true);
+        assert!(deleted.contains("Ptmux"), "{deleted}");
+        assert!(deleted.contains("a=d"), "{deleted}");
+        assert!(deleted.contains("i=5"), "{deleted}");
+        assert!(deleted.contains("\u{1b}\u{1b}_G"), "{deleted}");
+    }
+
+    #[test]
+    fn multiplexers_prefer_halfblocks_even_when_kitty_answers() {
+        let probe = Probe {
+            kitty: true,
+            sixel: true,
+        };
+        let herdr = hints(&[
+            ("HERDR_ENV", "1"),
+            ("TERM_PROGRAM", "ghostty"),
+            ("GHOSTTY_RESOURCES_DIR", "/usr/share/ghostty"),
+        ]);
+        assert!(herdr.herdr);
+        assert!(herdr.ghostty);
+        assert_eq!(detected_graphics(&herdr, probe), None);
+        assert_eq!(
+            choose_presentation(MarkdownImagesMode::Auto, &herdr, probe),
+            ImagePresentation::Halfblocks
+        );
+        assert_eq!(
+            choose_presentation(MarkdownImagesMode::Kitty, &herdr, probe),
+            ImagePresentation::Graphics(GraphicsProtocol::Kitty)
+        );
+
+        let zellij = hints(&[("ZELLIJ_SESSION_NAME", "dev"), ("COLORTERM", "truecolor")]);
+        assert!(zellij.zellij);
+        assert_eq!(
+            choose_presentation(MarkdownImagesMode::Auto, &zellij, probe),
+            ImagePresentation::Halfblocks
+        );
+        let named = hints(&[("TERM_PROGRAM", "herdr")]);
+        assert!(named.herdr);
+        assert_eq!(
+            choose_presentation(MarkdownImagesMode::Auto, &named, Probe::default()),
+            ImagePresentation::Placeholder
+        );
+    }
+
+    #[test]
+    fn fingerprint_covers_every_painted_image_row() {
+        use crate::theme::Style;
+        let mut runtime = ImageRuntime::new();
+        let mut buffer = crate::editor::RenderBuffer::new(8, 4, &Style::default());
+        let style = Style {
+            fg: Some(Color::Rgb { r: 1, g: 2, b: 3 }),
+            bg: Some(Color::Rgb { r: 4, g: 5, b: 6 }),
+            ..Style::default()
+        };
+        buffer.set_text(1, 1, "abcd", &style);
+        runtime.begin_frame();
+        runtime.stage_graphics(StagedImage {
+            id: 1,
+            x: 1,
+            y: 1,
+            cols: 4,
+            rows: 2,
+            total_rows: 2,
+            first_index: 0,
+            painted: 1,
+            signature: 1,
+            protocol: GraphicsProtocol::Kitty,
+            payload: "PLACE".to_string(),
+            source: None,
+            decoded: None,
+            cells: None,
+        });
+        runtime.seal_fingerprints(&buffer);
+        assert!(
+            runtime.staged[0].cells.is_none(),
+            "a fingerprint taken before the last row would not match the finished image"
+        );
+
+        buffer.set_text(1, 2, "wxyz", &style);
+        runtime.staged[0].painted = 2;
+        runtime.seal_fingerprints(&buffer);
+        let fingerprint = runtime.staged[0].cells.expect("full image fingerprint");
+        let rect = crate::ui::ScreenRect {
+            x: 1,
+            y: 1,
+            width: 4,
+            height: 2,
+        };
+        assert_eq!(fingerprint, hash_region(&buffer, rect));
+
+        let mut early = crate::editor::RenderBuffer::new(8, 4, &Style::default());
+        early.set_text(1, 1, "abcd", &style);
+        assert_ne!(fingerprint, hash_region(&early, rect));
+
+        assert!(runtime.commit_visible(&buffer));
+        let shown = runtime.graphics_payload(false);
+        assert!(shown.contains("PLACE"), "{shown}");
+    }
+
+    #[test]
+    fn cropped_kitty_placement_uses_a_source_rect() {
+        use crate::theme::Style;
+        let mut runtime = ImageRuntime::new();
+        let buffer = crate::editor::RenderBuffer::new(10, 6, &Style::default());
+        let image = Arc::new(DecodedImage {
+            width: 4,
+            height: 16,
+            rgba: vec![200u8; 4 * 16 * 4],
+        });
+        runtime.begin_frame();
+        for (index, y) in [(2u16, 1u16), (3, 2)] {
+            runtime.observe_graphics_row(ObservedGraphics {
+                id: 8,
+                x: 1,
+                y,
+                cols: 4,
+                total_rows: 4,
+                index,
+                signature: 11,
+                protocol: GraphicsProtocol::Kitty,
+                image: Arc::clone(&image),
+            });
+        }
+        runtime.seal_fingerprints(&buffer);
+        let staged = &runtime.staged[0];
+        assert_eq!(staged.rows, 2);
+        assert_eq!(staged.first_index, 2);
+        let source = staged.source.expect("partial image is cropped");
+        assert!(source.y > 0, "{source:?}");
+        assert!(source.h > 0, "{source:?}");
+        let control = staged.payload.split(';').next().unwrap();
+        assert!(control.contains("r=2"), "{control}");
+        assert!(!control.contains("r=4"), "{control}");
+        assert!(control.contains(&format!("y={}", source.y)), "{control}");
+        assert!(kitty_source_rect(10, 40, 4, 0, 4).is_none());
+        let top = kitty_source_rect(10, 40, 4, 1, 2).unwrap();
+        assert_eq!((top.y, top.h), (10, 20));
+    }
+
+    #[test]
+    fn bounded_append_stops_before_the_cap() {
+        let mut bytes = vec![1, 2, 3];
+        assert!(append_bounded(&mut bytes, &[4, 5], 5));
+        assert_eq!(bytes, vec![1, 2, 3, 4, 5]);
+        assert!(!append_bounded(&mut bytes, &[6], 5));
+        assert_eq!(bytes, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[tokio::test]
+    async fn remote_body_stops_when_it_exceeds_the_image_cap() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = socket.read(&mut buf).await;
+            let body = "x".repeat(48);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let response = client
+            .get(format!("http://{addr}/a.png"))
+            .send()
+            .await
+            .unwrap();
+        let error = read_bounded_body(response, 16).await.unwrap_err();
+        assert_eq!(error, "too large");
+        server.await.unwrap();
     }
 
     #[test]
@@ -2277,6 +2805,18 @@ mod tests {
             "the keymap popup should count as an overlay"
         );
         assert!(screen.contains('▀'), "{screen}");
+        for rect in &frame.overlay_rects {
+            for y in rect.y..rect.y.saturating_add(rect.height) {
+                for x in rect.x..rect.x.saturating_add(rect.width) {
+                    let cell = &frame.cells[y * frame.width + x];
+                    assert!(
+                        matches!(cell.style.bg, Some(Color::Rgb { .. })),
+                        "popup cell {x},{y} over the image needs an explicit background, got {:?}",
+                        cell.style.bg
+                    );
+                }
+            }
+        }
 
         editor.keymap_hints_visible = false;
         editor.waiting_key_action = None;
