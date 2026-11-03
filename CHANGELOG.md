@@ -2,12 +2,32 @@
 
 All notable changes to Red are documented in this file.
 
-## Unreleased
+## [0.11.0](https://github.com/codersauce/red/compare/v0.10.0...v0.11.0)
 
 ### Features
 
-- **cli:** Override configuration with repeatable `-c`/`--config key=value` flags
-- **editor:** Remember a counted `Ctrl-d`/`Ctrl-u` scroll distance, and scroll the view one line with `Ctrl-y` and `Alt-e`.
+- **editor:** Add a deterministic code explore mode ([#426](https://github.com/codersauce/red/issues/426)) ([1548ed5](https://github.com/codersauce/red/commit/1548ed5b9b6ecfaa640211e1246e2c86437ce4c2))
+- **editor:** Remember counted half-page scrolling ([#432](https://github.com/codersauce/red/issues/432)) ([34636a6](https://github.com/codersauce/red/commit/34636a6f06c33155b73edb7c0a942ec916c8c8a8))
+- **editor:** Render markdown images inline ([#430](https://github.com/codersauce/red/issues/430)) ([a0391a7](https://github.com/codersauce/red/commit/a0391a73dff37a44bd40dcf4da3ba87e08090f11))
+- **cli:** Override config with repeatable -c key=value flags ([#431](https://github.com/codersauce/red/issues/431)) ([ba5e331](https://github.com/codersauce/red/commit/ba5e331d659f29f57ff8eee208ad25900e422c86))
+- **editor:** Wrap markdown lines on concealed text ([#429](https://github.com/codersauce/red/issues/429)) ([6562c58](https://github.com/codersauce/red/commit/6562c5806b0207f71a5591a27f4c8975f6709b94))
+- **markdown:** Render tables and follow links in the editor ([#424](https://github.com/codersauce/red/issues/424)) ([6847f7f](https://github.com/codersauce/red/commit/6847f7f44642ae8024eb625a8ab07dabc43597fe))
+
+### Bug Fixes
+
+- **explore:** Call a called method a call, not a field ([9c0ca5e](https://github.com/codersauce/red/commit/9c0ca5e410bbf01761d5f868fe09561510b52ec9))
+- **ci:** Build Intel macOS artifacts on Intel runners ([#428](https://github.com/codersauce/red/issues/428)) ([07c48a2](https://github.com/codersauce/red/commit/07c48a2455bbe2bbc844e3e9914569b7fadeb3c6))
+- **deps:** Update audited dependencies to patched releases ([#427](https://github.com/codersauce/red/issues/427)) ([66a2069](https://github.com/codersauce/red/commit/66a20690209a082bb2087d04a0c694a40e92f836))
+- **markdown:** Reuse grapheme counts in table layout ([d4abb9d](https://github.com/codersauce/red/commit/d4abb9da9f2706d17866326aa9ffb19e1ecdc081))
+- **editor:** Keep lsp failures from aborting editing ([#423](https://github.com/codersauce/red/issues/423)) ([a65b280](https://github.com/codersauce/red/commit/a65b28078c85ae1c87d6526c01234eded68f881b))
+
+### Documentation
+
+- Prepare the v0.11.0 release around Markdown and Code explore ([#433](https://github.com/codersauce/red/issues/433)) ([59ebf4b](https://github.com/codersauce/red/commit/59ebf4b37cb7028adfa09f2357287ada620061e6))
+
+### Testing
+
+- **lsp:** Wait for server exit before checking failure ([a683307](https://github.com/codersauce/red/commit/a6833074a0def1087e4454102f27089d2b50a19d))
 
 ## [0.10.0](https://github.com/codersauce/red/compare/v0.9.1...v0.10.0)
 
