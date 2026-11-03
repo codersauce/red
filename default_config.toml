@@ -5,6 +5,10 @@
 #
 # 1. $XDG_CONFIG_HOME/red/config.toml
 # 2. $HOME/.config/red/config.toml
+#
+# Precedence is embedded defaults, then this file, then repeatable
+# `-c`/`--config key=value` flags. A value that is not valid TOML is a plain
+# string. `red --print-config` prints the merged configuration.
 # 
 
 # Name of the VSCode theme to use. The theme file should be present in the

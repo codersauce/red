@@ -20,9 +20,34 @@ pub struct Args {
     #[clap(short, long)]
     pub root: Option<String>,
 
-    /// Inline TOML config override. Can be provided multiple times.
-    #[clap(short = 'c', long = "config-override", value_name = "TOML")]
+    /// Override one configuration value. Repeat the flag to set several.
+    ///
+    /// `key` is a dotted path into the configuration. `value` is parsed as
+    /// TOML; if that fails, it is used as a plain string, so quotes are
+    /// optional for ordinary text. Later flags win. `--config-override` is
+    /// the same flag and still accepts a TOML document.
+    ///
+    /// Precedence is embedded defaults, then config.toml, then these flags.
+    /// Red does not load configuration from an environment variable.
+    ///
+    /// Examples:
+    ///   -c theme=onedark.json
+    ///   -c languages.rust.indent_width=2
+    ///   -c 'markdown_conceal=false'
+    ///   -c 'disabled_plugins=["indent_guides"]'
+    ///   -c 'search={ignorecase=true, smartcase=true}'
+    #[clap(
+        short = 'c',
+        long = "config",
+        visible_alias = "config-override",
+        value_name = "key=value",
+        verbatim_doc_comment
+    )]
     pub config_overrides: Vec<String>,
+
+    /// Print the merged configuration after defaults, config.toml, and `-c` overrides, then exit.
+    #[clap(long = "print-config")]
+    pub print_config: bool,
 
     /// List runtime files from user config, $RED_RUNTIME, and embedded assets.
     #[clap(long = "runtime-files")]
@@ -248,6 +273,7 @@ impl Args {
         self.command.is_some()
             || self.self_check
             || self.check_config
+            || self.print_config
             || self.agent_check
             || self.runtime_files
             || self.eject.is_some()
@@ -287,6 +313,42 @@ mod tests {
 
         assert_eq!(args.config_overrides.len(), 2);
         assert_eq!(args.files, vec!["src/editor.rs"]);
+
+        let args = Args::try_parse_from([
+            "red",
+            "--config",
+            "theme=onedark.json",
+            "-c",
+            "languages.rust.indent_width=2",
+            "--config-override",
+            "scrolloff=4",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.config_overrides,
+            [
+                "theme=onedark.json",
+                "languages.rust.indent_width=2",
+                "scrolloff=4",
+            ]
+        );
+    }
+
+    #[test]
+    fn config_help_documents_key_value_overrides() {
+        use clap::CommandFactory as _;
+
+        let mut command = Args::command();
+        let mut buffer = Vec::new();
+        command.write_long_help(&mut buffer).unwrap();
+        let help = String::from_utf8(buffer).unwrap();
+        assert!(help.contains("--config"));
+        assert!(help.contains("--config-override"));
+        assert!(help.contains("theme=onedark.json"));
+        assert!(help.contains("languages.rust.indent_width=2"));
+        assert!(help.contains("disabled_plugins="));
+        assert!(help.contains("--print-config"));
+        assert!(help.contains("embedded defaults"));
     }
 
     #[test]

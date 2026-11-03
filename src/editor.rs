@@ -5622,7 +5622,8 @@ impl Editor {
         self.config_diagnostics_acknowledged = true;
         self.sync_persistent_notifications();
         let diagnostics = self.config_diagnostics.clone();
-        let actions = diagnostics
+        let cli_overrides = self.language_config_overrides.clone();
+        let mut actions = diagnostics
             .iter()
             .enumerate()
             .map(|(index, diagnostic)| {
@@ -5635,7 +5636,7 @@ impl Editor {
                 (index.to_string(), action)
             })
             .collect::<HashMap<_, _>>();
-        let items = diagnostics
+        let mut items: Vec<_> = diagnostics
             .iter()
             .enumerate()
             .map(|(index, diagnostic)| {
@@ -5680,12 +5681,46 @@ impl Editor {
                 }
             })
             .collect();
+        for (index, raw) in cli_overrides.iter().enumerate() {
+            let id = format!("cli-override-{index}");
+            let single_line = raw.replace('\n', " ");
+            actions.insert(
+                id.clone(),
+                Action::Print(format!(
+                    "startup override -c {single_line} (precedence: defaults < config file < -c/--config)"
+                )),
+            );
+            items.push(PickerItem {
+                id,
+                icon: None,
+                label: single_line.clone(),
+                kind: Some("cli override".to_string()),
+                annotation: Some("-c/--config".to_string()),
+                detail: Some("highest precedence".to_string()),
+                data: serde_json::json!({
+                    "search_text": format!("cli override {single_line}"),
+                }),
+                matches: Vec::new(),
+                detail_matches: Vec::new(),
+                preview: Some(PickerPreview::Text {
+                    text: format!(
+                        "This process was started with:\n\n-c {single_line}\n\nPrecedence: embedded defaults < config.toml < -c/--config. Later flags win."
+                    ),
+                    language: None,
+                }),
+            });
+        }
+        let placeholder = if cli_overrides.is_empty() {
+            "Filter configuration problems"
+        } else {
+            "Filter configuration problems and CLI overrides"
+        };
         let picker = Picker::builder()
             .title("Configuration diagnostics")
             .structured_items(items)
             .item_layout(PickerItemLayout::LabelFirst)
             .filter_action(diagnostics_picker::diagnostic_filter_score)
-            .placeholder("Filter configuration problems")
+            .placeholder(placeholder)
             .history_key("config-diagnostics")
             .select_action(move |item| {
                 actions.get(&item).cloned().unwrap_or_else(|| {

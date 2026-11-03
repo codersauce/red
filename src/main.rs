@@ -87,6 +87,16 @@ async fn run() -> anyhow::Result<()> {
     let args = Args::parse();
     args.validate_utility_args()?;
 
+    if args.print_config {
+        anyhow::ensure!(
+            args.command.is_none(),
+            "--print-config only loads configuration and cannot be combined with a subcommand"
+        );
+        let loaded = Config::load_user_file(&Config::path("config.toml"), &args.config_overrides)?;
+        cli_style::print_text(&loaded.render_effective_toml());
+        return Ok(());
+    }
+
     match &args.command {
         Some(RootCommand::Update(update)) => {
             let message = if update.check {

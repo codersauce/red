@@ -6,6 +6,7 @@ All notable changes to Red are documented in this file.
 
 ### Features
 
+- **cli:** Override configuration with repeatable `-c`/`--config key=value` flags
 - **editor:** Remember a counted `Ctrl-d`/`Ctrl-u` scroll distance, and scroll the view one line with `Ctrl-y` and `Alt-e`.
 
 ## [0.10.0](https://github.com/codersauce/red/compare/v0.9.1...v0.10.0)
