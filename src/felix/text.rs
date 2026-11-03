@@ -501,11 +501,9 @@ fn find_char(
                 }
                 return found.map(|index| index.saturating_sub(1).max(head));
             }
-            FindKind::Prev => {
-                chars[..head]
-                    .iter()
-                    .rposition(|character| *character == target)?
-            }
+            FindKind::Prev => chars[..head]
+                .iter()
+                .rposition(|character| *character == target)?,
             FindKind::TillPrev => {
                 // Helix searches backward from the cursor scalar. When the
                 // scalar before the cursor is already the target, it skips

@@ -113,7 +113,13 @@ Side-by-side frames after the exercise keys, Helix on the left and Red on the ri
 
 ## Rendering
 
-The head cell is the cursor block. The other cells of each range use the selection style. Side-by-side tmux captures, Helix on the left and Red on the right:
+Normal and select use a painted block while the terminal cursor is hidden. Unfocused, that cursor is an underscore and the head cell is not painted. Insert uses a steady bar (`CSI 6 q`) at Helix's status column and does not paint a one-wide selection. `o` / `O` replace the selection with a cursor on the new line, so the original line does not keep a highlight. A count such as `2w`, `3j`, or `2fx` is one motion and one paint.
+
+Side-by-side tmux captures, Helix on the left and Red on the right:
+
+- `/opt/cursor/artifacts/helix-parity/insert-i-side-by-side.png`
+- `/opt/cursor/artifacts/helix-parity/insert-o-side-by-side.png`
+- `/opt/cursor/artifacts/helix-parity/normal-w-side-by-side.png`
 
 - `/opt/cursor/artifacts/helix-parity/w-side-by-side.png`
 - `/opt/cursor/artifacts/helix-parity/x-side-by-side.png`

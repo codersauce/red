@@ -14,18 +14,18 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crate::{
     buffer::BufferId,
     config::{Config, EditingModel, KeyAction},
-    editing::{MotionResolver, TextObjectScope, text_object_kind_for_key},
+    editing::{text_object_kind_for_key, MotionResolver, TextObjectScope},
     felix::{
-        self, Command, KeyNode, Range, Selection, SurroundOp, TextEdit, extend_command, motion_for,
-        normal_keymap,
+        self, extend_command, motion_for, normal_keymap, Command, KeyNode, Range, Selection,
+        SurroundOp, TextEdit,
     },
     textobjects::SyntaxObjectKind,
     undo::{TextPosition, TextRange},
 };
 
 use super::{
-    Action, Content, ContentKind, DEFAULT_REGISTER, Editor, Mode, RenderBuffer, Runtime,
-    SearchDirection,
+    Action, Content, ContentKind, Editor, Mode, RenderBuffer, Runtime, SearchDirection,
+    DEFAULT_REGISTER,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -363,7 +363,11 @@ impl Editor {
             .enumerate()
             .map(
                 |(index, existing)| {
-                    if index == primary { range } else { *existing }
+                    if index == primary {
+                        range
+                    } else {
+                        *existing
+                    }
                 },
             )
             .collect();
@@ -1280,55 +1284,152 @@ impl Editor {
         self.felix.insert_extend = command == Command::AppendMode;
         self.felix.insert_anchor = selection.primary().from();
         if matches!(command, Command::OpenBelow | Command::OpenAbove) {
-            let head = selection.primary().head;
-            let position = self.current_buffer().char_idx_to_position(head);
-            self.move_to_text_position(position);
-            let action = if command == Command::OpenBelow {
-                Action::InsertLineBelowCursor
-            } else {
-                Action::InsertLineAtCursor
-            };
-            self.execute(&action, buffer, runtime).await?;
+            self.open_felix_lines(command == Command::OpenBelow, buffer)?;
             return Ok(());
         }
-        let cursors: Vec<usize> = selection
-            .ranges()
-            .iter()
-            .map(|range| match command {
-                Command::AppendMode => range.span(len).1.min(len),
-                Command::InsertAtLineStart => {
-                    let position = self.current_buffer().char_idx_to_position(range.from());
-                    let line = self.current_buffer().get(position.line).unwrap_or_default();
-                    let offset = line
-                        .chars()
-                        .take_while(|character| character.is_whitespace() && *character != '\n')
-                        .count();
-                    range.from() - position.character + offset
-                }
-                Command::InsertAtLineEnd => {
-                    let position = self.current_buffer().char_idx_to_position(range.to());
-                    let line = self.current_buffer().get(position.line).unwrap_or_default();
-                    let content = line.trim_end_matches(['\n', '\r']).chars().count();
-                    range.to() - position.character + content
-                }
-                _ => range.from(),
-            })
-            .collect();
-        self.felix.insert_cursors = cursors;
-        self.felix.insert_primary = selection.primary_index();
-        let primary = self
-            .felix
-            .insert_cursors
-            .get(self.felix.insert_primary)
-            .copied()
-            .unwrap_or(0);
-        self.set_felix_selection(Selection::cursor(primary));
-        if self.felix.insert_cursors.len() <= 1 {
+        let primary_index = selection.primary_index();
+        let ranges: Vec<Range> = match command {
+            Command::AppendMode => selection
+                .ranges()
+                .iter()
+                .map(|range| Range::new(range.from(), range.to().saturating_add(1).min(len)))
+                .collect(),
+            Command::InsertAtLineStart | Command::InsertAtLineEnd => {
+                let at_end = command == Command::InsertAtLineEnd;
+                let mut lines: Vec<usize> = selection
+                    .ranges()
+                    .iter()
+                    .map(|range| self.current_buffer().char_idx_to_position(range.head).line)
+                    .collect();
+                lines.sort_unstable();
+                lines.dedup();
+                lines
+                    .into_iter()
+                    .map(|line| Range::cursor(self.felix_line_insert_index(line, at_end)))
+                    .collect()
+            }
+            _ => selection
+                .ranges()
+                .iter()
+                .map(|range| Range::new(range.to(), range.from()))
+                .collect(),
+        };
+        let primary = if matches!(
+            command,
+            Command::InsertAtLineStart | Command::InsertAtLineEnd
+        ) {
+            let primary_line = self
+                .current_buffer()
+                .char_idx_to_position(selection.primary().head)
+                .line;
+            ranges
+                .iter()
+                .position(|range| {
+                    self.current_buffer().char_idx_to_position(range.head).line == primary_line
+                })
+                .unwrap_or(0)
+        } else {
+            primary_index.min(ranges.len().saturating_sub(1))
+        };
+        self.felix.insert_cursors = ranges.iter().map(|range| range.head).collect();
+        self.felix.insert_primary = primary;
+        if ranges.len() <= 1 {
             self.felix.insert_cursors.clear();
         }
+        self.set_felix_selection(Selection::from_ranges(ranges, primary));
         self.execute(&Action::EnterMode(Mode::Insert), buffer, runtime)
             .await?;
         Ok(())
+    }
+
+    /// `o` / `O` insert one line per selected line and leave a cursor there.
+    /// The previous selection is replaced, so the old line cannot keep a
+    /// highlight.
+    fn open_felix_lines(&mut self, below: bool, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        let selection = self.felix_selection();
+        let primary_line = self
+            .current_buffer()
+            .char_idx_to_position(selection.primary().head)
+            .line;
+        let mut lines: Vec<usize> = selection
+            .ranges()
+            .iter()
+            .map(|range| self.current_buffer().char_idx_to_position(range.head).line)
+            .collect();
+        lines.sort_unstable();
+        lines.dedup();
+        let plans: Vec<(usize, String)> = lines
+            .iter()
+            .map(|line| {
+                let columns = self.indentation_columns_for_line(*line);
+                let prefix = self.indentation().whitespace_for_columns(columns);
+                let insert_line = if below { *line + 1 } else { *line };
+                (insert_line, prefix)
+            })
+            .collect();
+        if !self.transaction_active() {
+            self.begin_transaction(if below { "open below" } else { "open above" });
+        }
+        let mut descending = plans.clone();
+        descending.sort_by_key(|plan| std::cmp::Reverse(plan.0));
+        for (insert_line, prefix) in &descending {
+            self.replace_range(
+                TextRange::insertion(TextPosition::new(*insert_line, 0)),
+                &format!("{prefix}\n"),
+            );
+        }
+        let mut ascending = plans;
+        ascending.sort_by_key(|plan| plan.0);
+        let primary_insert = if below {
+            primary_line + 1
+        } else {
+            primary_line
+        };
+        let primary = ascending
+            .iter()
+            .position(|(line, _)| *line == primary_insert)
+            .unwrap_or(0);
+        let cursors: Vec<usize> = ascending
+            .iter()
+            .enumerate()
+            .map(|(offset, (insert_line, prefix))| {
+                self.current_buffer()
+                    .position_to_char_idx(TextPosition::new(
+                        *insert_line + offset,
+                        prefix.chars().count(),
+                    ))
+            })
+            .collect();
+        self.mode = Mode::Insert;
+        self.insert_entry_cursor = Some(self.cursor_snapshot());
+        self.felix.insert_extend = false;
+        self.felix.insert_primary = primary;
+        self.felix.insert_cursors = if cursors.len() > 1 {
+            cursors.clone()
+        } else {
+            Vec::new()
+        };
+        let ranges = cursors.into_iter().map(Range::cursor).collect();
+        self.set_felix_selection(Selection::from_ranges(ranges, primary));
+        self.render(buffer)?;
+        Ok(())
+    }
+
+    fn felix_line_insert_index(&self, line: usize, at_end: bool) -> usize {
+        let start = self
+            .current_buffer()
+            .position_to_char_idx(TextPosition::new(line, 0));
+        if at_end {
+            return start + self.line_character_len(line);
+        }
+        let text = self.current_buffer().get(line).unwrap_or_default();
+        let offset = text
+            .chars()
+            .take_while(|character| {
+                character.is_whitespace() && *character != '\n' && *character != '\r'
+            })
+            .count();
+        start + offset
     }
 
     fn felix_insert_text(&mut self, text: &str) {
@@ -1770,9 +1871,7 @@ impl Editor {
             let mut left = start;
             let mut right = end.max(start + 1).min(chars.len());
             if !chars[left].is_ascii_digit() {
-                if chars[left] == '-'
-                    && left + 1 < chars.len()
-                    && chars[left + 1].is_ascii_digit()
+                if chars[left] == '-' && left + 1 < chars.len() && chars[left + 1].is_ascii_digit()
                 {
                     right = right.max(left + 2);
                 } else {
@@ -1821,10 +1920,7 @@ impl Editor {
                 }
             })
             .collect();
-        self.set_felix_selection(Selection::from_ranges(
-            ranges,
-            selection.primary_index(),
-        ));
+        self.set_felix_selection(Selection::from_ranges(ranges, selection.primary_index()));
     }
 
     /// `Alt-)` / `Alt-(` rotate the text inside each selection.
@@ -1882,10 +1978,7 @@ impl Editor {
                 }
             })
             .collect();
-        self.set_felix_selection(Selection::from_ranges(
-            ranges,
-            selection.primary_index(),
-        ));
+        self.set_felix_selection(Selection::from_ranges(ranges, selection.primary_index()));
     }
 
     fn join_felix_selections(&mut self) {
@@ -1921,8 +2014,8 @@ impl Editor {
             .current_buffer()
             .char_idx_to_position(end.saturating_sub(1).max(start))
             .line;
-        let cursor_only = self.felix_selection().len() == 1
-            && self.felix_selection().primary().is_cursor();
+        let cursor_only =
+            self.felix_selection().len() == 1 && self.felix_selection().primary().is_cursor();
         if self.toggle_comment_lines(start_line, end_line) {
             let start = self
                 .current_buffer()

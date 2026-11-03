@@ -133,6 +133,67 @@ async fn helix_find_crosses_lines_and_percent_selects_the_file() {
 }
 
 #[tokio::test]
+async fn helix_insert_cursor_matches_helix_and_o_drops_the_old_selection() {
+    let mut harness = helix("hello world\n  alpha\nfoo bar foo\n");
+    press(&mut harness, "i").await;
+    harness.assert_mode(Mode::Insert);
+    assert_eq!(harness.editor.test_felix_selection(), (0, 0, 1));
+    press_code(&mut harness, KeyCode::Esc).await;
+
+    press(&mut harness, "a").await;
+    assert_eq!(harness.editor.test_felix_selection(), (0, 1, 1));
+    press_code(&mut harness, KeyCode::Esc).await;
+
+    press(&mut harness, "A").await;
+    assert_eq!(harness.editor.test_felix_selection(), (11, 11, 1));
+    press_code(&mut harness, KeyCode::Esc).await;
+
+    press(&mut harness, "jI").await;
+    assert_eq!(harness.buffer_line(), 1);
+    assert_eq!(harness.editor.test_felix_selection().2, 1);
+    let head = harness.editor.test_felix_selection().1;
+    assert_eq!(head, harness.editor.test_felix_selection().0);
+    press_code(&mut harness, KeyCode::Esc).await;
+
+    let mut harness = helix("hello world\n");
+    press(&mut harness, "wi").await;
+    harness.assert_mode(Mode::Insert);
+    assert_eq!(harness.editor.test_felix_selection(), (5, 0, 1));
+    press_code(&mut harness, KeyCode::Esc).await;
+
+    let mut harness = helix("hello world\n");
+    press(&mut harness, "wa").await;
+    assert_eq!(harness.editor.test_felix_selection(), (0, 6, 1));
+    press_code(&mut harness, KeyCode::Esc).await;
+
+    let mut harness = helix("hello world\n");
+    press(&mut harness, "o").await;
+    harness.assert_mode(Mode::Insert);
+    assert_eq!(harness.buffer_line(), 1);
+    assert_eq!(harness.editor.test_felix_selection().2, 1);
+    assert_eq!(
+        harness.editor.test_felix_selection().0,
+        harness.editor.test_felix_selection().1
+    );
+    assert!(
+        !markup(&harness).contains("#[hello"),
+        "o must not leave a selection on the original line, markup {}",
+        markup(&harness)
+    );
+    press_code(&mut harness, KeyCode::Esc).await;
+
+    let mut harness = helix("hello\nworld\n");
+    press(&mut harness, "C").await;
+    press(&mut harness, "o").await;
+    assert_eq!(harness.editor.test_felix_selection().2, 2);
+    assert!(
+        !markup(&harness).contains("#[hello"),
+        "multi o must not keep the old lines selected, markup {}",
+        markup(&harness)
+    );
+}
+
+#[tokio::test]
 async fn helix_escape_leaves_select_mode_and_keeps_the_selection() {
     let mut harness = helix("abcdef\n");
     press(&mut harness, "v").await;

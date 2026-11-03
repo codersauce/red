@@ -20,39 +20,38 @@ use std::{
 
 use chrono::Local;
 use crossterm::{
-    QueueableCommand as _,
     cursor::{self, MoveTo},
-    style, terminal,
+    style, terminal, QueueableCommand as _,
 };
 use unicode_segmentation::UnicodeSegmentation as _;
 
 use crate::{
-    color::{Color, blend_color, ensure_minimum_contrast},
+    color::{blend_color, ensure_minimum_contrast, Color},
     config::{CursorShape, FormattingProvider, KeyAction, PickerIconStyle, StatuslineSection},
     editor::RenderCommand,
     lsp::{Diagnostic, DiagnosticSeverity},
     notification::{NotificationCounts, NotificationState, Severity},
-    plugin::{DecorationAnchor, rpc::RpcStatuslineSide},
+    plugin::{rpc::RpcStatuslineSide, DecorationAnchor},
     splash,
     theme::{SelectionForegroundPriority, Style, SurfacePalette, Theme},
     ui::IconCatalog,
     undo::{TextPosition, TextRange},
     unicode_utils::{
-        TruncationSide, char_prefix, display_width, display_width_with_tabs, fit_display_width,
-        grapheme_len, grapheme_to_column_with_tabs, is_printable_ascii, trim_line_ending,
-        truncate_display_width, truncate_display_width_with_marker,
+        char_prefix, display_width, display_width_with_tabs, fit_display_width, grapheme_len,
+        grapheme_to_column_with_tabs, is_printable_ascii, trim_line_ending, truncate_display_width,
+        truncate_display_width_with_marker, TruncationSide,
     },
     utils::{expand_user_path, get_workspace_path},
     window::WindowId,
 };
 
 use super::{
-    Editor, GUTTER_SIGN_COLUMN_WIDTH, MAX_HIGHLIGHT_SLICE_BYTES, Mode, Point, Rect, RenderBuffer,
-    StatuslineGitChanges, StyleCursor, adjust_color_brightness, diagnostic_foreground,
-    diagnostic_priority,
+    adjust_color_brightness, diagnostic_foreground, diagnostic_priority,
     display_layout::{DisplayLayout, InlineCommentContent, LineSegment},
     inline_comments::InlineCommentConnector,
     render_buffer::Change,
+    Editor, Mode, Point, Rect, RenderBuffer, StatuslineGitChanges, StyleCursor,
+    GUTTER_SIGN_COLUMN_WIDTH, MAX_HIGHLIGHT_SLICE_BYTES,
 };
 
 fn diagnostic_row(diagnostics: &[&Diagnostic], available_width: usize) -> Option<String> {
@@ -4690,7 +4689,7 @@ mod tests {
     use crate::{
         buffer::{Buffer, ExternalFileChange},
         config::Config,
-        editor::{HighlightSpan, display_layout::LineSegment},
+        editor::{display_layout::LineSegment, HighlightSpan},
         lsp::{LspManager, Position, Range},
         plugin::{Decoration, DecorationAnchor},
         theme::Theme,
@@ -4867,11 +4866,9 @@ mod tests {
         for comment in &layout.inline_comments {
             let y = editor.window_to_terminal_y(&window, comment.row);
             let cells = &frame.cells[y * 60..(y + 1) * 60];
-            assert!(
-                cells[..content_start]
-                    .iter()
-                    .all(|cell| cell.style.bg == editor.theme.style.bg)
-            );
+            assert!(cells[..content_start]
+                .iter()
+                .all(|cell| cell.style.bg == editor.theme.style.bg));
             let block_cells = &cells[content_start..content_start + comment.block_width];
             match &comment.content {
                 InlineCommentContent::Text(_) => {
@@ -4888,11 +4885,9 @@ mod tests {
                         && cell.style.bg == editor.theme.style.bg));
                 }
             }
-            assert!(
-                cells[content_start + comment.block_width..]
-                    .iter()
-                    .all(|cell| cell.style.bg == editor.theme.style.bg)
-            );
+            assert!(cells[content_start + comment.block_width..]
+                .iter()
+                .all(|cell| cell.style.bg == editor.theme.style.bg));
             let expected = if comment.starts_connection {
                 "╭"
             } else if comment.content == InlineCommentContent::TopEdge {
@@ -4983,6 +4978,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn helix_insert_uses_a_bar_and_o_does_not_keep_the_old_highlight() {
+        use crate::config::EditingModel;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+        let mut editor = rendering_test_editor(Buffer::new(None, "hello world\n".to_string()));
+        editor.config.editing_model = EditingModel::Helix;
+        let key =
+            |character| Event::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        editor.test_execute_event(key('i')).await.unwrap();
+        assert_eq!(editor.mode, Mode::Insert);
+        assert_eq!(editor.active_cursor_shape(), CursorShape::SteadyBar);
+        assert!(editor.terminal_cursor_state().position.is_some());
+        let mut frame = RenderBuffer::new(60, 12, &editor.theme.style);
+        editor.render(&mut frame).unwrap();
+        let window = editor.active_window_with_editor_view().unwrap();
+        let start = editor.gutter_width_for_window(&window) + 1;
+        assert_eq!(
+            frame.cells[start].style.bg,
+            frame.cells[start + 1].style.bg,
+            "insert does not paint a one-wide selection on the cursor"
+        );
+
+        let mut editor = rendering_test_editor(Buffer::new(None, "hello world\n".to_string()));
+        editor.config.editing_model = EditingModel::Helix;
+        editor.test_execute_event(key('w')).await.unwrap();
+        editor.test_execute_event(key('o')).await.unwrap();
+        assert_eq!(editor.test_buffer_line(), 1);
+        let mut frame = RenderBuffer::new(60, 12, &editor.theme.style);
+        editor.render(&mut frame).unwrap();
+        let window = editor.active_window_with_editor_view().unwrap();
+        let start = editor.gutter_width_for_window(&window) + 1;
+        assert_eq!(
+            frame.cells[start].style.bg,
+            frame.cells[start + 1].style.bg,
+            "o must not leave the word selection painted on the original line"
+        );
+    }
+
+    #[tokio::test]
     async fn helix_counted_word_motion_paints_the_final_selection_once() {
         use crate::config::EditingModel;
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
@@ -5010,6 +5044,29 @@ mod tests {
             !markup.starts_with("#[this| "),
             "2w must not stop on the first word, markup {markup}"
         );
+
+        let mut editor =
+            rendering_test_editor(Buffer::new(None, "one\ntwo\nthree\nfour\n".to_string()));
+        editor.config.editing_model = EditingModel::Helix;
+        editor.test_execute_event(key('3')).await.unwrap();
+        let renders = editor.full_render_count;
+        editor.test_execute_event(key('j')).await.unwrap();
+        assert_eq!(editor.full_render_count, renders + 1);
+        assert_eq!(editor.test_buffer_line(), 3);
+
+        let mut editor = rendering_test_editor(Buffer::new(None, "abxcdx\n".to_string()));
+        editor.config.editing_model = EditingModel::Helix;
+        editor.test_execute_event(key('2')).await.unwrap();
+        editor.test_execute_event(key('f')).await.unwrap();
+        let renders = editor.full_render_count;
+        editor.test_execute_event(key('x')).await.unwrap();
+        assert_eq!(
+            editor.full_render_count,
+            renders + 1,
+            "2fx paints the final match once, markup {}",
+            editor.test_felix_markup()
+        );
+        assert!(editor.test_felix_markup().contains("|x"));
     }
 
     #[tokio::test]
@@ -5277,11 +5334,9 @@ mod tests {
         assert!(buffer.cells[..2].iter().all(|cell| cell.style == outer));
         assert!(buffer.cells[2..5].iter().all(|cell| cell.style == later));
         assert!(buffer.cells[5..7].iter().all(|cell| cell.style == outer));
-        assert!(
-            buffer.cells[7..]
-                .iter()
-                .all(|cell| cell.style == theme.style)
-        );
+        assert!(buffer.cells[7..]
+            .iter()
+            .all(|cell| cell.style == theme.style));
     }
 
     #[test]
@@ -5314,11 +5369,9 @@ mod tests {
         );
 
         assert_eq!(rendered_rows(&buffer), vec!["X  abc     X"]);
-        assert!(
-            buffer.cells[1..11]
-                .iter()
-                .all(|cell| cell.style == theme.style)
-        );
+        assert!(buffer.cells[1..11]
+            .iter()
+            .all(|cell| cell.style == theme.style));
         assert_eq!(buffer.cells[0].style, stale);
         assert_eq!(buffer.cells[11].style, stale);
     }
@@ -5402,12 +5455,10 @@ mod tests {
 
         let rendered = rendered_rows(&buffer).pop().unwrap();
         assert_eq!(rendered.trim_end(), EXPECTED);
-        assert!(
-            buffer
-                .cells
-                .iter()
-                .all(|cell| !cell.text.chars().any(char::is_control))
-        );
+        assert!(buffer
+            .cells
+            .iter()
+            .all(|cell| !cell.text.chars().any(char::is_control)));
     }
 
     #[test]
@@ -5685,11 +5736,9 @@ mod tests {
 
         editor.render(&mut buffer).unwrap();
 
-        assert!(
-            rendered_rows(&buffer)
-                .iter()
-                .any(|row| row.contains("yyyy"))
-        );
+        assert!(rendered_rows(&buffer)
+            .iter()
+            .any(|row| row.contains("yyyy")));
     }
 
     #[test]
@@ -5704,11 +5753,9 @@ mod tests {
 
         editor.render(&mut buffer).unwrap();
         let full_renders = editor.full_render_count;
-        assert!(
-            rendered_rows(&buffer)
-                .iter()
-                .any(|row| row.contains("alpha"))
-        );
+        assert!(rendered_rows(&buffer)
+            .iter()
+            .any(|row| row.contains("alpha")));
 
         editor.render_edited_window_rows(&mut buffer).unwrap();
 
@@ -5752,30 +5799,22 @@ mod tests {
         let mut buffer = RenderBuffer::new(60, 12, &Style::default());
         editor.render(&mut buffer).unwrap();
         let full_renders = editor.full_render_count;
-        assert!(
-            rendered_rows(&buffer)
-                .iter()
-                .any(|row| row.contains("outer(value: usize)"))
-        );
-        assert!(
-            rendered_rows(&buffer)
-                .iter()
-                .any(|row| row.contains("indexing workspace"))
-        );
+        assert!(rendered_rows(&buffer)
+            .iter()
+            .any(|row| row.contains("outer(value: usize)")));
+        assert!(rendered_rows(&buffer)
+            .iter()
+            .any(|row| row.contains("indexing workspace")));
 
         editor.render_edited_window_rows(&mut buffer).unwrap();
 
         assert_eq!(editor.full_render_count, full_renders);
-        assert!(
-            rendered_rows(&buffer)
-                .iter()
-                .any(|row| row.contains("outer(value: usize)"))
-        );
-        assert!(
-            rendered_rows(&buffer)
-                .iter()
-                .any(|row| row.contains("indexing workspace"))
-        );
+        assert!(rendered_rows(&buffer)
+            .iter()
+            .any(|row| row.contains("outer(value: usize)")));
+        assert!(rendered_rows(&buffer)
+            .iter()
+            .any(|row| row.contains("indexing workspace")));
     }
 
     #[test]
@@ -5803,11 +5842,9 @@ mod tests {
         editor.render_edited_window_rows(&mut buffer).unwrap();
 
         assert_eq!(editor.full_render_count, full_renders + 1);
-        assert!(
-            rendered_rows(&buffer)
-                .iter()
-                .any(|row| row.contains("indexing workspace"))
-        );
+        assert!(rendered_rows(&buffer)
+            .iter()
+            .any(|row| row.contains("indexing workspace")));
     }
 
     #[test]
@@ -5859,14 +5896,12 @@ mod tests {
 
         editor.render(&mut buffer).unwrap();
         let rows = rendered_rows(&buffer);
-        assert!(
-            rows.iter()
-                .any(|row| row.contains("first visible diagnostic"))
-        );
-        assert!(
-            rows.iter()
-                .any(|row| row.contains("second visible diagnostic"))
-        );
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("first visible diagnostic")));
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("second visible diagnostic")));
 
         editor.render_edited_window_rows(&mut buffer).unwrap();
 
@@ -7174,12 +7209,10 @@ mod tests {
             assert_eq!(output.matches("\x1b[?2026h").count(), 1);
             assert_eq!(output.matches("\x1b[?2026l").count(), 1);
             if fail_at.is_some() {
-                assert!(
-                    result
-                        .unwrap_err()
-                        .to_string()
-                        .contains("injected frame write failure")
-                );
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("injected frame write failure"));
                 assert!(editor.force_full_redraw);
             } else {
                 result.unwrap();
