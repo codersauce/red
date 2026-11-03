@@ -233,6 +233,12 @@ pub fn analyze(registry: &LanguageRegistry, language_id: &str, source: &str) -> 
     for name in &mut names {
         if definitions.iter().any(|def| def.name_span == name.span) {
             name.role = Role::Definition;
+        } else if calls.iter().any(|call| {
+            // A method name is a field identifier in the tree; the call's
+            // callee ends with it, so it reads as a call, not a field.
+            call.name == name.name && call.callee.end_byte == name.span.end_byte
+        }) {
+            name.role = Role::Call;
         }
     }
     let mut functions = Vec::new();
@@ -802,6 +808,38 @@ mod tests {
 
     fn rust(source: &str) -> Analysis {
         analyze(&LanguageRegistry::bundled(), "rust", source)
+    }
+
+    #[test]
+    fn called_names_read_as_calls_and_plain_fields_stay_fields() {
+        let source = r#"
+struct Bucket { tokens: u32 }
+impl Bucket {
+    fn refill(&mut self) {}
+    fn take(&mut self) -> u32 {
+        self.refill();
+        helper();
+        println!("x");
+        self.tokens
+    }
+}
+fn helper() {}
+"#;
+        let analysis = rust(source);
+        let role = |name: &str| {
+            let occurrences: Vec<Role> = analysis
+                .names
+                .iter()
+                .filter(|occ| occ.name == name && occ.role != Role::Definition)
+                .map(|occ| occ.role)
+                .collect();
+            assert!(!occurrences.is_empty(), "{name} has no uses");
+            occurrences
+        };
+        assert_eq!(role("refill"), vec![Role::Call]);
+        assert_eq!(role("helper"), vec![Role::Call]);
+        assert_eq!(role("println"), vec![Role::Call]);
+        assert!(role("tokens").contains(&Role::Field));
     }
 
     #[test]
