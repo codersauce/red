@@ -473,27 +473,61 @@ fn find_char(
     let mut head = head.min(chars.len().saturating_sub(1));
     for _ in 0..count.max(1) {
         head = match kind {
-            FindKind::Next | FindKind::TillNext => {
+            FindKind::Next => {
                 let start = head + 1;
-                let found = chars[start..]
+                chars[start..]
                     .iter()
                     .position(|character| *character == target)?
-                    + start;
-                if kind == FindKind::TillNext {
-                    found.saturating_sub(1).max(head)
-                } else {
-                    found
-                }
+                    + start
             }
-            FindKind::Prev | FindKind::TillPrev => {
-                let found = chars[..head]
-                    .iter()
-                    .rposition(|character| *character == target)?;
-                if kind == FindKind::TillPrev {
-                    found + 1
-                } else {
-                    found
+            FindKind::TillNext => {
+                // Same extra-match skip as TillPrev, in the other direction.
+                // On a run of the target, `t` covers the cursor and the next one.
+                let mut remaining = count.max(1);
+                if chars.get(head + 1) == Some(&target) {
+                    remaining += 1;
                 }
+                let mut index = head;
+                let mut found = None;
+                while index + 1 < chars.len() {
+                    index += 1;
+                    if chars[index] == target {
+                        remaining -= 1;
+                        if remaining == 0 {
+                            found = Some(index);
+                            break;
+                        }
+                    }
+                }
+                return found.map(|index| index.saturating_sub(1).max(head));
+            }
+            FindKind::Prev => {
+                chars[..head]
+                    .iter()
+                    .rposition(|character| *character == target)?
+            }
+            FindKind::TillPrev => {
+                // Helix searches backward from the cursor scalar. When the
+                // scalar before the cursor is already the target, it skips
+                // one extra match so `T` on a run of the same character
+                // covers the cursor and the match before it.
+                let mut remaining = count.max(1);
+                if head > 0 && chars.get(head - 1) == Some(&target) {
+                    remaining += 1;
+                }
+                let mut index = head;
+                let mut found = None;
+                while index > 0 {
+                    index -= 1;
+                    if chars[index] == target {
+                        remaining -= 1;
+                        if remaining == 0 {
+                            found = Some(index);
+                            break;
+                        }
+                    }
+                }
+                return found.map(|index| index + 1);
             }
         };
     }
@@ -736,8 +770,7 @@ pub fn regex_split(text: &str, selection: &Selection, pattern: &str) -> Result<S
     if ranges.is_empty() {
         return Err("nothing left after splitting".to_string());
     }
-    let primary = ranges.len() - 1;
-    let mut selection = Selection::from_ranges(ranges, primary);
+    let mut selection = Selection::from_ranges(ranges, 0);
     selection.normalize(len);
     Ok(selection)
 }
@@ -897,7 +930,9 @@ pub fn surround(
         }
         SurroundOp::Delete => {
             let (open, close) = pair_for(first);
-            let (outer_start, outer_end) = surrounding_pair(text, start, end, open, close)?;
+            let cursor = range.head.min(len.saturating_sub(1));
+            let (outer_start, outer_end) =
+                surrounding_pair(text, cursor, cursor.saturating_add(1), open, close)?;
             Ok((
                 vec![
                     TextEdit {
@@ -918,7 +953,9 @@ pub fn surround(
             let next = second.ok_or_else(|| "replacement character required".to_string())?;
             let (open, close) = pair_for(first);
             let (new_open, new_close) = pair_for(next);
-            let (outer_start, outer_end) = surrounding_pair(text, start, end, open, close)?;
+            let cursor = range.head.min(len.saturating_sub(1));
+            let (outer_start, outer_end) =
+                surrounding_pair(text, cursor, cursor.saturating_add(1), open, close)?;
             Ok((
                 vec![
                     TextEdit {

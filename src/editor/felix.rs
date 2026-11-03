@@ -867,6 +867,14 @@ impl Editor {
                 return Ok(());
             }
             Command::SearchSelection => self.search_felix_selection(buffer, runtime).await?,
+            Command::Increment => self.felix_increment(1),
+            Command::Decrement => self.felix_increment(-1),
+            Command::RotateContentsForward => self.rotate_felix_contents(true),
+            Command::RotateContentsBackward => self.rotate_felix_contents(false),
+            Command::SaveJump => {
+                let entry = self.current_jump_entry();
+                self.push_history_entry(entry);
+            }
             Command::Undo | Command::Redo | Command::Earlier | Command::Later => {
                 let action = match command {
                     Command::Redo => Action::Redo,
@@ -1006,7 +1014,12 @@ impl Editor {
             command,
             Command::SurroundAdd | Command::SurroundDelete | Command::SurroundReplace
         ) {
-            self.surround_felix(command, character, extra);
+            let (find, replacement) = if command == Command::SurroundReplace {
+                (extra.unwrap_or(character), Some(character))
+            } else {
+                (character, extra)
+            };
+            self.surround_felix(command, find, replacement);
             self.render(buffer)?;
             return Ok(());
         }
@@ -1092,6 +1105,11 @@ impl Editor {
             self.begin_transaction("insert");
         } else {
             self.set_felix_selection(next);
+            // Helix `d` leaves select mode. The tutor relies on that: the
+            // next `v` enters select again instead of toggling it off.
+            if self.mode == Mode::Select {
+                self.mode = Mode::Normal;
+            }
         }
         self.remember_felix_selection();
     }
@@ -1630,13 +1648,13 @@ impl Editor {
             }
         }
         self.apply_felix_edits(edits, false);
-        if op == SurroundOp::Delete {
-            let cursor = chosen
-                .first()
-                .map(|range| range.from().saturating_sub(1))
-                .unwrap_or(0);
-            self.set_felix_selection(Selection::cursor(cursor));
-        } else if !chosen.is_empty() {
+        if self.mode == Mode::Select {
+            self.mode = Mode::Normal;
+        }
+        // Add selects the new pair. Delete and replace keep the selection
+        // that was mapped through the edit, which is the text the cursor
+        // was already covering.
+        if op == SurroundOp::Add && !chosen.is_empty() {
             self.set_felix_selection(Selection::from_ranges(chosen, selection.primary_index()));
         }
     }
@@ -1738,6 +1756,138 @@ impl Editor {
         self.set_felix_selection(Selection::cursor(cursor));
     }
 
+    /// Adds `delta` to each integer overlapping a selection. The tutor uses
+    /// this for `Ctrl-a` / `Ctrl-x` on a number under the cursor.
+    fn felix_increment(&mut self, delta: i64) {
+        let chars: Vec<char> = self.felix_text().chars().collect();
+        let selection = self.felix_selection();
+        let mut jobs: Vec<(usize, usize, String, bool)> = Vec::new();
+        for range in selection.ranges() {
+            let (start, end) = range.span(chars.len());
+            if chars.is_empty() || start >= chars.len() {
+                continue;
+            }
+            let mut left = start;
+            let mut right = end.max(start + 1).min(chars.len());
+            if !chars[left].is_ascii_digit() {
+                if chars[left] == '-'
+                    && left + 1 < chars.len()
+                    && chars[left + 1].is_ascii_digit()
+                {
+                    right = right.max(left + 2);
+                } else {
+                    continue;
+                }
+            }
+            while left > 0 && chars[left - 1].is_ascii_digit() {
+                left -= 1;
+            }
+            if left > 0 && chars[left - 1] == '-' {
+                left -= 1;
+            }
+            while right < chars.len() && chars[right].is_ascii_digit() {
+                right += 1;
+            }
+            let body: String = chars[left..right].iter().collect();
+            let Ok(value) = body.parse::<i64>() else {
+                continue;
+            };
+            jobs.push((left, right, (value + delta).to_string(), range.is_forward()));
+        }
+        if jobs.is_empty() {
+            return;
+        }
+        jobs.sort_by_key(|job| std::cmp::Reverse(job.0));
+        self.remember_felix_selection();
+        self.begin_transaction("increment");
+        for (start, end, text, _) in &jobs {
+            let start_pos = self.current_buffer().char_idx_to_position(*start);
+            let end_pos = self.current_buffer().char_idx_to_position(*end);
+            self.replace_range(TextRange::new(start_pos, end_pos), text);
+        }
+        self.commit_transaction(self.cursor_snapshot());
+        jobs.sort_by_key(|job| job.0);
+        let mut shift: isize = 0;
+        let ranges = jobs
+            .iter()
+            .map(|(start, end, text, forward)| {
+                let new_start = (*start as isize + shift) as usize;
+                let new_len = text.chars().count();
+                shift += new_len as isize - (*end - *start) as isize;
+                if new_len == 0 {
+                    Range::cursor(new_start)
+                } else {
+                    Range::covering(new_start, new_start + new_len - 1, *forward)
+                }
+            })
+            .collect();
+        self.set_felix_selection(Selection::from_ranges(
+            ranges,
+            selection.primary_index(),
+        ));
+    }
+
+    /// `Alt-)` / `Alt-(` rotate the text inside each selection.
+    fn rotate_felix_contents(&mut self, forward: bool) {
+        let source = self.felix_text();
+        let selection = self.felix_selection();
+        let len = source.chars().count();
+        if selection.len() < 2 {
+            return;
+        }
+        let mut fragments: Vec<String> = selection
+            .ranges()
+            .iter()
+            .map(|range| {
+                let (start, end) = range.span(len);
+                source.chars().skip(start).take(end - start).collect()
+            })
+            .collect();
+        if forward {
+            fragments.rotate_right(1);
+        } else {
+            fragments.rotate_left(1);
+        }
+        let spans: Vec<(usize, usize, bool)> = selection
+            .ranges()
+            .iter()
+            .map(|range| {
+                let (start, end) = range.span(len);
+                (start, end, range.is_forward())
+            })
+            .collect();
+        let mut order: Vec<usize> = (0..spans.len()).collect();
+        order.sort_by_key(|index| std::cmp::Reverse(spans[*index].0));
+        self.remember_felix_selection();
+        self.begin_transaction("rotate selections");
+        for index in order {
+            let (start, end, _) = spans[index];
+            let start_pos = self.current_buffer().char_idx_to_position(start);
+            let end_pos = self.current_buffer().char_idx_to_position(end);
+            self.replace_range(TextRange::new(start_pos, end_pos), &fragments[index]);
+        }
+        self.commit_transaction(self.cursor_snapshot());
+        let mut shift: isize = 0;
+        let ranges = spans
+            .iter()
+            .zip(fragments.iter())
+            .map(|((start, end, forward), text)| {
+                let new_start = (*start as isize + shift) as usize;
+                let new_len = text.chars().count();
+                shift += new_len as isize - (*end - *start) as isize;
+                if new_len == 0 {
+                    Range::cursor(new_start)
+                } else {
+                    Range::covering(new_start, new_start + new_len - 1, *forward)
+                }
+            })
+            .collect();
+        self.set_felix_selection(Selection::from_ranges(
+            ranges,
+            selection.primary_index(),
+        ));
+    }
+
     fn join_felix_selections(&mut self) {
         let len = self.current_buffer().contents_snapshot().len_chars();
         let selection = self.felix_selection();
@@ -1771,11 +1921,27 @@ impl Editor {
             .current_buffer()
             .char_idx_to_position(end.saturating_sub(1).max(start))
             .line;
+        let cursor_only = self.felix_selection().len() == 1
+            && self.felix_selection().primary().is_cursor();
         if self.toggle_comment_lines(start_line, end_line) {
-            let cursor = self
+            let start = self
                 .current_buffer()
                 .position_to_char_idx(TextPosition::new(start_line, 0));
-            self.set_felix_selection(Selection::cursor(cursor));
+            if cursor_only {
+                self.set_felix_selection(Selection::cursor(start));
+                return;
+            }
+            let end_line_text = self.current_buffer().get(end_line).unwrap_or_default();
+            let end = self
+                .current_buffer()
+                .position_to_char_idx(TextPosition::new(end_line, 0))
+                + end_line_text.chars().count();
+            let range = if end > start {
+                Range::covering(start, end.saturating_sub(1), true)
+            } else {
+                Range::cursor(start)
+            };
+            self.set_felix_selection(Selection::single(range));
         }
     }
 

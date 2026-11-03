@@ -289,7 +289,9 @@ impl Selection {
         }
         let mut ranges = self.ranges.clone();
         ranges.remove(self.primary);
-        let primary = self.primary.saturating_sub(1).min(ranges.len() - 1);
+        // The selection that followed the removed primary takes its place.
+        // Removing the last one leaves the new last selection primary.
+        let primary = self.primary.min(ranges.len() - 1);
         Some(Self { ranges, primary })
     }
 

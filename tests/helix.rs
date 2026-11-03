@@ -327,6 +327,20 @@ async fn helix_mouse_click_and_scroll_move_the_selection() {
 }
 
 #[tokio::test]
+async fn till_backward_on_a_run_covers_the_cursor_and_the_previous_match() {
+    let mut harness = helix(
+        " --> -----[Free this sentence of its brackets!]-----\n --> ------Free this sentence of its dashes!------\n",
+    );
+    press_sequence(&mut harness, "f-f[dglF]djf-t-dglT-d").await;
+    assert_eq!(
+        harness.buffer_contents(),
+        " Free this sentence of its brackets!\n --> ------Free this sentence of its dashes!--\n",
+        "{}",
+        markup(&harness)
+    );
+}
+
+#[tokio::test]
 async fn helix_select_mode_extends_and_collapse_and_flip_move_the_ends() {
     let mut harness = helix("abcdef\n");
     press(&mut harness, "vl").await;

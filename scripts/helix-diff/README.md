@@ -55,5 +55,14 @@ python3 scripts/helix-diff/probe_hx.py --out /tmp/helix-diff/hx.json
 `--ids id1,id2` and `--limit N` narrow the run. A full probe of the 300 cases
 takes a few minutes because each case opens `hx`.
 
+The tutor walkthrough is separate:
+
+```bash
+python3 scripts/helix-diff/tutor.py
+```
+
+It replays each exercise from Helix 25.07.1's `:tutor` file. Sections that
+need a feature Red does not implement are printed and not probed.
+
 Key tokens in `cases.py` are literal characters plus `{enter}`, `{esc}`,
 `{alt-x}`, `{ctrl-f}`, `{home}`, and the other names listed in `probe_hx.py`.

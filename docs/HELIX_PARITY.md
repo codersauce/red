@@ -46,6 +46,71 @@ on equal terms. Helix's own default scrolloff is 5.
 | `Ctrl-f` `Ctrl-b` `Ctrl-d` `Ctrl-u`, PageUp, PageDown | **fixed** | The cursor moves by the 22-row text height of a 24-row frame. |
 | `Ctrl-o` `Ctrl-i` | **matched** | An empty jumplist leaves the selection alone. |
 
+## Tutor
+
+`scripts/helix-diff/tutor.py` replays each exercise from the Helix 25.07.1
+`:tutor` file (`helix-term/runtime/tutor`). A section matches when Red and
+Helix finish with the same buffer, selection anchors and heads, primary
+index, and mode. `python3 scripts/helix-diff/tutor.py` reruns it.
+
+| Section | Result | Notes |
+|---|---|---|
+| 1.1 Movement | **matched** | `hjkl` on a small grid. |
+| 1.2 Exiting | **matched** | `:` enters command mode and Esc leaves it. `q`, `quit`, `q!`, and `quit!` are the existing quit commands; the probe does not send them because they close the editor. |
+| 1.3 Deletion | **matched** | `d` deletes the selected scalar. |
+| 1.4 Insert | **matched** | `i` and Esc. |
+| 1.5 Saving | **matched** | `:w`. |
+| 2.1 More insert | **matched** | `A` inserts at the end of the line. |
+| 2.2 Opening lines | **matched** | `o` opens a line below. |
+| 3.1 Motions | **matched** | `w` then `d`. |
+| 3.2 More motions | **matched** | `e` and `b` around a word. |
+| 3.3 Words and WORDs | **matched** | `w` and `W`. |
+| 3.4 Change | **matched** | `c` replaces the selection. |
+| 3.5 Counts | **matched** | The count is applied inside one motion. |
+| 3.6 Select mode | **fixed** | `d` leaves select mode, so the next `v` enters it again. |
+| 3.7 Lines | **matched** | `x` and `2x`. |
+| 3.8 Collapse | **matched** | `;`. |
+| 4.1 Undo | **matched** | `u` and `U`. |
+| 4.2 Yank and paste | **matched** | `y`, `p`. Space y / Space p are not Helix clipboard commands. |
+| 4.3 Search | **matched** | `/`, `n`, `N`. |
+| 5.1 Multiple cursors | **matched** | `C` and `,`. |
+| 5.2 Select command | **matched** | `s`. |
+| 5.3 Regex select | **matched** | `s` with ` +`. |
+| 5.4 Align | **matched** | `&`. |
+| 5.5 Split into lines | **matched** | Alt-s then `&`. |
+| 6.1 Find and till | **fixed** | `t` and `T` on a run of the same character cover the cursor and the neighboring match, as Helix does. |
+| 6.2 Replace | **matched** | `r`. |
+| 6.3 Repetition | **not supported** | `.` replays the last insert and Alt-. replays the last `f`/`t`. Red does not record those. |
+| 7.1 Replace with yank | **matched** | `R`. |
+| 7.2 Join | **matched** | `J`. |
+| 7.3 Indent | **matched** | `>` and `<`. |
+| 7.4 Increment | **fixed** | Ctrl-a and Ctrl-x add or subtract 1 from the integer under the selection. |
+| 8.1 Registers | **not supported** | `"` chooses a named register. Yank and paste use one default register. |
+| 8.2 Macros | **not supported** | `Q` records and `q` replays. That needs a keystroke log. |
+| 9.1 Search selection | **matched** | `*` sets the search, `n` and `N` move. |
+| 9.2 Select on next match | **matched** | `n` in select mode adds a selection. |
+| 9.3 Jumplist | **fixed** | Ctrl-s pushes the cursor onto the jumplist. Ctrl-o returns to it. |
+| 9.4 Two-character labels | **not supported** | `gw` paints labels over the visible words. That is a popup, not a buffer edit. |
+| 10.1 Cycle selections | **fixed** | Alt-, leaves the following selection primary. |
+| 10.2 Cycle contents | **fixed** | Alt-( and Alt-) rotate the text inside the selections. |
+| 10.3 Case | **matched** | `~`, `` ` ``, and Alt-`. |
+| 10.4 Split on regex | **fixed** | `S` keeps the first piece primary. |
+| 11.1 Comment | **fixed** | A buffer with no language comment uses `# `, and a cursor stays a cursor. |
+| 11.2 Comment several lines | **matched** | The line selection is kept. |
+| 12.1 Match jump | **matched** | `mm`. |
+| 12.2 Select inside | **matched** | `mi(`. |
+| 12.3 Select around | **matched** | `ma(`. |
+| 12.4 Surround | **fixed** | Surround leaves select mode. |
+| 12.5 Delete surround | **fixed** | `md` looks around the cursor, including when `f` has a wide selection. |
+| 12.6 Replace surround | **fixed** | `mr([` finds `(` and replaces it with `[`. |
+| 13.1–13.7 Splits | **not supported** | Red keeps Ctrl-w as its own window menu, and Space f is format rather than Helix's file picker. The tutor's `Ctrl-w n v`, `Ctrl-w o`, `Ctrl-w t`, `Ctrl-w HJKL`, `:vs FILENAME`, and picker Ctrl-v / Ctrl-s chords are not Helix's. |
+
+Side-by-side frames after the exercise keys, Helix on the left and Red on the right:
+
+- `/opt/cursor/artifacts/helix-parity/tutor-1.4-side-by-side.png`
+- `/opt/cursor/artifacts/helix-parity/tutor-3.6-side-by-side.png`
+- `/opt/cursor/artifacts/helix-parity/tutor-5.2-side-by-side.png`
+
 ## Rendering
 
 The head cell is the cursor block. The other cells of each range use the selection style. Side-by-side tmux captures, Helix on the left and Red on the right:

@@ -29726,9 +29726,28 @@ impl Editor {
                     }
                     // Helix counts on goto are line numbers, not repeats.
                     // Other Helix commands still repeat once per count.
+                    // These commands take the count themselves. Repeating them
+                    // once per count paints a different selection than Helix,
+                    // which applies the count inside one motion.
                     KeyAction::Single(Action::Felix(
                         crate::felix::Command::GotoFileStart
                         | crate::felix::Command::GotoLine
+                        | crate::felix::Command::GotoLastLine
+                        | crate::felix::Command::GotoLineStart
+                        | crate::felix::Command::GotoLineEnd
+                        | crate::felix::Command::GotoFirstNonwhitespace
+                        | crate::felix::Command::MoveCharLeft
+                        | crate::felix::Command::MoveCharRight
+                        | crate::felix::Command::MoveLineUp
+                        | crate::felix::Command::MoveLineDown
+                        | crate::felix::Command::MoveNextWordStart
+                        | crate::felix::Command::MovePrevWordStart
+                        | crate::felix::Command::MoveNextWordEnd
+                        | crate::felix::Command::MovePrevWordEnd
+                        | crate::felix::Command::MoveNextLongWordStart
+                        | crate::felix::Command::MovePrevLongWordStart
+                        | crate::felix::Command::MoveNextLongWordEnd
+                        | crate::felix::Command::MovePrevLongWordEnd
                         | crate::felix::Command::FindNextChar
                         | crate::felix::Command::FindPrevChar
                         | crate::felix::Command::TillNextChar
@@ -30255,12 +30274,18 @@ impl Editor {
 
     fn comment_syntax(&mut self) -> Option<CommentSyntax> {
         let Some(language) = self.current_language_id() else {
+            if self.is_helix() {
+                return CommentSyntax::parse("# %s");
+            }
             self.set_legacy_message(Some(
                 "no comment syntax configured for unnamed buffer".to_string(),
             ));
             return None;
         };
         let Some(template) = self.comment_template_for_language(&language) else {
+            if self.is_helix() {
+                return CommentSyntax::parse("# %s");
+            }
             self.set_legacy_message(Some(format!("no comment syntax configured for {language}")));
             return None;
         };
