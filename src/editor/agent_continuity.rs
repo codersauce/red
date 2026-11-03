@@ -147,9 +147,9 @@ impl ConversationStore {
     /// The conversation saved for a workspace, if it is readable and was saved
     /// for exactly this workspace.
     pub fn load(&self, workspace: &Path) -> Option<SavedConversation> {
-        let key = workspace_key(workspace);
+        let (source, key) = workspace_identity(workspace);
         let record: Record = read_bounded_json(&self.directory.join(format!("{key}.json")))?;
-        (record.version == RECORD_VERSION && record.workspace == key_source(workspace)).then_some(
+        (record.version == RECORD_VERSION && record.workspace == source).then_some(
             SavedConversation {
                 saved_at_ms: record.saved_at_ms,
                 conversation: record.conversation,
@@ -163,12 +163,13 @@ impl ConversationStore {
         workspace: &Path,
         conversation: &AgentConversationSnapshot,
     ) -> anyhow::Result<bool> {
-        if !self.owns(workspace) {
+        let (source, key) = workspace_identity(workspace);
+        if !self.held.contains_key(&key) {
             return Ok(false);
         }
         let record = Record {
             version: RECORD_VERSION,
-            workspace: key_source(workspace),
+            workspace: source,
             saved_at_ms: now_ms(),
             conversation: conversation.clone(),
         };
@@ -178,9 +179,7 @@ impl ConversationStore {
             "agent conversation is too large to save"
         );
         ensure_private_directory(&self.directory)?;
-        let destination = self
-            .directory
-            .join(format!("{}.json", workspace_key(workspace)));
+        let destination = self.directory.join(format!("{key}.json"));
         if let Ok(metadata) = fs::symlink_metadata(&destination) {
             anyhow::ensure!(
                 metadata.is_file(),
@@ -245,20 +244,17 @@ pub fn describe_age(saved_at_ms: u64) -> String {
 }
 
 fn key_source(workspace: &Path) -> String {
-    // One spelling for the successful and failed cases. On macOS `canonicalize`
-    // rewrites `/var` and `/tmp` through `/private`, so a transient failure must
-    // not look like a different workspace from the call that succeeded.
-    let path = canonicalize_workspace(workspace).unwrap_or_else(|| workspace.to_path_buf());
+    // `canonicalize` rewrites macOS temp dirs through `/private`. A failed call
+    // used to keep `/var` or `/tmp`, so the same directory was saved and loaded
+    // under two names and the record was invisible.
+    let path = fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
     macos_workspace_alias(&path)
 }
 
-fn canonicalize_workspace(workspace: &Path) -> Option<PathBuf> {
-    for _ in 0..4 {
-        if let Ok(path) = fs::canonicalize(workspace) {
-            return Some(path);
-        }
-    }
-    None
+fn workspace_identity(workspace: &Path) -> (String, String) {
+    let source = key_source(workspace);
+    let key = format!("{:x}", Sha256::digest(source.as_bytes()));
+    (source, key)
 }
 
 fn macos_workspace_alias(path: &Path) -> String {
@@ -282,7 +278,7 @@ fn macos_workspace_alias(path: &Path) -> String {
 }
 
 fn workspace_key(workspace: &Path) -> String {
-    format!("{:x}", Sha256::digest(key_source(workspace).as_bytes()))
+    workspace_identity(workspace).1
 }
 
 fn now_ms() -> u64 {
@@ -1088,7 +1084,10 @@ mod tests {
         store.claim(workspace.path()).unwrap();
         let mut old = conversation("old-tools", workspace.path());
         old.tool_contract_version = 0;
-        store.save(workspace.path(), &old).unwrap();
+        assert!(
+            store.save(workspace.path(), &old).unwrap(),
+            "the owner must write the record it just claimed"
+        );
         store.release_all();
 
         let mut editor = editor();
