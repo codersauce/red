@@ -2318,6 +2318,8 @@ mod tests {
                     wrap: true,
                     cx: 0,
                     cy: 0,
+                    scroll_lines: None,
+                    scroll_height: 0,
                     vx: 0,
                 },
             },
