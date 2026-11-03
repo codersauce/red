@@ -321,12 +321,21 @@ impl Editor {
         runtime: &mut Runtime,
     ) -> anyhow::Result<bool> {
         self.repeater = None;
+        // A Helix count is one command. Repeating it step by step paints the
+        // intermediate selection (`2w` flashes the first word). Hold those
+        // frames and let the caller paint the final selection once.
+        let hold_frames = self.is_helix() && times > 1;
+        let was_deferring = self.defer_motion_render;
+        if hold_frames {
+            self.defer_motion_render = true;
+        }
         for index in 0..times {
             let checkpoint = self.rpc_command_checkpoint();
             if self
                 .handle_key_action(event, action, buffer, runtime)
                 .await?
             {
+                self.defer_motion_render = was_deferring;
                 return Ok(true);
             }
             if let Some(command) = self.rpc_command_started_since(checkpoint) {
@@ -342,6 +351,13 @@ impl Editor {
             if self.replay_checkpoint(buffer, runtime).await? {
                 break;
             }
+        }
+        self.defer_motion_render = was_deferring;
+        if hold_frames && !was_deferring {
+            // Drop the frames queued while rendering was held. The key event
+            // paints the final state once on the way out.
+            self.deferred_motion_render = super::MotionRender::None;
+            self.render(buffer)?;
         }
         Ok(false)
     }

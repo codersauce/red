@@ -14,18 +14,18 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crate::{
     buffer::BufferId,
     config::{Config, EditingModel, KeyAction},
-    editing::{text_object_kind_for_key, MotionResolver, TextObjectScope},
+    editing::{MotionResolver, TextObjectScope, text_object_kind_for_key},
     felix::{
-        self, extend_command, motion_for, normal_keymap, Command, KeyNode, Range, Selection,
-        SurroundOp, TextEdit,
+        self, Command, KeyNode, Range, Selection, SurroundOp, TextEdit, extend_command, motion_for,
+        normal_keymap,
     },
     textobjects::SyntaxObjectKind,
     undo::{TextPosition, TextRange},
 };
 
 use super::{
-    Action, Content, ContentKind, Editor, Mode, RenderBuffer, Runtime, SearchDirection,
-    DEFAULT_REGISTER,
+    Action, Content, ContentKind, DEFAULT_REGISTER, Editor, Mode, RenderBuffer, Runtime,
+    SearchDirection,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -356,11 +356,19 @@ impl Editor {
         };
         let len = source.contents_snapshot().len_chars();
         let style = self.theme.editor_selection_style();
-        for range in window.selection.ranges() {
+        let cursor_style = self.theme.synthetic_cursor_style(&self.theme.style);
+        let primary = window.selection.primary_index();
+        for (index, range) in window.selection.ranges().iter().enumerate() {
             let (start, end) = range.span(len);
             if end <= start {
                 continue;
             }
+            // Helix paints `ui.selection` on every scalar except the head.
+            // The head is the cursor cell: the focused primary head is drawn
+            // by the block cursor, an unfocused primary head is left as text
+            // (the terminal cursor is an underscore), and every other head
+            // uses the cursor style.
+            let head = (range.head < len).then(|| source.char_idx_to_position(range.head));
             let start_position = source.char_idx_to_position(start);
             let end_position = source.char_idx_to_position(end);
             for line_index in
@@ -380,26 +388,43 @@ impl Editor {
                 } else {
                     line.chars().count()
                 };
-                if end_char <= start_char {
-                    continue;
+                let head_char = head
+                    .filter(|head| head.line == line_index)
+                    .map(|head| head.character)
+                    .filter(|character| *character >= start_char && *character < end_char);
+                let mut pieces = Vec::new();
+                if let Some(head_char) = head_char {
+                    if head_char > start_char {
+                        pieces.push((start_char, head_char, false));
+                    }
+                    if index != primary {
+                        pieces.push((head_char, head_char + 1, true));
+                    }
+                    if end_char > head_char + 1 {
+                        pieces.push((head_char + 1, end_char, false));
+                    }
+                } else if end_char > start_char {
+                    pieces.push((start_char, end_char, false));
                 }
                 let tab_width = self.tab_width_for_buffer_index(window.buffer_index);
-                let start_col = crate::unicode_utils::display_width_with_tabs(
-                    crate::unicode_utils::char_prefix(line, start_char),
-                    tab_width,
-                );
-                let end_col = crate::unicode_utils::display_width_with_tabs(
-                    crate::unicode_utils::char_prefix(line, end_char),
-                    tab_width,
-                );
-                let points =
-                    self.display_col_range_points_in_window(window, line_index, start_col, end_col);
-                buffer.apply_selection_for_points(
-                    points,
-                    &style,
-                    &self.theme,
-                    crate::theme::SelectionForegroundPriority::Selection,
-                );
+                for (piece_start, piece_end, is_cursor) in pieces {
+                    let start_col = crate::unicode_utils::display_width_with_tabs(
+                        crate::unicode_utils::char_prefix(line, piece_start),
+                        tab_width,
+                    );
+                    let end_col = crate::unicode_utils::display_width_with_tabs(
+                        crate::unicode_utils::char_prefix(line, piece_end),
+                        tab_width,
+                    );
+                    let points = self
+                        .display_col_range_points_in_window(window, line_index, start_col, end_col);
+                    buffer.apply_selection_for_points(
+                        points,
+                        if is_cursor { &cursor_style } else { &style },
+                        &self.theme,
+                        crate::theme::SelectionForegroundPriority::Selection,
+                    );
+                }
             }
         }
     }

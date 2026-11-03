@@ -18,6 +18,7 @@ from pathlib import Path
 
 from cases import all_cases
 from probe_hx import run_cases
+from style_check import main as check_selection_style
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -98,6 +99,7 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--ids", default="")
     parser.add_argument("--skip-red", action="store_true")
+    parser.add_argument("--skip-style", action="store_true")
     args = parser.parse_args()
     cases = all_cases()
     if args.ids:
@@ -128,6 +130,8 @@ def main() -> None:
     print("summary", dict(counts), "of", len(rows))
     if counts["differ"] or counts["helix-error"] or counts["missing-red"]:
         raise SystemExit(1)
+    if not args.skip_style:
+        check_selection_style()
 
 
 if __name__ == "__main__":

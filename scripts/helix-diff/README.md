@@ -23,6 +23,10 @@ For every case in `cases.py` the harness records:
 - the primary index
 - the mode (`normal`, `select`, `insert`, `search`, or `command`)
 
+`style_check.py` also opens both editors in tmux and reads `capture-pane -e`.
+After `w`, the head cell (the trailing space) must not use the selection
+background. `run.py` runs that check unless `--skip-style` is set.
+
 Red is driven in-process through `cargo test --test helix
 dump_helix_state_for_the_differential_harness`. Helix is driven in a 100 by 24
 truecolor tmux pane (`TERM=tmux-256color`, `COLORTERM=truecolor`). The probe

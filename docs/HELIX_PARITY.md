@@ -16,7 +16,7 @@ on equal terms. Helix's own default scrolloff is 5.
 | Keys | Result | What changed |
 |---|---|---|
 | `h` `j` `k` `l`, arrows, counts | **fixed** | `l` and `j` can sit on the blank line after a trailing newline. |
-| `w` `b` `e` `W` `B` `E`, `3w`, `w` then `d` | **fixed** | A word motion takes the word plus its trailing whitespace. The cursor is the last scalar of that span. |
+| `w` `b` `e` `W` `B` `E`, `3w`, `w` then `d` | **fixed** | A word motion takes the word plus its trailing whitespace. The cursor is the last scalar of that span. A count paints only the final selection. The selection style covers every scalar except that head. |
 | `f` `t` `F` `T` | **fixed** | A count is the nth match, as in `2fx`. |
 | `x` `X` `Alt-x` `%` | **matched** | Line extend, line bounds, and select-all. |
 | `d` `Alt-d` `c` `Alt-c` | **fixed** | After a change, every cursor sits on the scalar after the inserted text. |
