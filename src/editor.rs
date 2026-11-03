@@ -54385,9 +54385,20 @@ while True:
         assert!(initial.get("entries").is_none());
         assert!(initial.to_string().len() < 512);
 
-        std::fs::write(root.path().join("new-file.rs"), "").unwrap();
-        let changed = directory_watch_snapshot(&root.path().to_string_lossy(), false);
+        // A create in the same timestamp tick can leave the directory mtime
+        // unchanged, so the non-recursive snapshot stays identical until the
+        // clock moves.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut changed = initial.clone();
+        while initial == changed && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let created = root.path().join("new-file.rs");
+            let _ = std::fs::remove_file(&created);
+            std::fs::write(&created, "").unwrap();
+            changed = directory_watch_snapshot(&root.path().to_string_lossy(), false);
+        }
         assert_ne!(initial, changed);
+        assert!(changed.get("entries").is_none());
     }
 
     #[test]
