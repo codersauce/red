@@ -250,6 +250,7 @@ struct Placement {
     signature: u64,
     protocol: GraphicsProtocol,
     source: Option<KittySourceRect>,
+    placement_id: u32,
 }
 
 struct PendingDraw {
@@ -262,6 +263,7 @@ struct PendingDraw {
     protocol: GraphicsProtocol,
     payload: String,
     source: Option<KittySourceRect>,
+    placement_id: u32,
 }
 
 struct StagedImage {
@@ -279,6 +281,8 @@ struct StagedImage {
     protocol: GraphicsProtocol,
     payload: String,
     source: Option<KittySourceRect>,
+    pixel_w: u32,
+    pixel_h: u32,
     decoded: Option<Arc<DecodedImage>>,
     /// Cell fingerprint taken after every image row is painted, before overlays.
     cells: Option<u64>,
@@ -325,8 +329,11 @@ pub(super) struct ImageRuntime {
     paints: HashMap<(BufferId, usize), Paint>,
     staged: Vec<StagedImage>,
     pending: Vec<PendingDraw>,
-    placed: HashMap<u32, Placement>,
-    visible_ids: Vec<u32>,
+    placed: HashMap<(u32, u32), Placement>,
+    /// Image id to the signature last transmitted with `a=t`. Placements can
+    /// come and go without sending the pixels again.
+    transmitted: HashMap<u32, u64>,
+    visible_ids: Vec<(u32, u32)>,
     ids: HashMap<(BufferId, usize), u32>,
     next_id: u32,
     frame_open: bool,
@@ -351,6 +358,7 @@ impl ImageRuntime {
             staged: Vec::new(),
             pending: Vec::new(),
             placed: HashMap::new(),
+            transmitted: HashMap::new(),
             visible_ids: Vec::new(),
             ids: HashMap::new(),
             next_id: 0,
@@ -555,6 +563,8 @@ impl ImageRuntime {
             protocol: row.protocol,
             payload: String::new(),
             source: None,
+            pixel_w: 0,
+            pixel_h: 0,
             decoded: Some(row.image),
             cells: None,
         });
@@ -590,15 +600,10 @@ impl ImageRuntime {
                             visible,
                         );
                         image.rows = visible;
-                        image.payload = kitty_transmit_placed(
-                            image.id,
-                            &decoded,
-                            image.cols,
-                            image.total_rows,
-                            visible,
-                            image.source,
-                            self.cell,
-                        );
+                        image.pixel_w = pixel_w;
+                        image.pixel_h = pixel_h;
+                        image.payload =
+                            kitty_transmit_data(image.id, &decoded, image.cols, image.total_rows, self.cell);
                     }
                     GraphicsProtocol::Iterm2 => {
                         image.payload = iterm_transmit(&decoded, image.cols, image.total_rows);
@@ -635,18 +640,55 @@ impl ImageRuntime {
                 width: usize::from(image.cols),
                 height: usize::from(image.rows),
             };
-            // Kitty images sit at z=-1, under text. An opaque popup covers the
-            // overlap without deleting the placement. Sixel and iTerm2 paint
-            // above the cell grid, so a popup still removes those placements.
-            let covered = image.protocol != GraphicsProtocol::Kitty
-                && (image
-                    .cells
-                    .is_some_and(|cells| hash_region(buffer, rect) != cells)
-                    || image_hidden_by_overlays(rect, &buffer.overlay_rects));
+            if image.protocol == GraphicsProtocol::Kitty {
+                // Herdr draws Kitty images above cells, so a popup cannot cover
+                // them with a background color. Split the placement instead.
+                let mut pieces = uncovered_cell_rects(rect, &buffer.overlay_rects);
+                pieces.sort_by_key(|piece| (piece.y, piece.x));
+                let full = pieces.len() == 1 && pieces[0] == rect;
+                let pixel_w = if image.pixel_w == 0 {
+                    u32::from(image.cols.max(1))
+                } else {
+                    image.pixel_w
+                };
+                let pixel_h = if image.pixel_h == 0 {
+                    u32::from(image.rows.max(1))
+                } else {
+                    image.pixel_h
+                };
+                let base = image.source.unwrap_or(KittySourceRect {
+                    x: 0,
+                    y: 0,
+                    w: pixel_w,
+                    h: pixel_h,
+                });
+                for (index, piece) in pieces.iter().enumerate() {
+                    let placement_id = if full { 1 } else { u32::try_from(index).unwrap_or(0) + 2 };
+                    let source = source_for_piece(rect, *piece, base);
+                    visible.push((image.id, placement_id));
+                    self.pending.push(PendingDraw {
+                        id: image.id,
+                        x: u16::try_from(piece.x).unwrap_or(u16::MAX),
+                        y: u16::try_from(piece.y).unwrap_or(u16::MAX),
+                        cols: u16::try_from(piece.width).unwrap_or(u16::MAX),
+                        rows: u16::try_from(piece.height).unwrap_or(u16::MAX),
+                        signature: image.signature,
+                        protocol: image.protocol,
+                        payload: image.payload.clone(),
+                        source,
+                        placement_id,
+                    });
+                }
+                continue;
+            }
+            let covered = image
+                .cells
+                .is_some_and(|cells| hash_region(buffer, rect) != cells)
+                || image_hidden_by_overlays(rect, &buffer.overlay_rects);
             if covered {
                 continue;
             }
-            visible.push(image.id);
+            visible.push((image.id, 1));
             self.pending.push(PendingDraw {
                 id: image.id,
                 x: image.x,
@@ -657,6 +699,7 @@ impl ImageRuntime {
                 protocol: image.protocol,
                 payload: image.payload,
                 source: image.source,
+                placement_id: 1,
             });
         }
         visible.sort_unstable();
@@ -675,16 +718,28 @@ impl ImageRuntime {
         // A forced redraw used to drop `placed` before emitting deletes, so the
         // ids were gone and the last image stayed on screen forever.
         if force {
-            for (id, placed) in &self.placed {
+            let mut images = Vec::new();
+            for ((image_id, placement_id), placed) in &self.placed {
                 if placed.protocol == GraphicsProtocol::Kitty {
-                    out.push_str(&wrap_protocol(self.hints.tmux, &kitty_delete(*id)));
+                    out.push_str(&wrap_protocol(
+                        self.hints.tmux,
+                        &kitty_delete_placement(*image_id, *placement_id),
+                    ));
+                    if !images.contains(image_id) {
+                        images.push(*image_id);
+                    }
                 }
+            }
+            for image_id in images {
+                self.transmitted.remove(&image_id);
             }
             self.placed.clear();
         }
         let mut next = HashMap::new();
+        let mut saw_transmit = std::collections::HashSet::new();
         for draw in &pending {
-            let previous = self.placed.get(&draw.id).copied();
+            let key = (draw.id, draw.placement_id);
+            let previous = self.placed.get(&key).copied();
             let unchanged = previous.is_some_and(|placed| {
                 placed.x == draw.x
                     && placed.y == draw.y
@@ -694,35 +749,40 @@ impl ImageRuntime {
                     && placed.protocol == draw.protocol
                     && placed.source == draw.source
             });
-            if unchanged && !force {
-                if let Some(placed) = previous {
-                    next.insert(draw.id, placed);
+            if draw.protocol == GraphicsProtocol::Kitty {
+                let needs_pixels = self.transmitted.get(&draw.id) != Some(&draw.signature);
+                if needs_pixels && saw_transmit.insert(draw.id) && !draw.payload.is_empty() {
+                    out.push_str(&wrap_protocol(self.hints.tmux, &draw.payload));
+                    self.transmitted.insert(draw.id, draw.signature);
                 }
-                continue;
-            }
-            let can_move = !force
-                && previous.is_some_and(|placed| {
-                    placed.protocol == GraphicsProtocol::Kitty
-                        && draw.protocol == GraphicsProtocol::Kitty
-                        && placed.signature == draw.signature
-                });
-            if can_move {
+                if unchanged && !force && !needs_pixels {
+                    if let Some(placed) = previous {
+                        next.insert(key, placed);
+                    }
+                    continue;
+                }
                 out.push_str(&format!("\u{1b}[{};{}H", draw.y + 1, draw.x + 1));
                 out.push_str(&wrap_protocol(
                     self.hints.tmux,
-                    &kitty_place(draw.id, draw.cols, draw.rows, draw.source),
+                    &kitty_place(
+                        draw.id,
+                        draw.placement_id,
+                        draw.cols,
+                        draw.rows,
+                        draw.source,
+                    ),
                 ));
-            } else {
-                if !force
-                    && previous.is_some_and(|placed| placed.protocol == GraphicsProtocol::Kitty)
-                {
-                    out.push_str(&wrap_protocol(self.hints.tmux, &kitty_delete(draw.id)));
+            } else if unchanged && !force {
+                if let Some(placed) = previous {
+                    next.insert(key, placed);
                 }
+                continue;
+            } else {
                 out.push_str(&format!("\u{1b}[{};{}H", draw.y + 1, draw.x + 1));
                 out.push_str(&wrap_protocol(self.hints.tmux, &draw.payload));
             }
             next.insert(
-                draw.id,
+                key,
                 Placement {
                     x: draw.x,
                     y: draw.y,
@@ -731,14 +791,20 @@ impl ImageRuntime {
                     signature: draw.signature,
                     protocol: draw.protocol,
                     source: draw.source,
+                    placement_id: draw.placement_id,
                 },
             );
         }
-        for (id, placed) in &self.placed {
-            if next.contains_key(id) || placed.protocol != GraphicsProtocol::Kitty {
+        for ((image_id, placement_id), placed) in &self.placed {
+            if next.contains_key(&(*image_id, *placement_id))
+                || placed.protocol != GraphicsProtocol::Kitty
+            {
                 continue;
             }
-            out.push_str(&wrap_protocol(self.hints.tmux, &kitty_delete(*id)));
+            out.push_str(&wrap_protocol(
+                self.hints.tmux,
+                &kitty_delete_placement(*image_id, *placement_id),
+            ));
         }
         self.placed = next;
         out
@@ -1571,6 +1637,112 @@ pub(super) fn decode_image_bytes(bytes: &[u8]) -> Result<DecodedImage, String> {
     })
 }
 
+/// Cell rectangles of `image` that do not intersect any overlay.
+///
+/// One popup yields at most four rectangles: above, below, left, and right.
+pub(super) fn uncovered_cell_rects(
+    image: crate::ui::ScreenRect,
+    overlays: &[crate::ui::ScreenRect],
+) -> Vec<crate::ui::ScreenRect> {
+    let mut rects = vec![image];
+    for overlay in overlays {
+        let mut next = Vec::new();
+        for rect in rects {
+            next.extend(subtract_cell_rect(rect, *overlay));
+        }
+        rects = next;
+    }
+    rects.retain(|rect| rect.width > 0 && rect.height > 0);
+    rects
+}
+
+fn subtract_cell_rect(
+    image: crate::ui::ScreenRect,
+    overlay: crate::ui::ScreenRect,
+) -> Vec<crate::ui::ScreenRect> {
+    if !rects_overlap(image, overlay) {
+        return vec![image];
+    }
+    let image_right = image.x.saturating_add(image.width);
+    let image_bottom = image.y.saturating_add(image.height);
+    let overlap_left = overlay.x.max(image.x);
+    let overlap_top = overlay.y.max(image.y);
+    let overlap_right = overlay.x.saturating_add(overlay.width).min(image_right);
+    let overlap_bottom = overlay.y.saturating_add(overlay.height).min(image_bottom);
+    let mut pieces = Vec::new();
+    if overlap_top > image.y {
+        pieces.push(crate::ui::ScreenRect {
+            x: image.x,
+            y: image.y,
+            width: image.width,
+            height: overlap_top - image.y,
+        });
+    }
+    if image_bottom > overlap_bottom {
+        pieces.push(crate::ui::ScreenRect {
+            x: image.x,
+            y: overlap_bottom,
+            width: image.width,
+            height: image_bottom - overlap_bottom,
+        });
+    }
+    let middle_height = overlap_bottom.saturating_sub(overlap_top);
+    if overlap_left > image.x && middle_height > 0 {
+        pieces.push(crate::ui::ScreenRect {
+            x: image.x,
+            y: overlap_top,
+            width: overlap_left - image.x,
+            height: middle_height,
+        });
+    }
+    if image_right > overlap_right && middle_height > 0 {
+        pieces.push(crate::ui::ScreenRect {
+            x: overlap_right,
+            y: overlap_top,
+            width: image_right - overlap_right,
+            height: middle_height,
+        });
+    }
+    pieces
+}
+
+fn source_for_piece(
+    image: crate::ui::ScreenRect,
+    piece: crate::ui::ScreenRect,
+    base: KittySourceRect,
+) -> Option<KittySourceRect> {
+    if image.width == 0 || image.height == 0 || base.w == 0 || base.h == 0 {
+        return None;
+    }
+    if piece.x == image.x
+        && piece.y == image.y
+        && piece.width == image.width
+        && piece.height == image.height
+    {
+        return (base.x != 0 || base.y != 0).then_some(base);
+    }
+    let x0 = base.x
+        + u32::try_from(piece.x.saturating_sub(image.x)).unwrap_or(0) * base.w
+            / u32::try_from(image.width).unwrap_or(1).max(1);
+    let x1 = base.x
+        + u32::try_from(piece.x.saturating_add(piece.width).saturating_sub(image.x)).unwrap_or(0)
+            * base.w
+            / u32::try_from(image.width).unwrap_or(1).max(1);
+    let y0 = base.y
+        + u32::try_from(piece.y.saturating_sub(image.y)).unwrap_or(0) * base.h
+            / u32::try_from(image.height).unwrap_or(1).max(1);
+    let y1 = base.y
+        + u32::try_from(piece.y.saturating_add(piece.height).saturating_sub(image.y)).unwrap_or(0)
+            * base.h
+            / u32::try_from(image.height).unwrap_or(1).max(1);
+    Some(KittySourceRect {
+        x: x0.min(base.x.saturating_add(base.w.saturating_sub(1))),
+        y: y0.min(base.y.saturating_add(base.h.saturating_sub(1))),
+        w: x1.saturating_sub(x0).max(1).min(base.w),
+        h: y1.saturating_sub(y0).max(1).min(base.h),
+    })
+}
+
 /// True when `image` shares any cell with a floating surface.
 pub(super) fn image_hidden_by_overlays(
     image: crate::ui::ScreenRect,
@@ -1646,6 +1818,7 @@ pub(super) fn kitty_transmit_with_cell(
     kitty_transmit_placed(id, image, cols, rows, rows, None, cell)
 }
 
+#[cfg(test)]
 fn kitty_transmit_placed(
     id: u32,
     image: &DecodedImage,
@@ -1702,13 +1875,30 @@ pub(super) fn kitty_source_rect(
     })
 }
 
+fn kitty_transmit_data(
+    id: u32,
+    image: &DecodedImage,
+    cols: u16,
+    rows: u16,
+    cell: CellPixels,
+) -> String {
+    let (width, height) = graphics_pixel_size(image, cols, rows.max(1), cell);
+    let rgba = resample_rgba(image, width, height);
+    let payload = base64::engine::general_purpose::STANDARD.encode(&rgba);
+    chunk_kitty(
+        &format!("a=t,f=32,s={width},v={height},i={id},q=2"),
+        &payload,
+    )
+}
+
 pub(super) fn kitty_place(
     id: u32,
+    placement_id: u32,
     cols: u16,
     rows: u16,
     source: Option<KittySourceRect>,
 ) -> String {
-    let mut control = format!("a=p,i={id},p={id}");
+    let mut control = format!("a=p,i={id},p={placement_id}");
     if let Some(source) = source {
         control.push_str(&format!(
             ",x={},y={},w={},h={}",
@@ -1743,10 +1933,14 @@ fn chunk_kitty(control: &str, payload: &str) -> String {
     out
 }
 
+#[cfg(test)]
 pub(super) fn kitty_delete(id: u32) -> String {
-    // `p` matches the placement created with the image. Herdr deletes that
-    // placement id; a bare image id is not enough for every parser.
-    format!("\u{1b}_Ga=d,d=i,i={id},p={id},q=2\u{1b}\\")
+    format!("\u{1b}_Ga=d,d=i,i={id},q=2\u{1b}\\")
+}
+
+pub(super) fn kitty_delete_placement(image_id: u32, placement_id: u32) -> String {
+    // Lowercase `d=i` removes one placement and keeps the transmitted pixels.
+    format!("\u{1b}_Ga=d,d=i,i={image_id},p={placement_id},q=2\u{1b}\\")
 }
 
 pub(super) fn kitty_delete_all() -> String {
@@ -2925,6 +3119,18 @@ mod tests {
             },
             &[image]
         ));
+        let popup = ScreenRect {
+            x: 8,
+            y: 4,
+            width: 6,
+            height: 3,
+        };
+        let pieces = uncovered_cell_rects(image, &[popup]);
+        assert!(pieces.len() <= 4, "{pieces:?}");
+        assert!(!pieces.is_empty());
+        for piece in &pieces {
+            assert!(!rects_overlap(*piece, popup), "{piece:?}");
+        }
     }
 
     #[test]
@@ -2951,6 +3157,8 @@ mod tests {
             protocol: GraphicsProtocol::Kitty,
             payload: "PLACE".to_string(),
             source: None,
+            pixel_w: 40,
+            pixel_h: 20,
             decoded: None,
             cells: Some(hash_region(buffer, rect)),
         };
@@ -2979,22 +3187,80 @@ mod tests {
         });
         runtime.begin_frame();
         runtime.stage_graphics(stage(&buffer));
-        // The popup changed the cells and intersects the image. Kitty stays
-        // at z=-1; the popup's own background covers the overlap.
         runtime.staged[0].cells = runtime.staged[0].cells.map(|cells| cells.wrapping_add(1));
-        assert!(!runtime.commit_visible(&buffer));
-        let kept = runtime.graphics_payload(false);
-        assert!(kept.is_empty(), "{kept}");
+        assert!(runtime.commit_visible(&buffer));
+        let split = runtime.graphics_payload(false);
+        assert!(split.contains("a=p"), "{split}");
+        assert!(split.contains("a=d"), "{split}");
+        assert_placements_miss(
+            &split,
+            crate::ui::ScreenRect {
+                x: 3,
+                y: 2,
+                width: 5,
+                height: 1,
+            },
+        );
 
         let mut sixel = stage(&buffer);
         sixel.protocol = GraphicsProtocol::Sixel;
         sixel.id = 9;
         sixel.payload = "SIXEL".to_string();
-        runtime.begin_frame();
-        runtime.stage_graphics(sixel);
-        assert!(runtime.commit_visible(&buffer));
-        let hidden = runtime.graphics_payload(false);
+        let mut sixel_runtime = ImageRuntime::new();
+        sixel_runtime.begin_frame();
+        sixel_runtime.stage_graphics(sixel);
+        let _ = sixel_runtime.commit_visible(&buffer);
+        let hidden = sixel_runtime.graphics_payload(false);
         assert!(!hidden.contains("SIXEL"), "{hidden}");
+    }
+
+    fn assert_placements_miss(payload: &str, popup: crate::ui::ScreenRect) {
+        for (x, y, cols, rows) in placement_rects(payload) {
+            let piece = crate::ui::ScreenRect {
+                x: usize::from(x),
+                y: usize::from(y),
+                width: usize::from(cols),
+                height: usize::from(rows),
+            };
+            assert!(
+                !rects_overlap(piece, popup),
+                "placement {piece:?} intersects popup {popup:?} in {payload}"
+            );
+        }
+    }
+
+    fn placement_rects(payload: &str) -> Vec<(u16, u16, u16, u16)> {
+        let mut rects = Vec::new();
+        let mut cursor_x = 1u16;
+        let mut cursor_y = 1u16;
+        for segment in payload.split('\u{1b}') {
+            if let Some(rest) = segment.strip_prefix('[') {
+                if let Some((position, _)) = rest.split_once('H') {
+                    let mut parts = position.split(';');
+                    if let (Some(y), Some(x)) = (parts.next(), parts.next()) {
+                        cursor_y = y.parse().unwrap_or(1);
+                        cursor_x = x.parse().unwrap_or(1);
+                    }
+                }
+            }
+            if segment.starts_with("_Ga=p") {
+                let control = segment.split(';').next().unwrap_or(segment);
+                let mut cols = 0u16;
+                let mut rows = 0u16;
+                for field in control.split(',') {
+                    if let Some(value) = field.strip_prefix("c=") {
+                        cols = value.parse().unwrap_or(0);
+                    }
+                    if let Some(value) = field.strip_prefix("r=") {
+                        rows = value.parse().unwrap_or(0);
+                    }
+                }
+                if cols > 0 && rows > 0 {
+                    rects.push((cursor_x.saturating_sub(1), cursor_y.saturating_sub(1), cols, rows));
+                }
+            }
+        }
+        rects
     }
 
     fn place_kitty(
@@ -3017,6 +3283,8 @@ mod tests {
             protocol: GraphicsProtocol::Kitty,
             payload: "PLACE".to_string(),
             source: None,
+            pixel_w: 40,
+            pixel_h: 20,
             decoded: None,
             cells: Some(hash_region(
                 buffer,
@@ -3170,6 +3438,8 @@ mod tests {
             protocol: GraphicsProtocol::Kitty,
             payload: "PLACE".to_string(),
             source: None,
+            pixel_w: 40,
+            pixel_h: 20,
             decoded: None,
             cells: None,
         });
@@ -3231,10 +3501,12 @@ mod tests {
         let source = staged.source.expect("partial image is cropped");
         assert!(source.y > 0, "{source:?}");
         assert!(source.h > 0, "{source:?}");
-        let control = staged.payload.split(';').next().unwrap();
-        assert!(control.contains("r=2"), "{control}");
-        assert!(!control.contains("r=4"), "{control}");
-        assert!(control.contains(&format!("y={}", source.y)), "{control}");
+        let place = kitty_place(8, 1, staged.cols, staged.rows, Some(source));
+        assert!(place.contains("r=2"), "{place}");
+        assert!(!place.contains("r=4"), "{place}");
+        assert!(place.contains(&format!("y={}", source.y)), "{place}");
+        assert!(staged.payload.contains("a=t,"), "{}", staged.payload);
+        assert!(!staged.payload.contains("a=T,"), "{}", staged.payload);
         assert!(kitty_source_rect(10, 40, 4, 0, 4).is_none());
         let top = kitty_source_rect(10, 40, 4, 1, 2).unwrap();
         assert_eq!((top.y, top.h), (10, 20));
