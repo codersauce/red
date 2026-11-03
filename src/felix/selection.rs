@@ -179,6 +179,12 @@ impl Selection {
         self.ranges.len()
     }
 
+    /// A normalized selection is never empty. This exists so `len` satisfies
+    /// the usual container convention.
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
     pub fn is_empty_document_cursor(&self) -> bool {
         self.len() == 1 && self.primary().is_cursor()
     }
@@ -277,6 +283,12 @@ impl Selection {
         ranges.remove(self.primary);
         let primary = self.primary.saturating_sub(1).min(ranges.len() - 1);
         Some(Self { ranges, primary })
+    }
+
+    pub fn push_range(&mut self, range: Range, len: usize) {
+        self.ranges.push(range);
+        self.primary = self.ranges.len() - 1;
+        self.normalize(len);
     }
 
     pub fn rotate(&self, forward: bool) -> Self {

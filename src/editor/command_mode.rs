@@ -28,7 +28,7 @@ impl Editor {
                 visual = self.visual_key_mappings_for_mode(mode);
                 &visual
             }
-            Mode::Insert | Mode::Command | Mode::Search => return None,
+            Mode::Insert | Mode::Command | Mode::Search | Mode::Select => return None,
         };
         let action = mappings
             .get(&key)

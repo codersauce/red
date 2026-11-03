@@ -3176,6 +3176,10 @@ impl Editor {
         }
 
         // Render selection last so its contrast guarantee is not overwritten by search highlights.
+        if self.is_helix() && window.active {
+            self.draw_felix_ranges(buffer, window);
+        }
+
         if self.is_visual() && window.active {
             self.update_selection();
 
@@ -3498,7 +3502,7 @@ impl Editor {
         Ok(())
     }
 
-    fn display_col_range_points_in_window(
+    pub(super) fn display_col_range_points_in_window(
         &self,
         window: &crate::window::Window,
         line_index: usize,
@@ -4618,7 +4622,7 @@ impl Editor {
             Mode::Command => self.config.cursor.command,
             Mode::Insert => self.config.cursor.insert,
             Mode::Search => self.config.cursor.search,
-            Mode::Visual => self.config.cursor.visual,
+            Mode::Visual | Mode::Select => self.config.cursor.visual,
             Mode::VisualLine => self.config.cursor.visual_line,
             Mode::VisualBlock => self.config.cursor.visual_block,
         }
@@ -4638,6 +4642,7 @@ fn format_mode_name(mode: &Mode) -> String {
         Mode::Visual => "VISUAL".to_string(),
         Mode::VisualLine => "V-LINE".to_string(),
         Mode::VisualBlock => "V-BLOCK".to_string(),
+        Mode::Select => "SELECT".to_string(),
     }
 }
 

@@ -1539,6 +1539,7 @@ fn key_action_label(action: &KeyAction) -> Option<String> {
 
 fn action_label(action: &Action) -> String {
     match action {
+        Action::Felix(command) => command.label(),
         Action::KeyboardShortcuts => "Keyboard shortcuts".to_string(),
         Action::CommandPalette => "All commands".to_string(),
         Action::OpenMessages => "Messages".to_string(),
@@ -1680,6 +1681,7 @@ fn group_label(prefix: &[String], key: &str) -> String {
         ("Space", "c") => "Commit message".to_string(),
         (_, "Ctrl-w") => "Windows".to_string(),
         (_, "g") => "Go to".to_string(),
+        (_, "m") => "Match".to_string(),
         (_, "z") => "View".to_string(),
         (_, "[") => "Previous".to_string(),
         (_, "]") => "Next".to_string(),

@@ -37,6 +37,7 @@ mod display_layout;
 mod edit_batch;
 mod edit_history;
 mod explore_ui;
+mod felix;
 mod file_watch;
 mod inline_actions;
 mod inline_agent_outcomes;
@@ -2670,6 +2671,21 @@ pub enum Action {
     /// Shows the backing file beside the current buffer as a unified conflict diff.
     CompareFileOnDisk,
     EnterMode(Mode),
+    /// Experimental Helix command. The Vim grammar never produces this.
+    Felix(crate::felix::Command),
+    /// Helix command plus the character argument it was waiting for.
+    FelixChar {
+        command: crate::felix::Command,
+        character: char,
+        extra: Option<char>,
+    },
+    /// Confirmed Helix prompt, such as a regex selection.
+    FelixPrompt {
+        command: crate::felix::Command,
+        text: String,
+    },
+    /// LSP location request issued by a Helix goto binding.
+    FelixGoto(String),
     RestoreLastVisualSelection,
     /// Opens a bounded inline edit for the enclosing function or exact selection.
     InlineAssist,
@@ -3379,6 +3395,8 @@ pub enum Mode {
     VisualLine,
     /// Rectangular selection.
     VisualBlock,
+    /// Helix select mode. Motions extend the current selection.
+    Select,
 }
 
 #[derive(Debug, Clone)]
@@ -3969,6 +3987,9 @@ pub struct Editor {
 
     /// Whether Normal-mode `r` is waiting for its replacement character.
     pending_replace: bool,
+
+    /// Runtime state for the experimental Helix grammar.
+    felix: felix::State,
 
     /// Executed actions
     actions: Vec<Action>,
@@ -6025,6 +6046,7 @@ impl Editor {
             pending_character_motion: None,
             last_character_motion: None,
             pending_replace: false,
+            felix: felix::State::default(),
             actions: vec![],
             last_semantic_change: None,
             pending_semantic_change: None,
@@ -12608,16 +12630,23 @@ impl Editor {
                         &msg,
                         InboundMessage::Notification(ParsedNotification::Progress(_))
                     );
-                    let completed_definition =
-                        if method.as_deref() == Some("textDocument/definition") {
-                            match &msg {
-                                InboundMessage::Message(response) => Some(response.id),
-                                InboundMessage::RequestError { id, .. } => Some(*id),
-                                _ => None,
-                            }
-                        } else {
-                            None
-                        };
+                    let completed_definition = if matches!(
+                        method.as_deref(),
+                        Some(
+                            "textDocument/definition"
+                                | "textDocument/declaration"
+                                | "textDocument/typeDefinition"
+                                | "textDocument/implementation"
+                        )
+                    ) {
+                        match &msg {
+                            InboundMessage::Message(response) => Some(response.id),
+                            InboundMessage::RequestError { id, .. } => Some(*id),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
                     if let Some(action) = self.handle_lsp_message(&msg, method) {
                         // TODO: handle quit
                         let generation_before = self.render_generation;
@@ -15424,7 +15453,12 @@ impl Editor {
             Mode::VisualBlock => {
                 Self::merge_key_mappings(&mut mappings, &self.config.keys.visual_block)
             }
-            Mode::Visual | Mode::Normal | Mode::Insert | Mode::Command | Mode::Search => {}
+            Mode::Visual
+            | Mode::Normal
+            | Mode::Insert
+            | Mode::Command
+            | Mode::Search
+            | Mode::Select => {}
         }
         mappings
     }
@@ -17037,7 +17071,25 @@ impl Editor {
                         return self.resolved_completion_action(msg);
                     }
 
-                    if method == "textDocument/definition" {
+                    if self.felix.reference_requests.remove(&msg.id) {
+                        let locations = match &msg.result {
+                            serde_json::Value::Array(locations) => locations.clone(),
+                            serde_json::Value::Object(location) => {
+                                vec![serde_json::Value::Object(location.clone())]
+                            }
+                            _ => Vec::new(),
+                        };
+                        self.felix_references_from_locations(&locations);
+                        return Some(Action::Refresh);
+                    }
+
+                    if matches!(
+                        method.as_str(),
+                        "textDocument/definition"
+                            | "textDocument/declaration"
+                            | "textDocument/typeDefinition"
+                            | "textDocument/implementation"
+                    ) {
                         let definition = match msg.result {
                             serde_json::Value::Array(ref arr) => {
                                 arr.first().and_then(|value| value.as_object())
@@ -17514,7 +17566,12 @@ impl Editor {
         }
 
         Ok(match self.mode {
+            Mode::Normal if self.is_helix() => self.handle_felix_event(ev),
+            Mode::Select => self.handle_felix_event(ev),
             Mode::Normal => self.handle_normal_event(ev),
+            Mode::Insert if self.is_helix() && self.felix.insert_cursors.len() > 1 => {
+                self.handle_felix_multi_insert(ev)
+            }
             Mode::Insert => self.handle_insert_event(ev)?,
             Mode::Command => self.handle_command_event(ev, runtime),
             Mode::Search => self.handle_search_event(ev),
@@ -18359,7 +18416,9 @@ impl Editor {
             ..
         }) = ev
         {
-            if (!self.is_normal() && !self.is_visual()) || !c.is_numeric() {
+            if (!self.is_normal() && !self.is_visual() && self.mode != Mode::Select)
+                || !c.is_numeric()
+            {
                 return false;
             }
 
@@ -19444,6 +19503,10 @@ impl Editor {
         self.check_bounds();
         self.refresh_cursor_goal();
         self.sync_to_window();
+        self.felix_select_search_match(
+            TextPosition::new(match_.start_y, match_.start_x),
+            TextPosition::new(match_.end_y, match_.end_x),
+        );
     }
 
     fn restore_search_origin(&mut self, origin: &HistoryEntry, vtop: usize) {
@@ -22103,6 +22166,7 @@ impl Editor {
 
             self.flush_edit_batch_events(runtime).await?;
             self.mode = new_mode;
+            self.finish_felix_mode_transition(old_mode, new_mode);
 
             if matches!(
                 new_mode,
@@ -23685,6 +23749,31 @@ impl Editor {
                 } else {
                     self.set_legacy_message(Some("No log file configured".to_string()));
                 }
+            }
+            Action::Felix(command) => {
+                self.execute_felix(*command, buffer, runtime).await?;
+            }
+            Action::FelixChar {
+                command,
+                character,
+                extra,
+            } => {
+                self.execute_felix_argument(*command, *character, *extra, None, buffer, runtime)
+                    .await?;
+            }
+            Action::FelixPrompt { command, text } => {
+                self.execute_felix_argument(
+                    *command,
+                    '\0',
+                    None,
+                    Some(text.clone()),
+                    buffer,
+                    runtime,
+                )
+                .await?;
+            }
+            Action::FelixGoto(method) => {
+                self.felix_lsp_goto(method, runtime).await?;
             }
             Action::ListPlugins
             | Action::PluginManagerCatalogLoaded { .. }
@@ -28674,7 +28763,7 @@ impl Editor {
                 -32003,
                 "red/DocumentSnapshot does not support block selections",
             )),
-            Mode::Normal | Mode::Insert | Mode::Command | Mode::Search => {
+            Mode::Normal | Mode::Insert | Mode::Command | Mode::Search | Mode::Select => {
                 unreachable!("stored visual selections retain a visual mode")
             }
         }
@@ -30421,7 +30510,9 @@ impl Editor {
                     vec![TextRange::new(start, end)]
                 }
             }
-            Mode::Normal | Mode::Insert | Mode::Command | Mode::Search => return false,
+            Mode::Normal | Mode::Insert | Mode::Command | Mode::Search | Mode::Select => {
+                return false
+            }
         };
 
         let edits = ranges
@@ -30740,6 +30831,7 @@ impl Editor {
             self.set_special_mark_at_char('.', edit.start_char, AnchorAffinity::Left);
         }
         self.restore_cursor_snapshot(cursor);
+        self.restore_felix_selection();
         self.restore_inline_history_comments();
         self.notify_change(runtime).await?;
         self.render(render_buffer)?;
@@ -30777,6 +30869,7 @@ impl Editor {
             self.set_special_mark_at_char('.', edit.start_char, AnchorAffinity::Left);
         }
         self.restore_cursor_snapshot(cursor);
+        self.restore_felix_selection();
         self.restore_inline_history_comments();
         self.notify_change(runtime).await?;
         self.render(render_buffer)?;
@@ -31466,7 +31559,9 @@ impl Editor {
                     Mode::Visual => SessionVisualMode::Character,
                     Mode::VisualLine => SessionVisualMode::Line,
                     Mode::VisualBlock => SessionVisualMode::Block,
-                    Mode::Normal | Mode::Insert | Mode::Command | Mode::Search => return None,
+                    Mode::Normal | Mode::Insert | Mode::Command | Mode::Search | Mode::Select => {
+                        return None
+                    }
                 };
                 Some(SessionVisualSelection {
                     buffer_index,

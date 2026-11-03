@@ -203,7 +203,7 @@ impl Editor {
             && !self.workspace_manager.is_filtering()
             && matches!(event, Event::Key(key) if key.code == KeyCode::Char('?') && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT));
         let editor_mapping = match self.mode {
-            Mode::Normal => &self.config.keys.normal,
+            Mode::Normal | Mode::Select => &self.config.keys.normal,
             Mode::Insert => &self.config.keys.insert,
             Mode::Visual => &self.config.keys.visual,
             Mode::VisualLine => &self.config.keys.visual_line,

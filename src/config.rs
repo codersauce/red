@@ -2123,7 +2123,13 @@ fn embedded_config_value() -> anyhow::Result<toml::Value> {
     Ok(value)
 }
 
-fn deserialize_config(value: toml::Value) -> anyhow::Result<Config> {
+fn deserialize_config(mut value: toml::Value) -> anyhow::Result<Config> {
+    if let Some(helix_keys) = value
+        .as_table_mut()
+        .and_then(|table| table.get_mut("helix_keys"))
+    {
+        normalize_felix_command_names(helix_keys);
+    }
     let mut config: Config = value
         .try_into()
         .map_err(|error| anyhow::anyhow!("failed to deserialize merged config: {error}"))?;
@@ -2280,6 +2286,13 @@ fn apply_user_value(
         return;
     }
 
+    if path.first().is_some_and(|part| part == "helix_keys") {
+        let mut value = value;
+        normalize_felix_command_names(&mut value);
+        apply_keymap_value(base, value, path, contents, source, diagnostics);
+        return;
+    }
+
     if path.first().is_some_and(|part| part == "plugin_config") {
         let mut candidate = base.clone();
         merge_at_path(&mut candidate, path, value);
@@ -2355,6 +2368,38 @@ fn apply_user_value(
                 fallback.to_string(),
             ));
         }
+    }
+}
+
+/// Rewrites a felix command name into `{ Felix = "name" }` so the keymap
+/// deserializer can store it beside ordinary Red actions.
+fn normalize_felix_command_names(value: &mut toml::Value) {
+    match value {
+        toml::Value::String(text) if crate::felix::Command::from_name(text).is_some() => {
+            let mut table = toml::map::Map::new();
+            table.insert(
+                "Felix".to_string(),
+                toml::Value::String(std::mem::take(text)),
+            );
+            *value = toml::Value::Table(table);
+        }
+        toml::Value::Array(items) => {
+            for item in items {
+                normalize_felix_command_names(item);
+            }
+        }
+        toml::Value::Table(table) => {
+            if table.contains_key("Felix") {
+                return;
+            }
+            let keys = table.keys().cloned().collect::<Vec<_>>();
+            for key in keys {
+                if let Some(child) = table.get_mut(&key) {
+                    normalize_felix_command_names(child);
+                }
+            }
+        }
+        _ => {}
     }
 }
 

@@ -2217,6 +2217,9 @@ impl super::Editor {
         if self.has_multi_cursor_session() {
             return Some(0..self.current_buffer().len().saturating_add(1));
         }
+        if let Some(lines) = self.felix_wide_lines(window) {
+            return Some(lines);
+        }
         if self.is_visual() {
             let anchor = self.selection_start.map_or(line, |point| point.y);
             return Some(anchor.min(line)..anchor.max(line) + 1);
