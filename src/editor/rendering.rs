@@ -1500,8 +1500,10 @@ impl Editor {
             self.request_motion_render(super::MotionRender::Full);
             return Ok(());
         }
+        self.begin_markdown_image_frame();
 
         buffer.shortcut_help_regions.clear();
+        buffer.overlay_rects.clear();
         let _span = super::perf::PerfSpan::start("render:full");
         #[cfg(test)]
         {
@@ -1616,6 +1618,10 @@ impl Editor {
         self.last_rendered_cursor_position = cursor_position;
         drop(overlays_span);
 
+        // Graphics are emitted after cells. Drop any image a popup has covered
+        // so the placement cannot hide that popup, and rewrite the frame when
+        // the set of visible images changes.
+        self.commit_markdown_image_visibility(buffer);
         // Flush changes to terminal
         let diff_span = super::perf::PerfSpan::start("render:diff+flush");
         let changes = self.render_buffer_changes(buffer);
@@ -1735,6 +1741,8 @@ impl Editor {
         buffer: &mut RenderBuffer,
         all_windows: bool,
     ) -> anyhow::Result<()> {
+        self.begin_markdown_image_frame();
+        buffer.overlay_rects.clear();
         self.update_gutter_width();
         self.fix_cursor_pos();
         self.sync_to_window();
@@ -1756,6 +1764,7 @@ impl Editor {
         self.render_cursor_cell(buffer, cursor_position);
         self.last_rendered_cursor_position = cursor_position;
 
+        self.commit_markdown_image_visibility(buffer);
         let changes = self.render_buffer_changes(buffer);
         self.render_diff(&changes)?;
         self.commit_render_buffer_changes(&changes);
@@ -2140,6 +2149,17 @@ impl Editor {
                 self.fill_line_in_window(buffer, term_x, term_y, content_width, &theme_style);
                 continue;
             };
+            if segment.image.is_some() {
+                self.paint_markdown_image_segment(
+                    buffer,
+                    window,
+                    segment,
+                    term_x,
+                    term_y,
+                    content_width,
+                );
+                continue;
+            }
             if self.render_projected_segment_in_window(buffer, window, segment) {
                 continue;
             }
@@ -2176,6 +2196,7 @@ impl Editor {
                 content_width,
             );
         }
+        self.seal_markdown_image_fingerprints(buffer);
 
         Ok(())
     }
@@ -2839,6 +2860,17 @@ impl Editor {
         for segment in &layout.rows {
             let term_y = self.window_to_terminal_y(window, segment.row);
             let term_x = self.window_to_terminal_x(window, gutter_width + 1);
+            if segment.image.is_some() {
+                self.paint_markdown_image_segment(
+                    buffer,
+                    window,
+                    segment,
+                    term_x,
+                    term_y,
+                    content_width,
+                );
+                continue;
+            }
             if self.render_projected_segment_in_window(buffer, window, segment) {
                 continue;
             }
@@ -2875,6 +2907,8 @@ impl Editor {
                 content_width,
             );
         }
+
+        self.seal_markdown_image_fingerprints(buffer);
 
         for comment in &layout.inline_comments {
             self.render_inline_comment_row_in_window(buffer, window, comment);
@@ -3758,6 +3792,7 @@ impl Editor {
         }
 
         if change_set.is_empty() {
+            self.write_markdown_graphics(false)?;
             self.draw_cursor_preserving_cursor_goal()?;
             self.flush_terminal_output()?;
             return Ok(());
@@ -3766,6 +3801,7 @@ impl Editor {
         // Unsupported terminals ignore this private mode. Keep the end marker
         // outside the fallible body so an interrupted frame cannot leave a
         // supporting terminal displaying a frozen screen.
+        let resend_images = self.force_full_redraw;
         let result = (|| -> anyhow::Result<()> {
             self.stdout.queue(terminal::BeginSynchronizedUpdate)?;
             self.stdout.queue(cursor::Hide)?;
@@ -3776,6 +3812,7 @@ impl Editor {
                 &self.theme.style,
                 usize::from(self.size.0),
             )?;
+            self.write_markdown_graphics(resend_images)?;
             self.draw_cursor_preserving_cursor_goal()?;
             Ok(())
         })();
@@ -5015,6 +5052,7 @@ mod tests {
             last_segment: true,
             visual_offset: 0,
             concealed: Vec::new(),
+            image: None,
         }
     }
 

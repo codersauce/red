@@ -103,6 +103,8 @@ impl Cell {
 pub struct RenderBuffer {
     pub cells: Vec<Cell>,
     pub(crate) shortcut_help_regions: Vec<crate::ui::ShortcutHelpRegion>,
+    /// Screen rectangles painted by popups, menus, and other floating surfaces.
+    pub(crate) overlay_rects: Vec<crate::ui::ScreenRect>,
     pub width: usize,
     #[allow(unused)]
     pub height: usize,
@@ -114,6 +116,7 @@ impl RenderBuffer {
 
         RenderBuffer {
             shortcut_help_regions: Vec::new(),
+            overlay_rects: Vec::new(),
             cells,
             width,
             height,
@@ -146,9 +149,17 @@ impl RenderBuffer {
 
         RenderBuffer {
             shortcut_help_regions: Vec::new(),
+            overlay_rects: Vec::new(),
             cells,
             width,
             height,
+        }
+    }
+
+    /// Records a floating surface that must not sit under a terminal image.
+    pub(crate) fn note_overlay(&mut self, rect: crate::ui::ScreenRect) {
+        if rect.width > 0 && rect.height > 0 {
+            self.overlay_rects.push(rect);
         }
     }
 
@@ -160,6 +171,7 @@ impl RenderBuffer {
     /// Resizes and clears the grid while retaining reusable cell allocations.
     pub(crate) fn reset(&mut self, width: usize, height: usize, style: &Style) {
         self.shortcut_help_regions.clear();
+        self.overlay_rects.clear();
         self.cells
             .resize_with(width * height, || Cell::new(' ', style.clone()));
         self.width = width;

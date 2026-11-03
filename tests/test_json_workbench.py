@@ -1413,7 +1413,9 @@ class JsonWorkbenchTest(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("jq"), "jq is not installed")
     def test_real_jq_smoke(self):
-        runner = WORKBENCH.JsonWorkbench([shutil.which("jq")], jq_timeout=2)
+        # Windows runners can spend the first couple of seconds just creating
+        # the jq process. The timeout still bounds a hung filter.
+        runner = WORKBENCH.JsonWorkbench([shutil.which("jq")], jq_timeout=15)
         self.assertEqual(
             runner.run_jq(".answer", b'{"answer":42}'), f"42{os.linesep}"
         )

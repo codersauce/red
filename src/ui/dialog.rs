@@ -198,9 +198,23 @@ impl Component for Dialog {
         if self.border_style != BorderStyle::None {
             width = width.saturating_add(2);
         }
+        buffer.note_overlay(super::geometry::ScreenRect {
+            x: self.x,
+            y: self.y,
+            width,
+            height,
+        });
+
+        // Kitty graphics sit under text and show through the terminal's default
+        // background. Every popup cell needs a concrete RGB, including blanks.
+        let popup_bg = self.theme.concrete_popup_bg();
+        let style = self.style.with_concrete_bg(popup_bg);
+        let border_draw_style = self.border_draw_style.with_concrete_bg(popup_bg);
+        let title_style = self.title_style.with_concrete_bg(popup_bg);
+        let footer_base = self.footer_style.with_concrete_bg(popup_bg);
 
         // Draw the dialog box
-        buffer.fill_rect(self.x, self.y, width, height, ' ', &self.style, &self.theme);
+        buffer.fill_rect(self.x, self.y, width, height, ' ', &style, &self.theme);
 
         // Draw the border
         if self.border_style != BorderStyle::None {
@@ -217,7 +231,7 @@ impl Component for Dialog {
                 width,
                 1,
                 top,
-                &self.border_draw_style,
+                &border_draw_style,
                 &self.theme,
             );
             buffer.fill_rect(
@@ -226,7 +240,7 @@ impl Component for Dialog {
                 width,
                 1,
                 bottom,
-                &self.border_draw_style,
+                &border_draw_style,
                 &self.theme,
             );
             buffer.fill_rect(
@@ -235,7 +249,7 @@ impl Component for Dialog {
                 1,
                 height,
                 left,
-                &self.border_draw_style,
+                &border_draw_style,
                 &self.theme,
             );
             buffer.fill_rect(
@@ -244,36 +258,30 @@ impl Component for Dialog {
                 1,
                 height,
                 right,
-                &self.border_draw_style,
+                &border_draw_style,
                 &self.theme,
             );
 
-            buffer.set_char(
-                self.x,
-                self.y,
-                top_left,
-                &self.border_draw_style,
-                &self.theme,
-            );
+            buffer.set_char(self.x, self.y, top_left, &border_draw_style, &self.theme);
             buffer.set_char(
                 self.x + width - 1,
                 self.y,
                 top_right,
-                &self.border_draw_style,
+                &border_draw_style,
                 &self.theme,
             );
             buffer.set_char(
                 self.x,
                 self.y + height - 1,
                 bottom_left,
-                &self.border_draw_style,
+                &border_draw_style,
                 &self.theme,
             );
             buffer.set_char(
                 self.x + width - 1,
                 self.y + height - 1,
                 bottom_right,
-                &self.border_draw_style,
+                &border_draw_style,
                 &self.theme,
             );
         }
@@ -297,10 +305,10 @@ impl Component for Dialog {
                     .saturating_add(inset)
                     .saturating_add(inner_width.saturating_sub(title_width) / 2)
             };
-            buffer.set_text(cx, self.y, &title, &self.title_style);
+            buffer.set_text(cx, self.y, &title, &title_style);
         }
 
-        let footer_style = self.footer_style.with_bg(self.style.bg);
+        let footer_style = footer_base.with_bg(style.bg);
 
         if let Some(status) = self.header_status.as_deref() {
             let status = format!(" {status} ");
