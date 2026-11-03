@@ -60,9 +60,45 @@ impl Editor {
         self.config.editing_model == EditingModel::Helix
     }
 
+    /// Esc and `v` leave select mode from every state: a count, a pending
+    /// character, or an open keymap menu. `v` is still the argument while a
+    /// character prompt is waiting (`fv`), and Esc is what leaves that prompt.
+    /// Ranges are left untouched.
+    pub(super) fn helix_select_exit_action(&mut self, event: &Event) -> Option<KeyAction> {
+        if !self.is_helix() || self.mode != Mode::Select {
+            return None;
+        }
+        let Event::Key(KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press | KeyEventKind::Repeat,
+            ..
+        }) = event
+        else {
+            return None;
+        };
+        let exit = match code {
+            KeyCode::Esc if modifiers.is_empty() => true,
+            KeyCode::Char('v') if modifiers.is_empty() && self.felix.pending.is_none() => true,
+            _ => false,
+        };
+        if !exit {
+            return None;
+        }
+        self.repeater = None;
+        self.felix.pending = None;
+        self.waiting_command = None;
+        self.waiting_key_action = None;
+        self.clear_keymap_hints();
+        Some(KeyAction::Single(Action::EnterMode(Mode::Normal)))
+    }
+
     pub(super) fn handle_felix_event(&mut self, event: &Event) -> Option<KeyAction> {
         if self.felix.prompt.is_some() {
             return self.handle_felix_prompt(event);
+        }
+        if let Some(action) = self.helix_select_exit_action(event) {
+            return Some(action);
         }
         if self.felix.pending.is_some() {
             return self.handle_felix_pending_key(event);
@@ -656,7 +692,15 @@ impl Editor {
                 self.transform_felix_case(change);
             }
             Command::SelectMode => {
-                self.mode = Mode::Select;
+                // Helix `v` toggles. Leaving select keeps every range.
+                let next = if self.mode == Mode::Select {
+                    Mode::Normal
+                } else {
+                    Mode::Select
+                };
+                self.execute(&Action::EnterMode(next), buffer, runtime)
+                    .await?;
+                return Ok(());
             }
             Command::NormalMode => {
                 self.execute(&Action::EnterMode(Mode::Normal), buffer, runtime)

@@ -17474,6 +17474,14 @@ impl Editor {
             return Ok(None);
         }
 
+        // Select mode must not swallow Esc or `v` inside a keymap menu. A
+        // dialog still owns Esc so a picker can close.
+        if self.current_dialog.is_none() {
+            if let Some(action) = self.helix_select_exit_action(ev) {
+                return Ok(Some(action));
+            }
+        }
+
         if let Some(ka) = self.waiting_key_action.take() {
             self.waiting_command = None;
             self.keymap_hint_deadline = None;

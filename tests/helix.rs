@@ -133,6 +133,78 @@ async fn helix_find_crosses_lines_and_percent_selects_the_file() {
 }
 
 #[tokio::test]
+async fn helix_escape_leaves_select_mode_and_keeps_the_selection() {
+    let mut harness = helix("abcdef\n");
+    press(&mut harness, "v").await;
+    harness.assert_mode(Mode::Select);
+    press_code(&mut harness, KeyCode::Esc).await;
+    harness.assert_mode(Mode::Normal);
+    assert_eq!(harness.editor.test_felix_selection(), (0, 0, 1));
+
+    press(&mut harness, "vl").await;
+    harness.assert_mode(Mode::Select);
+    assert_eq!(markup(&harness), "#[a|b]#cdef\n");
+    press_code(&mut harness, KeyCode::Esc).await;
+    harness.assert_mode(Mode::Normal);
+    assert_eq!(markup(&harness), "#[a|b]#cdef\n");
+
+    // `v` toggles back to normal and still keeps the range.
+    press(&mut harness, "v").await;
+    harness.assert_mode(Mode::Select);
+    press(&mut harness, "v").await;
+    harness.assert_mode(Mode::Normal);
+    assert_eq!(markup(&harness), "#[a|b]#cdef\n");
+
+    // A motion then `v` leaves select. The next motion replaces the range
+    // instead of extending it, so the mode change is real.
+    let mut harness = helix("abcdef\n");
+    press(&mut harness, "vlv").await;
+    harness.assert_mode(Mode::Normal);
+    assert_eq!(markup(&harness), "#[a|b]#cdef\n");
+    press(&mut harness, "l").await;
+    harness.assert_mode(Mode::Normal);
+    assert_eq!(markup(&harness), "ab#[|c]#def\n");
+}
+
+#[tokio::test]
+async fn helix_escape_leaves_select_from_a_count_a_pending_key_or_a_menu() {
+    let mut harness = helix("abcdef\n");
+    press(&mut harness, "v3").await;
+    press_code(&mut harness, KeyCode::Esc).await;
+    harness.assert_mode(Mode::Normal);
+    assert_eq!(harness.editor.test_felix_selection(), (0, 0, 1));
+
+    press(&mut harness, "v3l").await;
+    press_code(&mut harness, KeyCode::Esc).await;
+    harness.assert_mode(Mode::Normal);
+    assert_eq!(markup(&harness), "#[abc|d]#ef\n");
+
+    // A pending find and an open keymap menu used to swallow Esc and `v`.
+    let mut harness = helix("abcdef\n");
+    press(&mut harness, "vf").await;
+    press_code(&mut harness, KeyCode::Esc).await;
+    harness.assert_mode(Mode::Normal);
+    assert_eq!(harness.editor.test_felix_selection(), (0, 0, 1));
+
+    press(&mut harness, "vg").await;
+    press_code(&mut harness, KeyCode::Esc).await;
+    harness.assert_mode(Mode::Normal);
+    press(&mut harness, "v").await;
+    harness.assert_mode(Mode::Select);
+    press(&mut harness, "g").await;
+    press(&mut harness, "v").await;
+    harness.assert_mode(Mode::Normal);
+
+    let mut harness = helix("foo bar foo\n");
+    press_sequence(&mut harness, "%sfoo{enter}").await;
+    press_code(&mut harness, KeyCode::Esc).await;
+    harness.assert_mode(Mode::Normal);
+    let (primary, ranges) = harness.editor.test_felix_ranges();
+    assert_eq!(primary, 0);
+    assert_eq!(ranges, vec![(0, 2), (8, 10)]);
+}
+
+#[tokio::test]
 async fn helix_select_mode_extends_and_collapse_and_flip_move_the_ends() {
     let mut harness = helix("abcdef\n");
     press(&mut harness, "vl").await;
@@ -140,7 +212,8 @@ async fn helix_select_mode_extends_and_collapse_and_flip_move_the_ends() {
     assert_eq!(markup(&harness), "#[a|b]#cdef\n");
     press(&mut harness, ";").await;
     assert_eq!(harness.editor.test_felix_selection().2, 1);
-    press(&mut harness, "vll").await;
+    harness.assert_mode(Mode::Select);
+    press(&mut harness, "ll").await;
     press_modified(&mut harness, ';', KeyModifiers::ALT).await;
     let (anchor, head, _) = harness.editor.test_felix_selection();
     assert!(anchor > head);
