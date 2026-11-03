@@ -98,6 +98,15 @@ impl<'a> Doc<'a> {
         }
     }
 
+    /// Last scalar, or the blank line after a trailing newline.
+    fn cursor_limit(&self) -> usize {
+        if self.len() == 0 || self.chars.last() == Some(&'\n') {
+            self.len()
+        } else {
+            self.len() - 1
+        }
+    }
+
     fn grapheme_index(&self, head: usize) -> usize {
         self.graphemes
             .partition_point(|start| *start <= head.min(self.len()))
@@ -139,13 +148,23 @@ impl<'a> Doc<'a> {
             }
         } else {
             while remaining > 0 {
-                let (_, _, end) = self.line_at(line_start);
-                if end >= self.len() {
+                if line_start >= self.len() {
                     break;
                 }
-                line_start = end;
-                remaining -= 1;
+                let (_, _, end) = self.line_at(line_start);
+                if end < self.len() {
+                    line_start = end;
+                    remaining -= 1;
+                    continue;
+                }
+                if self.chars.last() == Some(&'\n') {
+                    line_start = self.len();
+                }
+                break;
             }
+        }
+        if line_start >= self.len() {
+            return self.cursor_limit();
         }
         let (_, content_end, end) = self.line_at(line_start);
         if content_end == line_start {
@@ -156,90 +175,208 @@ impl<'a> Doc<'a> {
     }
 }
 
-fn word_kind(character: char, long: bool) -> u8 {
-    if character.is_whitespace() {
-        0
-    } else if long || character.is_alphanumeric() || character == '_' {
-        1
+#[derive(Clone, Copy)]
+enum WordTarget {
+    NextStart,
+    NextEnd,
+    PrevStart,
+    PrevEnd,
+}
+
+fn is_eol(character: char) -> bool {
+    character == '\n' || character == '\r'
+}
+
+fn word_boundary(previous: char, next: char, long: bool) -> bool {
+    let kind = |character: char| {
+        if is_eol(character) {
+            0
+        } else if character.is_whitespace() {
+            1
+        } else if character.is_alphanumeric() || character == '_' {
+            2
+        } else {
+            3
+        }
+    };
+    let left = kind(previous);
+    let right = kind(next);
+    if long && ((left == 2 && right == 3) || (left == 3 && right == 2)) {
+        return false;
+    }
+    left != right
+}
+
+fn reached_word_target(target: WordTarget, previous: char, next: char, long: bool) -> bool {
+    let boundary = word_boundary(previous, next, long);
+    match target {
+        WordTarget::NextStart | WordTarget::PrevEnd => {
+            boundary && (is_eol(next) || !next.is_whitespace())
+        }
+        WordTarget::NextEnd | WordTarget::PrevStart => {
+            boundary && (!previous.is_whitespace() || is_eol(next))
+        }
+    }
+}
+
+impl Doc<'_> {
+    fn next_grapheme(&self, index: usize) -> usize {
+        let position = self.graphemes.partition_point(|start| *start <= index);
+        self.graphemes.get(position).copied().unwrap_or(self.len())
+    }
+
+    fn prev_grapheme(&self, index: usize) -> usize {
+        let position = self.graphemes.partition_point(|start| *start < index);
+        if position == 0 {
+            0
+        } else {
+            self.graphemes[position - 1]
+        }
+    }
+}
+
+/// Helix ranges are gaps: a forward range's head is exclusive, and the block
+/// cursor sits on the grapheme just inside that edge.
+fn to_helix(doc: &Doc<'_>, range: Range) -> (usize, usize) {
+    if range.head > range.anchor {
+        (range.anchor, doc.next_grapheme(range.head))
+    } else if range.head < range.anchor {
+        (doc.next_grapheme(range.anchor), range.head)
     } else {
-        2
+        (range.head, range.head)
     }
 }
 
-fn next_word_start(doc: &Doc<'_>, mut head: usize, count: usize, long: bool) -> usize {
+fn from_helix(doc: &Doc<'_>, anchor: usize, head: usize) -> Range {
+    if head > anchor {
+        Range::new(anchor, doc.prev_grapheme(head))
+    } else if head < anchor {
+        Range::new(doc.prev_grapheme(anchor), head)
+    } else {
+        Range::cursor(head.min(doc.len()))
+    }
+}
+
+fn range_to_word_target(
+    doc: &Doc<'_>,
+    origin_anchor: usize,
+    origin_head: usize,
+    target: WordTarget,
+    long: bool,
+) -> (usize, usize) {
+    let backward = matches!(target, WordTarget::PrevStart | WordTarget::PrevEnd);
+    let mut anchor = origin_anchor;
+    let mut head = origin_head;
     let len = doc.len();
-    if len == 0 {
-        return 0;
-    }
-    for _ in 0..count {
-        if head >= len {
-            break;
-        }
-        let kind = word_kind(doc.chars[head], long);
-        if kind != 0 {
-            while head < len && word_kind(doc.chars[head], long) == kind {
-                head += 1;
-            }
-        } else if head + 1 < len {
-            head += 1;
-        }
-        while head < len && word_kind(doc.chars[head], long) == 0 {
-            head += 1;
-        }
-    }
-    doc.clamp(head)
-}
+    let mut position = origin_head;
+    let mut previous = if backward {
+        (position < len).then(|| doc.chars[position])
+    } else {
+        position.checked_sub(1).map(|index| doc.chars[index])
+    };
 
-fn prev_word_start(doc: &Doc<'_>, mut head: usize, count: usize, long: bool) -> usize {
-    if doc.len() == 0 {
-        return 0;
-    }
-    for _ in 0..count {
-        if head == 0 {
-            break;
-        }
-        head -= 1;
-        while head > 0 && word_kind(doc.chars[head], long) == 0 {
-            head -= 1;
-        }
-        let kind = word_kind(doc.chars[head], long);
-        while head > 0 && word_kind(doc.chars[head - 1], long) == kind {
-            head -= 1;
-        }
-    }
-    head
-}
-
-fn next_word_end(doc: &Doc<'_>, mut head: usize, count: usize, long: bool) -> usize {
-    let len = doc.len();
-    if len == 0 {
-        return 0;
-    }
-    for _ in 0..count.max(1) {
-        if head + 1 >= len {
-            break;
-        }
-        let kind = word_kind(doc.chars[head], long);
-        if kind != 0 && head + 1 < len && word_kind(doc.chars[head + 1], long) == kind {
-            while head + 1 < len && word_kind(doc.chars[head + 1], long) == kind {
-                head += 1;
+    loop {
+        let next = if backward {
+            if position == 0 {
+                None
+            } else {
+                position -= 1;
+                Some(doc.chars[position])
             }
+        } else if position < len {
+            let character = doc.chars[position];
+            position += 1;
+            Some(character)
+        } else {
+            None
+        };
+        let Some(character) = next else {
+            break;
+        };
+        if !is_eol(character) {
+            if backward {
+                position += 1;
+            } else {
+                position -= 1;
+            }
+            break;
+        }
+        previous = Some(character);
+        if backward {
+            head = head.saturating_sub(1);
         } else {
             head += 1;
-            while head < len && word_kind(doc.chars[head], long) == 0 {
-                head += 1;
-            }
-            if head >= len {
-                head = len - 1;
-                break;
-            }
-            let kind = word_kind(doc.chars[head], long);
-            while head + 1 < len && word_kind(doc.chars[head + 1], long) == kind && kind != 0 {
-                head += 1;
-            }
         }
     }
-    head
+    if previous.is_some_and(is_eol) {
+        anchor = head;
+    }
+
+    let head_start = head;
+    loop {
+        let next = if backward {
+            if position == 0 {
+                None
+            } else {
+                position -= 1;
+                Some(doc.chars[position])
+            }
+        } else if position < len {
+            let character = doc.chars[position];
+            position += 1;
+            Some(character)
+        } else {
+            None
+        };
+        let Some(character) = next else {
+            break;
+        };
+        if previous.is_none() || reached_word_target(target, previous.unwrap(), character, long) {
+            if head == head_start {
+                anchor = head;
+            } else {
+                break;
+            }
+        }
+        previous = Some(character);
+        if backward {
+            head = head.saturating_sub(1);
+        } else {
+            head += 1;
+        }
+    }
+    (anchor, head)
+}
+
+fn word_range(doc: &Doc<'_>, range: Range, count: usize, target: WordTarget, long: bool) -> Range {
+    let backward = matches!(target, WordTarget::PrevStart | WordTarget::PrevEnd);
+    let (mut anchor, mut head) = to_helix(doc, range);
+    if (backward && head == 0) || (!backward && head == doc.len()) {
+        return from_helix(doc, anchor, head);
+    }
+    if backward {
+        if anchor < head {
+            anchor = head;
+            head = doc.prev_grapheme(head);
+        } else {
+            anchor = doc.next_grapheme(head);
+        }
+    } else if anchor < head {
+        anchor = doc.prev_grapheme(head);
+    } else {
+        let next = doc.next_grapheme(head);
+        anchor = head;
+        head = next;
+    }
+    for _ in 0..count.max(1) {
+        let (next_anchor, next_head) = range_to_word_target(doc, anchor, head, target, long);
+        if next_anchor == anchor && next_head == head {
+            break;
+        }
+        anchor = next_anchor;
+        head = next_head;
+    }
+    from_helix(doc, anchor, head)
 }
 
 /// Destination scalar for one motion, or `None` when a character search misses.
@@ -259,31 +396,23 @@ pub fn motion_head(
             doc.graphemes[current.saturating_sub(count)]
         }
         Motion::CharRight => {
-            let current = doc.grapheme_index(head);
-            let next = (current + count).min(doc.graphemes.len() - 1);
-            // The final grapheme start can be `len` only when a trailing
-            // grapheme was recorded; clamp onto a real scalar.
-            doc.clamp(doc.graphemes[next])
+            let mut next = head;
+            for _ in 0..count {
+                if next >= doc.cursor_limit() {
+                    break;
+                }
+                let stepped = doc.next_grapheme(next);
+                next = if stepped == next {
+                    doc.cursor_limit()
+                } else {
+                    stepped.min(doc.cursor_limit())
+                };
+            }
+            next
         }
         Motion::LineUp => doc.move_vertical(head, -(count as isize)),
         Motion::LineDown => doc.move_vertical(head, count as isize),
-        Motion::Word(motion) => {
-            if motion.end && motion.forward {
-                next_word_end(&doc, head, count, motion.long)
-            } else if motion.forward {
-                next_word_start(&doc, head, count, motion.long)
-            } else if motion.end {
-                // Previous word end: step to the previous start, then to its end.
-                let start = prev_word_start(&doc, head, count, motion.long);
-                if start == head {
-                    head
-                } else {
-                    next_word_end(&doc, start, 1, motion.long).min(head)
-                }
-            } else {
-                prev_word_start(&doc, head, count, motion.long)
-            }
-        }
+        Motion::Word(_) => head,
         Motion::LineStart => doc.line_at(head).0,
         Motion::LineEnd => {
             let (start, content_end, _) = doc.line_at(head);
@@ -331,7 +460,7 @@ pub fn motion_head(
         }
         Motion::Find(kind) => return find_char(&doc.chars, head, target?, kind, count),
     };
-    Some(doc.clamp(next))
+    Some(next.min(doc.cursor_limit()))
 }
 
 fn find_char(
@@ -384,7 +513,22 @@ pub fn apply_motion(
     extend: bool,
 ) -> Option<Selection> {
     let mut missed = false;
+    let doc = Doc::new(text);
     let next = selection.transform_each(|range| {
+        if let Motion::Word(word) = motion {
+            let target = match (word.forward, word.end) {
+                (true, false) => WordTarget::NextStart,
+                (true, true) => WordTarget::NextEnd,
+                (false, false) => WordTarget::PrevStart,
+                (false, true) => WordTarget::PrevEnd,
+            };
+            let moved = word_range(&doc, range, count, target, word.long);
+            return if extend {
+                Range::new(range.anchor, moved.head)
+            } else {
+                moved
+            };
+        }
         match motion_head(text, range.head, motion, count, target) {
             Some(head) => {
                 if extend {
@@ -535,9 +679,7 @@ pub fn transform_case(text: &str, change: CaseChange) -> String {
 }
 
 pub fn replacement(text: &str, character: char) -> String {
-    text.chars()
-        .map(|current| if current == '\n' { '\n' } else { character })
-        .collect()
+    text.chars().map(|_| character).collect()
 }
 
 fn char_to_byte(text: &str, index: usize) -> usize {
@@ -685,12 +827,16 @@ pub fn trim_ranges(text: &str, selection: &Selection) -> Selection {
 
 pub fn align_edits(text: &str, selection: &Selection) -> Vec<TextEdit> {
     let doc = Doc::new(text);
+    // Helix `&` pads on the left so the selection ends share a column.
     let columns: Vec<(usize, usize)> = selection
         .ranges()
         .iter()
         .map(|range| {
-            let (start, _) = doc.column_on_line(range.from());
-            (range.from(), range.from().saturating_sub(start))
+            let (start, _) = doc.column_on_line(range.to());
+            (
+                range.from(),
+                range.to().saturating_sub(start).saturating_add(1),
+            )
         })
         .collect();
     let Some(target) = columns.iter().map(|(_, column)| *column).max() else {
@@ -800,10 +946,22 @@ fn surrounding_pair(
     close: char,
 ) -> Result<(usize, usize), String> {
     let chars: Vec<char> = text.chars().collect();
-    let outer_start = start
-        .checked_sub(1)
-        .filter(|index| chars.get(*index) == Some(&open));
-    let outer_end = (end < chars.len() && chars[end] == close).then_some(end + 1);
+    let mut outer_start = None;
+    let mut index = start;
+    loop {
+        if chars.get(index) == Some(&open) {
+            outer_start = Some(index);
+            break;
+        }
+        if index == 0 {
+            break;
+        }
+        index -= 1;
+    }
+    let outer_end = chars[end.min(chars.len())..]
+        .iter()
+        .position(|character| *character == close)
+        .map(|offset| end.min(chars.len()) + offset + 1);
     match (outer_start, outer_end) {
         (Some(start), Some(end)) if end > start + 1 => Ok((start, end)),
         _ => Err("surrounding pair not found".to_string()),
@@ -816,6 +974,7 @@ pub fn join_span(text: &str, start: usize, end: usize) -> String {
         .skip(start)
         .take(end.saturating_sub(start))
         .collect();
+    let keep_trailing_newline = slice.ends_with('\n') || slice.ends_with('\r');
     let mut joined = String::new();
     let mut pending_break = false;
     for character in slice.chars() {
@@ -830,6 +989,9 @@ pub fn join_span(text: &str, start: usize, end: usize) -> String {
             pending_break = false;
         }
         joined.push(character);
+    }
+    if keep_trailing_newline {
+        joined.push('\n');
     }
     joined
 }
@@ -855,7 +1017,10 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(next.primary(), Range::new(0, 6));
+        // Helix 25.07.1: `w` covers the word and its trailing space, with the
+        // cursor on that space.
+        assert_eq!(next.primary(), Range::new(0, 5));
+        assert_eq!(&text[..6], "hello ");
         assert!(next.invariants_hold(text));
     }
 

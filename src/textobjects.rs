@@ -859,8 +859,8 @@ impl SyntaxTextObjectService {
                 }
             }
             SyntaxWalk::Shrink => largest_inner_child(node, start_byte, end_byte),
-            SyntaxWalk::NextSibling => node.next_named_sibling(),
-            SyntaxWalk::PrevSibling => node.prev_named_sibling(),
+            SyntaxWalk::NextSibling => node.next_sibling().or_else(|| node.next_named_sibling()),
+            SyntaxWalk::PrevSibling => node.prev_sibling().or_else(|| node.prev_named_sibling()),
         };
         Ok(chosen.map(|node| (node.start_byte(), node.end_byte())))
     }
@@ -872,8 +872,8 @@ fn tightest_node(root: Node<'_>, start: usize, end: usize) -> Option<Node<'_>> {
     }
     let mut best = root;
     let mut index = 0;
-    while index < best.named_child_count() {
-        let Some(child) = best.named_child(index) else {
+    while index < best.child_count() {
+        let Some(child) = best.child(index) else {
             break;
         };
         if child.start_byte() <= start && child.end_byte() >= end {

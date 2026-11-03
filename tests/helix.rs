@@ -106,13 +106,15 @@ async fn helix_x_selects_the_line_and_d_deletes_that_selection() {
 async fn helix_word_motion_selects_through_the_next_word_and_change_inserts() {
     let mut harness = helix("hello world\n");
     press(&mut harness, "w").await;
-    assert_eq!(markup(&harness), "#[hello |w]#orld\n");
+    // Helix 25.07.1 selects the word and its trailing space. The cursor
+    // block sits on that space.
+    assert_eq!(markup(&harness), "#[hello| ]#world\n");
     press(&mut harness, "c").await;
     harness.assert_mode(Mode::Insert);
     press(&mut harness, "X").await;
     press_code(&mut harness, KeyCode::Esc).await;
     harness.assert_mode(Mode::Normal);
-    harness.assert_buffer_contents("Xorld\n");
+    harness.assert_buffer_contents("Xworld\n");
 }
 
 #[tokio::test]
@@ -237,7 +239,7 @@ async fn helix_text_object_match_and_surround() {
     press(&mut harness, "ll").await;
     press(&mut harness, "mm").await;
     let (anchor, head, _) = harness.editor.test_felix_selection();
-    assert_ne!(anchor, head);
+    assert_eq!(anchor, head);
     press(&mut harness, ";").await;
     press(&mut harness, "miw").await;
     assert!(markup(&harness).contains("hello") || markup(&harness).contains("ell"));
@@ -256,6 +258,144 @@ async fn helix_undo_restores_the_deleted_text() {
     assert!(harness.buffer_contents().contains("keep"));
 }
 
+fn json_escape(text: &str) -> String {
+    let mut out = String::from('"');
+    for character in text.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            other if other.is_control() => out.push_str(&format!("\\u{:04x}", other as u32)),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn event_for_spec(spec: &str) -> Event {
+    let (spec, modifiers) = if let Some(rest) = spec.strip_prefix("alt-") {
+        (rest, KeyModifiers::ALT)
+    } else if let Some(rest) = spec.strip_prefix("ctrl-") {
+        (rest, KeyModifiers::CONTROL)
+    } else {
+        (spec, KeyModifiers::NONE)
+    };
+    let code = match spec {
+        "enter" => KeyCode::Enter,
+        "esc" => KeyCode::Esc,
+        "bspace" => KeyCode::Backspace,
+        "tab" => KeyCode::Tab,
+        "space" => KeyCode::Char(' '),
+        "home" => KeyCode::Home,
+        "end" => KeyCode::End,
+        "left" => KeyCode::Left,
+        "right" => KeyCode::Right,
+        "up" => KeyCode::Up,
+        "down" => KeyCode::Down,
+        "pageup" => KeyCode::PageUp,
+        "pagedown" => KeyCode::PageDown,
+        other => KeyCode::Char(other.chars().next().expect("key spec")),
+    };
+    Event::Key(KeyEvent::new(code, modifiers))
+}
+
+async fn press_sequence(harness: &mut EditorHarness, keys: &str) {
+    let mut rest = keys;
+    while !rest.is_empty() {
+        if let Some(spec) = rest.strip_prefix('{') {
+            let end = spec.find('}').expect("key token");
+            harness
+                .execute_event(event_for_spec(&spec[..end]))
+                .await
+                .unwrap();
+            rest = &spec[end + 1..];
+        } else {
+            let character = rest.chars().next().unwrap();
+            harness
+                .execute_event(Event::Key(KeyEvent::new(
+                    KeyCode::Char(character),
+                    KeyModifiers::NONE,
+                )))
+                .await
+                .unwrap();
+            rest = &rest[character.len_utf8()..];
+        }
+    }
+}
+
+fn mode_name(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Normal => "normal",
+        Mode::Insert => "insert",
+        Mode::Command => "command",
+        Mode::Search => "search",
+        Mode::Select => "select",
+        Mode::Visual => "visual",
+        Mode::VisualLine => "visual-line",
+        Mode::VisualBlock => "visual-block",
+    }
+}
+
+/// Dump Helix-mode state for `scripts/helix-diff`. Set `HELIX_DUMP_CASES`
+/// to a TSV file (`id`, base64 text, keys, path) and `HELIX_DUMP_OUT` to the
+/// JSON destination. Without those variables the test does nothing.
+#[tokio::test]
+async fn dump_helix_state_for_the_differential_harness() {
+    let Some(cases_path) = std::env::var_os("HELIX_DUMP_CASES") else {
+        return;
+    };
+    let out_path = std::env::var("HELIX_DUMP_OUT").expect("HELIX_DUMP_OUT");
+    let raw = std::fs::read_to_string(cases_path).unwrap();
+    let mut body = String::from("{\"results\":[\n");
+    let mut first = true;
+    for line in raw.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let mut fields = line.split('\t');
+        let id = fields.next().unwrap();
+        let text = String::from_utf8(
+            base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                fields.next().unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let keys = fields.next().unwrap();
+        let path = fields.next().unwrap_or("");
+        let file = Some(if path.is_empty() {
+            "fixture.txt".to_string()
+        } else {
+            path.to_string()
+        });
+        let mut harness =
+            EditorHarness::with_config_and_size(Buffer::new(file, text), helix_config(), 100, 24);
+        press_sequence(&mut harness, keys).await;
+        let (primary, ranges) = harness.editor.test_felix_ranges();
+        let ranges_json = ranges
+            .iter()
+            .map(|(anchor, head)| format!("{{\"anchor\":{anchor},\"head\":{head}}}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        if !first {
+            body.push_str(",\n");
+        }
+        first = false;
+        body.push_str(&format!(
+            "{{\"id\":{},\"mode\":{},\"text\":{},\"primary\":{primary},\"ranges\":[{ranges_json}]}}",
+            json_escape(id),
+            json_escape(mode_name(harness.mode())),
+            json_escape(&harness.buffer_contents()),
+        ));
+    }
+    body.push_str("\n]}\n");
+    std::fs::write(out_path, body).unwrap();
+}
+
 #[tokio::test]
 async fn helix_open_line_and_paste() {
     let mut harness = helix("ab\n");
@@ -266,3 +406,5 @@ async fn helix_open_line_and_paste() {
     press_code(&mut harness, KeyCode::Esc).await;
     assert!(harness.buffer_contents().contains('Z'));
 }
+
+include!("fixtures/helix_captured.rs");

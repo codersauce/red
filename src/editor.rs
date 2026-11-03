@@ -18333,6 +18333,10 @@ impl Editor {
     }
 
     fn key_string_for_event(ev: &Event) -> Option<String> {
+        Self::key_string_for_event_with(ev, false)
+    }
+
+    fn key_string_for_event_with(ev: &Event, preserve_case: bool) -> Option<String> {
         let Event::Key(KeyEvent {
             code, modifiers, ..
         }) = ev
@@ -18349,7 +18353,11 @@ impl Editor {
         );
         let key = match code {
             KeyCode::Char(' ') => "Space".to_string(),
-            KeyCode::Char(c) if has_modifier => c.to_ascii_lowercase().to_string(),
+            // Helix chords distinguish `Alt-c` from `Alt-C`. Vim chords do not.
+            KeyCode::Char(c) if has_modifier && !preserve_case => {
+                c.to_ascii_lowercase().to_string()
+            }
+            KeyCode::Char(c) if has_modifier => c.to_string(),
             KeyCode::Char(c) => c.to_string(),
             KeyCode::F(number) => format!("F{number}"),
             _ => format!("{code:?}"),
@@ -22129,18 +22137,27 @@ impl Editor {
 
             if matches!(old_mode, Mode::Insert) && matches!(new_mode, Mode::Normal) {
                 let cleaned_generated_indent = self.cleanup_generated_indent();
-                if self.insert_entry_cursor.is_some_and(|entry| {
-                    let y = self.buffer_line();
-                    y > entry.y || (y == entry.y && self.cx > entry.x)
-                }) {
+                // Vim moves back onto the last inserted scalar. Helix stays
+                // where the insert cursor was.
+                if !self.is_helix()
+                    && self.insert_entry_cursor.is_some_and(|entry| {
+                        let y = self.buffer_line();
+                        y > entry.y || (y == entry.y && self.cx > entry.x)
+                    })
+                {
                     self.cx = self.cx.saturating_sub(1);
                 }
-                self.cx = self.cx.min(self.line_length().saturating_sub(1));
+                if !self.is_helix() {
+                    self.cx = self.cx.min(self.line_length().saturating_sub(1));
+                }
                 // EnterMode renders before the generic post-action cursor-goal refresh.
                 self.refresh_cursor_goal();
                 self.insert_entry_cursor = None;
                 let after_cursor = self.cursor_snapshot();
                 self.commit_transaction(after_cursor);
+                if self.is_helix() {
+                    self.finish_helix_insert();
+                }
                 self.cancel_transaction_if_empty();
                 if cleaned_generated_indent {
                     self.notify_change(runtime).await?;
@@ -22621,6 +22638,9 @@ impl Editor {
 
                 // Move cursor by one character position (not display width)
                 self.cx += grapheme_len(&c.to_string());
+                if self.is_helix() {
+                    self.sync_helix_insert_selection();
+                }
                 let language =
                     self.highlight_language_id_for_buffer_index(self.buffer_manager.active_index());
                 let should_reindent = self.current_line_contents().is_some_and(|contents| {
@@ -29560,7 +29580,7 @@ impl Editor {
             event::Event::Key(KeyEvent {
                 code, modifiers, ..
             }) => {
-                let key = Self::key_string_for_event(ev)?;
+                let key = Self::key_string_for_event_with(ev, self.is_helix())?;
 
                 mappings
                     .get(&key)
@@ -29703,6 +29723,18 @@ impl Editor {
                     }
                     KeyAction::Single(Action::UnindentSelection(_)) => {
                         KeyAction::Single(Action::UnindentSelection(count))
+                    }
+                    // Helix counts on goto are line numbers, not repeats.
+                    // Other Helix commands still repeat once per count.
+                    KeyAction::Single(Action::Felix(
+                        crate::felix::Command::GotoFileStart
+                        | crate::felix::Command::GotoLine
+                        | crate::felix::Command::FindNextChar
+                        | crate::felix::Command::FindPrevChar
+                        | crate::felix::Command::TillNextChar
+                        | crate::felix::Command::TillPrevChar,
+                    )) => {
+                        return key_action;
                     }
                     KeyAction::Single(Action::StartUppercaseOperator(_)) => {
                         KeyAction::Single(Action::StartUppercaseOperator(count))
@@ -35786,6 +35818,22 @@ impl Editor {
             selection.primary().head,
             selection.len(),
         )
+    }
+
+    /// Every range as `(anchor, head)` plus the primary index.
+    #[doc(hidden)]
+    pub fn test_felix_ranges(&self) -> (usize, Vec<(usize, usize)>) {
+        let selection = self
+            .window_manager
+            .active_window()
+            .map(|window| window.selection.clone())
+            .unwrap_or_default();
+        let ranges = selection
+            .ranges()
+            .iter()
+            .map(|range| (range.anchor, range.head))
+            .collect();
+        (selection.primary_index(), ranges)
     }
 
     #[doc(hidden)]

@@ -95,9 +95,12 @@ impl Range {
     /// left edge of the edit and its head on the right edge.
     pub fn map_edit(self, start: usize, old_end: usize, new_end: usize) -> Self {
         let cursor = self.is_cursor();
+        // A cursor sits on one scalar. Replacing that scalar keeps the cursor
+        // on the new text. A pure insertion at the cursor still moves forward.
+        let insertion = old_end == start;
         Self {
-            anchor: map_point(self.anchor, start, old_end, new_end, cursor),
-            head: map_point(self.head, start, old_end, new_end, true),
+            anchor: map_point(self.anchor, start, old_end, new_end, cursor && insertion),
+            head: map_point(self.head, start, old_end, new_end, !cursor || insertion),
         }
     }
 }
@@ -119,7 +122,12 @@ fn map_point(index: usize, start: usize, old_end: usize, new_end: usize, right: 
     } else if index >= old_end {
         index.saturating_sub(replaced).saturating_add(inserted)
     } else if right {
-        start.saturating_add(inserted)
+        // Inclusive head stays on the last scalar of the replacement.
+        if inserted == 0 {
+            start
+        } else {
+            start + inserted - 1
+        }
     } else {
         start
     }

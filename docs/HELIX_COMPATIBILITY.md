@@ -11,8 +11,10 @@ kernel lives in `src/felix/` so it can move into a headless crate named
 this change.
 
 A row is **supported** only when a keystroke test or a felix unit test covers
-the behavior. Tests are original sequences in `tests/helix.rs` and
-`src/felix/`; they are not copied from Helix.
+the behavior. The expected selections were captured from Helix 25.07.1 with
+`scripts/helix-diff/` and encoded in `tests/helix.rs`. They are not copied
+from Helix's tests. The per-key result of that capture is in
+`docs/HELIX_PARITY.md`.
 
 ## How to turn it on
 
@@ -35,7 +37,7 @@ each range onto its head. `Alt-;` swaps anchor and head.
 | Keys | Status | Behavior |
 |---|---|---|
 | `h` `j` `k` `l`, arrows | **supported** | Move, collapsing each selection to one scalar. Counts repeat. |
-| `w` `b` `e`, `W` `B` `E` | **supported** | Select from the cursor through the next or previous word boundary. `w` lands on the first scalar of the next word, so that scalar is included. |
+| `w` `b` `e`, `W` `B` `E` | **supported** | Select the word and the whitespace that follows it. The cursor block sits on the last scalar of that span. Punctuation is its own word; `W` keeps punctuation inside a WORD. |
 | `f` `t` `F` `T` | **supported** | Select up to a character anywhere in the buffer, not only on the current line. A miss leaves the selection unchanged. |
 | `x`, `X`, `Alt-x` | **supported** | Extend to the current line and then downward, extend to full line bounds, shrink to whole lines inside the selection. |
 | `%` | **supported** | Select the whole buffer. |
