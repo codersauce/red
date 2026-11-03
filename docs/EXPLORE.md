@@ -1,10 +1,10 @@
 # Code explore
 
-The sidebar follows `docs/DESIGN.md`: a `sideBar` column from the top row, one `│` on the editor edge, and three levels. `Explore` is the title, bold, with the Neo-tree root icon. `Inside`, `Here`, `Definition`, and `Matches` are bold section headers in the content color, with one blank row above each. Names are regular weight. Notes and the definition count stay muted and inline. `DIM` and `REVIEW` stay on the trail row.
-
 Code explore is a reading mode. It keeps the editor you already use and adds a
 sidebar, dimming, and a review trail so a function is easier to follow. It does
 not send the buffer to a model and it does not ask you a question.
+
+![Code explore dimming a function to the calls that matter, with the sidebar showing the definition of refill](images/explore.jpg)
 
 Turn it on with `Space e e`, `Space E`, or `:explore`. The sidebar opens on the
 right when the window is wide enough. The row above the status line is
