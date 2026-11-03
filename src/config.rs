@@ -1,7 +1,7 @@
 //! Layered configuration loading with diagnostic recovery instead of startup-wide failure.
 //!
 //! Embedded defaults form the complete baseline, user TOML applies independent
-//! overrides, and command-line fragments are strict final overrides. Invalid user
+//! overrides, and `-c`/`--config` values are strict final overrides. Invalid user
 //! fields are diagnosed and replaced by their corresponding safe defaults when that can
 //! be done independently; malformed whole-file input falls back to a deliberately
 //! restricted profile. Loading never rewrites the user's configuration.
@@ -22,6 +22,9 @@ use serde_json::{json, Value};
 
 use crate::assets;
 use crate::editor::Action;
+
+#[path = "config_override.rs"]
+mod config_override;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -127,6 +130,36 @@ impl LoadedConfig {
         self.recovery == ConfigRecovery::Clean && self.diagnostics.is_empty()
     }
 
+    /// Renders the merged configuration, including the `-c`/`--config` values
+    /// that won over the user file and embedded defaults.
+    #[must_use]
+    pub fn render_effective_toml(&self) -> String {
+        let mut rendered = String::from(
+            "# effective configuration\n# precedence: embedded defaults < config.toml < -c/--config\n",
+        );
+        if self.override_fragments.is_empty() {
+            rendered.push_str("# cli overrides: none\n");
+        } else {
+            rendered.push_str("# cli overrides (later flags win):\n");
+            for raw in &self.override_fragments {
+                rendered.push_str("#   -c ");
+                rendered.push_str(&raw.replace('\n', " "));
+                rendered.push('\n');
+            }
+        }
+        rendered.push('\n');
+        match toml::to_string_pretty(&self.config) {
+            Ok(body) => rendered.push_str(&body),
+            Err(error) => {
+                rendered.push_str(&format!("# could not render configuration: {error}\n"));
+            }
+        }
+        if !rendered.ends_with('\n') {
+            rendered.push('\n');
+        }
+        rendered
+    }
+
     /// Returns the user configuration file whose contents produced this snapshot.
     #[must_use]
     pub fn source_path(&self) -> &Path {
@@ -150,18 +183,21 @@ impl LoadedConfig {
 
     fn explicit_names_at_path(&self, section: &str, entries: &str) -> HashSet<String> {
         let mut names = HashSet::new();
-        for source in std::iter::once(self.source_text.as_str())
-            .chain(self.override_fragments.iter().map(String::as_str))
-        {
-            let Ok(value) = source.parse::<toml::Value>() else {
-                continue;
-            };
+        let mut consider = |value: &toml::Value| {
             if let Some(table) = value
                 .get(section)
                 .and_then(|section| section.get(entries))
                 .and_then(toml::Value::as_table)
             {
                 names.extend(table.keys().cloned());
+            }
+        };
+        if let Ok(value) = self.source_text.parse::<toml::Value>() {
+            consider(&value);
+        }
+        for raw in &self.override_fragments {
+            if let Ok(value) = config_override::parse_config_override(raw) {
+                consider(&value);
             }
         }
         names
@@ -1726,24 +1762,14 @@ impl Config {
     /// Strictly parses TOML, applies ordered override fragments, and deserializes it.
     ///
     /// Unlike [`Self::load_user_toml`], this constructor does not recover
-    /// invalid individual fields.
+    /// invalid individual fields. Each override is either a TOML document or a
+    /// dotted `key=value` whose value is TOML, falling back to a plain string.
     pub fn from_toml_with_overrides(contents: &str, overrides: &[String]) -> anyhow::Result<Self> {
         let mut value: toml::Value = toml::from_str(contents)
             .map_err(|err| anyhow::anyhow!("failed to parse config.toml: {err}"))?;
         normalize_format_on_save_alias(&mut value);
-
-        for (index, override_toml) in overrides.iter().enumerate() {
-            let mut override_value: toml::Value = toml::from_str(override_toml).map_err(|err| {
-                anyhow::anyhow!("failed to parse config override #{}: {err}", index + 1)
-            })?;
-            normalize_format_on_save_alias(&mut override_value);
-            merge_toml_values(&mut value, override_value);
-        }
-
-        let mut config: Self = value
-            .try_into()
-            .map_err(|err| anyhow::anyhow!("failed to deserialize merged config: {err}"))?;
-        config.apply_disabled_plugins();
+        let mut config = deserialize_config(value)?;
+        apply_strict_overrides(&mut config, overrides)?;
         Ok(config)
     }
 
@@ -2595,16 +2621,26 @@ fn apply_strict_overrides(config: &mut Config, overrides: &[String]) -> anyhow::
     }
     let mut value = toml::Value::try_from(&*config)?;
     let mut allowed_servers = config.lsp.servers.keys().cloned().collect::<HashSet<_>>();
-    for (index, override_toml) in overrides.iter().enumerate() {
-        let mut override_value: toml::Value = toml::from_str(override_toml)
-            .map_err(|_| anyhow::anyhow!("failed to parse config override #{}", index + 1))?;
-        if let Some(path) = first_unknown_path(&override_value, &[]) {
-            anyhow::bail!(
-                "invalid config override #{}: unknown field {}",
+    for (index, raw) in overrides.iter().enumerate() {
+        let mut override_value = config_override::parse_config_override(raw).map_err(|error| {
+            anyhow::anyhow!(
+                "invalid config override #{} (-c/--config {}): {error}",
                 index + 1,
-                render_path(&path)
+                config_override::quote_flag(raw)
+            )
+        })?;
+        if let Some(path) = config_override::unknown_override_path(&override_value) {
+            let rendered = render_path(&path);
+            let hint = config_override::suggest_config_key(&rendered)
+                .map(|key| format!("; did you mean '{key}'?"))
+                .unwrap_or_default();
+            anyhow::bail!(
+                "invalid config override #{} (-c/--config {}): unknown key '{rendered}'{hint}",
+                index + 1,
+                config_override::quote_flag(raw)
             );
         }
+        let key_label = config_override::override_key_label(&override_value);
         if let Some(servers) = override_value
             .get("lsp")
             .and_then(|lsp| lsp.get("servers"))
@@ -2614,10 +2650,12 @@ fn apply_strict_overrides(config: &mut Config, overrides: &[String]) -> anyhow::
         }
         normalize_format_on_save_alias(&mut override_value);
         merge_config_values(&mut value, override_value, &[]);
-        *config = deserialize_config(value.clone()).map_err(|_| {
+        *config = deserialize_config(value.clone()).map_err(|error| {
             anyhow::anyhow!(
-                "invalid config override #{}: value does not match the expected configuration type",
-                index + 1
+                "invalid config override #{} (-c/--config {}): value does not match the expected type for {key_label}: {}",
+                index + 1,
+                config_override::quote_flag(raw),
+                config_override::type_error_detail(&error)
             )
         })?;
         config
@@ -2912,24 +2950,6 @@ fn is_identifier(value: &str) -> bool {
 
 fn sanitize_deserialize_error(_error: &anyhow::Error) -> String {
     "value does not match the expected configuration type".to_string()
-}
-
-fn merge_toml_values(base: &mut toml::Value, override_value: toml::Value) {
-    match (base, override_value) {
-        (toml::Value::Table(base), toml::Value::Table(override_table)) => {
-            for (key, value) in override_table {
-                match base.get_mut(&key) {
-                    Some(base_value) => merge_toml_values(base_value, value),
-                    None => {
-                        base.insert(key, value);
-                    }
-                }
-            }
-        }
-        (base, override_value) => {
-            *base = override_value;
-        }
-    }
 }
 
 fn update_theme_config_contents(contents: &str, theme_name: &str) -> anyhow::Result<String> {
