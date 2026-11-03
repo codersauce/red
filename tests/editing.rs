@@ -13099,6 +13099,31 @@ async fn nowrap_half_page_still_remembers_a_count() {
 }
 
 #[tokio::test]
+async fn consecutive_counted_half_pages_keep_the_screen_row() {
+    let mut config = default_key_config();
+    config.wrap = Some(false);
+    config.scrolloff = Some(3);
+    let mut harness = EditorHarness::with_config_and_size(numbered_buffer(80), config, 80, 12);
+
+    press_key(&mut harness, KeyCode::Char('3'), KeyModifiers::NONE).await;
+    ctrl(&mut harness, 'd').await;
+    assert_eq!(harness.buffer_line(), 3);
+    assert_eq!(harness.viewport_top(), 3);
+
+    press_key(&mut harness, KeyCode::Char('3'), KeyModifiers::NONE).await;
+    assert_eq!(harness.buffer_line(), 3);
+    assert_eq!(
+        harness.viewport_top(),
+        3,
+        "typing the next count must not pull the cursor into the scrolloff margin"
+    );
+
+    ctrl(&mut harness, 'd').await;
+    assert_eq!(harness.buffer_line(), 6);
+    assert_eq!(harness.viewport_top(), 6);
+}
+
+#[tokio::test]
 async fn structural_text_objects_support_inner_outer_and_linewise_operators() {
     let contents = "fn first() {\n    alpha();\n    beta();\n}\nfn second() {}\n";
     let mut harness = EditorHarness::with_config(

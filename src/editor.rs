@@ -26045,7 +26045,10 @@ impl Editor {
         self.observe_tutorial_action(action, buffer, runtime)
             .await?;
 
-        self.half_page_keeps_screen_row = false;
+        // Leave the flag set. The next event's initial bounds check runs before
+        // this action starts, and a count digit never reaches an action at all.
+        // Clearing it here lets that check pull a top-row cursor back into the
+        // scrolloff margin before the following Ctrl-D or Ctrl-U.
         Ok(false)
     }
 
