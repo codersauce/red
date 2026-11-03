@@ -503,9 +503,6 @@ impl ImageRuntime {
                 image: pixels.clone(),
             };
             self.paints.insert((id, line), paint);
-            if revealed {
-                continue;
-            }
             let (cols, image_rows, placeholder) = match (&pixels, presentation) {
                 (Some(image), ImagePresentation::Halfblocks | ImagePresentation::Graphics(_)) => {
                     let (cols, image_rows) =
@@ -576,15 +573,8 @@ impl ImageRuntime {
         if !self.frame_open {
             return;
         }
-        self.staged.retain(|image| {
-            if image.decoded.is_none() {
-                return true;
-            }
-            if image.protocol == GraphicsProtocol::Kitty {
-                return image.painted > 0;
-            }
-            image.first_index == 0 && image.painted == image.total_rows
-        });
+        self.staged
+            .retain(|image| image.decoded.is_none() || image.painted > 0);
         for image in &mut self.staged {
             if let Some(decoded) = image.decoded.clone() {
                 let visible = image.painted.max(1);
@@ -602,15 +592,35 @@ impl ImageRuntime {
                         image.rows = visible;
                         image.pixel_w = pixel_w;
                         image.pixel_h = pixel_h;
-                        image.payload =
-                            kitty_transmit_data(image.id, &decoded, image.cols, image.total_rows, self.cell);
+                        image.payload = kitty_transmit_data(
+                            image.id,
+                            &decoded,
+                            image.cols,
+                            image.total_rows,
+                            self.cell,
+                        );
                     }
-                    GraphicsProtocol::Iterm2 => {
-                        image.payload = iterm_transmit(&decoded, image.cols, image.total_rows);
-                    }
-                    GraphicsProtocol::Sixel => {
-                        image.payload =
-                            sixel_transmit(&decoded, image.cols, image.total_rows, self.cell);
+                    GraphicsProtocol::Iterm2 | GraphicsProtocol::Sixel => {
+                        let (pixel_w, pixel_h) =
+                            graphics_pixel_size(&decoded, image.cols, image.total_rows, self.cell);
+                        let source = kitty_source_rect(
+                            pixel_w,
+                            pixel_h,
+                            image.total_rows,
+                            image.first_index,
+                            visible,
+                        );
+                        let rgba = resample_rgba(&decoded, pixel_w, pixel_h);
+                        let (width, height, cropped) = crop_rgba(&rgba, pixel_w, pixel_h, source);
+                        image.rows = visible;
+                        image.pixel_w = width;
+                        image.pixel_h = height;
+                        image.source = source;
+                        image.payload = if image.protocol == GraphicsProtocol::Iterm2 {
+                            iterm_transmit_rgba(&cropped, width, height, image.cols, visible)
+                        } else {
+                            encode_sixel(&cropped, width as usize, height as usize)
+                        };
                     }
                 }
             }
@@ -663,8 +673,12 @@ impl ImageRuntime {
                     h: pixel_h,
                 });
                 for (index, piece) in pieces.iter().enumerate() {
-                    let placement_id = if full { 1 } else { u32::try_from(index).unwrap_or(0) + 2 };
-                    let source = source_for_piece(rect, *piece, base);
+                    let placement_id = if full {
+                        1
+                    } else {
+                        u32::try_from(index).unwrap_or(0) + 2
+                    };
+                    let source = source_for_piece(rect, *piece, base, pixel_h);
                     visible.push((image.id, placement_id));
                     self.pending.push(PendingDraw {
                         id: image.id,
@@ -1710,6 +1724,7 @@ fn source_for_piece(
     image: crate::ui::ScreenRect,
     piece: crate::ui::ScreenRect,
     base: KittySourceRect,
+    raster_h: u32,
 ) -> Option<KittySourceRect> {
     if image.width == 0 || image.height == 0 || base.w == 0 || base.h == 0 {
         return None;
@@ -1719,7 +1734,10 @@ fn source_for_piece(
         && piece.width == image.width
         && piece.height == image.height
     {
-        return (base.x != 0 || base.y != 0).then_some(base);
+        // A crop that starts at y=0 is still a crop. Dropping it makes Kitty
+        // scale the whole transmitted image into the visible rows.
+        let full_raster = base.x == 0 && base.y == 0 && base.h >= raster_h.max(1);
+        return (!full_raster).then_some(base);
     }
     let x0 = base.x
         + u32::try_from(piece.x.saturating_sub(image.x)).unwrap_or(0) * base.w
@@ -1858,15 +1876,15 @@ pub(super) fn kitty_source_rect(
     if first_index == 0 && visible_rows >= total_rows {
         return None;
     }
-    let total = u32::from(total_rows);
-    let start = u32::from(first_index.min(total_rows));
-    let end = u32::from(first_index.saturating_add(visible_rows).min(total_rows));
-    let y = start.saturating_mul(pixel_h) / total;
-    let bottom = end.saturating_mul(pixel_h) / total;
-    let h = bottom
-        .saturating_sub(y)
-        .max(1)
-        .min(pixel_h.saturating_sub(y).max(1));
+    // One scale for every scroll offset: hidden rows × pixels-per-row.
+    let per_row = (pixel_h / u32::from(total_rows).max(1)).max(1);
+    let y = u32::from(first_index.min(total_rows)).saturating_mul(per_row);
+    let visible = u32::from(visible_rows.min(total_rows.saturating_sub(first_index))).max(1);
+    let y = y.min(pixel_h.saturating_sub(1));
+    let h = visible
+        .saturating_mul(per_row)
+        .min(pixel_h.saturating_sub(y))
+        .max(1);
     Some(KittySourceRect {
         x: 0,
         y,
@@ -1947,14 +1965,23 @@ pub(super) fn kitty_delete_all() -> String {
     "\u{1b}_Ga=d,d=A,q=2\u{1b}\\".to_string()
 }
 
+#[cfg(test)]
 pub(super) fn iterm_transmit(image: &DecodedImage, cols: u16, rows: u16) -> String {
-    // The original pixels. iTerm2 fits them with the cell width, height, and
-    // preserveAspectRatio instead of a pre-scaled cell-count bitmap.
-    let mut png = Vec::new();
-    let encoded = image::codecs::png::PngEncoder::new(&mut png).write_image(
+    iterm_transmit_rgba(
         &image.rgba,
         image.width.max(1),
         image.height.max(1),
+        cols,
+        rows,
+    )
+}
+
+fn iterm_transmit_rgba(rgba: &[u8], width: u32, height: u32, cols: u16, rows: u16) -> String {
+    let mut png = Vec::new();
+    let encoded = image::codecs::png::PngEncoder::new(&mut png).write_image(
+        rgba,
+        width.max(1),
+        height.max(1),
         image::ExtendedColorType::Rgba8,
     );
     if encoded.is_err() {
@@ -1966,6 +1993,34 @@ pub(super) fn iterm_transmit(image: &DecodedImage, cols: u16, rows: u16) -> Stri
     )
 }
 
+fn crop_rgba(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    source: Option<KittySourceRect>,
+) -> (u32, u32, Vec<u8>) {
+    let Some(source) = source else {
+        return (width.max(1), height.max(1), rgba.to_vec());
+    };
+    if width == 0 || height == 0 || source.w == 0 || source.h == 0 {
+        return (width.max(1), height.max(1), rgba.to_vec());
+    }
+    let x = source.x.min(width.saturating_sub(1));
+    let y = source.y.min(height.saturating_sub(1));
+    let crop_w = source.w.min(width - x).max(1);
+    let crop_h = source.h.min(height - y).max(1);
+    let mut cropped = Vec::with_capacity((crop_w * crop_h * 4) as usize);
+    for row in y..y + crop_h {
+        let start = ((row * width + x) * 4) as usize;
+        let end = start + (crop_w * 4) as usize;
+        if let Some(slice) = rgba.get(start..end) {
+            cropped.extend_from_slice(slice);
+        }
+    }
+    (crop_w, crop_h, cropped)
+}
+
+#[cfg(test)]
 pub(super) fn sixel_transmit(
     image: &DecodedImage,
     cols: u16,
@@ -2509,8 +2564,11 @@ mod tests {
         assert!(!hidden.raw_lines.contains(&0));
 
         let revealed = runtime.layout_for(id, 40, 8, Some(&(0..1)), MarkdownImagesMode::Halfblocks);
-        assert!(revealed.rendered(0).is_none());
+        assert!(revealed.rendered(0).is_some());
         assert!(revealed.raw_lines.contains(&0));
+        let hidden_rows = hidden.rendered(0).unwrap().len();
+        let revealed_rows = revealed.rendered(0).unwrap().len();
+        assert_eq!(hidden_rows, revealed_rows);
     }
 
     #[test]
@@ -2916,7 +2974,7 @@ mod tests {
         for y in 0..8 {
             for x in 0..8 {
                 let index = (y * 8 + x) * 4;
-                rgba[index + usize::from(y >= 4) * 2] = 255;
+                rgba[index + usize::from((x + y) % 2 == 1) * 2] = 255;
                 rgba[index + 3] = 255;
             }
         }
@@ -2931,7 +2989,7 @@ mod tests {
         config.clipboard.enabled = false;
         config.scrolloff = Some(0);
         config.markdown_images = MarkdownImagesMode::Halfblocks;
-        let source = format!("hello\n![swatch]({})\n", path.display());
+        let source = format!("hello\n![swatch]({})\nafter\n", path.display());
         let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
         let mut editor = crate::editor::Editor::with_size(
             lsp,
@@ -2967,21 +3025,26 @@ mod tests {
         assert!(
             screen
                 .chars()
-                .any(|glyph| is_block_glyph(&glyph.to_string()))
-                || screen.contains(' '),
+                .any(|glyph| is_block_glyph(&glyph.to_string())),
             "{screen}"
         );
         assert!(!screen.contains("![swatch]"), "{screen}");
 
+        let after_row = frame_row(&frame, "after");
         editor.cy = 1;
         editor.render(&mut frame).unwrap();
         let screen = frame_text(&frame);
         assert!(screen.contains("![swatch]"), "{screen}");
+        assert_eq!(
+            frame_row(&frame, "after"),
+            after_row,
+            "the declaration stays inside the image block: {screen}"
+        );
         assert!(
-            !screen
+            screen
                 .chars()
                 .any(|glyph| is_block_glyph(&glyph.to_string())),
-            "{screen}"
+            "the image stays under the declaration line: {screen}"
         );
     }
 
@@ -3256,7 +3319,12 @@ mod tests {
                     }
                 }
                 if cols > 0 && rows > 0 {
-                    rects.push((cursor_x.saturating_sub(1), cursor_y.saturating_sub(1), cols, rows));
+                    rects.push((
+                        cursor_x.saturating_sub(1),
+                        cursor_y.saturating_sub(1),
+                        cols,
+                        rows,
+                    ));
                 }
             }
         }
@@ -3513,6 +3581,155 @@ mod tests {
     }
 
     #[test]
+    fn cropped_placement_keeps_pixels_per_row_as_the_scroll_offset_changes() {
+        let pixel_h = 120u32;
+        let total_rows = 12u16;
+        let visible = 5u16;
+        let per_row = pixel_h / u32::from(total_rows);
+        let mut heights = Vec::new();
+        for first in [0u16, 2, 4, 7] {
+            let source = kitty_source_rect(80, pixel_h, total_rows, first, visible)
+                .expect("a partial slice is cropped");
+            assert_eq!(source.y, u32::from(first) * per_row, "{source:?}");
+            assert_eq!(source.h, u32::from(visible) * per_row, "{source:?}");
+            heights.push(source.h);
+        }
+        assert!(heights.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+
+    #[test]
+    fn a_top_crop_is_placed_instead_of_scaling_the_whole_image() {
+        use crate::theme::Style;
+        let mut runtime = ImageRuntime::new();
+        let buffer = crate::editor::RenderBuffer::new(10, 6, &Style::default());
+        let image = Arc::new(DecodedImage {
+            width: 4,
+            height: 16,
+            rgba: vec![180u8; 4 * 16 * 4],
+        });
+        runtime.begin_frame();
+        for (index, y) in [(0u16, 1u16), (1, 2)] {
+            runtime.observe_graphics_row(ObservedGraphics {
+                id: 9,
+                x: 1,
+                y,
+                cols: 4,
+                total_rows: 4,
+                index,
+                signature: 12,
+                protocol: GraphicsProtocol::Kitty,
+                image: Arc::clone(&image),
+            });
+        }
+        runtime.seal_fingerprints(&buffer);
+        let source = runtime.staged[0]
+            .source
+            .expect("top crop keeps a source rect");
+        assert_eq!((source.y, source.h), (0, 8));
+        assert!(runtime.commit_visible(&buffer));
+        let shown = runtime.graphics_payload(false);
+        assert!(
+            shown.contains("x=0,y=0,w=4,h=8"),
+            "visible rows must crop the raster, not rescale it: {shown}"
+        );
+        assert!(shown.contains("r=2"), "{shown}");
+        assert!(!shown.contains("r=4"), "{shown}");
+    }
+
+    #[test]
+    fn sixel_and_iterm_crop_the_bitmap_to_the_visible_rows() {
+        use crate::theme::Style;
+        let image = Arc::new(DecodedImage {
+            width: 4,
+            height: 16,
+            rgba: vec![90u8; 4 * 16 * 4],
+        });
+        for protocol in [GraphicsProtocol::Sixel, GraphicsProtocol::Iterm2] {
+            let mut runtime = ImageRuntime::new();
+            let buffer = crate::editor::RenderBuffer::new(10, 6, &Style::default());
+            runtime.begin_frame();
+            for (index, y) in [(2u16, 1u16), (3, 2)] {
+                runtime.observe_graphics_row(ObservedGraphics {
+                    id: 4,
+                    x: 1,
+                    y,
+                    cols: 4,
+                    total_rows: 4,
+                    index,
+                    signature: 13,
+                    protocol,
+                    image: Arc::clone(&image),
+                });
+            }
+            runtime.seal_fingerprints(&buffer);
+            let staged = &runtime.staged[0];
+            assert_eq!(staged.rows, 2, "{protocol:?}");
+            assert_eq!(staged.pixel_h, 8, "{protocol:?}");
+            assert!(staged.pixel_h < 16, "{protocol:?}");
+            if protocol == GraphicsProtocol::Iterm2 {
+                assert!(
+                    staged.payload.contains("height=2;"),
+                    "{protocol:?} {}",
+                    staged.payload
+                );
+                assert!(!staged.payload.contains("height=4;"), "{}", staged.payload);
+            } else {
+                assert!(
+                    staged.payload.contains("SIXEL") || staged.payload.contains("\u{1b}P"),
+                    "{protocol:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn declaration_line_keeps_the_image_block_the_same_height() {
+        use super::super::display_layout::{
+            layout_lines_with_tables, BreakIndentOptions, LayoutConfig,
+        };
+
+        let plan = ImageLayout {
+            rows: BTreeMap::from([(0, image_line_segments(0, 6, 10, false))]),
+            raw_lines: BTreeSet::new(),
+        };
+        let lines = vec!["![alt](pic.png)\n".to_string(), "after\n".to_string()];
+        let config = LayoutConfig {
+            content_width: 40,
+            height: 20,
+            wrap: true,
+            vtop: 0,
+            vleft: 0,
+            skipcol: 0,
+            break_indent: BreakIndentOptions::disabled(),
+        };
+        let hidden =
+            layout_lines_with_tables(&lines, 2, config, None, None, None, None, Some(&plan));
+        let mut revealed_plan = plan;
+        revealed_plan.raw_lines.insert(0);
+        let revealed = layout_lines_with_tables(
+            &lines,
+            2,
+            config,
+            None,
+            None,
+            None,
+            None,
+            Some(&revealed_plan),
+        );
+        assert_eq!(hidden.rows.len(), revealed.rows.len());
+        assert!(revealed.rows[0].image.is_none());
+        assert!(revealed.rows[0].line == 0);
+        assert!(revealed.rows[1].image.is_some());
+        assert_eq!(revealed.rows[1].image.unwrap().index, 1);
+        assert_eq!(hidden.rows.last().unwrap().line, 1);
+        assert_eq!(revealed.rows.last().unwrap().line, 1);
+        assert_eq!(
+            hidden.rows.last().unwrap().row,
+            revealed.rows.last().unwrap().row
+        );
+    }
+
+    #[test]
     fn bounded_append_stops_before_the_cap() {
         let mut bytes = vec![1, 2, 3];
         assert!(append_bounded(&mut bytes, &[4, 5], 5));
@@ -3673,5 +3890,18 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn frame_row(frame: &crate::editor::RenderBuffer, needle: &str) -> usize {
+        frame
+            .cells
+            .chunks(frame.width)
+            .position(|row| {
+                row.iter()
+                    .map(|cell| cell.text.as_str())
+                    .collect::<String>()
+                    .contains(needle)
+            })
+            .unwrap_or_else(|| panic!("missing {needle} in {}", frame_text(frame)))
     }
 }

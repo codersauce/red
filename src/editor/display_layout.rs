@@ -746,6 +746,44 @@ pub fn layout_lines(lines: &[String], line_count: usize, config: LayoutConfig) -
     layout_lines_with_tables(lines, line_count, config, None, None, None, None, None)
 }
 
+/// The declaration replaces the image's first row while the cursor is on it.
+/// The remaining image rows stay, so the block keeps the same height.
+fn image_rows_with_declaration(
+    line: &str,
+    line_index: usize,
+    image_rows: &[LineSegment],
+    show_declaration: bool,
+    line_skipcol: usize,
+    config: LayoutConfig,
+) -> Vec<LineSegment> {
+    let mut segments = Vec::new();
+    if show_declaration && line_skipcol == 0 {
+        segments.extend(nowrap_line_segment(
+            line,
+            line_index,
+            config.content_width,
+            config.vleft,
+            config.break_indent.tab_width,
+        ));
+    }
+    segments.extend(
+        image_rows
+            .iter()
+            .filter(|segment| {
+                let index = segment
+                    .image
+                    .map(|span| usize::from(span.index))
+                    .unwrap_or(0);
+                if show_declaration && index == 0 {
+                    return false;
+                }
+                line_skipcol == 0 || segment.start_col >= line_skipcol
+            })
+            .cloned(),
+    );
+    segments
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn layout_lines_with_tables(
     lines: &[String],
@@ -784,11 +822,14 @@ pub(super) fn layout_lines_with_tables(
         };
         let segments =
             if let Some(image_rows) = images.and_then(|images| images.rendered(line_index)) {
-                image_rows
-                    .iter()
-                    .filter(|segment| line_skipcol == 0 || segment.start_col >= line_skipcol)
-                    .cloned()
-                    .collect()
+                image_rows_with_declaration(
+                    line,
+                    line_index,
+                    image_rows,
+                    images.is_some_and(|images| images.raw_lines.contains(&line_index)),
+                    line_skipcol,
+                    config,
+                )
             } else if let Some(table) = tables.and_then(|tables| tables.line(line_index, reveal)) {
                 table
                     .rows
