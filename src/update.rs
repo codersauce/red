@@ -718,15 +718,40 @@ async fn executable_version(path: &Path) -> anyhow::Result<Version> {
     Version::parse(version).context("Red version output was not SemVer")
 }
 
+/// Linux can return ETXTBSY for a moment after a staged binary's write handle
+/// closes. The file is complete; the spawn is retried until the kernel allows it.
+async fn spawn_executable(
+    path: &Path,
+    arguments: &[&str],
+) -> anyhow::Result<tokio::process::Child> {
+    let mut delay = Duration::from_millis(20);
+    let mut last_error = None;
+    for _ in 0..6 {
+        match tokio::process::Command::new(path)
+            .args(arguments)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(child) => return Ok(child),
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                last_error = Some(error);
+                tokio::time::sleep(delay).await;
+                delay = delay.saturating_mul(2).min(Duration::from_millis(320));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("could not run {}", path.display()));
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| std::io::Error::other("could not spawn the executable")))
+        .with_context(|| format!("could not run {}", path.display()))
+}
+
 async fn run_bounded(path: &Path, arguments: &[&str]) -> anyhow::Result<CommandOutput> {
-    let mut child = tokio::process::Command::new(path)
-        .args(arguments)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| format!("could not run {}", path.display()))?;
+    let mut child = spawn_executable(path, arguments).await?;
     let stdout = child
         .stdout
         .take()
