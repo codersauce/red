@@ -758,13 +758,24 @@ fn image_rows_with_declaration(
 ) -> Vec<LineSegment> {
     let mut segments = Vec::new();
     if show_declaration && line_skipcol == 0 {
-        segments.extend(nowrap_line_segment(
-            line,
-            line_index,
-            config.content_width,
-            config.vleft,
-            config.break_indent.tab_width,
-        ));
+        // Real text rows only. Image rows stay below them and are not wrap rows.
+        if config.wrap {
+            segments.extend(wrap_line_segments(
+                line,
+                line_index,
+                config.content_width,
+                0,
+                config.break_indent,
+            ));
+        } else {
+            segments.extend(nowrap_line_segment(
+                line,
+                line_index,
+                config.content_width,
+                config.vleft,
+                config.break_indent.tab_width,
+            ));
+        }
     }
     segments.extend(
         image_rows

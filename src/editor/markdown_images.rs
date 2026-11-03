@@ -3048,6 +3048,122 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn vertical_motion_steps_over_image_rows() {
+        use crate::{buffer::Buffer, config::Config, editor::Action, theme::Theme};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("swatch.png");
+        let mut rgba = vec![0u8; 8 * 8 * 4];
+        for y in 0..8 {
+            for x in 0..8 {
+                let index = (y * 8 + x) * 4;
+                rgba[index + usize::from((x + y) % 2 == 1) * 2] = 255;
+                rgba[index + 3] = 255;
+            }
+        }
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&rgba, 8, 8, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        std::fs::write(&path, &png).unwrap();
+
+        let mut config: Config = toml::from_str(include_str!("../../default_config.toml")).unwrap();
+        config.lsp.servers.clear();
+        config.clipboard.enabled = false;
+        config.scrolloff = Some(0);
+        config.wrap = Some(true);
+        config.markdown_images = MarkdownImagesMode::Halfblocks;
+        let source = "before\n![swatch](swatch.png)\nafter\n".to_string();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let mut editor = crate::editor::Editor::with_size(
+            lsp,
+            40,
+            24,
+            config,
+            Theme::default(),
+            vec![Buffer::new(
+                Some(dir.path().join("notes.md").display().to_string()),
+                source,
+            )],
+        )
+        .unwrap();
+        editor.test_disable_terminal_output();
+        editor.cy = 1;
+        editor.cx = 0;
+        editor.refresh_cursor_goal();
+
+        editor
+            .test_execute_production_action(Action::MoveDown)
+            .await
+            .unwrap();
+        assert_eq!(
+            editor.test_buffer_line(),
+            2,
+            "j from column 0 leaves the image line, cx {}",
+            editor.test_cursor_x()
+        );
+
+        editor.cy = 1;
+        editor.cx = 0;
+        editor.vtop = 0;
+        editor.skipcol = 0;
+        editor.refresh_cursor_goal();
+        editor
+            .test_execute_production_action(Action::MoveToLineEnd)
+            .await
+            .unwrap();
+        assert_eq!(editor.test_buffer_line(), 1);
+        editor
+            .test_execute_production_action(Action::MoveDown)
+            .await
+            .unwrap();
+        assert_eq!(
+            editor.test_buffer_line(),
+            2,
+            "j from the end of the declaration leaves the image line"
+        );
+
+        editor
+            .test_execute_production_action(Action::MoveUp)
+            .await
+            .unwrap();
+        assert_eq!(editor.test_buffer_line(), 1, "k from the next line returns");
+
+        editor.current_buffer_mut().set(
+            1,
+            "![Red editing its Rust rendering pipeline with the project tree open beside the buffer](swatch.png)\n"
+                .to_string(),
+        );
+        editor.cy = 1;
+        editor.cx = 0;
+        editor.vtop = 0;
+        editor.skipcol = 0;
+        editor.refresh_cursor_goal();
+        let mut steps = 0;
+        while editor.test_buffer_line() == 1 && steps < 8 {
+            editor
+                .test_execute_production_action(Action::MoveDown)
+                .await
+                .unwrap();
+            steps += 1;
+        }
+        assert_eq!(
+            editor.test_buffer_line(),
+            2,
+            "j walks the declaration wraps and then leaves the image in {steps} steps"
+        );
+        assert!(
+            steps < 6,
+            "image rows must not be extra j stops, took {steps}"
+        );
+        editor
+            .test_execute_production_action(Action::MoveUp)
+            .await
+            .unwrap();
+        assert_eq!(editor.test_buffer_line(), 1);
+    }
+
     #[test]
     fn kitty_image_cells_stay_blank_when_a_popup_opens() {
         use std::collections::HashMap;

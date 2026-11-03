@@ -8577,6 +8577,52 @@ impl Editor {
         )
     }
 
+    /// Rows the cursor can land on. Picture rows are display-only, so an image
+    /// line contributes its source text (including real wraps) and nothing else.
+    fn navigable_line_segments(
+        &self,
+        line_index: usize,
+        width: usize,
+    ) -> Vec<self::display_layout::LineSegment> {
+        if self
+            .markdown_image_line_segments(line_index, width)
+            .is_some()
+        {
+            return self.source_text_segments(line_index, width);
+        }
+        self.wrapped_line_segments_for_width(line_index, width)
+    }
+
+    fn buffer_line_has_markdown_image(&self, line: usize) -> bool {
+        self.markdown_image_line_segments(line, self.active_content_width().max(1))
+            .is_some()
+    }
+
+    fn source_text_segments(
+        &self,
+        line_index: usize,
+        width: usize,
+    ) -> Vec<self::display_layout::LineSegment> {
+        let Some(line) = self.current_buffer().get(line_index) else {
+            return Vec::new();
+        };
+        let line = trim_line_ending(&line);
+        if !self.wrap {
+            return display_layout::nowrap_line_segment(
+                line,
+                line_index,
+                usize::MAX,
+                0,
+                self.active_tab_width(),
+            );
+        }
+        let break_indent =
+            self.break_indent_options_for_buffer_index(self.buffer_manager.active_index());
+        // The declaration is raw text while the cursor is on it, so motion uses
+        // that text rather than the concealed markup.
+        display_layout::wrap_line_segments(line, line_index, width, 0, break_indent)
+    }
+
     fn visible_cursor_segment(&self, line_index: usize, display_col: usize) -> bool {
         let Some(window) = self.active_window_with_editor_view() else {
             return false;
@@ -8644,7 +8690,7 @@ impl Editor {
         let Some(target) = layout
             .rows
             .iter()
-            .filter(|segment| bounds.contains(&segment.row))
+            .filter(|segment| bounds.contains(&segment.row) && segment.image.is_none())
             .min_by_key(|segment| {
                 let nearest_col = segment.projection.as_ref().map_or_else(
                     || display_col.clamp(segment.start_col, segment.end_col),
@@ -8900,7 +8946,7 @@ impl Editor {
         delta: isize,
         width: usize,
     ) -> Option<ScreenLineTarget> {
-        let segments = self.wrapped_line_segments_for_width(line_index, width);
+        let segments = self.navigable_line_segments(line_index, width);
         let current_index = segments
             .iter()
             .position(|segment| segment.contains_cursor_col(display_col))
@@ -8945,7 +8991,7 @@ impl Editor {
             let mut index = current_index;
 
             loop {
-                let segments = self.wrapped_line_segments_for_width(line, width);
+                let segments = self.navigable_line_segments(line, width);
                 let available_after = segments.len().saturating_sub(index + 1);
                 if remaining <= available_after {
                     let target = &segments[index + remaining];
@@ -8960,7 +9006,7 @@ impl Editor {
                 index = 0;
                 if remaining == 0 {
                     let target = self
-                        .wrapped_line_segments_for_width(line, width)
+                        .navigable_line_segments(line, width)
                         .first()?
                         .to_owned();
                     return Some(target_position(&target));
@@ -8974,8 +9020,7 @@ impl Editor {
 
         loop {
             if remaining <= index {
-                let target =
-                    self.wrapped_line_segments_for_width(line, width)[index - remaining].clone();
+                let target = self.navigable_line_segments(line, width)[index - remaining].clone();
                 return Some(target_position(&target));
             }
 
@@ -8984,7 +9029,7 @@ impl Editor {
                 return Some(unchanged);
             };
             line = previous_line;
-            let segments = self.wrapped_line_segments_for_width(line, width);
+            let segments = self.navigable_line_segments(line, width);
             index = segments.len().saturating_sub(1);
             if remaining == 0 {
                 let target = segments.get(index)?;
@@ -21993,7 +22038,12 @@ impl Editor {
                 }
             }
             Action::MoveUp => {
-                if self.cy == 0 {
+                if self.buffer_line_has_markdown_image(self.buffer_line()) {
+                    // Walk the declaration's own wraps, then leave. Image rows
+                    // are not stops on the way.
+                    self.move_screen_line(-1);
+                    self.finish_cursor_motion(buffer, true)?;
+                } else if self.cy == 0 {
                     // scroll up
                     if self.vtop > 0 {
                         self.vtop -= 1;
@@ -22007,7 +22057,10 @@ impl Editor {
                 }
             }
             Action::MoveDown => {
-                if self.vtop + self.cy < self.last_navigable_line() {
+                if self.buffer_line_has_markdown_image(self.buffer_line()) {
+                    self.move_screen_line(1);
+                    self.finish_cursor_motion(buffer, true)?;
+                } else if self.vtop + self.cy < self.last_navigable_line() {
                     self.cy += 1;
                     if self.cy >= self.vheight() {
                         // scroll if possible

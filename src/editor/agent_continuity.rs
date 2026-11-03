@@ -245,10 +245,40 @@ pub fn describe_age(saved_at_ms: u64) -> String {
 }
 
 fn key_source(workspace: &Path) -> String {
-    fs::canonicalize(workspace)
-        .unwrap_or_else(|_| workspace.to_path_buf())
-        .to_string_lossy()
-        .into_owned()
+    // One spelling for the successful and failed cases. On macOS `canonicalize`
+    // rewrites `/var` and `/tmp` through `/private`, so a transient failure must
+    // not look like a different workspace from the call that succeeded.
+    let path = canonicalize_workspace(workspace).unwrap_or_else(|| workspace.to_path_buf());
+    macos_workspace_alias(&path)
+}
+
+fn canonicalize_workspace(workspace: &Path) -> Option<PathBuf> {
+    for _ in 0..4 {
+        if let Ok(path) = fs::canonicalize(workspace) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn macos_workspace_alias(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(rest) = text.strip_prefix("/var/") {
+            return format!("/private/var/{rest}");
+        }
+        if text == "/var" {
+            return "/private/var".to_string();
+        }
+        if let Some(rest) = text.strip_prefix("/tmp/") {
+            return format!("/private/tmp/{rest}");
+        }
+        if text == "/tmp" {
+            return "/private/tmp".to_string();
+        }
+    }
+    text.into_owned()
 }
 
 fn workspace_key(workspace: &Path) -> String {
@@ -1080,6 +1110,29 @@ mod tests {
             Some("You: Remember HERON\n"),
             "it stays as the archived transcript the next message recaps"
         );
+    }
+
+    #[test]
+    fn macos_temp_aliases_name_the_same_workspace() {
+        let var_path = macos_workspace_alias(std::path::Path::new("/var/folders/ab/T/ws"));
+        let private_var =
+            macos_workspace_alias(std::path::Path::new("/private/var/folders/ab/T/ws"));
+        let tmp_path = macos_workspace_alias(std::path::Path::new("/tmp/ws"));
+        let private_tmp = macos_workspace_alias(std::path::Path::new("/private/tmp/ws"));
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(var_path, "/private/var/folders/ab/T/ws");
+            assert_eq!(var_path, private_var);
+            assert_eq!(tmp_path, "/private/tmp/ws");
+            assert_eq!(tmp_path, private_tmp);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(var_path, "/var/folders/ab/T/ws");
+            assert_eq!(private_var, "/private/var/folders/ab/T/ws");
+            assert_eq!(tmp_path, "/tmp/ws");
+            assert_eq!(private_tmp, "/private/tmp/ws");
+        }
     }
 
     #[test]

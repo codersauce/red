@@ -373,6 +373,32 @@ impl super::Editor {
             }
         }
         self.clamp_cursor_to_scrolled_viewport();
+        // Picture rows are not cursor stops. Once the declaration leaves the
+        // viewport, the cursor steps to the neighboring buffer line.
+        if !self.markdown_text_cursor_visible() {
+            let target = if down {
+                self.buffer_line()
+                    .saturating_add(1)
+                    .min(self.last_navigable_line())
+            } else {
+                self.buffer_line().saturating_sub(1)
+            };
+            if target != self.buffer_line() {
+                self.reveal_cursor_destination(target);
+                self.apply_cursor_goal_to_current_line();
+            }
+        }
+    }
+
+    fn markdown_text_cursor_visible(&self) -> bool {
+        let Some(window) = self.active_window_with_editor_view() else {
+            return true;
+        };
+        let line = self.buffer_line();
+        let column = self.current_cursor_display_col();
+        self.layout_for_window(&window).rows.iter().any(|segment| {
+            segment.line == line && segment.image.is_none() && segment.contains_cursor_col(column)
+        })
     }
 
     pub(super) fn ensure_markdown_cursor_visible(
