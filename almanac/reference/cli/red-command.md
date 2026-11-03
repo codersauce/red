@@ -45,7 +45,8 @@ The README and getting-started guide present `red path/to/file`, multiple files,
 | Option | Meaning |
 | --- | --- |
 | `-r, --root <ROOT>` | Changes the current directory before opening editor buffers, except where conflicts prevent a lifecycle from accepting a root [@cli] [@main]. |
-| `-c, --config-override <TOML>` | Applies an inline TOML config override. The flag can appear multiple times and is passed to configuration loading in order [@cli] [@main]. |
+| `-c, --config <key=value>` | Overrides one dotted configuration key. The value is parsed as TOML and falls back to a plain string when it is not valid TOML. Repeat the flag; later flags win. `--config-override` is the same option and still accepts a TOML document. Precedence is embedded defaults, then `config.toml`, then these flags. Red does not load configuration from an environment variable [@cli] [@main]. |
+| `--print-config` | Prints the merged configuration, including the winning `-c` values, and exits [@cli] [@main]. |
 | `--resume` | Restores the latest core-owned crash-safe session snapshot and conflicts with file arguments and `--root` [@cli] [@main]. |
 | `--no-typecheck` | Sets the runtime-only `disable_plugin_typecheck` escape hatch after configuration finalization [@cli] [@main]. |
 | `FILES...` | Opens the listed file or directory targets as buffers; without targets, Red starts with an empty buffer [@cli] [@main] [@buffer]. |
@@ -63,7 +64,7 @@ The README and getting-started guide present `red path/to/file`, multiple files,
 | `--eject <ASSET>` | Copies a bundled or runtime asset into the user config directory without overwriting an existing user file [@cli] [@main]. |
 | `--eject-force <ASSET>` | Copies the asset and allows overwrite of an existing user file [@cli] [@main]. |
 
-`Args::utility_requested` treats any root subcommand as a utility, and also includes `--runtime-files`, `--check-config`, `--agent-check`, hidden `--self-check`, `--eject`, `--eject-force`, and hidden process-editor replacement [@cli]. `Args::validate_utility_args` rejects utility modes combined with files to edit, except the hidden process-editor replacement mode, which requires exactly one target file [@cli].
+`Args::utility_requested` treats any root subcommand as a utility, and also includes `--runtime-files`, `--check-config`, `--print-config`, `--agent-check`, hidden `--self-check`, `--eject`, `--eject-force`, and hidden process-editor replacement [@cli]. `Args::validate_utility_args` rejects utility modes combined with files to edit, except the hidden process-editor replacement mode, which requires exactly one target file [@cli].
 
 ## Plugin And Language Subcommands
 
@@ -86,7 +87,7 @@ Install and update forms accept `--trust-native-grammars` when the package inclu
 | --- | --- |
 | `red language trust <LANGUAGE_OR_PATH>` | Resolves a configured language id, enabled compatible package language id, or explicit path, then records trust for the current native grammar bytes [@cli] [@main]. |
 | `red language untrust <LANGUAGE_OR_PATH>` | Resolves the same language-or-path forms and revokes the grammar approval for that path [@cli] [@main]. |
-| `red language check-indent <FIXTURES>` | Loads user config plus any `-c` overrides, finalizes language configuration, builds the language registry, checks the JSON indentation fixture file, and prints `Passed {count} indentation fixtures` on success [@cli] [@main]. |
+| `red language check-indent <FIXTURES>` | Loads user config plus any `-c`/`--config` overrides, finalizes language configuration, builds the language registry, checks the JSON indentation fixture file, and prints `Passed {count} indentation fixtures` on success [@cli] [@main]. |
 
 Language trust commands load the effective user config with any `-c` overrides, resolve relative configured grammar paths under the Red config directory, and then fall back to treating the argument as a filesystem path [@main]. Indentation fixture checks require native grammars to have been trusted already, because the command uses the same finalized language configuration and registry as the editor [@cli] [@main].
 

@@ -41,6 +41,15 @@ A starter configuration at `~/.config/red/config.toml` remains optional. Press
 `c` on the welcome screen to create one without overwriting existing settings.
 Embedded configuration, themes, and plugins work when the file is absent.
 
+For one launch, repeat `-c` or `--config` to override a dotted key. The value
+is TOML, or a plain string when it is not valid TOML. These flags win over
+both the config file and the embedded defaults:
+
+```shell
+red -c theme=onedark.json -c languages.rust.indent_width=2 src/main.rs
+red --print-config
+```
+
 ## Updating Red
 
 Red checks for a newer stable release once per day and notifies you. To update an

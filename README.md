@@ -246,6 +246,30 @@ setting that ships with Red. Custom themes go in `~/.config/red/themes/`, and
 custom Husk plugins go in `~/.config/red/plugins/`. Run `red --runtime-files`
 to see every visible runtime asset and its source.
 
+Override settings for a single launch with repeatable `-c` or `--config`
+flags. The key is a dotted path. The value is TOML, and a value that is not
+valid TOML is used as a plain string, so ordinary words do not need quotes.
+Later flags win. `--config-override` is the same flag and still accepts a
+TOML document.
+
+```shell
+red -c theme=onedark.json -c languages.rust.indent_width=2 src/main.rs
+red -c 'disabled_plugins=["indent_guides"]' -c 'search={ignorecase=true}'
+red --print-config -c scrolloff=8
+```
+
+Precedence, from lowest to highest:
+
+1. Embedded defaults
+2. `config.toml` (`$XDG_CONFIG_HOME/red/config.toml`, or `~/.config/red/config.toml`)
+3. `-c` / `--config` / `--config-override`
+
+Red does not read configuration from an environment variable. `XDG_CONFIG_HOME`
+only chooses the directory that contains `config.toml`. `red --print-config`
+prints the merged result, and `:config-diagnostics` lists startup overrides
+next to any configuration problems. `:set relativenumber` still toggles that
+option for the current session after startup.
+
 Markdown files show pipe tables as aligned grids in Normal mode, with wrapped
 cells, column alignment, and inline formatting. Enter Insert or Visual mode in
 a table to reveal its original Markdown; Escape restores the grid. The display
