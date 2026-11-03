@@ -635,10 +635,14 @@ impl ImageRuntime {
                 width: usize::from(image.cols),
                 height: usize::from(image.rows),
             };
-            let covered = image
-                .cells
-                .is_some_and(|cells| hash_region(buffer, rect) != cells)
-                || image_hidden_by_overlays(rect, &buffer.overlay_rects);
+            // Kitty images sit at z=-1, under text. An opaque popup covers the
+            // overlap without deleting the placement. Sixel and iTerm2 paint
+            // above the cell grid, so a popup still removes those placements.
+            let covered = image.protocol != GraphicsProtocol::Kitty
+                && (image
+                    .cells
+                    .is_some_and(|cells| hash_region(buffer, rect) != cells)
+                    || image_hidden_by_overlays(rect, &buffer.overlay_rects));
             if covered {
                 continue;
             }
@@ -2058,9 +2062,10 @@ impl super::Editor {
         buffer: &crate::editor::RenderBuffer,
     ) {
         if self.markdown_images.borrow_mut().commit_visible(buffer) {
-            // Sixel and iTerm2 have no delete command. Rewriting every cell
-            // clears the previous pixels before the popup is shown, and again
-            // when the image is placed back.
+            // Sixel and iTerm2 have no z-order. Rewriting every cell clears
+            // their pixels when a popup covers them, and again when they return.
+            // A switch away from block glyphs also needs the whole image region
+            // sent, not only the cells whose text happened to differ.
             self.force_full_redraw = true;
         }
     }
@@ -2142,15 +2147,10 @@ impl super::Editor {
         let Some(image) = paint.image else {
             return true;
         };
-        let draw_halfblocks = match presentation {
-            ImagePresentation::Halfblocks => true,
-            ImagePresentation::Graphics(_) => {
-                self.markdown_images.borrow().hints.truecolor
-                    || self.config.markdown_images == MarkdownImagesMode::Auto
-            }
-            ImagePresentation::Placeholder => false,
-        };
-        if draw_halfblocks {
+        // Block glyphs have their own background. Under a z=-1 graphic those
+        // cells punch holes in the picture, and hiding the placement for a
+        // popup leaves only the blocks. Graphics mode keeps the rectangle blank.
+        if matches!(presentation, ImagePresentation::Halfblocks) {
             let grid = self
                 .markdown_images
                 .borrow_mut()
@@ -2791,6 +2791,82 @@ mod tests {
         );
     }
 
+    #[test]
+    fn kitty_image_cells_stay_blank_when_a_popup_opens() {
+        use std::collections::HashMap;
+
+        use crate::{
+            buffer::Buffer,
+            config::{Config, KeyAction},
+            editor::render_buffer::RenderBuffer,
+            theme::{Style, Theme},
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("swatch.png");
+        let mut rgba = vec![0u8; 8 * 8 * 4];
+        for y in 0..8 {
+            for x in 0..8 {
+                let index = (y * 8 + x) * 4;
+                rgba[index] = 220;
+                rgba[index + 1] = if y > 4 { 180 } else { 20 };
+                rgba[index + 3] = 255;
+            }
+        }
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&rgba, 8, 8, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        std::fs::write(&path, &png).unwrap();
+
+        let mut config: Config = toml::from_str(include_str!("../../default_config.toml")).unwrap();
+        config.lsp.servers.clear();
+        config.clipboard.enabled = false;
+        config.scrolloff = Some(0);
+        config.markdown_images = MarkdownImagesMode::Kitty;
+        let source = format!("hello\n![swatch]({})\n", path.display());
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let mut editor = crate::editor::Editor::with_size(
+            lsp,
+            80,
+            16,
+            config,
+            Theme::default(),
+            vec![Buffer::new(
+                Some(dir.path().join("notes.md").display().to_string()),
+                source,
+            )],
+        )
+        .unwrap();
+        editor.test_disable_terminal_output();
+        let mut frame = RenderBuffer::new(80, 16, &Style::default());
+        editor.render(&mut frame).unwrap();
+        let screen = frame_text(&frame);
+        assert!(!screen.contains("![swatch]"), "{screen}");
+        assert!(
+            !screen
+                .chars()
+                .any(|glyph| is_block_glyph(&glyph.to_string())),
+            "graphics mode must not paint block cells under the image: {screen}"
+        );
+
+        editor.keymap_hint_prefix = vec!["g".to_string()];
+        editor.waiting_key_action = Some(KeyAction::Nested(HashMap::from([(
+            "j".to_string(),
+            KeyAction::Single(crate::editor::Action::MoveScreenLineDown),
+        )])));
+        editor.keymap_hints_visible = true;
+        editor.render(&mut frame).unwrap();
+        let screen = frame_text(&frame);
+        assert!(screen.contains("g · keymaps"), "{screen}");
+        assert!(
+            !screen
+                .chars()
+                .any(|glyph| is_block_glyph(&glyph.to_string())),
+            "a popup must not switch the image to block glyphs: {screen}"
+        );
+    }
+
     fn is_block_glyph(text: &str) -> bool {
         matches!(
             text,
@@ -2852,7 +2928,7 @@ mod tests {
     }
 
     #[test]
-    fn covered_graphics_are_removed_and_restored_when_the_overlay_closes() {
+    fn kitty_placement_stays_under_an_overlay_and_sixel_is_removed() {
         use crate::theme::Style;
         let mut runtime = ImageRuntime::new();
         let mut buffer = crate::editor::RenderBuffer::new(20, 8, &Style::default());
@@ -2903,20 +2979,22 @@ mod tests {
         });
         runtime.begin_frame();
         runtime.stage_graphics(stage(&buffer));
-        // The fingerprint above includes the popup. Stage the pre-popup hash
-        // so the cell change and the overlay rect both hide the image.
+        // The popup changed the cells and intersects the image. Kitty stays
+        // at z=-1; the popup's own background covers the overlap.
         runtime.staged[0].cells = runtime.staged[0].cells.map(|cells| cells.wrapping_add(1));
+        assert!(!runtime.commit_visible(&buffer));
+        let kept = runtime.graphics_payload(false);
+        assert!(kept.is_empty(), "{kept}");
+
+        let mut sixel = stage(&buffer);
+        sixel.protocol = GraphicsProtocol::Sixel;
+        sixel.id = 9;
+        sixel.payload = "SIXEL".to_string();
+        runtime.begin_frame();
+        runtime.stage_graphics(sixel);
         assert!(runtime.commit_visible(&buffer));
         let hidden = runtime.graphics_payload(false);
-        assert!(!hidden.contains("PLACE"));
-        assert!(hidden.contains("a=d"));
-
-        buffer = crate::editor::RenderBuffer::new(20, 8, &Style::default());
-        runtime.begin_frame();
-        runtime.stage_graphics(stage(&buffer));
-        assert!(runtime.commit_visible(&buffer));
-        let restored = runtime.graphics_payload(false);
-        assert!(restored.contains("PLACE"));
+        assert!(!hidden.contains("SIXEL"), "{hidden}");
     }
 
     fn place_kitty(
