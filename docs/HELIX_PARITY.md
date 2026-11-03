@@ -37,6 +37,7 @@ on equal terms. Helix's own default scrolloff is 5.
 | `K` `Alt-K` `&` `_` | **fixed** | `&` pads on the left until the selection ends share a column. |
 | `/` `?` `n` `N` `*` | **fixed** | `*` only sets the search. `N` starts before the current match. |
 | `u` `U` `:` `v` | **fixed** | `v` toggles select mode. Esc leaves select from a count, a pending character, or a keymap menu, and the ranges stay. |
+| mouse click, alt-click, drag, wheel | **fixed** | The selection follows the pointer. A click is a point, alt-click adds a cursor, drag extends, and the wheel moves the cursor only to stay inside `scrolloff`. |
 | `;` `Alt-;` | **matched** | Collapse and flip. |
 | `z` `z` `z` `t` `z` `b` | **matched** | The selection stays put. |
 | `z` `j` `z` `k` | **fixed** | Scrolling pulls the cursor inside `scrolloff`. |

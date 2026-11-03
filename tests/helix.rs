@@ -205,6 +205,128 @@ async fn helix_escape_leaves_select_from_a_count_a_pending_key_or_a_menu() {
 }
 
 #[tokio::test]
+async fn helix_mouse_click_and_scroll_move_the_selection() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+    let mut harness = helix("hello world\n");
+    press(&mut harness, "w").await;
+    assert_eq!(markup(&harness), "#[hello| ]#world\n");
+
+    // Default gutter plus the padding column puts buffer column 0 at screen
+    // column 4. 'w' in "hello world" is six scalars later.
+    let column = 10u16;
+    let row = 0u16;
+    let click = |kind, modifiers| {
+        Event::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers,
+        })
+    };
+    harness
+        .execute_event(click(
+            MouseEventKind::Down(MouseButton::Left),
+            KeyModifiers::NONE,
+        ))
+        .await
+        .unwrap();
+    harness
+        .execute_event(click(
+            MouseEventKind::Up(MouseButton::Left),
+            KeyModifiers::NONE,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        markup(&harness),
+        "hello #[|w]#orld\n",
+        "a click has to move the selection, otherwise the next motion jumps backward"
+    );
+    press(&mut harness, "w").await;
+    assert!(
+        !markup(&harness).starts_with("#[hello"),
+        "w must continue from the click, markup {}",
+        markup(&harness)
+    );
+
+    let text = (0..40)
+        .map(|line| format!("word{line:02} rest"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut harness = helix(&text);
+    press(&mut harness, "w").await;
+    let before = markup(&harness);
+    for _ in 0..4 {
+        harness
+            .execute_event(Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .await
+            .unwrap();
+    }
+    assert_ne!(
+        markup(&harness),
+        before,
+        "scrolling the cursor out of the scrolloff region updates the selection"
+    );
+    let line = harness.buffer_line();
+    press(&mut harness, "w").await;
+    assert_eq!(
+        harness.buffer_line(),
+        line,
+        "w stays on the scrolled line instead of jumping back"
+    );
+
+    let mut harness = helix("hello world\n");
+    press(&mut harness, "w").await;
+    harness
+        .execute_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 14,
+            row,
+            modifiers: KeyModifiers::ALT,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        harness.editor.test_felix_selection().2,
+        2,
+        "alt-click adds a cursor, markup {}",
+        markup(&harness)
+    );
+
+    let mut harness = helix("hello world\n");
+    harness
+        .execute_event(click(
+            MouseEventKind::Down(MouseButton::Left),
+            KeyModifiers::NONE,
+        ))
+        .await
+        .unwrap();
+    harness
+        .execute_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: column + 4,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .await
+        .unwrap();
+    let (anchor, head, count) = harness.editor.test_felix_selection();
+    assert_eq!(count, 1);
+    assert_eq!(anchor.min(head), 6, "drag starts at the press");
+    assert!(
+        head > anchor,
+        "drag extends the primary, markup {}",
+        markup(&harness)
+    );
+}
+
+#[tokio::test]
 async fn helix_select_mode_extends_and_collapse_and_flip_move_the_ends() {
     let mut harness = helix("abcdef\n");
     press(&mut harness, "vl").await;

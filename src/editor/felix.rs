@@ -40,6 +40,8 @@ pub(super) struct State {
     syntax_history: Vec<Range>,
     pub(super) reference_requests: HashSet<i64>,
     search_extend: bool,
+    /// Anchor scalar captured by a left-button press so a drag can extend it.
+    mouse_anchor: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -337,12 +339,104 @@ impl Editor {
     }
 
     fn set_felix_selection(&mut self, mut selection: Selection) {
+        self.store_felix_selection(&mut selection);
+        self.place_felix_cursor();
+    }
+
+    /// Writes the selection without moving the cursor. Pointer and scroll
+    /// paths have already placed the cursor; folding it back through
+    /// `place_felix_cursor` would fight that position.
+    fn store_felix_selection(&mut self, selection: &mut Selection) {
         let len = self.current_buffer().contents_snapshot().len_chars();
         selection.normalize(len);
         if let Some(window) = self.window_manager.active_window_mut() {
-            window.selection = selection;
+            window.selection = selection.clone();
         }
-        self.place_felix_cursor();
+    }
+
+    fn replace_felix_primary(&mut self, range: Range) {
+        let current = self.felix_selection();
+        let primary = current.primary_index();
+        let ranges = current
+            .ranges()
+            .iter()
+            .enumerate()
+            .map(
+                |(index, existing)| {
+                    if index == primary { range } else { *existing }
+                },
+            )
+            .collect();
+        let mut selection = Selection::from_ranges(ranges, primary);
+        self.store_felix_selection(&mut selection);
+    }
+
+    /// A cursor move that did not come from the selection (scroll, jump,
+    /// `SetCursor`) makes the selection follow. Select mode keeps the anchor.
+    pub(super) fn follow_helix_cursor(&mut self) {
+        if !self.is_helix() || self.is_insert() {
+            return;
+        }
+        let len = self.current_buffer().contents_snapshot().len_chars();
+        let index = self.cursor_char_index().min(len);
+        let current = self.felix_selection();
+        let primary = current.primary();
+        if index == primary.head {
+            return;
+        }
+        let range = if self.mode == Mode::Select {
+            Range::new(primary.anchor, index)
+        } else {
+            Range::cursor(index)
+        };
+        if self.mode == Mode::Select {
+            self.replace_felix_primary(range);
+        } else {
+            let mut selection = Selection::single(range);
+            self.store_felix_selection(&mut selection);
+        }
+    }
+
+    /// Helix 25.07.1 mouse: click is a point, alt-click adds one, and a click
+    /// in select mode extends the primary and drops the others. There is no
+    /// double-click word select.
+    pub(super) fn helix_mouse_click(&mut self, alt: bool) {
+        let len = self.current_buffer().contents_snapshot().len_chars();
+        let index = self.cursor_char_index().min(len);
+        if alt {
+            let mut selection = self.felix_selection();
+            selection.push_range(Range::cursor(index), len);
+            self.store_felix_selection(&mut selection);
+            self.felix.mouse_anchor = Some(index);
+            return;
+        }
+        if self.mode == Mode::Select {
+            let anchor = self.felix_selection().primary().anchor;
+            let mut selection = Selection::single(Range::new(anchor, index));
+            self.store_felix_selection(&mut selection);
+            self.felix.mouse_anchor = Some(anchor);
+            return;
+        }
+        let mut selection = Selection::cursor(index);
+        self.store_felix_selection(&mut selection);
+        self.felix.mouse_anchor = Some(index);
+    }
+
+    pub(super) fn helix_mouse_drag(&mut self) {
+        let Some(anchor) = self.felix.mouse_anchor else {
+            return;
+        };
+        let len = self.current_buffer().contents_snapshot().len_chars();
+        let index = self.cursor_char_index().min(len);
+        self.replace_felix_primary(Range::new(anchor, index));
+    }
+
+    pub(super) fn clear_helix_mouse_anchor(&mut self) {
+        self.felix.mouse_anchor = None;
+    }
+
+    pub(super) fn helix_mouse_is_dragging(&self) -> bool {
+        self.felix.mouse_anchor.is_some()
     }
 
     pub(super) fn draw_felix_ranges(
