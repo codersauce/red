@@ -35,6 +35,8 @@ const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_IMAGE_EDGE: u32 = 8_192;
 pub(super) const KITTY_GRAPHICS_QUERY: &str = "\u{1b}_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\u{1b}\\";
 pub(super) const DA1_QUERY: &str = "\u{1b}[c";
+/// Report cell size in pixels. The reply is `CSI 6 ; height ; width t`.
+pub(super) const CELL_SIZE_QUERY: &str = "\u{1b}[16t";
 const PROBE_TIMEOUT: Duration = Duration::from_millis(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +69,8 @@ pub(super) struct TerminalHints {
     pub tmux: bool,
     pub herdr: bool,
     pub zellij: bool,
+    /// GNU screen does not relay Kitty or Sixel. A failed query stays on half-blocks.
+    pub screen: bool,
     pub truecolor: bool,
 }
 
@@ -102,6 +106,7 @@ impl TerminalHints {
         let zellij = var("ZELLIJ").is_some()
             || var("ZELLIJ_SESSION_NAME").is_some()
             || equals_ignore_ascii(&term_program, "zellij");
+        let screen = var("STY").is_some() || term == "screen" || term.starts_with("screen.");
         let known_truecolor =
             kitty || wezterm || ghostty || konsole || iterm || vscode || sixel_term;
         let truecolor = known_truecolor
@@ -123,14 +128,19 @@ impl TerminalHints {
             tmux,
             herdr,
             zellij,
+            screen,
             truecolor,
         }
     }
 
-    /// Herdr, tmux, and zellij can display a Kitty placement, but deletes and
-    /// moves are not reliable. Auto mode uses half-blocks there instead.
-    fn unreliable_graphics(&self) -> bool {
-        self.tmux || self.herdr || self.zellij
+    /// Multiplexers whose environment lies about the outer terminal.
+    ///
+    /// Herdr, tmux, and Zellij can relay graphics, but only an answered query
+    /// proves it. GNU screen does not relay Kitty or Sixel, so a failed query
+    /// is the fallback. Leaked `GHOSTTY_RESOURCES_DIR` or `KITTY_WINDOW_ID`
+    /// must not choose a protocol by itself.
+    fn query_required(&self) -> bool {
+        self.tmux || self.herdr || self.zellij || self.screen
     }
 
     fn prefer_kitty(&self) -> bool {
@@ -146,10 +156,43 @@ impl TerminalHints {
     }
 }
 
+/// Cell size in pixels. `10×20` is the stand-in when a multiplexer reports 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct CellPixels {
+    pub width: u16,
+    pub height: u16,
+}
+
+impl Default for CellPixels {
+    fn default() -> Self {
+        Self {
+            width: 10,
+            height: 20,
+        }
+    }
+}
+
+impl CellPixels {
+    pub(super) fn measured(width: u16, height: u16) -> Self {
+        if width == 0 || height == 0 {
+            Self::default()
+        } else {
+            Self {
+                width: width.clamp(1, 128),
+                height: height.clamp(1, 256),
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct Probe {
     pub kitty: bool,
     pub sixel: bool,
+    /// From `CSI 16 t` (`CSI 6 ; height ; width t`). Zero means the terminal
+    /// did not answer.
+    pub cell_width: u16,
+    pub cell_height: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -287,6 +330,8 @@ pub(super) struct ImageRuntime {
     ids: HashMap<(BufferId, usize), u32>,
     next_id: u32,
     frame_open: bool,
+    cell: CellPixels,
+    text_grid: Option<(u64, u16, u16, Arc<DecodedImage>)>,
 }
 
 impl ImageRuntime {
@@ -310,6 +355,8 @@ impl ImageRuntime {
             ids: HashMap::new(),
             next_id: 0,
             frame_open: false,
+            cell: CellPixels::default(),
+            text_grid: None,
         }
     }
 
@@ -318,14 +365,42 @@ impl ImageRuntime {
     }
 
     pub(super) fn note_probe(&mut self, probe: Probe) {
-        if probe != self.probe {
+        let cell = if probe.cell_width > 0 && probe.cell_height > 0 {
+            CellPixels::measured(probe.cell_width, probe.cell_height)
+        } else {
+            ioctl_cell_pixels()
+                .map(|(width, height)| CellPixels::measured(width, height))
+                .unwrap_or_default()
+        };
+        if probe != self.probe || cell != self.cell {
             self.probe = probe;
+            self.cell = cell;
+            self.text_grid = None;
             self.epoch = self.epoch.wrapping_add(1);
         }
     }
 
     pub(super) fn presentation(&self, mode: MarkdownImagesMode) -> ImagePresentation {
         choose_presentation(mode, &self.hints, self.probe)
+    }
+
+    fn text_samples(&mut self, image: &DecodedImage, cols: u16, rows: u16) -> Arc<DecodedImage> {
+        let key = text_sample_key(image);
+        if let Some((cached, cached_cols, cached_rows, grid)) = &self.text_grid {
+            if *cached == key && *cached_cols == cols && *cached_rows == rows {
+                return Arc::clone(grid);
+            }
+        }
+        let width = u32::from(cols).saturating_mul(2).max(1);
+        let height = u32::from(rows).saturating_mul(2).max(1);
+        let rgba = resample_rgba(image, width, height);
+        let grid = Arc::new(DecodedImage {
+            width,
+            height,
+            rgba,
+        });
+        self.text_grid = Some((key, cols, rows, Arc::clone(&grid)));
+        grid
     }
 
     /// Returns true when a remote image finished and the screen should redraw.
@@ -426,7 +501,7 @@ impl ImageRuntime {
             let (cols, image_rows, placeholder) = match (&pixels, presentation) {
                 (Some(image), ImagePresentation::Halfblocks | ImagePresentation::Graphics(_)) => {
                     let (cols, image_rows) =
-                        image_cell_grid(image.width, image.height, width, max_rows);
+                        image_cell_grid(image.width, image.height, width, max_rows, self.cell);
                     if cols == 0 || image_rows == 0 {
                         (1, 1, true)
                     } else {
@@ -505,12 +580,8 @@ impl ImageRuntime {
                 let visible = image.painted.max(1);
                 match image.protocol {
                     GraphicsProtocol::Kitty => {
-                        let (pixel_w, pixel_h) = fitted_size(
-                            decoded.width,
-                            decoded.height,
-                            u32::from(image.cols).saturating_mul(4).max(1),
-                            u32::from(image.total_rows).saturating_mul(8).max(1),
-                        );
+                        let (pixel_w, pixel_h) =
+                            graphics_pixel_size(&decoded, image.cols, image.total_rows, self.cell);
                         image.source = kitty_source_rect(
                             pixel_w,
                             pixel_h,
@@ -526,13 +597,15 @@ impl ImageRuntime {
                             image.total_rows,
                             visible,
                             image.source,
+                            self.cell,
                         );
                     }
                     GraphicsProtocol::Iterm2 => {
                         image.payload = iterm_transmit(&decoded, image.cols, image.total_rows);
                     }
                     GraphicsProtocol::Sixel => {
-                        image.payload = sixel_transmit(&decoded, image.cols, image.total_rows);
+                        image.payload =
+                            sixel_transmit(&decoded, image.cols, image.total_rows, self.cell);
                     }
                 }
             }
@@ -827,7 +900,7 @@ pub(super) fn choose_presentation(
         MarkdownImagesMode::Auto => {
             if let Some(protocol) = detected_graphics(hints, probe) {
                 ImagePresentation::Graphics(protocol)
-            } else if hints.truecolor || (probe.kitty && !hints.unreliable_graphics()) {
+            } else if hints.truecolor {
                 ImagePresentation::Halfblocks
             } else {
                 ImagePresentation::Placeholder
@@ -838,15 +911,17 @@ pub(super) fn choose_presentation(
 
 /// Kitty, then iTerm2, then Sixel.
 ///
-/// Herdr, tmux, and zellij are excluded. They may paint a placement, but a
-/// later delete or move often never reaches the outer terminal, which leaves
-/// the image stranded on screen.
+/// A successful Kitty or Sixel query wins inside every multiplexer, including
+/// Herdr, tmux, and Zellij. Those three parse or relay the protocol, but their
+/// environment variables describe the wrong terminal, so hints are used only
+/// after the query fails and only outside a multiplexer. GNU screen does not
+/// relay graphics; a failed query there stays on half-blocks.
 pub(super) fn detected_graphics(hints: &TerminalHints, probe: Probe) -> Option<GraphicsProtocol> {
-    if hints.unreliable_graphics() {
-        return None;
-    }
     if probe.kitty {
         return Some(GraphicsProtocol::Kitty);
+    }
+    if hints.query_required() {
+        return probe.sixel.then_some(GraphicsProtocol::Sixel);
     }
     if hints.prefer_kitty() {
         return Some(GraphicsProtocol::Kitty);
@@ -862,10 +937,65 @@ pub(super) fn detected_graphics(hints: &TerminalHints, probe: Probe) -> Option<G
 
 pub(super) fn parse_probe_response(bytes: &[u8]) -> Probe {
     let text = String::from_utf8_lossy(bytes);
+    let (cell_height, cell_width) = parse_cell_pixels(bytes).unwrap_or((0, 0));
     Probe {
         kitty: text.contains("i=31;OK") || text.contains("_Gi=31;OK"),
         sixel: da1_has_sixel(bytes),
+        cell_width,
+        cell_height,
     }
+}
+
+/// `CSI 6 ; height ; width t` from `CSI 16 t`.
+pub(super) fn parse_cell_pixels(bytes: &[u8]) -> Option<(u16, u16)> {
+    let mut index = 0;
+    while index + 3 < bytes.len() {
+        if bytes[index] != 0x1b || bytes[index + 1] != b'[' {
+            index += 1;
+            continue;
+        }
+        let mut cursor = index + 2;
+        let mut numbers = Vec::new();
+        let mut number = 0u16;
+        let mut saw_digit = false;
+        let mut valid = true;
+        while cursor < bytes.len() {
+            match bytes[cursor] {
+                b'0'..=b'9' => {
+                    let digit = u16::from(bytes[cursor] - b'0');
+                    number = number.saturating_mul(10).saturating_add(digit);
+                    saw_digit = true;
+                }
+                b';' if saw_digit => {
+                    numbers.push(number);
+                    number = 0;
+                    saw_digit = false;
+                }
+                b't' if saw_digit => {
+                    numbers.push(number);
+                    if numbers.first() == Some(&6) && numbers.len() >= 3 {
+                        let height = numbers[1];
+                        let width = numbers[2];
+                        if width > 0 && height > 0 {
+                            return Some((height, width));
+                        }
+                    }
+                    break;
+                }
+                _ => {
+                    valid = false;
+                    break;
+                }
+            }
+            cursor += 1;
+        }
+        if !valid {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    None
 }
 
 pub(super) fn da1_has_sixel(bytes: &[u8]) -> bool {
@@ -933,14 +1063,11 @@ pub(super) fn tmux_passthrough(sequence: &str) -> String {
 }
 
 pub(super) fn probe_query(tmux: bool) -> String {
+    let parts = [KITTY_GRAPHICS_QUERY, DA1_QUERY, CELL_SIZE_QUERY];
     if tmux {
-        format!(
-            "{}{}",
-            tmux_passthrough(KITTY_GRAPHICS_QUERY),
-            tmux_passthrough(DA1_QUERY)
-        )
+        parts.into_iter().map(tmux_passthrough).collect()
     } else {
-        format!("{KITTY_GRAPHICS_QUERY}{DA1_QUERY}")
+        parts.concat()
     }
 }
 
@@ -963,7 +1090,41 @@ pub(super) fn probe_terminal() -> Probe {
     {
         return Probe::default();
     }
-    parse_probe_response(&read_probe_response(PROBE_TIMEOUT))
+    let mut probe = parse_probe_response(&read_probe_response(PROBE_TIMEOUT));
+    if probe.cell_width == 0 || probe.cell_height == 0 {
+        if let Some((width, height)) = ioctl_cell_pixels() {
+            probe.cell_width = width;
+            probe.cell_height = height;
+        }
+    }
+    probe
+}
+
+fn ioctl_cell_pixels() -> Option<(u16, u16)> {
+    #[cfg(unix)]
+    {
+        let mut size = libc::winsize {
+            ws_row: 0,
+            ws_col: 0,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let rc = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) };
+        if rc != 0 || size.ws_col == 0 || size.ws_row == 0 {
+            return None;
+        }
+        // Multiplexers often report a character grid and zero pixel size.
+        if size.ws_xpixel == 0 || size.ws_ypixel == 0 {
+            return None;
+        }
+        let width = size.ws_xpixel / size.ws_col;
+        let height = size.ws_ypixel / size.ws_row;
+        (width > 0 && height > 0).then_some((width, height))
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
 }
 
 #[cfg(unix)]
@@ -1117,20 +1278,45 @@ pub(super) fn image_cell_grid(
     pixel_h: u32,
     max_cols: usize,
     max_rows: usize,
+    cell: CellPixels,
 ) -> (u16, u16) {
     if pixel_w == 0 || pixel_h == 0 || max_cols == 0 || max_rows == 0 {
         return (0, 0);
     }
     let max_cols = max_cols.min(usize::from(u16::MAX));
     let max_rows = max_rows.min(64);
+    let cell_w = u64::from(cell.width.max(1));
+    let cell_h = u64::from(cell.height.max(1));
+    // Use the full viewport width when the picture is at least that wide.
+    // A narrower picture stays at its pixel width so a tiny icon is not stretched
+    // across the window.
     let mut cols = max_cols.min(pixel_w as usize).max(1);
-    let mut rows = ((u64::from(pixel_h) * cols as u64) / (u64::from(pixel_w) * 2)).max(1) as usize;
+    let mut rows = ((u64::from(pixel_h) * cols as u64 * cell_w) / (u64::from(pixel_w) * cell_h))
+        .max(1) as usize;
     if rows > max_rows {
         rows = max_rows;
-        cols = ((rows as u64 * 2 * u64::from(pixel_w)) / u64::from(pixel_h)).max(1) as usize;
+        cols = ((rows as u64 * u64::from(pixel_w) * cell_h) / (u64::from(pixel_h) * cell_w)).max(1)
+            as usize;
         cols = cols.min(max_cols).max(1);
     }
     (cols as u16, rows.min(max_rows).max(1) as u16)
+}
+
+/// Pixel size of a graphics payload. Never larger than the source, and never
+/// a cell-count bitmap. Kitty `c`/`r` fit this raster into the cell rectangle.
+pub(super) fn graphics_pixel_size(
+    image: &DecodedImage,
+    cols: u16,
+    rows: u16,
+    cell: CellPixels,
+) -> (u32, u32) {
+    let max_w = u32::from(cols)
+        .saturating_mul(u32::from(cell.width.max(1)))
+        .clamp(1, 4096);
+    let max_h = u32::from(rows)
+        .saturating_mul(u32::from(cell.height.max(1)))
+        .clamp(1, 4096);
+    fit_inside(image.width, image.height, max_w, max_h)
 }
 
 pub(super) fn placeholder_text(
@@ -1156,6 +1342,7 @@ pub(super) fn placeholder_text(
     }
 }
 
+#[cfg(test)]
 pub(super) fn halfblock_colors(
     image: &DecodedImage,
     cols: u32,
@@ -1164,7 +1351,7 @@ pub(super) fn halfblock_colors(
     row: u32,
     background: [u8; 3],
 ) -> (Color, Color) {
-    let top = sample(
+    let top = area_sample(
         image,
         cols,
         rows.saturating_mul(2),
@@ -1172,7 +1359,7 @@ pub(super) fn halfblock_colors(
         row.saturating_mul(2),
         background,
     );
-    let bottom = sample(
+    let bottom = area_sample(
         image,
         cols,
         rows.saturating_mul(2),
@@ -1194,7 +1381,107 @@ pub(super) fn halfblock_colors(
     )
 }
 
-fn sample(
+/// One text cell. Quadrant block elements (same Unicode block as `▀`) give a
+/// 2×2 sample. Sextants stay unused: the Legacy Computing block is missing
+/// from many fonts, including some Nerd Fonts.
+pub(super) fn quadrant_cell(grid: &DecodedImage, col: u32, row: u32) -> (char, Color, Color) {
+    let samples = [
+        grid_pixel(grid, col * 2, row * 2),
+        grid_pixel(grid, col * 2 + 1, row * 2),
+        grid_pixel(grid, col * 2, row * 2 + 1),
+        grid_pixel(grid, col * 2 + 1, row * 2 + 1),
+    ];
+    let mut darkest = samples[0];
+    let mut lightest = samples[0];
+    for sample in samples {
+        if luminance(sample) < luminance(darkest) {
+            darkest = sample;
+        }
+        if luminance(sample) > luminance(lightest) {
+            lightest = sample;
+        }
+    }
+    if color_distance(darkest, lightest) < 24 * 24 {
+        return (
+            ' ',
+            Color::Rgb {
+                r: lightest[0],
+                g: lightest[1],
+                b: lightest[2],
+            },
+            Color::Rgb {
+                r: darkest[0],
+                g: darkest[1],
+                b: darkest[2],
+            },
+        );
+    }
+    let mut mask = 0u8;
+    for (bit, sample) in samples.iter().enumerate() {
+        if color_distance(*sample, lightest) <= color_distance(*sample, darkest) {
+            mask |= 1 << bit;
+        }
+    }
+    (
+        quadrant_char(mask),
+        Color::Rgb {
+            r: lightest[0],
+            g: lightest[1],
+            b: lightest[2],
+        },
+        Color::Rgb {
+            r: darkest[0],
+            g: darkest[1],
+            b: darkest[2],
+        },
+    )
+}
+
+fn quadrant_char(mask: u8) -> char {
+    match mask & 0b1111 {
+        0b0001 => '▘',
+        0b0010 => '▝',
+        0b0100 => '▖',
+        0b1000 => '▗',
+        0b0011 => '▀',
+        0b1100 => '▄',
+        0b0101 => '▌',
+        0b1010 => '▐',
+        0b1001 => '▚',
+        0b0110 => '▞',
+        0b0111 => '▛',
+        0b1011 => '▜',
+        0b1101 => '▙',
+        0b1110 => '▟',
+        0b1111 => '█',
+        _ => ' ',
+    }
+}
+
+fn grid_pixel(grid: &DecodedImage, x: u32, y: u32) -> [u8; 3] {
+    if grid.width == 0 || grid.height == 0 {
+        return [0, 0, 0];
+    }
+    let x = x.min(grid.width - 1);
+    let y = y.min(grid.height - 1);
+    let index = ((y * grid.width + x) * 4) as usize;
+    let pixel = grid.rgba.get(index..index + 4).unwrap_or(&[0, 0, 0, 255]);
+    [pixel[0], pixel[1], pixel[2]]
+}
+
+fn luminance(pixel: [u8; 3]) -> u16 {
+    u16::from(pixel[0]) * 3 + u16::from(pixel[1]) * 6 + u16::from(pixel[2])
+}
+
+fn color_distance(left: [u8; 3], right: [u8; 3]) -> u32 {
+    let red = i32::from(left[0]) - i32::from(right[0]);
+    let green = i32::from(left[1]) - i32::from(right[1]);
+    let blue = i32::from(left[2]) - i32::from(right[2]);
+    (red * red + green * green + blue * blue) as u32
+}
+
+#[cfg(test)]
+fn area_sample(
     image: &DecodedImage,
     dest_w: u32,
     dest_h: u32,
@@ -1205,15 +1492,38 @@ fn sample(
     if image.width == 0 || image.height == 0 || dest_w == 0 || dest_h == 0 {
         return background;
     }
-    let sx = (u64::from(x) * u64::from(image.width) / u64::from(dest_w))
-        .min(u64::from(image.width - 1)) as u32;
-    let sy = (u64::from(y) * u64::from(image.height) / u64::from(dest_h))
-        .min(u64::from(image.height - 1)) as u32;
-    let index = ((sy * image.width + sx) * 4) as usize;
-    let pixel = image.rgba.get(index..index + 4).unwrap_or(&[0, 0, 0, 0]);
-    composite(pixel, background)
+    let x0 = u64::from(x) * u64::from(image.width) / u64::from(dest_w);
+    let x1 = (u64::from(x) + 1) * u64::from(image.width) / u64::from(dest_w);
+    let y0 = u64::from(y) * u64::from(image.height) / u64::from(dest_h);
+    let y1 = (u64::from(y) + 1) * u64::from(image.height) / u64::from(dest_h);
+    let x1 = x1.max(x0 + 1).min(u64::from(image.width));
+    let y1 = y1.max(y0 + 1).min(u64::from(image.height));
+    let mut red = 0u64;
+    let mut green = 0u64;
+    let mut blue = 0u64;
+    let mut count = 0u64;
+    for sy in y0..y1 {
+        for sx in x0..x1 {
+            let index = ((sy as u32 * image.width + sx as u32) * 4) as usize;
+            let pixel = image.rgba.get(index..index + 4).unwrap_or(&[0, 0, 0, 0]);
+            let composed = composite(pixel, background);
+            red += u64::from(composed[0]);
+            green += u64::from(composed[1]);
+            blue += u64::from(composed[2]);
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return background;
+    }
+    [
+        (red / count) as u8,
+        (green / count) as u8,
+        (blue / count) as u8,
+    ]
 }
 
+#[cfg(test)]
 fn composite(pixel: &[u8], background: [u8; 3]) -> [u8; 3] {
     let alpha = u16::from(pixel[3]);
     if alpha == 255 {
@@ -1318,7 +1628,18 @@ pub(super) struct KittySourceRect {
 
 #[cfg(test)]
 pub(super) fn kitty_transmit(id: u32, image: &DecodedImage, cols: u16, rows: u16) -> String {
-    kitty_transmit_placed(id, image, cols, rows, rows, None)
+    kitty_transmit_with_cell(id, image, cols, rows, CellPixels::default())
+}
+
+#[cfg(test)]
+pub(super) fn kitty_transmit_with_cell(
+    id: u32,
+    image: &DecodedImage,
+    cols: u16,
+    rows: u16,
+    cell: CellPixels,
+) -> String {
+    kitty_transmit_placed(id, image, cols, rows, rows, None, cell)
 }
 
 fn kitty_transmit_placed(
@@ -1328,12 +1649,10 @@ fn kitty_transmit_placed(
     total_rows: u16,
     visible_rows: u16,
     source: Option<KittySourceRect>,
+    cell: CellPixels,
 ) -> String {
-    let (width, height, rgba) = scale_rgba(
-        image,
-        u32::from(cols).saturating_mul(4).max(1),
-        u32::from(total_rows).saturating_mul(8).max(1),
-    );
+    let (width, height) = graphics_pixel_size(image, cols, total_rows.max(1), cell);
+    let rgba = resample_rgba(image, width, height);
     let payload = base64::engine::general_purpose::STANDARD.encode(&rgba);
     let mut control = format!("a=T,f=32,s={width},v={height},i={id},p={id}");
     if let Some(source) = source {
@@ -1421,7 +1740,9 @@ fn chunk_kitty(control: &str, payload: &str) -> String {
 }
 
 pub(super) fn kitty_delete(id: u32) -> String {
-    format!("\u{1b}_Ga=d,d=i,i={id},q=2\u{1b}\\")
+    // `p` matches the placement created with the image. Herdr deletes that
+    // placement id; a bare image id is not enough for every parser.
+    format!("\u{1b}_Ga=d,d=i,i={id},p={id},q=2\u{1b}\\")
 }
 
 pub(super) fn kitty_delete_all() -> String {
@@ -1429,16 +1750,13 @@ pub(super) fn kitty_delete_all() -> String {
 }
 
 pub(super) fn iterm_transmit(image: &DecodedImage, cols: u16, rows: u16) -> String {
-    let (width, height, rgba) = scale_rgba(
-        image,
-        u32::from(cols).saturating_mul(4).max(1),
-        u32::from(rows).saturating_mul(8).max(1),
-    );
+    // The original pixels. iTerm2 fits them with the cell width, height, and
+    // preserveAspectRatio instead of a pre-scaled cell-count bitmap.
     let mut png = Vec::new();
     let encoded = image::codecs::png::PngEncoder::new(&mut png).write_image(
-        &rgba,
-        width,
-        height,
+        &image.rgba,
+        image.width.max(1),
+        image.height.max(1),
         image::ExtendedColorType::Rgba8,
     );
     if encoded.is_err() {
@@ -1450,21 +1768,25 @@ pub(super) fn iterm_transmit(image: &DecodedImage, cols: u16, rows: u16) -> Stri
     )
 }
 
-pub(super) fn sixel_transmit(image: &DecodedImage, cols: u16, rows: u16) -> String {
-    let (width, height, rgba) = scale_rgba(
-        image,
-        u32::from(cols).saturating_mul(2).max(1),
-        u32::from(rows).saturating_mul(6).max(1),
-    );
+pub(super) fn sixel_transmit(
+    image: &DecodedImage,
+    cols: u16,
+    rows: u16,
+    cell: CellPixels,
+) -> String {
+    let (width, height) = graphics_pixel_size(image, cols, rows, cell);
+    let rgba = resample_rgba(image, width, height);
     encode_sixel(&rgba, width as usize, height as usize)
 }
 
-fn fitted_size(src_w: u32, src_h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
-    let max_w = max_w.clamp(1, 800);
-    let max_h = max_h.clamp(1, 800);
+fn fit_inside(src_w: u32, src_h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
+    let max_w = max_w.max(1);
+    let max_h = max_h.max(1);
+    if src_w == 0 || src_h == 0 {
+        return (1, 1);
+    }
     let width = src_w.min(max_w).max(1);
     let height = src_h.min(max_h).max(1);
-    // Fit inside the cap while keeping the source aspect ratio.
     if u64::from(src_w) * u64::from(height) > u64::from(src_h) * u64::from(width) {
         let height = ((u64::from(width) * u64::from(src_h)) / u64::from(src_w).max(1))
             .clamp(1, u64::from(max_h)) as u32;
@@ -1476,15 +1798,37 @@ fn fitted_size(src_w: u32, src_h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
     }
 }
 
-fn scale_rgba(image: &DecodedImage, max_w: u32, max_h: u32) -> (u32, u32, Vec<u8>) {
-    let (width, height) = fitted_size(image.width, image.height, max_w, max_h);
+fn resample_rgba(image: &DecodedImage, width: u32, height: u32) -> Vec<u8> {
+    let width = width.max(1);
+    let height = height.max(1);
+    if image.width == 0 || image.height == 0 {
+        return vec![0; (width * height * 4) as usize];
+    }
+    if width == image.width && height == image.height {
+        return image.rgba.clone();
+    }
+    let Some(buffer) = image::RgbaImage::from_raw(image.width, image.height, image.rgba.clone())
+    else {
+        return nearest_rgba(image, width, height);
+    };
+    // Lanczos when shrinking, Catmull-Rom if a caller ever asks for a larger
+    // raster. Graphics payloads only shrink.
+    let filter = if width < image.width || height < image.height {
+        image::imageops::FilterType::Lanczos3
+    } else {
+        image::imageops::FilterType::CatmullRom
+    };
+    image::imageops::resize(&buffer, width, height, filter).into_raw()
+}
+
+fn nearest_rgba(image: &DecodedImage, width: u32, height: u32) -> Vec<u8> {
     let mut rgba = vec![0u8; (width * height * 4) as usize];
     for y in 0..height {
         for x in 0..width {
             let sx = (u64::from(x) * u64::from(image.width) / u64::from(width))
-                .min(u64::from(image.width - 1)) as u32;
+                .min(u64::from(image.width.saturating_sub(1))) as u32;
             let sy = (u64::from(y) * u64::from(image.height) / u64::from(height))
-                .min(u64::from(image.height - 1)) as u32;
+                .min(u64::from(image.height.saturating_sub(1))) as u32;
             let from = ((sy * image.width + sx) * 4) as usize;
             let to = ((y * width + x) * 4) as usize;
             if let Some(pixel) = image.rgba.get(from..from + 4) {
@@ -1492,7 +1836,7 @@ fn scale_rgba(image: &DecodedImage, max_w: u32, max_h: u32) -> (u32, u32, Vec<u8
             }
         }
     }
-    (width, height, rgba)
+    rgba
 }
 
 fn encode_sixel(rgba: &[u8], width: usize, height: usize) -> String {
@@ -1683,9 +2027,7 @@ impl super::Editor {
     }
 
     pub(super) fn probe_terminal_graphics(&self) {
-        if self.config.markdown_images == MarkdownImagesMode::Off
-            || self.config.markdown_images == MarkdownImagesMode::Halfblocks
-        {
+        if self.config.markdown_images == MarkdownImagesMode::Off {
             return;
         }
         let probe = probe_terminal();
@@ -1809,20 +2151,18 @@ impl super::Editor {
             ImagePresentation::Placeholder => false,
         };
         if draw_halfblocks {
-            let background = theme_background(&self.theme.style);
+            let grid = self
+                .markdown_images
+                .borrow_mut()
+                .text_samples(&image, span.cols, span.rows);
             for col in 0..usize::from(span.cols).min(content_width) {
-                let (fg, bg) = halfblock_colors(
-                    &image,
-                    u32::from(span.cols),
-                    u32::from(span.rows),
-                    col as u32,
-                    u32::from(span.index),
-                    background,
-                );
+                let (glyph, fg, bg) = quadrant_cell(&grid, col as u32, u32::from(span.index));
+                let mut encoded = [0u8; 4];
+                let text = glyph.encode_utf8(&mut encoded);
                 buffer.set_text(
                     origin_x + col,
                     origin_y,
-                    "▀",
+                    text,
                     &crate::theme::Style {
                         fg: Some(fg),
                         bg: Some(bg),
@@ -1854,11 +2194,16 @@ impl super::Editor {
     }
 }
 
-fn theme_background(style: &crate::theme::Style) -> [u8; 3] {
-    match style.bg {
-        Some(Color::Rgb { r, g, b }) | Some(Color::Rgba { r, g, b, .. }) => [r, g, b],
-        None => [0, 0, 0],
-    }
+fn text_sample_key(image: &DecodedImage) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    image.width.hash(&mut hasher);
+    image.height.hash(&mut hasher);
+    image.rgba.len().hash(&mut hasher);
+    image.rgba.first().hash(&mut hasher);
+    image.rgba.last().hash(&mut hasher);
+    hasher.finish()
 }
 
 fn image_signature(image: &DecodedImage, cols: u16, rows: u16, protocol: GraphicsProtocol) -> u64 {
@@ -1938,17 +2283,20 @@ mod tests {
 
     #[test]
     fn reserves_rows_from_aspect_ratio_and_caps_height() {
-        let (cols, rows) = image_cell_grid(200, 100, 80, 16);
+        let (cols, rows) = image_cell_grid(200, 100, 80, 16, CellPixels::default());
         assert_eq!(rows, 16);
         assert_eq!(cols, 64);
 
-        let (cols, rows) = image_cell_grid(100, 400, 80, 16);
+        let (cols, rows) = image_cell_grid(100, 400, 80, 16, CellPixels::default());
         assert_eq!(rows, 16);
         assert_eq!(cols, 8);
 
-        let (_, rows) = image_cell_grid(2, 2, 80, 16);
+        let (_, rows) = image_cell_grid(2, 2, 80, 16, CellPixels::default());
         assert_eq!(rows, 1);
-        assert_eq!(image_cell_grid(0, 10, 80, 16), (0, 0));
+        assert_eq!(
+            image_cell_grid(0, 10, 80, 16, CellPixels::default()),
+            (0, 0)
+        );
     }
 
     #[test]
@@ -1979,7 +2327,8 @@ mod tests {
             rgba: vec![255, 0, 0, 255, 0, 0, 255, 255],
         };
         // The grid helper is what layout uses once pixels are known.
-        let (cols, rows) = image_cell_grid(image.width, image.height, 80, 10);
+        let (cols, rows) =
+            image_cell_grid(image.width, image.height, 80, 10, CellPixels::default());
         let segments = image_line_segments(2, rows, cols, false);
         assert_eq!(segments.len(), usize::from(rows));
         assert_eq!(segments[0].line, 2);
@@ -2047,7 +2396,8 @@ mod tests {
                 &queried,
                 Probe {
                     kitty: true,
-                    sixel: true
+                    sixel: true,
+                    ..Probe::default()
                 }
             ),
             Some(GraphicsProtocol::Kitty)
@@ -2057,7 +2407,8 @@ mod tests {
                 &queried,
                 Probe {
                     kitty: false,
-                    sixel: true
+                    sixel: true,
+                    ..Probe::default()
                 }
             ),
             Some(GraphicsProtocol::Sixel)
@@ -2073,10 +2424,11 @@ mod tests {
                 &kitty_tmux,
                 Probe {
                     kitty: true,
-                    sixel: false
+                    sixel: false,
+                    ..Probe::default()
                 }
             ),
-            None
+            Some(GraphicsProtocol::Kitty)
         );
         assert_eq!(
             choose_presentation(
@@ -2084,10 +2436,11 @@ mod tests {
                 &kitty_tmux,
                 Probe {
                     kitty: true,
-                    sixel: false
+                    sixel: false,
+                    ..Probe::default()
                 }
             ),
-            ImagePresentation::Halfblocks
+            ImagePresentation::Graphics(GraphicsProtocol::Kitty)
         );
         let wrapped = tmux_passthrough(KITTY_GRAPHICS_QUERY);
         assert!(wrapped.starts_with("\u{1b}Ptmux;\u{1b}"));
@@ -2096,6 +2449,8 @@ mod tests {
         assert!(probe_query(true).contains("Ptmux"));
         assert!(probe_query(false).starts_with(KITTY_GRAPHICS_QUERY));
         assert!(probe_query(false).contains(DA1_QUERY));
+        assert!(probe_query(false).contains(CELL_SIZE_QUERY));
+        assert!(probe_query(true).contains(CELL_SIZE_QUERY));
     }
 
     #[test]
@@ -2116,7 +2471,8 @@ mod tests {
                 &plain,
                 Probe {
                     kitty: true,
-                    sixel: true
+                    sixel: true,
+                    ..Probe::default()
                 }
             ),
             ImagePresentation::Placeholder
@@ -2169,7 +2525,7 @@ mod tests {
         assert!(kitty_delete(7).contains("a=d"));
         assert!(kitty_delete_all().contains("d=A"));
 
-        let sixel = sixel_transmit(&image, 1, 1);
+        let sixel = sixel_transmit(&image, 1, 1, CellPixels::default());
         assert!(sixel.starts_with("\u{1b}Pq"));
         assert!(sixel.ends_with("\u{1b}\\"));
 
@@ -2177,6 +2533,73 @@ mod tests {
         assert!(iterm.starts_with("\u{1b}]1337;File=inline=1;"));
         assert!(iterm.contains("width=2"));
         assert!(iterm.ends_with('\u{7}'));
+    }
+
+    #[test]
+    fn graphics_rasters_use_cell_pixels_not_cell_counts() {
+        let image = DecodedImage {
+            width: 80,
+            height: 40,
+            rgba: vec![200u8; 80 * 40 * 4],
+        };
+        let cell = CellPixels {
+            width: 10,
+            height: 20,
+        };
+        // 4 columns by 2 rows is 40×40 pixels. The 80×40 source fits as 40×20,
+        // not the old 4×8 cell-count bitmap.
+        assert_eq!(graphics_pixel_size(&image, 4, 2, cell), (40, 20));
+        let kitty = kitty_transmit_with_cell(3, &image, 4, 2, cell);
+        let control = kitty.split(';').next().unwrap();
+        assert!(control.contains("s=40"), "{control}");
+        assert!(control.contains("v=20"), "{control}");
+        assert!(control.contains("c=4"), "{control}");
+        assert!(control.contains("r=2"), "{control}");
+        assert!(!control.contains("s=16"), "{control}");
+        let sixel = sixel_transmit(&image, 4, 2, cell);
+        let tiny = sixel_transmit(
+            &DecodedImage {
+                width: 4,
+                height: 2,
+                rgba: vec![1u8; 4 * 2 * 4],
+            },
+            4,
+            2,
+            CellPixels {
+                width: 1,
+                height: 1,
+            },
+        );
+        assert!(
+            sixel.len() > tiny.len(),
+            "sixel at cell-pixel size should carry more raster than a cell-count bitmap"
+        );
+    }
+
+    #[test]
+    fn resampling_mixes_neighbors_instead_of_copying_one_pixel() {
+        let image = DecodedImage {
+            width: 2,
+            height: 2,
+            rgba: vec![
+                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+            ],
+        };
+        let nearest = nearest_rgba(&image, 1, 1);
+        let mixed = resample_rgba(&image, 1, 1);
+        assert_eq!(&nearest[..3], &[255, 0, 0]);
+        assert_ne!(&mixed[..3], &[255, 0, 0]);
+        let grid = DecodedImage {
+            width: 2,
+            height: 2,
+            rgba: vec![
+                255, 0, 0, 255, 255, 0, 0, 255, 0, 0, 255, 255, 0, 0, 255, 255,
+            ],
+        };
+        let (glyph, fg, bg) = quadrant_cell(&grid, 0, 0);
+        assert_eq!(glyph, '▀');
+        assert_eq!(fg, Color::Rgb { r: 255, g: 0, b: 0 });
+        assert_eq!(bg, Color::Rgb { r: 0, g: 0, b: 255 });
     }
 
     #[test]
@@ -2332,26 +2755,60 @@ mod tests {
         let mut frame = RenderBuffer::new(80, 16, &Style::default());
         editor.render(&mut frame).unwrap();
         let screen = frame_text(&frame);
-        let swatch = frame.cells.iter().find(|cell| cell.text == "▀").unwrap();
+        let swatch = frame
+            .cells
+            .iter()
+            .find(|cell| {
+                matches!(
+                    cell.style.fg.or(cell.style.bg),
+                    Some(crate::color::Color::Rgb { r, g, b }) if r > 150 && g < 80 && b < 80
+                )
+            })
+            .unwrap();
         assert!(
-            matches!(
-                (swatch.style.fg, swatch.style.bg),
-                (
-                    Some(crate::color::Color::Rgb { r, g, b }),
-                    Some(crate::color::Color::Rgb { .. })
-                ) if r > 150 && g < 220 && b < 180
-            ),
-            "half-block color {:?} screen {screen}",
-            swatch.style
+            is_block_glyph(&swatch.text) || swatch.text == " ",
+            "image cell {:?} screen {screen}",
+            swatch.text
         );
-        assert!(screen.contains('▀'), "{screen}");
+        assert!(
+            screen
+                .chars()
+                .any(|glyph| is_block_glyph(&glyph.to_string()))
+                || screen.contains(' '),
+            "{screen}"
+        );
         assert!(!screen.contains("![swatch]"), "{screen}");
 
         editor.cy = 1;
         editor.render(&mut frame).unwrap();
         let screen = frame_text(&frame);
         assert!(screen.contains("![swatch]"), "{screen}");
-        assert!(!screen.contains('▀'), "{screen}");
+        assert!(
+            !screen
+                .chars()
+                .any(|glyph| is_block_glyph(&glyph.to_string())),
+            "{screen}"
+        );
+    }
+
+    fn is_block_glyph(text: &str) -> bool {
+        matches!(
+            text,
+            "▀" | "▄"
+                | "▌"
+                | "▐"
+                | "█"
+                | "▖"
+                | "▗"
+                | "▘"
+                | "▝"
+                | "▚"
+                | "▞"
+                | "▛"
+                | "▜"
+                | "▙"
+                | "▟"
+        )
     }
 
     #[test]
@@ -2561,40 +3018,53 @@ mod tests {
     }
 
     #[test]
-    fn multiplexers_prefer_halfblocks_even_when_kitty_answers() {
+    fn multiplexers_use_kitty_when_the_query_succeeds() {
         let probe = Probe {
             kitty: true,
-            sixel: true,
+            sixel: false,
+            cell_width: 10,
+            cell_height: 22,
         };
         let herdr = hints(&[
             ("HERDR_ENV", "1"),
             ("TERM_PROGRAM", "ghostty"),
             ("GHOSTTY_RESOURCES_DIR", "/usr/share/ghostty"),
         ]);
-        assert!(herdr.herdr);
-        assert!(herdr.ghostty);
-        assert_eq!(detected_graphics(&herdr, probe), None);
+        assert!(herdr.herdr && herdr.ghostty && herdr.query_required());
         assert_eq!(
-            choose_presentation(MarkdownImagesMode::Auto, &herdr, probe),
-            ImagePresentation::Halfblocks
+            detected_graphics(&herdr, probe),
+            Some(GraphicsProtocol::Kitty)
         );
         assert_eq!(
-            choose_presentation(MarkdownImagesMode::Kitty, &herdr, probe),
+            choose_presentation(MarkdownImagesMode::Auto, &herdr, probe),
             ImagePresentation::Graphics(GraphicsProtocol::Kitty)
+        );
+        // A leaked Ghostty variable is not a protocol. Herdr answers the query
+        // itself; until that answer arrives, auto mode stays on half-blocks.
+        assert_eq!(
+            choose_presentation(MarkdownImagesMode::Auto, &herdr, Probe::default()),
+            ImagePresentation::Halfblocks
         );
 
         let zellij = hints(&[("ZELLIJ_SESSION_NAME", "dev"), ("COLORTERM", "truecolor")]);
-        assert!(zellij.zellij);
         assert_eq!(
             choose_presentation(MarkdownImagesMode::Auto, &zellij, probe),
+            ImagePresentation::Graphics(GraphicsProtocol::Kitty)
+        );
+        assert_eq!(
+            choose_presentation(MarkdownImagesMode::Auto, &zellij, Probe::default()),
             ImagePresentation::Halfblocks
         );
-        let named = hints(&[("TERM_PROGRAM", "herdr")]);
-        assert!(named.herdr);
+
+        let screen = hints(&[("STY", "123.pts-0.box"), ("KITTY_WINDOW_ID", "1")]);
+        assert!(screen.screen);
         assert_eq!(
-            choose_presentation(MarkdownImagesMode::Auto, &named, Probe::default()),
-            ImagePresentation::Placeholder
+            choose_presentation(MarkdownImagesMode::Auto, &screen, Probe::default()),
+            ImagePresentation::Halfblocks
         );
+        let (height, width) = parse_cell_pixels(b"\x1b[6;22;10t").unwrap();
+        assert_eq!((height, width), (22, 10));
+        assert!(parse_cell_pixels(b"\x1b[6;0;0t").is_none());
     }
 
     #[test]
@@ -2777,7 +3247,12 @@ mod tests {
         let mut frame = RenderBuffer::new(80, 18, &Style::default());
         editor.render(&mut frame).unwrap();
         let screen = frame_text(&frame);
-        assert!(screen.contains('▀'), "{screen}");
+        assert!(
+            screen
+                .chars()
+                .any(|glyph| is_block_glyph(&glyph.to_string())),
+            "{screen}"
+        );
         assert!(!screen.contains("keymaps"), "{screen}");
 
         editor.keymap_hint_prefix = vec!["g".to_string()];
@@ -2804,7 +3279,12 @@ mod tests {
             ),
             "the keymap popup should count as an overlay"
         );
-        assert!(screen.contains('▀'), "{screen}");
+        assert!(
+            screen
+                .chars()
+                .any(|glyph| is_block_glyph(&glyph.to_string())),
+            "{screen}"
+        );
         for rect in &frame.overlay_rects {
             for y in rect.y..rect.y.saturating_add(rect.height) {
                 for x in rect.x..rect.x.saturating_add(rect.width) {
@@ -2824,7 +3304,12 @@ mod tests {
         editor.render(&mut frame).unwrap();
         let screen = frame_text(&frame);
         assert!(!screen.contains("keymaps"), "{screen}");
-        assert!(screen.contains('▀'), "{screen}");
+        assert!(
+            screen
+                .chars()
+                .any(|glyph| is_block_glyph(&glyph.to_string())),
+            "{screen}"
+        );
     }
 
     fn frame_text(frame: &crate::editor::RenderBuffer) -> String {
