@@ -41,4 +41,4 @@ remaining = ["Completion preview layout in decorated and split views, nested or 
 [[area]]
 name = "Undo and repeat"
 cases = ["append-and-undo", "repeat-count", "repeat-bracketed-paste", "repeat-change", "repeat-checkpoint"]
-remaining = ["Repeat recipes containing snippets or completion edits"]
+remaining = ["Counted completion repeats across documents, and repeats containing multiple accepted completions"]

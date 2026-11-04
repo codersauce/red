@@ -24,7 +24,7 @@ pub(super) fn native_keys() -> &'static crate::config::Keys {
 #[derive(Clone, Copy)]
 pub(super) enum Input<'a> {
     Key(&'a str),
-    Replay(felix_core::ReplayKey<'a>),
+    Replay(felix_core::ReplayStep<'a>),
     Bracketed(&'a str),
     ClipboardPaste(felix_core::Paste),
     ClipboardReplace,
@@ -47,6 +47,17 @@ pub(super) struct FelixHost {
     search: Vec<String>,
     before: Option<Selections>,
     history: HashMap<(BufferId, String), (Selections, Selections)>,
+}
+
+/// Filter keys edit the live document. An accepted item belongs to the original request.
+/// Keep inverse edits in application order so acceptance can restore that exact version.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct FilterSavepoint {
+    pub(super) owner: Owner,
+    text: ropey::Rope,
+    selections: Selections,
+    recipe: usize,
+    inverse: Vec<(usize, usize, String)>,
 }
 
 pub(super) struct CompletionPreview {
@@ -251,21 +262,22 @@ impl Editor {
         }
         let edit = self.completion_main_edit(item, Some(snapshot))?;
         let buffer = self.current_buffer();
-        let mut text = buffer.contents_snapshot();
+        let (mut text, selections) = match snapshot.felix_filter.as_deref() {
+            Some(savepoint) => (savepoint.text.clone(), &savepoint.selections),
+            None => (buffer.contents_snapshot(), self.felix_active_selection()?),
+        };
         let offset = |position: LspPosition| {
             let line = text.get_line(position.line)?;
             let ch = line.try_utf16_cu_to_char(position.character).ok()?;
             (line.char_to_utf16_cu(ch) == position.character
-                && ch <= buffer.line_char_len_without_ending(position.line))
+                && (ch == 0 || !matches!(line.char(ch - 1), '\r' | '\n')))
             .then(|| text.line_to_char(position.line) + ch)
         };
         let (start, end) = (offset(edit.range.start)?, offset(edit.range.end)?);
         if start > end {
             return None;
         }
-        let (ranges, state) = self
-            .felix_active_selection()?
-            .completion_ranges(text.slice(..), start..end);
+        let (ranges, state) = selections.completion_ranges(text.slice(..), start..end);
         let parsed = matches!(item.insert_text_format, Some(InsertTextFormat::Snippet))
             .then(|| snippet::parse_snippet(&edit.new_text));
         let value = parsed
@@ -528,13 +540,18 @@ impl Editor {
                 &self.felix.unnamed,
                 indentation.tab_width,
             ),
-            Input::Replay(step) => self.plan_felix_key(
-                text,
-                &initial,
-                step.key,
-                &self.felix.unnamed,
-                indentation.tab_width,
-            ),
+            Input::Replay(step) => match step.event {
+                felix_core::InsertEvent::Key(key) => self.plan_felix_key(
+                    text,
+                    &initial,
+                    key,
+                    &self.felix.unnamed,
+                    indentation.tab_width,
+                ),
+                felix_core::InsertEvent::Completion(change) => {
+                    self.felix.session.replay_completion(text, &initial, change)
+                }
+            },
             Input::Bracketed(value) => self.felix.session.bracketed_paste(text, &initial, value),
             Input::ClipboardYank { primary } => {
                 let mut plan = self.plan_felix_key(
@@ -600,6 +617,41 @@ impl Editor {
         if let Some(saved) = &plan.save_jump {
             self.felix.jumps.entry(id.1).or_default().save(id.0, saved);
         }
+        let filtering = !removed_placeholders
+            && !plan.edits.is_empty()
+            && matches!(input, Input::Key(key) if key.chars().count() == 1 || key == "<backspace>")
+            && self.current_dialog.as_ref().is_some_and(|d| {
+                d.accepts_completion_updates() && d.selected_completion().is_none()
+            })
+            && self
+                .completion_snapshot
+                .as_ref()
+                .is_some_and(|s| self.completion_snapshot_is_current(s));
+        if filtering {
+            let savepoint = self
+                .completion_snapshot
+                .as_mut()
+                .unwrap()
+                .felix_filter
+                .get_or_insert_with(|| {
+                    std::sync::Arc::new(FilterSavepoint {
+                        owner,
+                        text: rope.clone(),
+                        selections: initial.clone(),
+                        recipe: self.felix.last_insert.checkpoint(),
+                        inverse: Vec::new(),
+                    })
+                });
+            std::sync::Arc::make_mut(savepoint)
+                .inverse
+                .extend(plan.edits.iter().rev().map(|edit| {
+                    (
+                        edit.start,
+                        edit.start + edit.insert.chars().count(),
+                        text.slice(edit.start..edit.end).to_string(),
+                    )
+                }));
+        }
         match input {
             Input::Key(key) => {
                 self.felix
@@ -647,6 +699,9 @@ impl Editor {
             felix_core::Mode::Insert => Mode::Insert,
             _ => Mode::Normal,
         };
+        if plan.next.mode != felix_core::Mode::Insert {
+            self.snippet_session = None;
+        }
         self.felix.session = plan.next;
         if let Some((line, col)) = viewport {
             let pos = self
@@ -763,6 +818,21 @@ impl Editor {
         if plan.host.is_none() || plan.message.is_some() {
             self.set_legacy_message(plan.message);
         }
+        if filtering {
+            let owner = self
+                .felix_owner()
+                .context("missing completion filter destination")?;
+            let cursor = self.cursor_text_position();
+            let snapshot = self
+                .completion_snapshot
+                .as_mut()
+                .expect("filter retains menu");
+            snapshot.cursor = Some(cursor);
+            snapshot.revision = owner.2;
+            // Keep current_range in request coordinates: resolution, preview, and
+            // acceptance all use the original server item after rolling back the filter.
+            std::sync::Arc::make_mut(snapshot.felix_filter.as_mut().unwrap()).owner = owner;
+        }
         if removed_placeholders || !plan.edits.is_empty() {
             self.notify_change(runtime).await?;
         }
@@ -777,20 +847,28 @@ impl Editor {
 impl Editor {
     pub(super) async fn apply_felix_completion(
         &mut self,
-        contents: &str,
+        savepoint: Option<&FilterSavepoint>,
         main: &LspTextEdit,
         additional: &[LspTextEdit],
         format: Option<&InsertTextFormat>,
         commit_character: Option<char>,
         runtime: &mut Runtime,
     ) -> anyhow::Result<bool> {
-        let before = self
-            .felix_active_selection()
-            .expect("active Felix completion")
-            .clone();
-        let buffer = self.current_buffer();
-        let doc = buffer.id();
-        let rope = buffer.contents_snapshot();
+        let (rope, before) = match savepoint {
+            Some(filter) if Some(filter.owner) == self.felix_owner() => {
+                (filter.text.clone(), filter.selections.clone())
+            }
+            Some(_) => return Ok(false),
+            None => (
+                self.current_buffer().contents_snapshot(),
+                self.felix_active_selection()
+                    .expect("active Felix completion")
+                    .clone(),
+            ),
+        };
+        let doc = self.current_buffer().id();
+        let contents = rope.to_string();
+        let contents = contents.as_str();
         let (start, end) = match text_edit_char_range(contents, &main.range) {
             Ok(range) => range,
             Err(err) => {
@@ -815,7 +893,8 @@ impl Editor {
         // Keep projected ranges in original character coordinates. Only edits
         // received from the server require UTF-16 conversion.
         let mut edits: Vec<_> = ranges
-            .into_iter()
+            .iter()
+            .cloned()
             .map(|range| (range, replacement.as_ref(), true))
             .collect();
         for edit in additional {
@@ -834,6 +913,23 @@ impl Editor {
             ));
             return Ok(false);
         }
+        if let Some(filter) = savepoint {
+            for (start, end, value) in filter.inverse.iter().rev() {
+                let buffer = self.current_buffer();
+                let range = TextRange::new(
+                    buffer.char_idx_to_position(*start),
+                    buffer.char_idx_to_position(*end),
+                );
+                self.replace_range(range, value);
+            }
+            self.set_felix_active_selection(before.clone());
+            self.felix.last_insert.restore(filter.recipe);
+        }
+        self.felix.last_insert.record_completion(
+            &ranges,
+            before.primary().cursor(rope.slice(..)),
+            &replacement,
+        );
         self.commit_felix_transaction(doc, &before);
         self.begin_transaction("Helix completion");
         self.felix.before = Some(before);
@@ -1269,21 +1365,44 @@ mod tests {
             },
             new_text: value.into(),
         };
-        let original = editor.current_buffer().contents();
+        let request_selections = editor.felix_active_selection().unwrap().clone();
+        let candidate = serde_json::from_value(json!({"label": "Filled"})).unwrap();
+        assert!(editor.show_completion_items(vec![candidate], editor.completion_snapshot()));
+        let owner = editor.felix_owner().unwrap();
+        editor
+            .execute_felix(Input::Key("i"), owner, &mut frame, &mut runtime)
+            .await
+            .unwrap();
+        let filter = editor
+            .completion_snapshot
+            .as_ref()
+            .unwrap()
+            .felix_filter
+            .clone()
+            .unwrap();
         let state = editor.felix_active_selection().unwrap().clone();
         let owner = editor.felix_owner();
+        let checkpoint = editor.felix.last_insert.checkpoint();
         let primary = edit(1, 0, 1, "Filled");
         let overlap = edit(1, 2, 3, "conflict");
         assert!(!editor
-            .apply_felix_completion(&original, &primary, &[overlap], None, None, &mut runtime)
+            .apply_felix_completion(
+                Some(&filter),
+                &primary,
+                &[overlap],
+                None,
+                None,
+                &mut runtime
+            )
             .await
             .unwrap());
         assert_eq!(editor.felix_owner(), owner);
         assert_eq!(editor.felix_active_selection(), Some(&state));
-        assert_eq!(editor.current_buffer().contents(), original);
+        assert_eq!(editor.current_buffer().contents(), "😀\nFi Fi\n");
+        assert_eq!(editor.felix.last_insert.checkpoint(), checkpoint);
         let extra = edit(0, 0, 2, "λ");
         assert!(editor
-            .apply_felix_completion(&original, &primary, &[extra], None, None, &mut runtime)
+            .apply_felix_completion(Some(&filter), &primary, &[extra], None, None, &mut runtime)
             .await
             .unwrap());
         assert_eq!(editor.current_buffer().contents(), "λ\nFilled Filled\n");
@@ -1294,8 +1413,8 @@ mod tests {
                 .await
                 .unwrap();
         }
-        assert_eq!(editor.current_buffer().contents(), original);
-        assert_eq!(editor.felix_active_selection(), Some(&state));
+        assert_eq!(editor.current_buffer().contents(), "😀\nF F\n");
+        assert_eq!(editor.felix_active_selection(), Some(&request_selections));
     }
 
     #[tokio::test]
@@ -1309,7 +1428,6 @@ mod tests {
                     .await
                     .unwrap();
             }
-            let original = editor.current_buffer().contents();
             let edit = LspTextEdit {
                 range: Range {
                     start: LspPosition {
@@ -1325,7 +1443,7 @@ mod tests {
             };
             assert!(editor
                 .apply_felix_completion(
-                    &original,
+                    None,
                     &edit,
                     &[],
                     Some(&InsertTextFormat::Snippet),

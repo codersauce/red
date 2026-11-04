@@ -1,5 +1,5 @@
 //! Exercise the same pinned reference snapshots without Red's input or edit adapter.
-use felix_core::{History, HostAction, Range, Selections, Session};
+use felix_core::{History, HostAction, InsertEvent, Range, Selections, Session};
 use ropey::Rope;
 use serde_json::{Value, json};
 
@@ -27,10 +27,11 @@ fn reference_sequences() {
             let key = event["key"].as_str().unwrap();
             let recipe = last_insert.clone();
             let mut replay = recipe.replay(0);
-            let mut physical = Some(key);
+            let mut physical = Some(InsertEvent::Key(key.to_owned()));
             loop {
                 let step = replay.next();
-                let Some(token) = step.map(|step| step.key).or_else(|| physical.take()) else {
+                let physical_event = physical.take();
+                let Some(input) = step.map(|step| step.event).or(physical_event.as_ref()) else {
                     break;
                 };
                 // A fixed-cell layout for the explicitly ASCII, unindented wrap fixture.
@@ -58,10 +59,9 @@ fn reference_sequences() {
                         .map_or(text.len_chars(), |next| next - 1);
                     ((rows[destination] + goal).min(end), goal)
                 };
-                let mut plan = if let Some(value) = event["paste"].as_str() {
-                    session.bracketed_paste(text.slice(..), &sel, value)
-                } else {
-                    session.plan(
+                let mut plan = match (input, event["paste"].as_str()) {
+                    (_, Some(value)) => session.bracketed_paste(text.slice(..), &sel, value),
+                    (InsertEvent::Key(token), None) => session.plan(
                         text.slice(..),
                         &sel,
                         token,
@@ -73,12 +73,15 @@ fn reference_sequences() {
                             indent: &indent,
                             ..Default::default()
                         },
-                    )
+                    ),
+                    (InsertEvent::Completion(change), None) => {
+                        session.replay_completion(text.slice(..), &sel, change)
+                    }
                 };
                 if let Some(step) = step {
                     plan.history = step.history(plan.history);
                 } else if event.get("paste").is_none() {
-                    last_insert.record(token, session.mode, plan.next.mode);
+                    last_insert.record(key, session.mode, plan.next.mode);
                 }
                 viewport_start = plan
                     .viewport_start

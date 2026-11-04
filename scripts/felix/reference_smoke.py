@@ -86,7 +86,7 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
 
     checkpoints = []
 
-    def observe(label, line, mode, sels="1/2 sels", name=None, copies=1, menu=None):
+    def observe(label, line, mode, sels="1/2 sels", name=None, copies=1, menu=None, cursor=None):
         name = name or fixture.name
         # Reading the tmux screen sends no input to the editor.
         deadline = time.monotonic() + (30 if label == "open" else 5)
@@ -103,6 +103,8 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
             else:
                 matches = (expected_line in rows and status[:2] == [mode, f"~/{name}"]
                            and status[-3:-1] == sels.split())
+            if cursor is not None and not red:
+                matches &= bool(status) and status[-1] == cursor and not rows[-1].startswith("select:")
             if copies > 1:
                 matches &= sum(row.strip() == (f"1 {line}" if red else f"1  {line}") for row in rows) == copies
             if menu is not None:
@@ -150,10 +152,10 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
             observe("change two selections", "", "INS")
             tmux("send-keys", "C-x")
             observe("completion before Ctrl-C", "", "INS", menu=True)
-            tmux("send-keys", "C-c")
-            observe("dismiss with Ctrl-C", "", "INS", menu=False)
             tmux("send-keys", "F")
-            observe("type after dismissal", "F F", "INS", menu=False)
+            observe("filter before dismissal", "F F", "INS", menu=True)
+            tmux("send-keys", "C-c")
+            observe("dismiss with Ctrl-C and keep filter", "F F", "INS", menu=False)
             observe_server("F F\n")
             tmux("send-keys", "C-x")
             observe("unselected menu", "F F", "INS", menu=True)
@@ -200,7 +202,14 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
             observe("undo next prefix", "foo foo", "NOR")
             tmux("send-keys", "c", "F", "C-x")
             observe("request completion at two selections", "F F", "INS", menu=True)
-            tmux("send-keys", "C-n", "Enter")
+            tmux("send-keys", "e", "l")
+            observe("extend filter at both cursors", "Fel Fel", "INS", menu=True)
+            tmux("send-keys", "BSpace")
+            observe("filter at both cursors", "Fe Fe", "INS", menu=True)
+            observe_server("Fe Fe\n")
+            tmux("send-keys", "C-n")
+            observe("preview after filter", "FelixCandidate FelixCandidate", "INS", menu=True)
+            tmux("send-keys", "Enter")
             observe("accept at both selections", "FelixCandidate FelixCandidate", "INS", menu=False)
             observe_server("FelixCandidate FelixCandidate\n")
             tmux("send-keys", "!", "Escape")
@@ -209,7 +218,17 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
             observe("undo completion and typing", "F F", "NOR")
             tmux("send-keys", "u")
             observe("undo initial change", "foo foo", "NOR")
-            observe_server("foo foo\n")
+            requests = observe_server("foo foo\n")["completion_requests"]
+            tmux("send-keys", ".")
+            observe("repeat completion", "FelixCandidate! F!", "NOR", menu=False)
+            if observe_server("FelixCandidate! F!\n")["completion_requests"] != requests:
+                raise RuntimeError("dot requested a new completion")
+            tmux("send-keys", "u")
+            observe("undo completion repeat", "foo foo", "NOR")
+            tmux("send-keys", "U")
+            observe("redo completion repeat", "FelixCandidate! F!", "NOR")
+            tmux("send-keys", "u")
+            observe("restore before completion repeat", "foo foo", "NOR")
             tmux("send-keys", "c", "S", "C-x")
             observe("request snippet", "S S", "INS", menu=True)
             tmux("send-keys", "C-n", "Enter")
@@ -227,7 +246,17 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
             observe("undo snippet edits", "S S", "NOR")
             tmux("send-keys", "u")
             observe("undo snippet prefix", "foo foo", "NOR")
-            observe_server("foo foo\n")
+            requests = observe_server("foo foo\n")["completion_requests"]
+            tmux("send-keys", ".")
+            observe("repeat snippet", "one=twoX SXY", "NOR", menu=False)
+            if observe_server("one=twoX SXY\nY")["completion_requests"] != requests:
+                raise RuntimeError("dot requested a new completion")
+            tmux("send-keys", "u")
+            observe("undo snippet repeat", "foo foo", "NOR")
+            tmux("send-keys", "U")
+            observe("redo snippet repeat", "one=twoX SXY", "NOR")
+            tmux("send-keys", "u")
+            observe("restore before snippet repeat", "foo foo", "NOR")
             return checkpoints
         if scenario == "paging":
             observe_page(1)
@@ -255,7 +284,7 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
         observe("open", "foo foo", "NOR", "1 sel")
         tmux("send-keys", "-l", "%sfoo")
         tmux("send-keys", "Enter")
-        observe("select matches", "foo foo", "NOR")
+        observe("select matches", "foo foo", "NOR", cursor="1:3")
         tmux("send-keys", "c")
         observe("change", "", "INS")
         for prefix in ("b", "ba", "bar"):
@@ -341,7 +370,11 @@ def main():
                     for actual, expected in zip(observed, checkpoints, strict=True):
                         # The transient message row can vary between renders.
                         if actual["frame"][:-1] != expected["frame"][:-1]:
-                            raise ValueError(f"{name}: release frame mismatch at {expected['step']}")
+                            raise ValueError(
+                                f"{name}: release frame mismatch at {expected['step']}\n"
+                                + "release:\n" + "\n".join(expected["frame"])
+                                + "\nobserver:\n" + "\n".join(actual["frame"])
+                            )
                 records = [json.loads(line) for line in trace.read_text().splitlines()]
                 verify_records(records)
     print(json.dumps({"release": VERSION, "commit": COMMIT, "archive_sha256": digest,

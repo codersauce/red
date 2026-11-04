@@ -4897,6 +4897,8 @@ fn changed_char_range(before: &str, after: &str) -> Option<(usize, usize)> {
 
 #[derive(Debug, Clone, PartialEq)]
 struct CompletionSnapshot {
+    #[cfg(feature = "helix")]
+    felix_filter: Option<std::sync::Arc<felix::FilterSavepoint>>,
     buffer_id: BufferId,
     initial_revision: u64,
     revision: u64,
@@ -4917,6 +4919,8 @@ struct PendingCompletion {
 impl From<PendingLspEdit> for CompletionSnapshot {
     fn from(pending: PendingLspEdit) -> Self {
         Self {
+            #[cfg(feature = "helix")]
+            felix_filter: None,
             buffer_id: pending.buffer_id,
             initial_revision: pending.revision,
             revision: pending.revision,
@@ -16185,6 +16189,14 @@ impl Editor {
     }
 
     fn completion_snapshot_is_current(&self, snapshot: &CompletionSnapshot) -> bool {
+        #[cfg(feature = "helix")]
+        if snapshot
+            .felix_filter
+            .as_ref()
+            .is_some_and(|savepoint| Some(savepoint.owner) != self.felix_owner())
+        {
+            return false;
+        }
         let buffer = self.current_buffer();
         buffer.id() == snapshot.buffer_id
             && buffer.revision() == snapshot.revision
@@ -32597,6 +32609,8 @@ impl Editor {
 
     fn completion_snapshot(&self) -> CompletionSnapshot {
         CompletionSnapshot {
+            #[cfg(feature = "helix")]
+            felix_filter: None,
             buffer_id: self.current_buffer().id(),
             initial_revision: self.current_buffer().revision(),
             revision: self.current_buffer().revision(),
@@ -32872,7 +32886,6 @@ impl Editor {
             return Ok(());
         }
 
-        let contents = self.current_buffer().contents();
         let Some(main_text_edit) = self.completion_main_edit(item, snapshot.as_ref()) else {
             self.set_legacy_message(Some(
                 "completion edit could not be rebased after typing".to_string(),
@@ -32891,7 +32904,7 @@ impl Editor {
         }
         if !self
             .apply_completion_edits(
-                &contents,
+                snapshot.as_ref(),
                 &main_text_edit,
                 &additional_text_edits,
                 item,
@@ -32924,7 +32937,7 @@ impl Editor {
 
     async fn apply_completion_edits(
         &mut self,
-        contents: &str,
+        _snapshot: Option<&CompletionSnapshot>,
         main_text_edit: &LspTextEdit,
         additional_text_edits: &[LspTextEdit],
         item: &CompletionResponseItem,
@@ -32938,7 +32951,7 @@ impl Editor {
         {
             return self
                 .apply_felix_completion(
-                    contents,
+                    _snapshot.and_then(|s| s.felix_filter.as_deref()),
                     main_text_edit,
                     additional_text_edits,
                     item.insert_text_format.as_ref(),
@@ -32948,6 +32961,8 @@ impl Editor {
                 .await;
         }
 
+        let contents = self.current_buffer().contents();
+        let contents = contents.as_str();
         let validation_edits = std::iter::once(main_text_edit)
             .chain(additional_text_edits.iter())
             .cloned()
@@ -34477,6 +34492,10 @@ fn rebase_completion_edit(
     snapshot: Option<&CompletionSnapshot>,
     is_main: bool,
 ) -> Option<LspTextEdit> {
+    #[cfg(feature = "helix")]
+    if snapshot.is_some_and(|s| s.felix_filter.is_some()) {
+        return Some(edit.clone());
+    }
     let Some(snapshot) = snapshot.filter(|s| s.initial_revision != s.revision) else {
         return Some(edit.clone());
     };

@@ -34,6 +34,29 @@ impl Range {
         }
     }
 
+    fn map_edit(self, start: usize, end: usize, inserted: usize) -> Self {
+        let map = |pos, after| {
+            if pos < start {
+                return pos;
+            }
+            if pos >= end && (pos != start || after) {
+                return pos - (end - start) + inserted;
+            }
+            if pos == start || !after {
+                return start;
+            }
+            if inserted == end - start {
+                pos
+            } else {
+                start + inserted
+            }
+        };
+        Self {
+            anchor: map(self.anchor, self.anchor <= self.head),
+            head: map(self.head, self.head <= self.anchor),
+        }
+    }
+
     pub(crate) fn lines(self, text: RopeSlice<'_>) -> (usize, usize) {
         (
             text.char_to_line(self.start()),
@@ -225,7 +248,7 @@ pub use jumps::Jumps;
 mod repeat;
 mod search;
 pub use command::{Context, Edit, History, HostAction, Mode, Paste, Plan, Session};
-pub use repeat::{LastInsert, ReplayKey};
+pub use repeat::{CompletionChange, InsertEvent, LastInsert, ReplayStep};
 
 impl Selections {
     /// Project the primary completion replacement onto each cursor. Cursors
@@ -282,27 +305,8 @@ impl Selections {
     ) -> Self {
         let mut ranges = self.ranges.clone();
         for (start, end, inserted) in edits {
-            let map = |pos, after| {
-                if pos < start {
-                    return pos;
-                }
-                if pos >= end && (pos != start || after) {
-                    return pos - (end - start) + inserted;
-                }
-                if pos == start || !after {
-                    return start;
-                }
-                if inserted == end - start {
-                    pos
-                } else {
-                    start + inserted
-                }
-            };
-            for r in &mut ranges {
-                *r = Range {
-                    anchor: map(r.anchor, r.anchor <= r.head),
-                    head: map(r.head, r.head <= r.anchor),
-                };
+            for range in &mut ranges {
+                *range = range.map_edit(start, end, inserted);
             }
         }
         Self::new(text, ranges, self.primary).expect("rebasing retains a selection")

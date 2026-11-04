@@ -27,6 +27,8 @@ def main():
     parser.add_argument("--completion", action="store_true", help="serve deterministic completion items")
     args = parser.parse_args()
     state = dict(opened=False, notifications=0, full=0, incremental=0, text_bytes=0)
+    if args.completion:
+        state["completion_requests"] = 0
     document = ""
     version = 0
 
@@ -61,6 +63,8 @@ def main():
                     capabilities["completionProvider"] = {"resolveProvider": True}
                 reply(message, {"capabilities": capabilities})
             elif method == "textDocument/completion" and args.completion:
+                state["completion_requests"] += 1
+                save()
                 cursor = offset(document, params["position"])
                 item = {"label": "FelixCandidate", "kind": 6}
                 if document[:cursor].endswith("S"):

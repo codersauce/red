@@ -495,6 +495,28 @@ impl Session {
         }
     }
 
+    pub fn replay_completion(
+        &self,
+        text: RopeSlice<'_>,
+        selections: &Selections,
+        change: &crate::CompletionChange,
+    ) -> Plan {
+        let mut plan = self.unchanged(selections);
+        let cursor = selections.primary().cursor(text);
+        if let Some(range) = change.destination(cursor, text.len_chars()) {
+            let size = change.text.chars().count();
+            for selection in &mut plan.ranges {
+                *selection = selection.map_edit(range.start, range.end, size);
+            }
+            plan.edits.push(Edit {
+                start: range.start,
+                end: range.end,
+                insert: change.text.clone(),
+            });
+        }
+        plan
+    }
+
     pub fn bracketed_paste(
         &self,
         text: RopeSlice<'_>,

@@ -192,7 +192,10 @@ impl Editor {
             return Ok(false);
         }
 
-        if snapshot.initial_revision != snapshot.revision {
+        let needs_refresh = snapshot.initial_revision != snapshot.revision;
+        #[cfg(feature = "helix")]
+        let needs_refresh = needs_refresh && snapshot.felix_filter.is_none();
+        if needs_refresh {
             let position = self.cursor_lsp_position();
             if let Some(uri) = snapshot.uri.as_deref() {
                 let params = serde_json::json!({
@@ -583,6 +586,8 @@ mod tests {
         editor.cx = 4;
         let revision = editor.current_buffer().revision();
         let snapshot = CompletionSnapshot {
+            #[cfg(feature = "helix")]
+            felix_filter: None,
             buffer_id: editor.current_buffer().id(),
             initial_revision: revision.wrapping_sub(1),
             revision,
