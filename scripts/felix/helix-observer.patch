@@ -1,5 +1,5 @@
 diff --git a/helix-term/src/application.rs b/helix-term/src/application.rs
-index cf09aac..e7ebe45 100644
+index cf09aac..c0ae41f 100644
 --- a/helix-term/src/application.rs
 +++ b/helix-term/src/application.rs
 @@ -642,7 +642,11 @@ pub async fn handle_terminal_events(&mut self, event: std::io::Result<CrosstermE
@@ -15,7 +15,7 @@ index cf09aac..e7ebe45 100644
              CrosstermEvent::Resize(width, height) => {
                  self.terminal
                      .resize(Rect::new(0, 0, width, height))
-@@ -663,6 +667,29 @@ pub async fn handle_terminal_events(&mut self, event: std::io::Result<CrosstermE
+@@ -663,6 +667,30 @@ pub async fn handle_terminal_events(&mut self, event: std::io::Result<CrosstermE
              event => self.compositor.handle_event(&event.into(), &mut cx),
          };
  
@@ -37,6 +37,7 @@ index cf09aac..e7ebe45 100644
 +                "pending": ui.keymaps.pending().iter().map(ToString::to_string).collect::<Vec<_>>(),
 +                "count": self.editor.count, "last_insert": format!("{:?}", ui.last_insert),
 +                "revision": doc.version(), "document": doc.display_name(),
++                "viewport": {"anchor": doc.view_offset(view.id).anchor, "height": view.inner_height()},
 +                "history_revision": self.editor.document_mut(view.doc).unwrap().get_current_revision()
 +            });
 +            writeln!(output, "{record}").expect("write reference trace");

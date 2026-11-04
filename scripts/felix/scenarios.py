@@ -37,6 +37,11 @@ def scenarios(seed, steps):
     yield "auto-pairs", "abc \n", list("A(x)") + ["<esc>", "u", "U"]
     yield "whole-line-change", "one\ntwo\n", list("xcX") + ["<esc>", "u", "%", "c", "Y", "<esc>", "u"]
     yield "paragraph-and-copies", "abc\ndef\n\nnext\n", list("lC") + ["<a-C>", ","] + list("mipmap")
+    yield "page-movement", "abc\n" * 90, ["l", "<pagedown>", "2", "<c-f>", "<c-b>", "<c-d>", "v", "<c-u>", "<esc>", "<pageup>"]
+    yield "wrapped-motion", "abcdefghijklmnopqrstuvwxyz" * 3 + "\nabc\n" + "ABCDEF" * 12 + "\n", list("4ljjkkvj") + ["<esc>"] + list("gjgkk")
+    yield "page-through-eof", "abc\n" * 40, ["<c-f>", "<c-f>", "<c-f>", "<c-b>", "<c-b>"]
+    yield "page-edges", "a\nbc\ndef", ["<c-f>", "<c-f>", "<c-u>", "<pageup>", "i", "<pagedown>", "<pageup>", "<esc>"]
+    yield "page-multiple", "abcdef\n" * 75, ["l", "C", "<c-d>", "<c-f>", "<c-u>", "<pageup>"]
     # Every seed includes a reproducible mix of direction changes and pending prefixes.
     rng = random.Random(seed)
     commands = ["w", "B", "E", "e", "h", "l", "v", "%", ";", "3W", "2b", "gg", "ge", "gh", "gl", "gs", "<esc>", "<a-;>"]
@@ -52,6 +57,14 @@ def capture(observer, runtime, root, name, text, keys):
     path = root / "example.txt"
     path.write_bytes(text.encode())
     trace = root / "trace.jsonl"
+    wrap_width = 20 if name == "wrapped-motion" else None
+    if wrap_width:
+        config = root / "config" / "helix"
+        config.mkdir(parents=True)
+        (config / "config.toml").write_text(
+            f"[editor]\ntext-width = {wrap_width}\n[editor.soft-wrap]\nenable = true\n"
+            'wrap-at-text-width = true\nwrap-indicator = ""\nmax-indent-retain = 0\nmax-wrap = 0\n'
+        )
     env = {"PATH": os.environ["PATH"], "HOME": str(root), "SHELL": "/bin/sh",
            "LANG": "en_US.UTF-8", "HELIX_RUNTIME": str(runtime),
            "FELIX_REFERENCE_TRACE": str(trace), "XDG_CONFIG_HOME": str(root/"config")}
@@ -68,7 +81,7 @@ def capture(observer, runtime, root, name, text, keys):
         events = []
         trace_offset = 0
         for index, key in enumerate(keys):
-            named = {"<esc>": "Escape", "<enter>": "Enter", "<tab>": "Tab", "<a-;>": "M-;", "<a-,>": "M-,"}
+            named = {"<pageup>": "PageUp", "<pagedown>": "PageDown", "<esc>": "Escape", "<enter>": "Enter", "<tab>": "Tab", "<a-;>": "M-;", "<a-,>": "M-,"}
             if key.startswith("<a-"):
                 raw = b"\x1b" + key[3:-1].encode()
                 tmux("send-keys","-t","h","-H",*[format(byte,"02x") for byte in raw])
@@ -94,14 +107,19 @@ def capture(observer, runtime, root, name, text, keys):
                 time.sleep(.01)
             record = json.loads(line)
             raw_event = record["event"]
-            special = {"<esc>": "Esc", "<enter>": "Enter", "<tab>": "Tab", "<a-;>": "Char(';')", "<a-,>": "Char(',')"}
+            special = {"<pageup>": "PageUp", "<pagedown>": "PageDown", "<esc>": "Esc", "<enter>": "Enter", "<tab>": "Tab", "<a-;>": "Char(';')", "<a-,>": "Char(',')"}
             ch = key[3:-1] if key.startswith(("<a-", "<c-")) else key
             code = special.get(key, f"Char('{ch}')")
             if f"code: {code}," not in raw_event or ("ALT" in raw_event) != key.startswith("<a-") or ("CONTROL" in raw_event) != key.startswith("<c-"):
                 raise ValueError(f"{name}: input {index+1} expected {key}, observed {raw_event}")
             events.append({"key": key, **{k: record[k] for k in
                 ("mode", "text", "ranges", "primary", "unnamed", "search", "pending", "count", "document")}})
-        return {"name": name, "text": text, "events": events}
+            if name.startswith("page-"):
+                events[-1]["viewport"] = record["viewport"]
+        case = {"name": name, "text": text, "events": events}
+        if wrap_width:
+            case["wrap_width"] = wrap_width
+        return case
     finally:
         tmux("kill-server", check=False)
 
@@ -111,7 +129,8 @@ def dump_suite(commit, seed, cases):
     encode = lambda value: json.dumps(value, ensure_ascii=False)
     print('{"commit": ' + encode(commit) + ', "seed": ' + str(seed) + ', "cases": [')
     for index, case in enumerate(cases):
-        print('  {"name": ' + encode(case["name"]) + ', "text": ' + encode(case["text"]) + ', "events": [')
+        header = {key: value for key, value in case.items() if key != "events"}
+        print("  " + encode(header)[:-1] + ', "events": [')
         print(",\n".join("    " + encode(event) for event in case["events"]))
         print("  ]}" + ("," if index + 1 < len(cases) else ""))
     print("]}")

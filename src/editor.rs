@@ -9248,6 +9248,29 @@ impl Editor {
         width: usize,
         clamp_at_boundary: bool,
     ) -> Option<ScreenLineTarget> {
+        let goal = match self.cursor_goal {
+            CursorGoal::ScreenCol { screen_col, .. } => Some(screen_col),
+            _ => None,
+        };
+        self.screen_line_target(
+            line_index,
+            display_col,
+            delta,
+            width,
+            goal,
+            clamp_at_boundary,
+        )
+    }
+
+    fn screen_line_target(
+        &self,
+        line_index: usize,
+        display_col: usize,
+        delta: isize,
+        width: usize,
+        goal: Option<usize>,
+        clamp_at_boundary: bool,
+    ) -> Option<ScreenLineTarget> {
         let segments = self.navigable_line_segments(line_index, width);
         let current_index = segments
             .iter()
@@ -9256,18 +9279,13 @@ impl Editor {
         let current = &segments[current_index];
         // Preserve the screen column across rows: with break-indent the same
         // screen x maps to different line columns on different rows.
-        let screen_col = match self.cursor_goal {
-            CursorGoal::ScreenCol { screen_col, .. } => screen_col,
-            _ => current.screen_col_for_display_col(display_col, width),
-        };
+        let screen_col =
+            goal.unwrap_or_else(|| current.screen_col_for_display_col(display_col, width));
         let unchanged = ScreenLineTarget {
             line: line_index,
             display_col,
             screen_col,
         };
-        if delta == 0 {
-            return Some(unchanged);
-        }
         let target_position = |target: &self::display_layout::LineSegment| {
             let mapped = target.display_col_for_screen_col(screen_col);
             let display_col = if target.projection.is_some() {
@@ -9278,6 +9296,14 @@ impl Editor {
                 } else {
                     target.last_visible_source_col()
                 };
+                #[cfg(feature = "helix")]
+                let limit = if self.config.editing_model == crate::config::EditingModel::Helix
+                    && target.last_segment
+                {
+                    target.end_col
+                } else {
+                    limit
+                };
                 mapped.min(limit)
             };
             ScreenLineTarget {
@@ -9286,6 +9312,10 @@ impl Editor {
                 screen_col,
             }
         };
+
+        if delta == 0 {
+            return Some(target_position(current));
+        }
 
         if delta > 0 {
             let mut remaining = delta as usize;
@@ -9775,6 +9805,14 @@ impl Editor {
             last_line
         } else {
             last_line.saturating_sub(viewport_height.saturating_sub(1))
+        };
+
+        // A Helix page may leave the final line above the bottom of the viewport.
+        #[cfg(feature = "helix")]
+        let max_vtop = if self.config.editing_model == crate::config::EditingModel::Helix {
+            last_line
+        } else {
+            max_vtop
         };
 
         let buffer_line = (self.vtop + self.cy).min(last_line);

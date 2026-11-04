@@ -47,6 +47,16 @@ pub(super) struct FelixHost {
     history: HashMap<(BufferId, String), (Selections, Selections)>,
 }
 
+fn felix_display_col(
+    text: ropey::RopeSlice<'_>,
+    offset: usize,
+    tab_width: usize,
+) -> (usize, usize) {
+    let line = text.char_to_line(offset);
+    let prefix: std::borrow::Cow<'_, str> = text.slice(text.line_to_char(line)..offset).into();
+    (line, display_width_with_tabs(&prefix, tab_width))
+}
+
 impl Editor {
     pub(super) fn felix_active_selection(&self) -> Option<&Selections> {
         let (doc, view, _, _) = self.felix_owner()?;
@@ -293,6 +303,55 @@ impl Editor {
         self.move_to_insert_text_position(pos);
     }
 
+    fn plan_felix_key(
+        &self,
+        text: ropey::RopeSlice<'_>,
+        initial: &Selections,
+        key: &str,
+        register: &[String],
+        tab_width: usize,
+    ) -> felix_core::Plan {
+        let viewport_line = self.vtop.min(text.len_lines() - 1);
+        let display_offset = |line, col| {
+            if col == 0 {
+                return text.line_to_char(line);
+            }
+            let source = text.line(line);
+            let source = std::borrow::Cow::from(source);
+            let grapheme = column_to_grapheme_with_tabs(trim_line_ending(&source), col, tab_width);
+            text.line_to_char(line) + self.grapheme_to_char_on_line(grapheme, line)
+        };
+        let visual_motion = |offset, delta, goal| {
+            let (line, col) = felix_display_col(text, offset, tab_width);
+            self.screen_line_target(
+                line,
+                col,
+                delta,
+                self.active_content_width().max(1),
+                goal,
+                true,
+            )
+            .map(|target| {
+                (
+                    display_offset(target.line, target.display_col),
+                    target.screen_col,
+                )
+            })
+            .unwrap_or((offset, goal.unwrap_or(col)))
+        };
+        let context = felix_core::Context {
+            search: self.felix.search.last().map(String::as_str),
+            register,
+            tab_width,
+            indent: &self.felix.indent[&self.current_buffer().id()],
+            page_height: self.vheight(),
+            viewport_start: display_offset(viewport_line, self.skipcol),
+            scrolloff: self.config.scrolloff.unwrap_or(5),
+            visual_motion: self.wrap.then_some(&visual_motion),
+        };
+        self.felix.session.plan(text, initial, key, &context)
+    }
+
     pub(super) async fn execute_felix(
         &mut self,
         input: Input<'_>,
@@ -318,20 +377,18 @@ impl Editor {
             )
         });
         let indentation = self.indentation_for_buffer_index(self.buffer_manager.active_index());
-        let page_height = self.vheight();
-        let indent = self.felix.indent.entry(id.0).or_insert_with(|| {
+        self.felix.indent.entry(id.0).or_insert_with(|| {
             felix_core::detect_indent(text)
                 .unwrap_or_else(|| indentation.whitespace_for_columns(indentation.shift_width))
         });
-        let context = felix_core::Context {
-            search: self.felix.search.last().map(String::as_str),
-            register: &self.felix.unnamed,
-            tab_width: indentation.tab_width,
-            indent,
-            page_height,
-        };
         let plan = match input {
-            Input::Key(key) => self.felix.session.plan(text, &initial, key, &context),
+            Input::Key(key) => self.plan_felix_key(
+                text,
+                &initial,
+                key,
+                &self.felix.unnamed,
+                indentation.tab_width,
+            ),
             Input::Bracketed(value) => self.felix.session.paste(
                 text,
                 &initial,
@@ -343,7 +400,13 @@ impl Editor {
                 },
             ),
             Input::ClipboardYank { primary } => {
-                let mut plan = self.felix.session.plan(text, &initial, "y", &context);
+                let mut plan = self.plan_felix_key(
+                    text,
+                    &initial,
+                    "y",
+                    &self.felix.unnamed,
+                    indentation.tab_width,
+                );
                 let values = if primary {
                     vec![text
                         .slice(initial.primary().start()..initial.primary().end())
@@ -386,18 +449,13 @@ impl Editor {
                 if let Input::ClipboardPaste(placement) = input {
                     self.felix.session.paste(text, &initial, values, placement)
                 } else {
-                    self.felix.session.plan(
-                        text,
-                        &initial,
-                        "R",
-                        &felix_core::Context {
-                            register: values,
-                            ..context
-                        },
-                    )
+                    self.plan_felix_key(text, &initial, "R", values, indentation.tab_width)
                 }
             }
         };
+        let viewport = plan
+            .viewport_start
+            .map(|offset| felix_display_col(text, offset, indentation.tab_width));
         if !plan.edits.is_empty() && self.current_buffer().directory.is_some() {
             self.set_legacy_message(Some("Directory buffers are read-only".into()));
             return self.render(frame);
@@ -452,7 +510,17 @@ impl Editor {
             _ => Mode::Normal,
         };
         self.felix.session = plan.next;
-        self.place_felix_cursor(&selections);
+        if let Some((line, col)) = viewport {
+            let pos = self
+                .current_buffer()
+                .char_idx_to_position(selections.primary().cursor(after.slice(..)));
+            self.vtop = line.min(pos.line);
+            self.skipcol = if self.wrap { col } else { 0 };
+            self.cy = pos.line - self.vtop;
+            self.cx = self.char_to_grapheme_on_line(pos.character, pos.line);
+        } else {
+            self.place_felix_cursor(&selections);
+        }
         if matches!(
             plan.history,
             History::Atomic | History::Commit | History::Checkpoint
@@ -694,8 +762,7 @@ mod tests {
 
     fn fixture_editor(text: &str) -> (Editor, RenderBuffer, Runtime) {
         let mut config =
-            Config::from_toml_with_overrides(crate::assets::DEFAULT_CONFIG, &[]).unwrap();
-        config.editing_model = crate::config::EditingModel::Helix;
+            Config::from_user_toml_with_overrides("editing_model = 'helix'", &[]).unwrap();
         config.lsp.enabled = false;
         let lsp = Box::new(crate::LspManager::new(config.lsp.clone()));
         let buffers = vec![
@@ -985,7 +1052,7 @@ mod tests {
             "../../scripts/felix/fixtures/change-two-matches.json"
         ))
         .unwrap();
-        replay("change-two-matches", "foo foo\n", &fixture).await;
+        replay("change-two-matches", "foo foo\n", &fixture, None).await;
     }
 
     #[tokio::test]
@@ -1003,14 +1070,21 @@ mod tests {
                 case["name"].as_str().unwrap(),
                 case["text"].as_str().unwrap(),
                 case["events"].as_array().unwrap(),
+                case["wrap_width"].as_u64().map(|width| width as usize),
             )
             .await;
         }
     }
 
-    async fn replay(name: &str, text: &str, fixture: &[Value]) {
+    async fn replay(name: &str, text: &str, fixture: &[Value], wrap_width: Option<usize>) {
         assert!(!fixture.is_empty());
         let (mut editor, mut frame, mut runtime) = fixture_editor(text);
+        if let Some(width) = wrap_width {
+            editor.wrap = true;
+            let chrome = usize::from(editor.size.0) - editor.active_content_width();
+            editor.test_set_size((width + chrome) as u16, editor.size.1);
+            assert_eq!(editor.active_content_width(), width);
+        }
         for (index, expected) in fixture.iter().enumerate() {
             let token = expected["key"].as_str().unwrap();
             let mut modifiers = KeyModifiers::NONE;
@@ -1023,6 +1097,8 @@ mod tests {
                     };
                     KeyCode::Char(token.chars().nth(3).unwrap())
                 }
+                "<pageup>" => KeyCode::PageUp,
+                "<pagedown>" => KeyCode::PageDown,
                 "<esc>" => KeyCode::Esc,
                 "<enter>" => KeyCode::Enter,
                 "<tab>" => KeyCode::Tab,
@@ -1045,6 +1121,9 @@ mod tests {
                 "search":(!editor.felix.search.is_empty()).then(|| editor.felix.search.iter().rev().collect::<Vec<_>>()),
                 "unnamed":(!editor.felix.unnamed.is_empty()).then_some(&editor.felix.unnamed),
                 "pending":editor.felix.session.pending_keys()});
+            if expected.get("viewport").is_some() {
+                actual["viewport"] = json!({"height":editor.vheight(),"anchor":editor.current_buffer().contents_snapshot().line_to_char(editor.vtop)});
+            }
             if expected.get("count").is_some() {
                 actual["count"] = json!(editor.felix.session.count());
             }

@@ -1856,6 +1856,20 @@ impl Config {
         overrides: &[String],
     ) -> anyhow::Result<LoadedConfig> {
         let mut base_value = embedded_config_value()?;
+        // Resolve model-specific viewport defaults after the user and CLI layers.
+        // Leaving the options absent here preserves explicit false and zero.
+        #[cfg(feature = "helix")]
+        let vim_viewport = {
+            let base = base_value
+                .as_table_mut()
+                .expect("bundled config is a table");
+            (
+                base.remove("wrap").and_then(|v| v.as_bool()),
+                base.remove("scrolloff")
+                    .and_then(|v| v.as_integer())
+                    .and_then(|v| usize::try_from(v).ok()),
+            )
+        };
         let source = ConfigDiagnosticSource::UserFile(path.to_path_buf());
         let mut diagnostics = Vec::new();
         let mut disabled_plugins = HashSet::new();
@@ -1961,6 +1975,15 @@ impl Config {
             ));
         }
         apply_strict_overrides(&mut config, overrides)?;
+        #[cfg(feature = "helix")]
+        {
+            let (wrap, scrolloff) = match config.editing_model {
+                EditingModel::Helix => (Some(false), Some(5)),
+                EditingModel::Vim => vim_viewport,
+            };
+            config.wrap = config.wrap.or(wrap);
+            config.scrolloff = config.scrolloff.or(scrolloff);
+        }
         config.apply_disabled_plugins();
 
         Ok(LoadedConfig {
@@ -3916,6 +3939,37 @@ buffer_picker = "buffer_picker.hk"
             config.plugins.get("lsp_symbols").map(String::as_str),
             Some("/tmp/lsp_symbols.hk")
         );
+    }
+
+    #[cfg(feature = "helix")]
+    #[test]
+    fn helix_viewport_defaults_follow_the_model_and_respect_explicit_settings() {
+        for (user, overrides, expected) in [
+            ("", vec![], (Some(true), Some(3))),
+            (
+                "",
+                vec!["editing_model=helix".into()],
+                (Some(false), Some(5)),
+            ),
+            (
+                "editing_model = 'helix'\nwrap = true\nscrolloff = 3",
+                vec![],
+                (Some(true), Some(3)),
+            ),
+            (
+                "editing_model = 'helix'",
+                vec!["scrolloff=0".into()],
+                (Some(false), Some(0)),
+            ),
+            (
+                "editing_model = 'helix'",
+                vec!["editing_model=vim".into()],
+                (Some(true), Some(3)),
+            ),
+        ] {
+            let config = Config::from_user_toml_with_overrides(user, &overrides).unwrap();
+            assert_eq!((config.wrap, config.scrolloff), expected);
+        }
     }
 
     #[test]

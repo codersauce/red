@@ -18,11 +18,35 @@ fn reference_sequences() {
         let mut search = Vec::new();
         let mut register = Vec::new();
         let mut jumps = felix_core::Jumps::default();
+        let mut viewport_start = 0;
         let mut before = None;
         let mut undo = Vec::new();
         let mut redo = Vec::new();
         for (i, event) in case["events"].as_array().unwrap().iter().enumerate() {
             let key = event["key"].as_str().unwrap();
+            // A fixed-cell layout for the explicitly ASCII, unindented wrap fixture.
+            // Red's parallel replay uses its production Unicode display layout.
+            let wrap_width = case["wrap_width"].as_u64().map(|w| w as usize);
+            let mut rows = Vec::new();
+            if let Some(width) = wrap_width {
+                assert!(width > 0 && text.chars().all(|ch| ch == '\n' || ch.is_ascii_graphic()));
+                for line in 0..text.len_lines() {
+                    let start = text.line_to_char(line);
+                    let length = text.line(line).len_chars();
+                    for col in (0..length.max(1)).step_by(width) {
+                        rows.push(start + col);
+                    }
+                }
+            }
+            let visual_motion = |pos: usize, delta: isize, goal: Option<usize>| {
+                let row = rows.partition_point(|&start| start <= pos) - 1;
+                let goal = goal.unwrap_or(pos - rows[row]);
+                let destination = row.saturating_add_signed(delta).min(rows.len() - 1);
+                let end = rows
+                    .get(destination + 1)
+                    .map_or(text.len_chars(), |next| next - 1);
+                ((rows[destination] + goal).min(end), goal)
+            };
             let plan = session.plan(
                 text.slice(..),
                 &sel,
@@ -30,10 +54,16 @@ fn reference_sequences() {
                 &felix_core::Context {
                     search: search.last().map(String::as_str),
                     register: &register,
+                    visual_motion: wrap_width.map(|_| &visual_motion as &_),
+                    viewport_start,
                     indent: &indent,
                     ..Default::default()
                 },
             );
+            viewport_start = plan
+                .viewport_start
+                .unwrap_or(viewport_start)
+                .min(text.len_chars());
             if plan.save_jump {
                 jumps.save((), &sel);
             }
@@ -94,6 +124,15 @@ fn reference_sequences() {
                 "primary":sel.primary_index(),"pending":session.pending_keys(),"count":session.count(),
                 "search":(!search.is_empty()).then(||search.iter().rev().collect::<Vec<_>>()),
                 "unnamed":(!register.is_empty()).then_some(&register)});
+            if let Some(viewport) = event.get("viewport") {
+                assert_eq!(
+                    json!({"anchor":viewport_start, "height":felix_core::Context::default().page_height}),
+                    *viewport,
+                    "{} input {} viewport",
+                    case["name"],
+                    i + 1
+                );
+            }
             for (field, value) in actual.as_object().unwrap() {
                 assert_eq!(
                     value,

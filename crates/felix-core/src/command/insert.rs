@@ -219,6 +219,7 @@ impl Plan {
             {
                 self.host = Some(HostAction::SyntaxParentEnd)
             }
+            "<pageup>" | "<pagedown>" => self.page(text, selections, key, ctx),
             "<c-s>" => self.history = History::Checkpoint,
             "<left>" | "<right>" | "<home>" | "<end>" => {
                 self.set(selections.transform(text, |r| {
@@ -234,7 +235,7 @@ impl Plan {
                 }))
             }
             "<up>" | "<down>" => {
-                self.vertical(text, selections, key == "<down>", 1, ctx.tab_width, false)
+                self.visual_vertical(text, selections, if key == "<down>" { 1 } else { -1 }, ctx)
             }
             "<backspace>" | "<c-h>" | "<delete>" | "<c-d>" | "<c-w>" | "<a-d>" | "<c-u>"
             | "<c-k>" => {

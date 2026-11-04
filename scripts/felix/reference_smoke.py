@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import subprocess
 import tarfile
 import tempfile
@@ -24,10 +25,10 @@ ARCHIVES = {
 }
 
 
-def run_trace(bundle, root, executable=None, trace=None, red=False):
+def run_trace(bundle, root, executable=None, trace=None, red=False, paging=False):
     root.mkdir()
     fixture = root / "example.txt"
-    fixture.write_text("foo foo\n")
+    fixture.write_text("".join(f"ROW-{number:03}\n" for number in range(1, 41)) if paging else "foo foo\n")
     other = root / "other.txt"
     other.write_text("other buffer\n")
     env = {
@@ -45,8 +46,11 @@ def run_trace(bundle, root, executable=None, trace=None, red=False):
     if red:
         config = root / "config/red"
         config.mkdir(parents=True)
+        # Compare equal document heights. Red's optional breadcrumb plugin
+        # can reserve a screen row asynchronously after the document opens.
+        window_config = 'disabled_plugins = ["barbecue"]\n' if paging else ""
         (config / "config.toml").write_text(
-            'editing_model = "helix"\ndisable_ai = true\nsplash = false\n'
+            window_config + 'editing_model = "helix"\ndisable_ai = true\nsplash = false\n'
             'show_whats_new = false\nfetch_release_notes = false\n[lsp]\nenabled = false\n'
         )
 
@@ -84,9 +88,28 @@ def run_trace(bundle, root, executable=None, trace=None, red=False):
                 raise RuntimeError(f"{label}: expected {line!r} in {mode} mode\n{frame}")
             time.sleep(0.02)
 
+    def observe_page(first):
+        expected = list(range(first, min(41, first + 22)))
+        deadline = time.monotonic() + 20
+        while True:
+            frame = tmux("capture-pane", "-p", "-t", "oracle:0.0").stdout
+            visible = [int(match) for match in re.findall(r"ROW-(\d{3})", frame)]
+            if visible == expected:
+                checkpoints.append({"first": first, "visible": visible, "frame": frame.splitlines()})
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"paging: expected rows {expected}, saw {visible}\n{frame}")
+            time.sleep(0.02)
+
     try:
         tmux("new-session", "-d", "-x", "80", "-y", "24", "-s", "oracle",
              str(executable or bundle / "hx"), str(fixture), str(other))
+        if paging:
+            observe_page(1)
+            for key, first in [("PageDown", 23), ("PageDown", 36), ("PageUp", 14), ("PageUp", 1)]:
+                tmux("send-keys", key)
+                observe_page(first)
+            return checkpoints
         observe("open", "foo foo", "NOR", "1 sel")
         tmux("send-keys", "-l", "%sfoo")
         tmux("send-keys", "Enter")
@@ -158,6 +181,9 @@ def main():
             bundle = root / f"helix-{VERSION}-{target}"
             checkpoints = run_trace(bundle, root / "release")
             red_frames = run_trace(bundle, root / "red", args.candidate.resolve(strict=True), red=True) if args.candidate else None
+            pages = run_trace(bundle, root / "release-pages", paging=True)
+            red_pages = (run_trace(bundle, root / "red-pages", args.candidate.resolve(strict=True), red=True,
+                                   paging=True) if args.candidate else None)
             records = None
             if args.observer:
                 observer = args.observer.resolve(strict=True)
@@ -171,7 +197,8 @@ def main():
                 records = [json.loads(line) for line in trace.read_text().splitlines()]
                 verify_records(records)
     print(json.dumps({"release": VERSION, "commit": COMMIT, "archive_sha256": digest,
-                      "target": target, "checkpoints": checkpoints, "events": records, "red_checkpoints": red_frames}, indent=2))
+                      "target": target, "checkpoints": checkpoints, "events": records, "red_checkpoints": red_frames,
+                      "paging": pages, "red_paging": red_pages}, indent=2))
 
 
 if __name__ == "__main__":

@@ -36,6 +36,10 @@ enum Pending {
     },
 }
 
+/// Map a character offset to a destination on another display row, retaining
+/// the preferred screen column across consecutive vertical movements.
+pub type VisualMotion<'a> = dyn Fn(usize, isize, Option<usize>) -> (usize, usize) + 'a;
+
 /// Document settings and register contents supplied by the current host.
 pub struct Context<'a> {
     pub search: Option<&'a str>,
@@ -43,6 +47,9 @@ pub struct Context<'a> {
     pub tab_width: usize,
     pub indent: &'a str,
     pub page_height: usize,
+    pub viewport_start: usize,
+    pub scrolloff: usize,
+    pub visual_motion: Option<&'a VisualMotion<'a>>,
 }
 
 impl Default for Context<'_> {
@@ -52,8 +59,31 @@ impl Default for Context<'_> {
             register: &[],
             tab_width: 4,
             indent: "    ",
-            page_height: 24,
+            page_height: 22,
+            viewport_start: 0,
+            scrolloff: 5,
+            visual_motion: None,
         }
+    }
+}
+
+impl Context<'_> {
+    fn row_start(&self, text: RopeSlice<'_>, pos: usize, delta: isize) -> usize {
+        if let Some(resolve) = self.visual_motion {
+            return resolve(pos, delta, Some(0)).0;
+        }
+        let line = text.char_to_line(pos).saturating_add_signed(delta);
+        text.line_to_char(line.min(text.len_lines()))
+    }
+
+    fn reveal(&self, text: RopeSlice<'_>, top: usize, cursor: usize) -> usize {
+        let height = self.page_height.max(1);
+        let upper = self.scrolloff.min((height - 1) / 2) as isize;
+        let lower = (height - 1 - self.scrolloff.min(height / 2)) as isize;
+        top.clamp(
+            self.row_start(text, cursor, -lower),
+            self.row_start(text, cursor, -upper),
+        )
     }
 }
 
@@ -63,7 +93,9 @@ pub struct Session {
     pub mode: Mode,
     pending: Pending,
     count: Option<usize>,
+    // A logical source column and a screen column differ on a wrapped line.
     goals: Vec<usize>,
+    visual_goals: Vec<usize>,
     restore_append: bool,
     last_find: Option<(char, char, usize, bool)>,
 }
@@ -107,6 +139,8 @@ pub struct Plan {
     pub search: Option<String>,
     pub host: Option<HostAction>,
     pub save_jump: bool,
+    /// New top display row, as a document character offset.
+    pub viewport_start: Option<usize>,
     pub message: Option<String>,
     ranges: Vec<Range>,
     primary: usize,
@@ -251,6 +285,71 @@ impl Plan {
         self.next.goals = goals;
     }
 
+    fn visual_vertical(
+        &mut self,
+        text: RopeSlice<'_>,
+        selections: &Selections,
+        delta: isize,
+        ctx: &Context<'_>,
+    ) {
+        let extend = self.next.mode == Mode::Select;
+        let Some(resolve) = ctx.visual_motion else {
+            self.vertical(
+                text,
+                selections,
+                delta >= 0,
+                delta.unsigned_abs(),
+                ctx.tab_width,
+                extend,
+            );
+            return;
+        };
+        let mut goals = Vec::with_capacity(self.ranges.len());
+        for (index, &range) in selections.ranges().iter().enumerate() {
+            let (pos, goal) = resolve(
+                range.cursor(text),
+                delta,
+                self.next.visual_goals.get(index).copied(),
+            );
+            if !extend || text.line(text.char_to_line(pos)).len_chars() != 0 {
+                self.ranges[index] = range.move_to(text, pos, extend);
+            }
+            goals.push(goal);
+        }
+        self.next.visual_goals = goals;
+        self.next.goals.clear();
+    }
+
+    fn page(&mut self, text: RopeSlice<'_>, selections: &Selections, key: &str, ctx: &Context<'_>) {
+        let height = ctx.page_height.max(1);
+        let half = matches!(key, "<c-d>" | "<c-u>");
+        let down = matches!(key, "<c-f>" | "<pagedown>" | "<c-d>");
+        let distance = if half { height / 2 } else { height } as isize;
+        let delta = if down { distance } else { -distance };
+        let top = ctx.row_start(text, ctx.viewport_start, delta);
+        if half {
+            self.visual_vertical(text, selections, delta, ctx);
+        } else {
+            let margin = ctx.scrolloff.min((height - 1) / 2);
+            let edge = if down { margin } else { height - 1 - margin };
+            let head = ctx.row_start(text, top, edge as isize);
+            let primary = selections.primary();
+            let cursor = primary.cursor(text);
+            if (down && head > cursor) || (!down && head < cursor) {
+                self.ranges[self.primary] = Range {
+                    anchor: if self.next.mode == Mode::Select {
+                        primary.anchor
+                    } else {
+                        head
+                    },
+                    head,
+                };
+            }
+        }
+        let cursor = self.selections(text).primary().cursor(text);
+        self.viewport_start = Some(ctx.reveal(text, top, cursor));
+    }
+
     fn set(&mut self, selections: Selections) {
         self.ranges = selections.ranges;
         self.primary = selections.primary;
@@ -318,6 +417,7 @@ impl Session {
             search: None,
             host: None,
             save_jump: false,
+            viewport_start: None,
             message: None,
             ranges: selections.ranges.clone(),
             primary: selections.primary,
@@ -363,10 +463,11 @@ impl Session {
         let register = context.register;
         let count = self.count.unwrap_or(1);
         let extend = self.mode == Mode::Select;
-        if !matches!(key, "j" | "k" | "<down>" | "<up>" | "g")
+        if !matches!(key, "j" | "k" | "<down>" | "<up>" | "<c-d>" | "<c-u>" | "g")
             && !key.bytes().all(|ch| ch.is_ascii_digit())
         {
             p.next.goals.clear();
+            p.next.visual_goals.clear();
         }
         match &self.pending {
             Pending::Regex {
@@ -803,23 +904,17 @@ impl Session {
                     r.move_to(text, target, extend)
                 }));
             }
-            "j" | "k" | "<up>" | "<down>" | "<pageup>" | "<pagedown>" | "<c-f>" | "<c-b>"
-            | "<c-u>" | "<c-d>" => {
-                let rows = match key {
-                    "<pageup>" | "<pagedown>" | "<c-f>" | "<c-b>" => {
-                        context.page_height.saturating_sub(2).max(1)
-                    }
-                    "<c-u>" | "<c-d>" => (context.page_height / 2).max(1),
-                    _ => 1,
+            "j" | "k" | "<up>" | "<down>" => {
+                let distance = count.min(isize::MAX as usize) as isize;
+                let delta = if matches!(key, "j" | "<down>") {
+                    distance
+                } else {
+                    -distance
                 };
-                p.vertical(
-                    text,
-                    selections,
-                    matches!(key, "j" | "<down>" | "<pagedown>" | "<c-f>" | "<c-d>"),
-                    count.saturating_mul(rows),
-                    context.tab_width,
-                    extend,
-                );
+                p.visual_vertical(text, selections, delta, context);
+            }
+            "<pageup>" | "<pagedown>" | "<c-f>" | "<c-b>" | "<c-u>" | "<c-d>" => {
+                p.page(text, selections, key, context);
             }
             "w" | "W" | "e" | "E" | "b" | "B" => p.set(
                 selections.transform(text, |r| crate::motion::word(text, r, key, count, extend)),
