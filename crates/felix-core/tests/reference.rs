@@ -17,6 +17,7 @@ fn reference_sequences() {
         let mut session = Session::default();
         let mut search = Vec::new();
         let mut register = Vec::new();
+        let mut jumps = felix_core::Jumps::default();
         let mut before = None;
         let mut undo = Vec::new();
         let mut redo = Vec::new();
@@ -33,6 +34,9 @@ fn reference_sequences() {
                     ..Default::default()
                 },
             );
+            if plan.save_jump {
+                jumps.save((), &sel);
+            }
             if !plan.edits.is_empty() && before.is_none() {
                 before = Some((text.clone(), sel.clone()));
             }
@@ -51,25 +55,30 @@ fn reference_sequences() {
             if matches!(
                 plan.history,
                 History::Commit | History::Atomic | History::Checkpoint
-            ) {
-                if let Some(original) = before.take() {
-                    if text != original.0 {
-                        undo.push(original);
-                        redo.clear();
-                    }
-                }
+            ) && let Some(original) = before.take()
+                && text != original.0
+            {
+                undo.push(original);
+                redo.clear();
             }
             match plan.host {
-                Some(HostAction::Undo) => {
-                    if let Some(previous) = undo.pop() {
+                Some(HostAction::Undo(count)) => {
+                    for _ in 0..count {
+                        let Some(previous) = undo.pop() else { break };
                         redo.push((text, sel));
                         (text, sel) = previous;
                     }
                 }
-                Some(HostAction::Redo) => {
-                    if let Some(next) = redo.pop() {
+                Some(HostAction::Redo(count)) => {
+                    for _ in 0..count {
+                        let Some(next) = redo.pop() else { break };
                         undo.push((text, sel));
                         (text, sel) = next;
+                    }
+                }
+                Some(HostAction::Jump { forward, count }) => {
+                    if let Some(((), saved)) = jumps.navigate((), &sel, forward, count) {
+                        sel = saved;
                     }
                 }
                 None => {}

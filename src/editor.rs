@@ -2664,6 +2664,12 @@ pub enum Action {
     #[cfg(feature = "helix")]
     FelixSwapWindow(crate::window::Direction),
     #[cfg(feature = "helix")]
+    FelixClipboardYank,
+    #[cfg(feature = "helix")]
+    FelixClipboardYankPrimary,
+    #[cfg(feature = "helix")]
+    FelixClipboardReplace,
+    #[cfg(feature = "helix")]
     FelixClipboardBefore,
     #[cfg(feature = "helix")]
     FelixClipboardAfter,
@@ -7688,6 +7694,11 @@ impl Editor {
             line_count = line_count.max(self.buffer_line() + 1);
         }
 
+        #[cfg(feature = "helix")]
+        if self.config.editing_model == crate::config::EditingModel::Helix {
+            line_count = buffer.len() + 1;
+            line_count_override = Some(line_count);
+        }
         let break_indent = self.break_indent_options_for_buffer_index(window.buffer_index);
         let prediction = self
             .visible_inline_suggestion()
@@ -22264,15 +22275,25 @@ impl Editor {
                 return Ok(Some((true, false)));
             }
             #[cfg(feature = "helix")]
-            Action::FelixClipboardBefore | Action::FelixClipboardAfter => {
+            Action::FelixClipboardBefore
+            | Action::FelixClipboardAfter
+            | Action::FelixClipboardYank
+            | Action::FelixClipboardYankPrimary
+            | Action::FelixClipboardReplace => {
                 if let Some(owner) = self.felix_owner() {
-                    let placement = if matches!(action, Action::FelixClipboardBefore) {
-                        felix_core::Paste::Before
-                    } else {
-                        felix_core::Paste::After
+                    let input = match action {
+                        Action::FelixClipboardBefore => {
+                            felix::Input::ClipboardPaste(felix_core::Paste::Before)
+                        }
+                        Action::FelixClipboardAfter => {
+                            felix::Input::ClipboardPaste(felix_core::Paste::After)
+                        }
+                        Action::FelixClipboardReplace => felix::Input::ClipboardReplace,
+                        _ => felix::Input::ClipboardYank {
+                            primary: matches!(action, Action::FelixClipboardYankPrimary),
+                        },
                     };
-                    self.execute_felix(felix::Input::Clipboard(placement), owner, buffer, runtime)
-                        .await?;
+                    self.execute_felix(input, owner, buffer, runtime).await?;
                 }
                 return Ok(Some((true, false)));
             }
@@ -24081,8 +24102,9 @@ impl Editor {
                                                 diagnostic.range.end.line,
                                                 diagnostic.range.end.character,
                                             );
-                                            let cursor = (position.line, position.character);
-                                            start <= cursor && cursor <= end
+                                            let from = (range.start.line, range.start.character);
+                                            let to = (range.end.line, range.end.character);
+                                            start <= to && from <= end
                                         })
                                         .collect();
                                     (source, diagnostics)
@@ -25038,7 +25060,14 @@ impl Editor {
                 }
                 Action::CommandPalette => {
                     let commands = self.plugin_registry.registered_commands(runtime);
-                    let entries = command_palette::entries(&self.config.keys, &commands);
+                    let keys = &self.config.keys;
+                    #[cfg(feature = "helix")]
+                    let keys = if self.config.editing_model == crate::config::EditingModel::Helix {
+                        felix::native_keys()
+                    } else {
+                        keys
+                    };
+                    let entries = command_palette::entries(keys, &commands);
                     let actions = entries
                         .iter()
                         .map(|entry| (entry.id.clone(), entry.action.clone()))
@@ -29923,10 +29952,6 @@ impl Editor {
     }
 
     fn update_anchors_for_edit(&mut self, edit: AppliedTextEdit) {
-        #[cfg(feature = "helix")]
-        if self.config.editing_model == crate::config::EditingModel::Helix {
-            self.rebase_felix_views(edit);
-        }
         if !self.inline_history.conversations.is_empty()
             || !self.inline_jobs.is_empty()
             || self.inline_history_browser.is_some()
@@ -30150,6 +30175,10 @@ impl Editor {
             }
         }
         perf::increment("edit:replacements", 1);
+        #[cfg(feature = "helix")]
+        if self.config.editing_model == crate::config::EditingModel::Helix {
+            self.rebase_felix_views(std::slice::from_ref(&edit));
+        }
         self.update_anchors_for_edit(edit);
         self.set_special_mark_at_char('.', edit.start_char, AnchorAffinity::Left);
     }
@@ -30824,14 +30853,22 @@ impl Editor {
             return Ok(());
         };
         self.clear_current_buffer_diagnostics();
-        if let Some(transaction) = transaction {
-            self.set_inline_history_transaction_applied(&transaction, false);
+        if let Some(transaction) = &transaction {
+            self.set_inline_history_transaction_applied(transaction, false);
+        }
+        #[cfg(feature = "helix")]
+        if self.config.editing_model == crate::config::EditingModel::Helix {
+            self.rebase_felix_views(&edits);
         }
         for edit in edits {
             self.update_anchors_for_edit(edit);
             self.set_special_mark_at_char('.', edit.start_char, AnchorAffinity::Left);
         }
         self.restore_cursor_snapshot(cursor);
+        #[cfg(feature = "helix")]
+        if self.config.editing_model == crate::config::EditingModel::Helix {
+            self.restore_felix_history(transaction.as_deref(), true);
+        }
         self.restore_inline_history_comments();
         self.notify_change(runtime).await?;
         self.render(render_buffer)?;
@@ -30856,19 +30893,27 @@ impl Editor {
             return Ok(());
         };
         self.clear_current_buffer_diagnostics();
-        if let Some(transaction) = self
+        let transaction = self
             .current_buffer()
             .undo_history
             .latest_transaction()
-            .map(|transaction| transaction.id.clone())
-        {
-            self.set_inline_history_transaction_applied(&transaction, true);
+            .map(|transaction| transaction.id.clone());
+        if let Some(transaction) = &transaction {
+            self.set_inline_history_transaction_applied(transaction, true);
+        }
+        #[cfg(feature = "helix")]
+        if self.config.editing_model == crate::config::EditingModel::Helix {
+            self.rebase_felix_views(&edits);
         }
         for edit in edits {
             self.update_anchors_for_edit(edit);
             self.set_special_mark_at_char('.', edit.start_char, AnchorAffinity::Left);
         }
         self.restore_cursor_snapshot(cursor);
+        #[cfg(feature = "helix")]
+        if self.config.editing_model == crate::config::EditingModel::Helix {
+            self.restore_felix_history(transaction.as_deref(), false);
+        }
         self.restore_inline_history_comments();
         self.notify_change(runtime).await?;
         self.render(render_buffer)?;

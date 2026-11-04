@@ -37,6 +37,8 @@ def run(args, scenario):
     body = ' let emoji = "😀"; ' if args.unicode else ""
     ordinary = "".join(f"fn value_{i}() {{{body}}}{newline}" for i in range(args.lines))
     source = "z" * (args.chars * 2) + newline + ordinary if scenario == "delete" else ordinary
+    if scenario == "felix-change":
+        source = ordinary.replace("value_", "selected_", args.block_rows)
     with tempfile.TemporaryDirectory(prefix="red-edit-replay-") as name:
         root = Path(name)
         config = root / "config" / "red"
@@ -54,8 +56,10 @@ def run(args, scenario):
                 'file_extensions = ["rs"]\nroot_markers = []\n'
             )
         disabled = [] if args.plugins else list(tomllib.loads((ROOT / "default_config.toml").read_text())["plugins"])
+        editing_model = 'editing_model = "helix"\n' if scenario == "felix-change" else ""
         (config / "config.toml").write_text(
-            f"log_file = {json.dumps(str(log))}\n"
+            editing_model
+            + f"log_file = {json.dumps(str(log))}\n"
             f"disabled_plugins = {json.dumps(disabled)}\n"
             "disable_ai = true\nshow_whats_new = false\nfetch_release_notes = false\n"
             f"[lsp]\nenabled = {str(args.lsp != 'off').lower()}\n"
@@ -137,6 +141,9 @@ def run(args, scenario):
                 expected_before = text + source
                 trigger = b"." if scenario == "dot" else b"u"
                 expected = text * 2 + source if scenario == "dot" else source
+            elif scenario == "felix-change":
+                send(b"%sselected_\r")
+                trigger, expected = b"d", source.replace("selected_", "")
             elif scenario == "macro":
                 send(b"qai" + text.encode())
                 send(b"\x1b")
@@ -187,6 +194,9 @@ def run(args, scenario):
                 "highlight_misses": len(samples["highlight:miss"]),
                 "buffer_notifications": len(samples["notify buffer:changed"]),
             }
+            if scenario == "felix-change":
+                result["selections"] = args.block_rows
+                result["source_sha256"] = hashlib.sha256(source.encode()).hexdigest()
             if before_lsp is not None:
                 after_lsp = synced(expected)
                 result.update({"lsp": args.lsp, **{
@@ -220,7 +230,7 @@ def run(args, scenario):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, default=ROOT / "target/release/red")
-    parser.add_argument("--scenario", choices=SCENARIOS, action="append")
+    parser.add_argument("--scenario", choices=(*SCENARIOS, "felix-change"), action="append")
     parser.add_argument("--chars", type=int, default=128)
     parser.add_argument("--lines", type=int, default=2000)
     parser.add_argument("--block-rows", type=int, default=16)

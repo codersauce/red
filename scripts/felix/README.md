@@ -29,6 +29,13 @@ python3 scripts/felix/reference_smoke.py ~/.cache/red-felix/reference/helix-25.0
 
 The runner cross-checks the observer with tracing disabled and enabled against the release's visible frames, compares all 17 reference events to the checked fixture, and independently checks the Red binary at 11 terminal checkpoints. The Red integration test compares directed selections, primary index, mode, register values, pending prefixes, text, and active document at each event. To replay the manual workflow in disposable files, run `sh scripts/felix/try-workflow.sh "$PWD/target/debug/red"`.
 
-The motion suite uses a separate isolated session per case. Each includes its initial text and the input prefix leading up to every observation. It checks that Helix received the intended keys and includes CRLF, empty files, an EOF selection, combining marks, ZWJ emoji, counts and direction changes. Run both stored-fixture tests with `cargo test --locked -p red --features helix --lib editor::felix`. To compare a fresh trace, extract the verified release runtime, run `scripts/felix/scenarios.py` with Python and its `--observer`, `--runtime`, `--seed` and `--steps` options, then pass the output file to the same tests through `FELIX_SCENARIOS`. The Felix conformance workflow does this on pull requests and runs a longer motion sequence nightly.
+The per-key suite uses a separate isolated session per case. Each includes its initial text and the input prefix leading up to every observation. It checks that Helix received the intended keys and includes CRLF, empty files, an EOF selection, combining marks, ZWJ emoji, counts and direction changes. Run both stored-fixture tests with `cargo test --locked -p red --features helix --lib editor::felix`. To compare a fresh trace, extract the verified release runtime, run `scripts/felix/scenarios.py` with Python and its `--observer`, `--runtime`, `--seed` and `--steps` options, then pass the output file to the same tests through `FELIX_SCENARIOS`. The Felix conformance workflow does this on pull requests and runs a longer motion sequence nightly.
+
+To exercise the real LSP delivery path, run the following with a Helix-enabled binary. A local test language server applies Red's incremental updates independently. The runner checks the server's final document hash and the bytes Red saved to disk after deleting eight selections in a Unicode file opened in a split.
+
+```sh
+python3 scripts/edit_replay_bench.py --binary target/debug/red --scenario felix-change \
+  --lines 300 --block-rows 8 --lsp incremental --split --unicode
+```
 
 See the [milestone acceptance criteria](../../docs/HELIX_IMPLEMENTATION_PLAN.md) for the remaining command families and host workflows.

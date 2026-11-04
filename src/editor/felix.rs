@@ -17,11 +17,17 @@ static NATIVE_KEYS: std::sync::LazyLock<crate::config::Keys> = std::sync::LazyLo
     keys
 });
 
+pub(super) fn native_keys() -> &'static crate::config::Keys {
+    &NATIVE_KEYS
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum Input<'a> {
     Key(&'a str),
     Bracketed(&'a str),
-    Clipboard(felix_core::Paste),
+    ClipboardPaste(felix_core::Paste),
+    ClipboardReplace,
+    ClipboardYank { primary: bool },
 }
 
 type Owner = (BufferId, WindowId, u64, u64);
@@ -30,10 +36,12 @@ type Owner = (BufferId, WindowId, u64, u64);
 pub(super) struct FelixHost {
     session: Session,
     last_insert: Vec<String>,
+    jumps: HashMap<WindowId, felix_core::Jumps<BufferId>>,
     indent: HashMap<BufferId, String>,
     selections: HashMap<(BufferId, WindowId), Selections>,
     generation: u64,
     unnamed: Vec<String>,
+    clipboard: Vec<String>,
     search: Vec<String>,
     before: Option<Selections>,
     history: HashMap<(BufferId, String), (Selections, Selections)>,
@@ -69,10 +77,16 @@ impl Editor {
         self.felix
             .selections
             .retain(|(_, view), _| self.window_manager.window(*view).is_some());
+        self.felix
+            .jumps
+            .retain(|view, _| self.window_manager.window(*view).is_some());
     }
 
     pub(super) fn felix_forget_document(&mut self, doc: BufferId) {
         self.felix.indent.remove(&doc);
+        for jumps in self.felix.jumps.values_mut() {
+            jumps.forget(doc);
+        }
         self.felix.selections.retain(|(id, _), _| *id != doc);
         self.felix.history.retain(|(id, _), _| *id != doc);
     }
@@ -107,7 +121,7 @@ impl Editor {
         self.felix.generation = self.felix.generation.wrapping_add(1);
     }
 
-    pub(super) fn rebase_felix_views(&mut self, edit: AppliedTextEdit) {
+    pub(super) fn rebase_felix_views(&mut self, edits: &[AppliedTextEdit]) {
         let buffer = self.current_buffer();
         let id = buffer.id();
         let snapshot = buffer.contents_snapshot();
@@ -115,14 +129,29 @@ impl Editor {
             if *doc == id {
                 *selections = selections.rebase(
                     snapshot.slice(..),
-                    edit.start_char,
-                    edit.end_char,
-                    edit.new_char_len,
+                    edits
+                        .iter()
+                        .map(|edit| (edit.start_char, edit.end_char, edit.new_char_len)),
                 );
             }
         }
         self.felix.generation = self.felix.generation.wrapping_add(1);
         self.felix.session.cancel_pending();
+    }
+
+    pub(super) fn restore_felix_history(&mut self, transaction: Option<&str>, undo: bool) {
+        let Some((doc, view, _, _)) = self.felix_owner() else {
+            return;
+        };
+        let recorded = transaction
+            .and_then(|key| self.felix.history.get(&(doc, key.to_owned())))
+            .map(|(before, after)| if undo { before } else { after });
+        let state = recorded
+            .or_else(|| self.felix.selections.get(&(doc, view)))
+            .cloned();
+        if let Some(state) = state {
+            self.set_felix_active_selection(state);
+        }
     }
 
     pub(super) fn felix_owner(&self) -> Option<Owner> {
@@ -254,18 +283,72 @@ impl Editor {
                     felix_core::Paste::Cursor
                 },
             ),
-            Input::Clipboard(placement) => {
-                let Some(value) = self.clipboard.read_text().await? else {
-                    return Ok(());
+            Input::ClipboardYank { primary } => {
+                let mut plan = self.felix.session.plan(text, &initial, "y", &context);
+                let values = if primary {
+                    vec![text
+                        .slice(initial.primary().start()..initial.primary().end())
+                        .to_string()]
+                } else {
+                    plan.register.take().unwrap_or_default()
                 };
-                self.felix
-                    .session
-                    .paste(text, &initial, &[value], placement)
+                plan.register = None;
+                if !self.config.clipboard.enabled {
+                    self.set_legacy_message(Some("Clipboard is disabled".into()));
+                    return self.render(frame);
+                }
+                if let Err(err) = self.clipboard.copy(&values.join("\n"), &mut self.stdout) {
+                    self.set_legacy_message(Some(format!("Clipboard write failed: {err}")));
+                    return self.render(frame);
+                }
+                self.felix.clipboard = values;
+                plan
+            }
+            Input::ClipboardPaste(_) | Input::ClipboardReplace => {
+                if !self.config.clipboard.enabled {
+                    self.set_legacy_message(Some("Clipboard is disabled".into()));
+                    return self.render(frame);
+                }
+                let value = match self.clipboard.read_text().await {
+                    Ok(Some(value)) => value,
+                    Ok(None) => return Ok(()),
+                    Err(err) => {
+                        self.set_legacy_message(Some(format!("Clipboard read failed: {err}")));
+                        return self.render(frame);
+                    }
+                };
+                let values = if !self.felix.clipboard.is_empty()
+                    && self.felix.clipboard.join("\n") == value
+                {
+                    &self.felix.clipboard[..]
+                } else {
+                    std::slice::from_ref(&value)
+                };
+                if let Input::ClipboardPaste(placement) = input {
+                    self.felix.session.paste(text, &initial, values, placement)
+                } else {
+                    self.felix.session.plan(
+                        text,
+                        &initial,
+                        "R",
+                        &felix_core::Context {
+                            register: values,
+                            ..context
+                        },
+                    )
+                }
             }
         };
         if !plan.edits.is_empty() && self.current_buffer().directory.is_some() {
             self.set_legacy_message(Some("Directory buffers are read-only".into()));
             return self.render(frame);
+        }
+        if plan.save_jump {
+            self.felix
+                .jumps
+                .entry(id.1)
+                .or_default()
+                .save(id.0, &initial);
         }
         if let Input::Key(key) = input {
             if self.felix.session.mode != felix_core::Mode::Insert
@@ -332,29 +415,17 @@ impl Editor {
         }
         if let Some(request) = plan.host {
             match request {
-                HostAction::Undo | HostAction::Redo => {
-                    let undo = request == HostAction::Undo;
-                    let mut tx = self
-                        .current_buffer()
-                        .undo_history
-                        .latest_transaction()
-                        .map(|t| t.id.clone());
-                    if undo {
-                        self.undo_transaction(frame, runtime).await?;
-                    } else {
-                        self.redo_transaction(frame, runtime).await?;
-                        tx = self
-                            .current_buffer()
-                            .undo_history
-                            .latest_transaction()
-                            .map(|t| t.id.clone());
-                    }
-                    if let Some((before, after)) =
-                        tx.and_then(|key| self.felix.history.get(&(id.0, key)))
-                    {
-                        let state = if undo { before } else { after }.clone();
-                        self.place_felix_cursor(&state);
-                        self.felix.selections.insert(id, state);
+                HostAction::Undo(count) | HostAction::Redo(count) => {
+                    for _ in 0..count {
+                        let revision = self.current_buffer().revision();
+                        if matches!(request, HostAction::Undo(_)) {
+                            self.undo_transaction(frame, runtime).await?;
+                        } else {
+                            self.redo_transaction(frame, runtime).await?;
+                        }
+                        if self.current_buffer().revision() == revision {
+                            break;
+                        }
                     }
                 }
                 HostAction::NextBuffer | HostAction::PreviousBuffer => {
@@ -384,6 +455,30 @@ impl Editor {
                                     runtime,
                                 ))
                                 .await?;
+                            }
+                        }
+                    }
+                }
+                HostAction::Jump { forward, count } => {
+                    let dest = self.felix.jumps.entry(id.1).or_default().navigate(
+                        id.0,
+                        &selections,
+                        forward,
+                        count,
+                    );
+                    if let Some((doc, saved)) = dest {
+                        if let Some(index) = self.buffer_manager.iter().position(|b| b.id() == doc)
+                        {
+                            if index != self.buffer_manager.active_index() {
+                                self.set_current_buffer(frame, index).await?;
+                            }
+                            let text = self.current_buffer().contents_snapshot();
+                            if let Some(current) = Selections::new(
+                                text.slice(..),
+                                saved.ranges().to_vec(),
+                                saved.primary_index(),
+                            ) {
+                                self.set_felix_active_selection(current);
                             }
                         }
                     }
@@ -418,7 +513,9 @@ impl Editor {
                 }
             }
         }
-        self.set_legacy_message(plan.message);
+        if plan.host.is_none() || plan.message.is_some() {
+            self.set_legacy_message(plan.message);
+        }
         if !plan.edits.is_empty() {
             self.notify_change(runtime).await?;
         }
@@ -482,8 +579,28 @@ impl Editor {
                 } else {
                     display_width_with_tabs(line, tab_width) + 1
                 };
+                // Source glyph spans exclude the cell after the last glyph.
+                // Helix can select a newline and can place a cursor at EOF.
+                let points_for = |left, right| {
+                    let mut points =
+                        self.display_col_range_points_in_window(window, row, left, right);
+                    let eol = display_width_with_tabs(line, tab_width);
+                    if let Some((x, y)) = (left <= eol && right > eol)
+                        .then(|| self.buffer_to_window_coords(window, grapheme_len(line), row))
+                        .flatten()
+                    {
+                        let point = Point::new(
+                            self.window_to_terminal_x(window, x),
+                            self.window_to_terminal_y(window, y),
+                        );
+                        if !points.contains(&point) {
+                            points.push(point);
+                        }
+                    }
+                    points
+                };
                 if left < right {
-                    let points = self.display_col_range_points_in_window(window, row, left, right);
+                    let points = points_for(left, right);
                     frame.apply_selection_for_points(
                         points,
                         &self.theme.editor_selection_style(),
@@ -500,7 +617,7 @@ impl Editor {
                     } else {
                         1
                     };
-                    for pt in self.display_col_range_points_in_window(window, row, x, x + width) {
+                    for pt in points_for(x, x + width) {
                         if let Some(cell) = frame.cells.get_mut(pt.y * frame.width + pt.x) {
                             cell.style = self.theme.synthetic_cursor_style(&cell.style);
                         }
@@ -592,6 +709,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_clipboard_preserves_fragments_and_bracketed_paste_edits_all_ranges() {
+        let (mut editor, mut frame, mut runtime) = fixture_editor("a bb\n");
+        let provider = crate::clipboard::MemoryClipboardProvider::with_text("system");
+        let storage = provider.shared_text();
+        editor.test_set_clipboard(Box::new(provider));
+        editor.config.clipboard.enabled = true;
+        for key in ["%", "s", "[", "a", "b", "]", "+", "<enter>", "y"] {
+            let owner = editor.felix_owner().unwrap();
+            editor
+                .execute_felix(Input::Key(key), owner, &mut frame, &mut runtime)
+                .await
+                .unwrap();
+        }
+        assert_eq!(storage.lock().unwrap().as_deref(), Some("system"));
+        let owner = editor.felix_owner().unwrap();
+        editor
+            .execute_felix(
+                Input::ClipboardYank { primary: false },
+                owner,
+                &mut frame,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        assert_eq!(storage.lock().unwrap().as_deref(), Some("a\nbb"));
+        let owner = editor.felix_owner().unwrap();
+        editor
+            .execute_felix(
+                Input::ClipboardPaste(felix_core::Paste::After),
+                owner,
+                &mut frame,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), "aa bbbb\n");
+        let event = Event::Paste("é".into());
+        let action = editor
+            .handle_event_with_runtime(&event, Some(&runtime))
+            .unwrap()
+            .unwrap();
+        editor
+            .handle_key_action(&event, &action, &mut frame, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), "aéa bbébb\n");
+    }
+
+    #[tokio::test]
+    async fn render_distinguishes_secondary_cursor_and_trailing_eof() {
+        let (mut editor, _, _) = fixture_editor("ab\n");
+        let text = editor.current_buffer().contents_snapshot();
+        let state = Selections::new(
+            text.slice(..),
+            vec![
+                FelixRange { anchor: 0, head: 2 },
+                FelixRange { anchor: 3, head: 3 },
+            ],
+            1,
+        )
+        .unwrap();
+        editor.set_felix_active_selection(state);
+        let window = editor.active_window_with_editor_view().unwrap();
+        let mut frame = RenderBuffer::new(80, 24, &Style::default());
+        editor.render_felix_selections(&mut frame, &window);
+        let row = window.position.y + editor.window_content_top(&window);
+        let col = window.position.x + editor.gutter_width_for_window(&window) + 1;
+        let selected = &frame.cells[row * frame.width + col].style;
+        let secondary = &frame.cells[row * frame.width + col + 1].style;
+        let eof = &frame.cells[(row + 1) * frame.width + col].style;
+        assert_ne!(selected, secondary);
+        assert_eq!(eof, &editor.theme.synthetic_cursor_style(&Style::default()));
+        assert_eq!(editor.cursor_text_position(), TextPosition::new(1, 0));
+    }
+
+    #[tokio::test]
     async fn agreed_leader_actions_resolve_through_document_input() {
         let (mut editor, mut frame, mut runtime) = fixture_editor("abc");
         for (key, action) in [
@@ -666,6 +859,7 @@ mod tests {
                 }
                 "<esc>" => KeyCode::Esc,
                 "<enter>" => KeyCode::Enter,
+                "<tab>" => KeyCode::Tab,
                 _ => KeyCode::Char(token.chars().next().unwrap()),
             };
             let event = Event::Key(KeyEvent::new(code, modifiers));

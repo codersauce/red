@@ -219,65 +219,45 @@ impl Selections {
 }
 
 mod command;
+mod jumps;
 mod motion;
+pub use jumps::Jumps;
 mod search;
 pub use command::{Context, Edit, History, HostAction, Mode, Paste, Plan, Session};
 
 impl Selections {
     /// Carry endpoints across a host replacement expressed in original offsets.
-    pub fn rebase(&self, text: RopeSlice<'_>, start: usize, end: usize, inserted: usize) -> Self {
-        let map = |p, after| {
-            if p < start {
-                p
-            } else if p > end {
-                p - (end - start) + inserted
-            } else if p == end && end != start || after {
-                start + inserted
-            } else {
-                start
+    pub fn rebase(
+        &self,
+        text: RopeSlice<'_>,
+        edits: impl IntoIterator<Item = (usize, usize, usize)>,
+    ) -> Self {
+        let mut ranges = self.ranges.clone();
+        for (start, end, inserted) in edits {
+            let map = |pos, after| {
+                if pos < start {
+                    return pos;
+                }
+                if pos >= end && (pos != start || after) {
+                    return pos - (end - start) + inserted;
+                }
+                if pos == start || !after {
+                    return start;
+                }
+                if inserted == end - start {
+                    pos
+                } else {
+                    start + inserted
+                }
+            };
+            for r in &mut ranges {
+                *r = Range {
+                    anchor: map(r.anchor, r.anchor <= r.head),
+                    head: map(r.head, r.head <= r.anchor),
+                };
             }
-        };
-        self.transform(text, |r| Range {
-            anchor: map(r.anchor, r.anchor <= r.head),
-            head: map(r.head, r.head <= r.anchor),
-        })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ropey::Rope;
-    #[test]
-    fn graphemes_across_rope_chunks_and_line_endings() {
-        use unicode_segmentation::UnicodeSegmentation;
-        let source = "🇧🇷e\u{301}👩‍💻\r\n".repeat(600);
-        let rope = Rope::from_str(&source);
-        let mut i = 0;
-        for cluster in source.graphemes(true) {
-            let next = i + cluster.chars().count();
-            assert_eq!(boundary(rope.slice(..), i, true), next);
-            assert_eq!(boundary(rope.slice(..), next, false), i);
-            i = next;
         }
-    }
-
-    #[test]
-    fn normalize_retains_primary_when_ranges_merge_but_touching_ranges_survive() {
-        let rope = Rope::from_str("abc def");
-        let s = Selections::new(
-            rope.slice(..),
-            vec![
-                Range { anchor: 7, head: 5 },
-                Range { anchor: 3, head: 0 },
-                Range { anchor: 5, head: 3 },
-                Range { anchor: 7, head: 6 },
-            ],
-            3,
-        )
-        .unwrap();
-        assert_eq!(s.ranges().len(), 3);
-        assert_eq!(s.primary(), Range { anchor: 7, head: 5 });
+        Self::new(text, ranges, self.primary).expect("rebasing retains a selection")
     }
 }
 
@@ -320,4 +300,41 @@ pub fn detect_indent(text: RopeSlice<'_>) -> Option<String> {
             " ".repeat(unit)
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ropey::Rope;
+    #[test]
+    fn graphemes_across_rope_chunks_and_line_endings() {
+        use unicode_segmentation::UnicodeSegmentation;
+        let source = "🇧🇷e\u{301}👩‍💻\r\n".repeat(600);
+        let rope = Rope::from_str(&source);
+        let mut i = 0;
+        for cluster in source.graphemes(true) {
+            let next = i + cluster.chars().count();
+            assert_eq!(boundary(rope.slice(..), i, true), next);
+            assert_eq!(boundary(rope.slice(..), next, false), i);
+            i = next;
+        }
+    }
+
+    #[test]
+    fn normalize_retains_primary_when_ranges_merge_but_touching_ranges_survive() {
+        let rope = Rope::from_str("abc def");
+        let s = Selections::new(
+            rope.slice(..),
+            vec![
+                Range { anchor: 7, head: 5 },
+                Range { anchor: 3, head: 0 },
+                Range { anchor: 5, head: 3 },
+                Range { anchor: 7, head: 6 },
+            ],
+            3,
+        )
+        .unwrap();
+        assert_eq!(s.ranges().len(), 3);
+        assert_eq!(s.primary(), Range { anchor: 7, head: 5 });
+    }
 }

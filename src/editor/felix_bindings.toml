@@ -7,6 +7,9 @@
 "Ctrl-Shift-p" = "CommandPalette"
 
 [normal." "]
+y = "FelixClipboardYank"
+Y = "FelixClipboardYankPrimary"
+R = "FelixClipboardReplace"
 p = "FelixClipboardAfter"
 P = "FelixClipboardBefore"
 f = "FilePicker"

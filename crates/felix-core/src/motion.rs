@@ -342,3 +342,111 @@ pub(crate) fn vertical(
     }
     (r.move_to(text, pos, extend), goal)
 }
+
+pub(crate) fn paragraph(text: RopeSlice<'_>, r: Range, count: usize, around: bool) -> Range {
+    let cursor = r.cursor(text);
+    let row = text.char_to_line(cursor);
+    let blank = |i| {
+        let line = text.line(i);
+        line.len_chars() == 0 || line == "\n" || line == "\r\n"
+    };
+    let mut start = row;
+    let mut end = row;
+    let before_blank = blank(row.saturating_sub(1));
+    if !blank(row) && before_blank && cursor == boundary(text, text.line_to_char(row + 1), false) {
+        start += 1;
+    } else if start > 0 {
+        while start > 0 && blank(start - 1) {
+            start -= 1;
+        }
+        while start > 0 && !blank(start - 1) {
+            start -= 1;
+        }
+    }
+    if blank(row) && !before_blank && cursor == boundary(text, text.line_to_char(row + 1), false) {
+        end += 1;
+    }
+    let mut found = 0;
+    for _ in 0..count {
+        let first = end;
+        while end < text.len_lines() && !blank(end) {
+            end += 1;
+        }
+        if first != end {
+            found += 1;
+        }
+        while end < text.len_lines() && blank(end) {
+            end += 1;
+        }
+        if end == text.len_lines() {
+            break;
+        }
+    }
+    if found < count && end == text.len_lines() {
+        while start > 0 && blank(start - 1) {
+            start -= 1;
+        }
+        while start > 0 && !blank(start - 1) {
+            start -= 1;
+        }
+    }
+    if !around {
+        while end > 0 && blank(end - 1) {
+            end -= 1;
+        }
+    }
+    Range {
+        anchor: text.line_to_char(start),
+        head: text.line_to_char(end),
+    }
+}
+
+pub(crate) fn copies(
+    text: RopeSlice<'_>,
+    selections: &crate::Selections,
+    down: bool,
+    count: usize,
+    tab_width: usize,
+) -> crate::Selections {
+    let mut out = selections.ranges().to_vec();
+    let mut primary = selections.primary_index();
+    for (i, &r) in selections.ranges().iter().enumerate() {
+        let head = if r.head > r.anchor {
+            r.head - 1
+        } else {
+            r.head
+        };
+        let anchor = if r.head > r.anchor {
+            r.anchor
+        } else {
+            r.anchor.saturating_sub(1)
+        };
+        let rows = text.char_to_line(head).abs_diff(text.char_to_line(anchor)) + 1;
+        let max = if down {
+            text.len_lines() - 1 - text.char_to_line(head.max(anchor))
+        } else {
+            text.char_to_line(head.max(anchor))
+        };
+        let mut added = 0;
+        for step in (rows..=max).step_by(rows) {
+            let project = |pos| {
+                let base = Range::at(text, pos);
+                let (next, goal) = vertical(text, base, down, step, tab_width, None, false);
+                let (_, actual) = vertical(text, next, down, 0, tab_width, None, false);
+                (goal == actual).then(|| next.cursor(text))
+            };
+            if let (Some(a), Some(h)) = (project(anchor), project(head)) {
+                let copied = Range { anchor: a, head: a }.move_to(text, h, true);
+                if i == selections.primary_index() {
+                    primary = out.len();
+                }
+                out.push(copied);
+                added += 1;
+                if added >= count {
+                    break;
+                }
+            }
+        }
+    }
+    crate::Selections::new(text, out, primary).expect("copy retains original selections")
+}

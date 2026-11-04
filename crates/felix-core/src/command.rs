@@ -70,14 +70,15 @@ pub struct Session {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostAction {
-    Undo,
-    Redo,
+    Undo(usize),
+    Redo(usize),
     NextBuffer,
     PreviousBuffer,
     CommandLine,
     References,
     RepeatInsert(usize),
     SyntaxParentEnd,
+    Jump { forward: bool, count: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -105,6 +106,7 @@ pub struct Plan {
     pub register: Option<Vec<String>>,
     pub search: Option<String>,
     pub host: Option<HostAction>,
+    pub save_jump: bool,
     pub message: Option<String>,
     ranges: Vec<Range>,
     primary: usize,
@@ -315,6 +317,7 @@ impl Session {
             register: None,
             search: None,
             host: None,
+            save_jump: false,
             message: None,
             ranges: selections.ranges.clone(),
             primary: selections.primary,
@@ -435,6 +438,7 @@ impl Session {
                 p.next.pending = Pending::None;
                 if key.chars().count() == 1 {
                     p.set(selections.transform(text, |r| match key {
+                        "p" => crate::motion::paragraph(text, r, *count, *around),
                         "w" | "W" => crate::motion::word_object(text, r, key == "W", *around),
                         _ => crate::motion::pair_object(
                             text,
@@ -478,6 +482,7 @@ impl Session {
             Pending::Goto => {
                 p.next.count = None;
                 p.next.pending = Pending::None;
+                p.save_jump = matches!(key, "g" | "e");
                 match key {
                     "n" => p.host = Some(HostAction::NextBuffer),
                     "p" => p.host = Some(HostAction::PreviousBuffer),
@@ -515,7 +520,15 @@ impl Session {
         if key != "g" && key != "m" {
             p.next.count = None;
         }
+        p.save_jump = key == "G" && self.count.is_some();
         match key {
+            "<c-s>" => p.save_jump = true,
+            "<c-o>" | "<c-i>" | "<tab>" => {
+                p.host = Some(HostAction::Jump {
+                    forward: key != "<c-o>",
+                    count,
+                })
+            }
             "." => p.host = Some(HostAction::RepeatInsert(count)),
             "g" => p.next.pending = Pending::Goto,
             "m" => p.next.pending = Pending::Match,
@@ -599,6 +612,40 @@ impl Session {
                     _ => r.with_bounds(start, end),
                 }
             })),
+            "C" | "<a-C>" => p.set(crate::motion::copies(
+                text,
+                selections,
+                key == "C",
+                count,
+                context.tab_width,
+            )),
+            "<a-_>" => {
+                let mut merged: Vec<Range> = Vec::new();
+                let mut primary = 0;
+                for (i, &r) in selections.ranges().iter().enumerate() {
+                    if let Some(prev) = merged.last_mut().filter(|prev| prev.end() == r.start()) {
+                        let lo = prev.start();
+                        let hi = r.end();
+                        *prev = if prev.head < prev.anchor && r.head < r.anchor {
+                            Range {
+                                anchor: hi,
+                                head: lo,
+                            }
+                        } else {
+                            Range {
+                                anchor: lo,
+                                head: hi,
+                            }
+                        };
+                    } else {
+                        merged.push(r);
+                    }
+                    if i == selections.primary_index() {
+                        primary = merged.len() - 1;
+                    }
+                }
+                p.set(Selections::new(text, merged, primary).unwrap());
+            }
             "<a-s>" => {
                 let regex = Query::compile(r"\r?\n").unwrap();
                 if let Some(split) = Query::Split.apply(text, selections, &regex, false) {
@@ -736,8 +783,8 @@ impl Session {
                 }
             }
             "<esc>" => p.next.mode = Mode::Normal,
-            "u" => p.host = Some(HostAction::Undo),
-            "U" => p.host = Some(HostAction::Redo),
+            "u" => p.host = Some(HostAction::Undo(count)),
+            "U" => p.host = Some(HostAction::Redo(count)),
             ":" => p.host = Some(HostAction::CommandLine),
             ">" | "<" | "J" | "<a-J>" => p.edit_lines(text, selections, key, count, context),
             "o" | "O" => p.open_lines(text, selections, key == "o", count),
@@ -816,8 +863,29 @@ impl Session {
                     p.next.mode = Mode::Normal;
                 }
                 if key != "y" {
-                    p.replace(selections.ranges(), "");
                     let change = key == "c" || key == "<a-c>";
+                    let whole_lines = change
+                        && selections.ranges().iter().all(|r| {
+                            let (first, last) = r.lines(text);
+                            text.slice(r.start()..r.end()).len_lines() > 1
+                                && r.start() == text.line_to_char(first)
+                                && r.end() == text.line_to_char(last + 1)
+                        });
+                    p.replace(
+                        selections.ranges(),
+                        if whole_lines {
+                            document_newline(text)
+                        } else {
+                            ""
+                        },
+                    );
+                    if whole_lines {
+                        let width = document_newline(text).chars().count();
+                        for r in &mut p.ranges {
+                            r.anchor -= width;
+                            r.head -= width;
+                        }
+                    }
                     p.history = if change {
                         History::Begin
                     } else {

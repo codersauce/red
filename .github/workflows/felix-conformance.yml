@@ -61,6 +61,10 @@ jobs:
         run: |
           mkdir -p evidence
           python3 scripts/felix/reference_smoke.py "$ARCHIVE" --observer reference/target/debug/hx --candidate target/debug/red > evidence/terminal.json
+      - name: Verify multi-selection edits reach the language server
+        run: |
+          python3 scripts/edit_replay_bench.py --binary target/debug/red --scenario felix-change \
+            --lines 300 --block-rows 8 --lsp incremental --split --unicode > evidence/lsp.json
       - name: Compare live reference events with Red
         env:
           EXTENDED: ${{ github.event_name == 'schedule' }}

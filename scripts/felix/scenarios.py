@@ -5,11 +5,12 @@ import json
 import os
 from pathlib import Path
 import random
+import runpy
 import subprocess
 import tempfile
 import time
 
-from reference_smoke import COMMIT
+COMMIT = runpy.run_path(str(Path(__file__).with_name("reference_smoke.py")))["COMMIT"]
 
 
 def scenarios(seed, steps):
@@ -31,6 +32,10 @@ def scenarios(seed, steps):
     yield "insert-controls", "  abc def\n", list("A") + ["<c-w>", "z", "<c-s>", "<c-u>", "q", "<esc>", "u", "u", "U"]
     yield "indent-join", "abc\n  de f\nxy\n", list("x>") + ["<", "J", "<a-J>", "u", "U"]
     yield "open-line", "abc\nxyz\n", list("oHi") + ["<esc>", "u", "O", "z", "<esc>", "u"]
+    yield "selection-jumplist", "abc de\nxyz\n", list("e") + ["<c-s>"] + list("gegg") + ["<c-o>", "<c-o>", "<tab>"]
+    yield "auto-pairs", "abc \n", list("A(x)") + ["<esc>", "u", "U"]
+    yield "whole-line-change", "one\ntwo\n", list("xcX") + ["<esc>", "u", "%", "c", "Y", "<esc>", "u"]
+    yield "paragraph-and-copies", "abc\ndef\n\nnext\n", list("lC") + ["<a-C>", ","] + list("mipmap")
     # Every seed includes a reproducible mix of direction changes and pending prefixes.
     rng = random.Random(seed)
     commands = ["w", "B", "E", "e", "h", "l", "v", "%", ";", "3W", "2b", "gg", "ge", "gh", "gl", "gs", "<esc>", "<a-;>"]
@@ -60,31 +65,35 @@ def capture(observer, runtime, root, name, text, keys):
                 raise TimeoutError(f"{name}: Helix did not open example.txt")
             time.sleep(.02)
         events = []
+        trace_offset = 0
         for index, key in enumerate(keys):
-            named = {"<esc>": "Escape", "<enter>": "Enter", "<a-;>": "M-;", "<a-,>": "M-,"}
+            named = {"<esc>": "Escape", "<enter>": "Enter", "<tab>": "Tab", "<a-;>": "M-;", "<a-,>": "M-,"}
             if key.startswith("<a-"):
                 raw = b"\x1b" + key[3:-1].encode()
                 tmux("send-keys","-t","h","-H",*[format(byte,"02x") for byte in raw])
             elif key.startswith("<c-"):
                 tmux("send-keys","-t","h","C-"+key[3:-1])
             elif key == ";":
-                raw = b";" if key == ";" else b"\x1b;"
-                tmux("send-keys","-t","h","-H",*[format(byte,"02x") for byte in raw])
+                tmux("send-keys", "-t", "h", "-H", "3b")
             elif key in named:
                 tmux("send-keys", "-t", "h", named[key])
             else:
                 tmux("send-keys", "-t", "h", "-l", key)
             deadline = time.monotonic() + 5
             while True:
-                data = trace.read_bytes() if trace.exists() else b""
-                if data.endswith(b"\n") and len(data.splitlines()) > index:
-                    break
+                if trace.exists():
+                    with trace.open("rb") as stream:
+                        stream.seek(trace_offset)
+                        line = stream.readline()
+                        if line.endswith(b"\n"):
+                            trace_offset = stream.tell()
+                            break
                 if time.monotonic() >= deadline:
                     raise TimeoutError(f"{name}: no observation for key {index + 1} ({key})")
                 time.sleep(.01)
-            record = json.loads(data.splitlines()[index])
+            record = json.loads(line)
             raw_event = record["event"]
-            special = {"<esc>": "Esc", "<enter>": "Enter", "<a-;>": "Char(';')", "<a-,>": "Char(',')"}
+            special = {"<esc>": "Esc", "<enter>": "Enter", "<tab>": "Tab", "<a-;>": "Char(';')", "<a-,>": "Char(',')"}
             ch = key[3:-1] if key.startswith(("<a-", "<c-")) else key
             code = special.get(key, f"Char('{ch}')")
             if f"code: {code}," not in raw_event or ("ALT" in raw_event) != key.startswith("<a-") or ("CONTROL" in raw_event) != key.startswith("<c-"):
@@ -94,6 +103,17 @@ def capture(observer, runtime, root, name, text, keys):
         return {"name": name, "text": text, "events": events}
     finally:
         tmux("kill-server", check=False)
+
+
+def dump_suite(commit, seed, cases):
+    """Keep each captured event on its own line so behavioral changes can be reviewed."""
+    encode = lambda value: json.dumps(value, ensure_ascii=False)
+    print('{"commit": ' + encode(commit) + ', "seed": ' + str(seed) + ', "cases": [')
+    for index, case in enumerate(cases):
+        print('  {"name": ' + encode(case["name"]) + ', "text": ' + encode(case["text"]) + ', "events": [')
+        print(",\n".join("    " + encode(event) for event in case["events"]))
+        print("  ]}" + ("," if index + 1 < len(cases) else ""))
+    print("]}")
 
 
 def main():
@@ -107,7 +127,7 @@ def main():
         result = [capture(args.observer.resolve(strict=True), args.runtime.resolve(strict=True),
                           Path(tmp)/str(i), *scenario)
                   for i, scenario in enumerate(scenarios(args.seed, args.steps))]
-    print(json.dumps({"commit": COMMIT, "seed": args.seed, "cases": result}, ensure_ascii=False))
+    dump_suite(COMMIT, args.seed, result)
 
 
 if __name__ == "__main__":
