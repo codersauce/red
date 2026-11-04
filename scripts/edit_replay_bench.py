@@ -24,6 +24,8 @@ import threading
 import time
 import tomllib
 
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from perf_trace import END, EVENT, TIMING
 
 
