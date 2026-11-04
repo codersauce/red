@@ -26,6 +26,8 @@ pub(super) enum RpcContinuation {
     Keys(Event, KeyAction),
     Commands(Vec<Action>),
     Macro,
+    #[cfg(feature = "helix")]
+    FelixMacro(felix_core::MacroReplay),
     Semantic(SemanticChange),
 }
 
@@ -178,6 +180,10 @@ impl Editor {
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
+        #[cfg(feature = "helix")]
+        if self.felix.playback.active() {
+            return Ok(());
+        }
         if self.rpc_commands.resuming
             || self.macro_replay_depth > 0
             || self.replaying_semantic_change
@@ -268,6 +274,13 @@ impl Editor {
             }
             RpcContinuation::Commands(actions) => {
                 self.execute_command_actions(actions, buffer, runtime).await
+            }
+            #[cfg(feature = "helix")]
+            RpcContinuation::FelixMacro(tail) => {
+                self.felix.playback = tail;
+                self.drain_felix_macro(buffer, runtime)
+                    .await
+                    .map(|()| false)
             }
             RpcContinuation::Macro => self
                 .drain_macro_replay(buffer, runtime)

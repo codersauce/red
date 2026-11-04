@@ -274,6 +274,7 @@ pub enum HostAction {
     CommandLine,
     References,
     RepeatInsert(usize),
+    ReplayMacro { register: char, count: usize },
     SyntaxParentEnd,
     Jump { forward: bool, count: usize },
 }
@@ -307,6 +308,7 @@ pub struct Plan {
     pub search: Option<String>,
     pub search_name: char,
     pub host: Option<HostAction>,
+    record_macro: Option<char>,
     pub save_jump: Option<Selections>,
     /// New top display row, as a document character offset.
     pub viewport_start: Option<usize>,
@@ -345,6 +347,23 @@ fn register_text(value: &str, newline: &str, count: usize) -> Result<String, &'s
 }
 
 impl Plan {
+    pub fn apply_macro_recording(&mut self, recorder: &mut crate::MacroRecorder) {
+        let Some(register) = self.record_macro.take() else {
+            return;
+        };
+        if let Some((dest, notation)) = recorder.toggle(register) {
+            if matches!(dest, '#' | '.' | '%') {
+                self.message = Some(format!("Register {dest} does not support writing"));
+            } else {
+                self.register_name = dest;
+                self.register = Some(vec![notation]);
+                self.message = Some(format!("Recorded to register [{dest}]"));
+            }
+        } else {
+            self.message = Some(format!("Recording to register [{register}]"));
+        }
+    }
+
     fn push_query(&mut self, query: String) {
         if matches!(self.search_name, '#' | '.' | '%') {
             self.message = Some(format!(
@@ -634,6 +653,7 @@ impl Session {
             search: None,
             search_name: self.selected_register.unwrap_or('/'),
             host: None,
+            record_macro: None,
             save_jump: None,
             viewport_start: None,
             message: None,
@@ -1144,6 +1164,13 @@ impl Session {
                 })
             }
             "." => p.host = Some(HostAction::RepeatInsert(count)),
+            "Q" => p.record_macro = Some(self.selected_register.unwrap_or('@')),
+            "q" => {
+                p.host = Some(HostAction::ReplayMacro {
+                    register: self.selected_register.unwrap_or('@'),
+                    count,
+                })
+            }
             "<copy-between-registers>" => p.next.pending = Pending::CopyFrom,
             "\"" => p.next.pending = Pending::SelectRegister,
             "g" => p.next.pending = Pending::Goto,

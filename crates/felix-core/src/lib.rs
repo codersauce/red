@@ -243,6 +243,10 @@ impl Selections {
 
 mod command;
 mod jumps;
+mod macro_key;
+mod macros;
+pub use macro_key::{MacroCode, MacroKey, NamedKey};
+pub use macros::{MacroRecorder, MacroReplay};
 mod motion;
 pub use jumps::Jumps;
 pub use motion::cell_width;

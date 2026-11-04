@@ -109,3 +109,11 @@ The register corpus runs separately from the accepted M1 motions fixture. Genera
 The 16 cases compare 366 per-key observations across named and built-in registers, Insert replay, directed selections, and the search register used by `n` and `N`. Search prompts compare their text, caret and candidates after each key. The copy command also exercises missing, read-only and empty slots. The observer binds F12 for that case. In Red, open `Space ?` and select **Copy between registers**, then type the source and destination register names.
 
 The clipboard trace exercises the system and primary targets independently in both terminals. Red’s provider tests cover external clipboard changes, rejected writes before deletion, and reads after attaching a different client. On Linux, run `xvfb-run -a cargo test --features helix --lib native_primary_selection_is_independent_of_system_clipboard -- --ignored` to exercise the desktop provider on an isolated display.
+
+### M2 macro comparisons
+
+Press `Q` to start recording in the default register (`@`), press `Q` to finish, then use `q` to replay. To record into register `a`, type `"aQ`. After stopping, `"a2q` replays it twice. Each edit keeps its normal undo boundary. You can replay a recording in another document or paste its key notation from a register.
+
+Run `scenarios.py --suite macros --observer <hx> --runtime <runtime>` and compare the output with `fixtures/macros.json` in this directory. The 17 cases check 230 physical inputs against Helix 25.07.1. Both `cargo test -p felix-core --test reference reference_macros` and `cargo test --features helix --lib macros_match_reference_at_every_key` replay that corpus. The paired terminal smoke checks the recording indicator, document switching, counted replay, and individual undo steps.
+
+A recording stores physical keys. A nested replay stores the invocation, and a bracketed paste edits the document without adding its contents to the recording. Red applies its 10,000-key playback limit across the entire counted and nested invocation. Input in a sensitive dialog is excluded. A replay that reaches a focused panel or the workspace manager stops before sending it another key.

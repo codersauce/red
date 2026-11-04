@@ -62,6 +62,50 @@ fn reference_registers() {
     ));
 }
 
+#[test]
+fn reference_macros() {
+    replay_suite(include_str!("../../../scripts/felix/fixtures/macros.json"));
+}
+
+// The fixture's physical input tokens use the document grammar. The register
+// itself stores Helix key notation, including physical Shift on capital letters.
+fn fixture_macro_key(token: &str, shift: bool) -> felix_core::MacroKey {
+    let name = match token {
+        "<enter>" => "ret",
+        "<delete>" => "del",
+        "<backtab>" => "S-tab",
+        token if token.starts_with('<') && token.len() > 1 => {
+            token.trim_start_matches('<').trim_end_matches('>')
+        }
+        token => token,
+    };
+    let name = name.replace("c-", "C-").replace("a-", "A-");
+    let mut key = felix_core::MacroKey::parse(&name).unwrap();
+    key.shift |= shift;
+    key
+}
+
+fn fixture_document_key(key: felix_core::MacroKey) -> String {
+    use felix_core::{MacroCode, NamedKey};
+    let name = match key.code {
+        MacroCode::Char(ch) => {
+            return if key.control {
+                format!("<c-{ch}>")
+            } else if key.alt {
+                format!("<a-{ch}>")
+            } else {
+                ch.to_string()
+            };
+        }
+        MacroCode::Named(NamedKey::Enter) => "enter",
+        MacroCode::Named(NamedKey::Delete) => "delete",
+        MacroCode::Named(NamedKey::Tab) if key.shift => "backtab",
+        MacroCode::Named(code) => code.name(),
+        MacroCode::Function(n) => return format!("<f{n}>"),
+    };
+    format!("<{name}>")
+}
+
 fn replay_suite(source: &str) {
     let suite: Value = serde_json::from_str(source).unwrap();
     for case in suite["cases"].as_array().unwrap() {
@@ -74,17 +118,27 @@ fn replay_suite(source: &str) {
         let mut viewport_start = 0;
         let mut before: Option<(Rope, Selections)> = None;
         let mut last_insert = felix_core::LastInsert::default();
+        let mut recorder = felix_core::MacroRecorder::default();
+        let mut macros = felix_core::MacroReplay::default();
         let mut undo = Vec::new();
         let mut redo = Vec::new();
         for (i, event) in case["events"].as_array().unwrap().iter().enumerate() {
             let key = event["key"].as_str().unwrap();
-            let recipe = last_insert.clone();
-            let mut replay = recipe.replay(0);
+            let mut repeat_steps = std::collections::VecDeque::new();
+            let mut status = None;
+            if event.get("paste").is_none() {
+                recorder.record(|| fixture_macro_key(key, event["shift"] == true));
+            }
             let mut physical = Some(InsertEvent::Key(key.to_owned()));
             loop {
-                let step = replay.next();
-                let physical_event = physical.take();
-                let Some(input) = step.map(|step| step.event).or(physical_event.as_ref()) else {
+                let step: Option<(InsertEvent, History, History)> = repeat_steps.pop_front();
+                let input = if let Some((event, _, _)) = &step {
+                    event.clone()
+                } else if let Some(physical) = physical.take() {
+                    physical
+                } else if let Some(key) = macros.next_key(10_000).unwrap() {
+                    InsertEvent::Key(fixture_document_key(key))
+                } else {
                     break;
                 };
                 // Plain unindented fixture layout, with no retained indent, word
@@ -94,7 +148,7 @@ fn replay_suite(source: &str) {
                     text: text.slice(..),
                     width: wrap_width.unwrap_or(1),
                 };
-                let mut plan = match (input, event["paste"].as_str()) {
+                let mut plan = match (&input, event["paste"].as_str()) {
                     (_, Some(value)) => session.bracketed_paste(text.slice(..), &sel, value),
                     (InsertEvent::Key(token), None) => {
                         let token = if token == "<f12>" {
@@ -126,9 +180,18 @@ fn replay_suite(source: &str) {
                         session.replay_completion(text.slice(..), &sel, change)
                     }
                 };
-                if let Some(step) = step {
-                    plan.history = step.history(plan.history);
-                } else if event.get("paste").is_none() && !session.awaiting_register_argument() {
+                plan.apply_macro_recording(&mut recorder);
+                status = plan.message.clone();
+                if let Some((_, begin, commit)) = step {
+                    plan.history = match plan.history {
+                        History::Begin => begin,
+                        History::Commit => commit,
+                        other => other,
+                    };
+                } else if event.get("paste").is_none()
+                    && !session.awaiting_register_argument()
+                    && let InsertEvent::Key(key) = &input
+                {
                     last_insert.record(key, session.mode, plan.next.mode);
                 }
                 viewport_start = plan
@@ -142,7 +205,7 @@ fn replay_suite(source: &str) {
                     && let Some(original) = before.take()
                     && text != original.0
                 {
-                    undo.push(original);
+                    undo.push((original, (text.clone(), sel.clone())));
                     redo.clear();
                 }
                 if !plan.edits.is_empty() && before.is_none() {
@@ -171,22 +234,22 @@ fn replay_suite(source: &str) {
                 ) && let Some(original) = before.take()
                     && text != original.0
                 {
-                    undo.push(original);
+                    undo.push((original, (text.clone(), sel.clone())));
                     redo.clear();
                 }
                 match plan.host {
                     Some(HostAction::Undo(count)) => {
                         for _ in 0..count {
                             let Some(previous) = undo.pop() else { break };
-                            redo.push((text, sel));
-                            (text, sel) = previous;
+                            (text, sel) = previous.0.clone();
+                            redo.push(previous);
                         }
                     }
                     Some(HostAction::Redo(count)) => {
                         for _ in 0..count {
                             let Some(next) = redo.pop() else { break };
-                            undo.push((text, sel));
-                            (text, sel) = next;
+                            (text, sel) = next.1.clone();
+                            undo.push(next);
                         }
                     }
                     Some(HostAction::Jump { forward, count }) => {
@@ -194,7 +257,21 @@ fn replay_suite(source: &str) {
                             sel = saved;
                         }
                     }
-                    Some(HostAction::RepeatInsert(count)) => replay = recipe.replay(count),
+                    Some(HostAction::RepeatInsert(count)) => {
+                        repeat_steps.extend(last_insert.replay(count).map(|s| {
+                            (
+                                s.event.clone(),
+                                s.history(History::Begin),
+                                s.history(History::Commit),
+                            )
+                        }));
+                    }
+                    Some(HostAction::ReplayMacro { register, count }) => {
+                        let values = registers.exists(register).then(|| {
+                            registers.read(register, text.slice(..), &sel, "~/example.txt")
+                        });
+                        status = macros.start(register, values.as_deref(), count).err();
+                    }
                     None => {}
                     other => panic!("fixture requires additional host implementation: {other:?}"),
                 }
@@ -213,6 +290,12 @@ fn replay_suite(source: &str) {
                 "primary":sel.primary_index(),"pending":session.pending_keys(),"count":session.count(),
                 "search":registers.exists('/').then(||registers.search_history().iter().rev().collect::<Vec<_>>()),
                 "unnamed":registers.stored('"')});
+            if event.get("macro_recording").is_some() {
+                actual["macro_recording"] = json!(recorder.register());
+                if event.get("macro_status").is_some() {
+                    actual["macro_status"] = json!(status);
+                }
+            }
             if event.get("last_search_register").is_some() {
                 actual["last_search_register"] = json!(session.last_search_register());
             }

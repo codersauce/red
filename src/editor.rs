@@ -14793,6 +14793,8 @@ impl Editor {
         let started_with_panel_focus = self.panel_manager.focused_panel_id().is_some();
         let started_in_normal = self.is_normal();
         let semantic_can_start = started_in_normal || self.is_visual();
+        #[cfg(feature = "helix")]
+        self.record_felix_macro_key(&ev);
         let was_recording_macro = self.macro_recording.is_some();
         let resolve_span = perf::PerfSpan::start("event:resolve_action");
         let mut action = self.handle_event_with_runtime(&ev, Some(runtime))?;

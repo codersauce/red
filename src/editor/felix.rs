@@ -1,5 +1,6 @@
 //! Red adapter for document-window Felix sessions.
 
+mod macros;
 mod prompt;
 
 use super::*;
@@ -83,6 +84,8 @@ pub(super) struct FelixHost {
     native_prefix_owner: Option<Owner>,
     pub(super) preview: Option<CompletionPreview>,
     last_insert: felix_core::LastInsert,
+    pub(super) recorder: felix_core::MacroRecorder,
+    pub(super) playback: felix_core::MacroReplay,
     jumps: HashMap<WindowId, felix_core::Jumps<BufferId>>,
     indent: HashMap<BufferId, String>,
     selections: HashMap<(BufferId, WindowId), Selections>,
@@ -1124,6 +1127,7 @@ impl Editor {
                 }
             }
         };
+        plan.apply_macro_recording(&mut self.felix.recorder);
         // Complete a provider write before changing the document or opening undo history.
         if let Some(values) = plan
             .register
@@ -1314,6 +1318,10 @@ impl Editor {
                         .await?;
                     self.felix.session = Session::default();
                     self.mode = Mode::Normal;
+                }
+                HostAction::ReplayMacro { register, count } => {
+                    self.play_felix_macro(register, count, frame, runtime)
+                        .await?;
                 }
                 HostAction::RepeatInsert(count) => {
                     let recipe = self.felix.last_insert.clone();
@@ -1599,8 +1607,14 @@ impl Editor {
             .selections
             .get(&(doc, view))
             .map_or((1, 1), |s| (s.primary_index() + 1, s.ranges().len()));
+        let recording = self
+            .felix
+            .recorder
+            .register()
+            .map(|r| format!(" [{r}]"))
+            .unwrap_or_default();
         Some(format!(
-            "{} {primary}/{total}",
+            "{} {primary}/{total}{recording}",
             match self.felix.session.mode {
                 felix_core::Mode::Insert => "INSERT",
                 felix_core::Mode::Select => "SELECT",
@@ -2515,6 +2529,49 @@ mod tests {
         assert_eq!(peer.get_text().unwrap().as_deref(), Some("system"));
     }
 
+    async fn chars(editor: &mut Editor, keys: &str) {
+        for ch in keys.chars() {
+            editor
+                .test_execute_event(Event::Key(KeyEvent::new(
+                    KeyCode::Char(ch),
+                    KeyModifiers::NONE,
+                )))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn macro_replay_reads_external_keys_and_skips_sensitive_input() {
+        let (mut editor, _, _) = fixture_editor("abc\n");
+        let provider = crate::clipboard::MemoryClipboardProvider::default();
+        let shared = provider.shared_text();
+        editor.test_set_clipboard(Box::new(provider));
+        editor.config.clipboard.enabled = true;
+        chars(&mut editor, "\"+Ql").await;
+        editor.current_dialog = Some(Box::new(InputPrompt::secret(
+            &editor,
+            "Secret",
+            Action::Print,
+        )));
+        chars(&mut editor, "secret").await;
+        editor.current_dialog = None;
+        chars(&mut editor, "Q").await;
+        assert_eq!(shared.lock().unwrap().as_deref(), Some("l"));
+        *shared.lock().unwrap() = Some("rX<invalid>".into());
+        chars(&mut editor, "\"+q").await;
+        assert_eq!(editor.current_buffer().contents(), "abc\n");
+        assert!(editor
+            .last_error
+            .as_deref()
+            .unwrap()
+            .starts_with("Invalid macro:"));
+        *shared.lock().unwrap() = Some("rXlrY".into());
+        chars(&mut editor, "\"+q").await;
+        assert_eq!(editor.current_buffer().contents(), "aXY\n");
+        assert!(!editor.felix.playback.active());
+    }
+
     #[tokio::test]
     async fn named_registers_survive_a_document_switch_and_use_the_live_system_clipboard() {
         let (mut editor, _, _) = fixture_editor("abc\n");
@@ -2522,17 +2579,6 @@ mod tests {
         let shared = provider.shared_text();
         editor.test_set_clipboard(Box::new(provider));
         editor.config.clipboard.enabled = true;
-        async fn chars(editor: &mut Editor, keys: &str) {
-            for ch in keys.chars() {
-                editor
-                    .test_execute_event(Event::Key(KeyEvent::new(
-                        KeyCode::Char(ch),
-                        KeyModifiers::NONE,
-                    )))
-                    .await
-                    .unwrap();
-            }
-        }
         chars(&mut editor, "\"ayl\"+y").await;
         assert_eq!(shared.lock().unwrap().as_deref(), Some("b"));
         editor
@@ -2897,6 +2943,11 @@ mod tests {
         replay_suite(include_str!("../../scripts/felix/fixtures/registers.json")).await;
     }
 
+    #[tokio::test]
+    async fn macros_match_reference_at_every_key() {
+        replay_suite(include_str!("../../scripts/felix/fixtures/macros.json")).await;
+    }
+
     async fn replay_suite(capture: &str) {
         let suite: Value = serde_json::from_str(capture).unwrap();
         let cases = suite["cases"].as_array().unwrap();
@@ -2962,23 +3013,38 @@ mod tests {
                 "<backtab>" => KeyCode::BackTab,
                 _ => KeyCode::Char(token.chars().next().unwrap()),
             };
+            if expected["shift"] == true {
+                modifiers.insert(KeyModifiers::SHIFT);
+            }
             let event = match expected.get("paste") {
                 Some(value) => Event::Paste(value.as_str().unwrap().to_owned()),
                 None => Event::Key(KeyEvent::new(code, modifiers)),
             };
             // F12 is bound only in the reference fixture to Helix's unbound static command.
-            let action = if token == "<f12>" {
-                KeyAction::Single(Action::FelixCopyBetweenRegisters)
-            } else {
+            if name.starts_with("macro-") {
                 editor
-                    .handle_event_with_runtime(&event, Some(&runtime))
-                    .unwrap()
-                    .expect("document key")
-            };
-            editor
-                .handle_key_action(&event, &action, &mut frame, &mut runtime)
-                .await
-                .unwrap();
+                    .process_editor_event(
+                        event.clone(),
+                        &mut frame,
+                        &mut runtime,
+                        EventRenderMode::Immediate,
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                let action = if token == "<f12>" {
+                    KeyAction::Single(Action::FelixCopyBetweenRegisters)
+                } else {
+                    editor
+                        .handle_event_with_runtime(&event, Some(&runtime))
+                        .unwrap()
+                        .expect("document key")
+                };
+                editor
+                    .handle_key_action(&event, &action, &mut frame, &mut runtime)
+                    .await
+                    .unwrap();
+            }
             let (doc, view, _, _) = editor.felix_owner().unwrap();
             let s = &editor.felix.selections[&(doc, view)];
             let mut actual = json!({"key":token,"document":format!("~/{}",std::path::Path::new(&editor.current_file_name().unwrap()).file_name().unwrap().to_string_lossy()),
@@ -3005,6 +3071,15 @@ mod tests {
                         "{name} input {} caret",
                         index + 1
                     );
+                }
+            }
+            if expected.get("macro_recording").is_some() {
+                actual["macro_recording"] = json!(editor.felix.recorder.register());
+                if expected.get("macro_status").is_some() {
+                    actual["macro_status"] = json!(editor.last_error);
+                }
+                if expected.get("shift").is_some() {
+                    actual["shift"] = json!(modifiers.contains(KeyModifiers::SHIFT));
                 }
             }
             if expected.get("last_search_register").is_some() {

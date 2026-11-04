@@ -1,5 +1,5 @@
 diff --git a/helix-term/src/application.rs b/helix-term/src/application.rs
-index cf09aac..d3f6152 100644
+index cf09aac..fe09251 100644
 --- a/helix-term/src/application.rs
 +++ b/helix-term/src/application.rs
 @@ -642,7 +642,11 @@ pub async fn handle_terminal_events(&mut self, event: std::io::Result<CrosstermE
@@ -15,7 +15,7 @@ index cf09aac..d3f6152 100644
              CrosstermEvent::Resize(width, height) => {
                  self.terminal
                      .resize(Rect::new(0, 0, width, height))
-@@ -663,6 +667,48 @@ pub async fn handle_terminal_events(&mut self, event: std::io::Result<CrosstermE
+@@ -663,6 +667,50 @@ pub async fn handle_terminal_events(&mut self, event: std::io::Result<CrosstermE
              event => self.compositor.handle_event(&event.into(), &mut cx),
          };
  
@@ -47,6 +47,8 @@ index cf09aac..d3f6152 100644
 +                "event": event, "paste": paste, "mode": format!("{:?}", self.editor.mode),
 +                "text": doc.text().to_string(), "primary": selections.primary_index(),
 +                "ranges": selections.iter().map(|r| [r.anchor, r.head]).collect::<Vec<_>>(),
++                "macro_recording": self.editor.macro_recording.as_ref().map(|(name, _)| *name),
++                "macro_status": self.editor.get_status().map(|(msg, _)| msg.as_ref()),
 +                "last_search_register": self.editor.registers.last_search_register, "selected_register": self.editor.selected_register, "registers": observed_slots,
 +                "register_prompt": self.editor.autoinfo.as_ref().map(|info| info.title.as_ref())
 +                    .filter(|title| matches!(*title, "Select register" | "Insert register" | "Copy from register" | "Copy into register")),

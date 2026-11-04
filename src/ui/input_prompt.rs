@@ -112,6 +112,10 @@ impl InputPrompt {
 }
 
 impl Component for InputPrompt {
+    fn is_sensitive_input(&self) -> bool {
+        self.masked
+    }
+
     fn shortcut_context(&self) -> &str {
         self.dialog.title().unwrap_or("Input")
     }

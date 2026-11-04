@@ -580,6 +580,31 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
             tmux("send-keys", "l", "r", "Q")
             observe("move once in the new split", "fYYZQ foo", "NOR", "1 sel", copies=2)
             return checkpoints
+        if scenario == "macros":
+            observe("open", "foo foo", "NOR", "1 sel")
+            tmux("send-keys", "-l", '"aQ')
+            observe("start named recording", "foo foo", "NOR", "1 sel", message="Recording to register [a]")
+            tmux("send-keys", "-l", "l")
+            observe("recording indicator after motion", "foo foo", "NOR", "1 sel", message="[a]")
+            tmux("send-keys", "-l", "rZQ")
+            observe("save named recording", "fZo foo", "NOR", "1 sel", message="Recorded to register [a]")
+            tmux("send-keys", "-l", "gn")
+            observe("switch documents", "other buffer", "NOR", "1 sel", "other.txt")
+            tmux("send-keys", "-l", '"a2q')
+            observe("replay twice in another document", "oZZer buffer", "NOR", "1 sel", "other.txt")
+            tmux("send-keys", "u")
+            observe("undo one replacement", "oZher buffer", "NOR", "1 sel", "other.txt")
+            tmux("send-keys", "u")
+            observe("undo the first replacement", "other buffer", "NOR", "1 sel", "other.txt")
+            tmux("send-keys", "-l", "QgpggrWQ")
+            observe("record a document switch and edit", "WZo foo", "NOR", "1 sel")
+            tmux("send-keys", "-l", "ugn")
+            observe("return to the starting document", "other buffer", "NOR", "1 sel", "other.txt")
+            tmux("send-keys", "-l", "q")
+            observe("switch documents during replay", "WZo foo", "NOR", "1 sel")
+            tmux("send-keys", "C-w", "s", "u")
+            observe("undo the replay from a split", "fZo foo", "NOR", "1 sel", copies=2)
+            return checkpoints
         if scenario == "registers":
             observe("open", "foo foo", "NOR", "1 sel")
             tmux("send-keys", "-l", '"')
@@ -710,7 +735,7 @@ def main():
             for scenario, directory in (("split-search", "split"), ("wrapped-split-search", "wrap"),
                                         ("selection-errors", "sel"), ("clipboard", "clip"),
                                         ("completion-repeat", "cr"), ("snippet-stops", "st"), ("rust-edit", "rs"),
-                                        ("split-completion", "sc"), ("registers", "reg")):
+                                        ("split-completion", "sc"), ("registers", "reg"), ("macros", "mac")):
                 key = scenario.replace("-", "_")
                 additional_traces[key] = run_trace(bundle, root / f"release-{directory}", scenario=scenario)
                 additional_traces[f"red_{key}"] = (run_trace(bundle, root / f"red-{directory}",

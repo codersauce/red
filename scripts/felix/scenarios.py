@@ -61,6 +61,28 @@ def register_followup_cases():
         '<f12>', '_', '/', '<f12>', '/', 'a']
 
 
+def macro_cases():
+    text = "one two three four\nred blue green\n"
+    yield "macro-default-count-undo", text, list("QlrXQ2quuU")
+    yield "macro-record-overwrite", text, list('"aQ') + ['i', 'Q', '<esc>'] + list('Q"aql"aQQ"aq')
+    yield "macro-nested-recording", text, list('"aQlrXQ"bQ"aqhQ2"bq')
+    yield "macro-case-sensitive", text, list('"aQlQ"AQjQ"aq"Aq"bq')
+    yield "macro-self-recursion", text, list('"aQ"aqlQ"aqh"aq')
+    yield "macro-mutual-recursion", text, list('"aQ"bqlQ"bQ"aqhQ"aq')
+    yield "macro-tail-recursion", '"aq tail\n', list('vll"ay;gg"aqh')
+    yield "macro-repeat-insert", text, ['i', '!', '<esc>'] + list('Ql.Q2qu')
+    yield "macro-select-search", text, ['%', 'Q', 's', 'o', '<enter>', 'r', 'Z', 'Q', 'u', '%', 'q', 'u']
+    yield "macro-mode-boundaries", text, ['v', 'Q', 'l', 'i', '!', '<esc>', 'Q', 'q', '.', 'u']
+    yield "macro-key-notation", text + "\tindented\n", ['Q', 'i', 'é', ' ', '-', '<', '>', '<left>', '<backspace>',
+        '<enter>', '<tab>', '<esc>', 'Q', 'q', 'u']
+    yield "macro-paste-event", text, ['Q', 'i', {'paste': 'PASTE'}, '!', '<esc>', 'Q', 'q', 'u']
+    yield "macro-register-fragments", text, ['%', 's', 'o', '<enter>'] + list('"ay"aq"bq')
+    yield "macro-register-sources", 'lrZ rest\n', list('vll"ay;gg"aq')
+    yield "macro-invalid-notation", 'l<bogus>\n', list('x"aygg"aq')
+    yield "macro-special-registers", text, list('"#QlQ"_QhQ"_q')
+    yield "macro-count-and-stop-register", text, list('3"aQ2l"bQ"aq"bq')
+
+
 def pending_input_cases():
     for mode, start in (("normal", []), ("select", ["v"])):
         yield f"modified-arguments-{mode}", "aa b c x c w (aa bb) x 2 🦊 2\n", (
@@ -366,8 +388,8 @@ def capture(observer, runtime, root, name, text, keys):
     env = {"PATH": os.environ["PATH"], "HOME": str(root), "SHELL": "/bin/sh",
            "LANG": "en_US.UTF-8", "HELIX_RUNTIME": str(runtime),
            "FELIX_REFERENCE_TRACE": str(trace), "XDG_CONFIG_HOME": str(root/"config")}
-    if name.startswith("register-"):
-        env["FELIX_REFERENCE_REGISTERS"] = REGISTER_SLOTS
+    if name.startswith(("register-", "macro-")):
+        env["FELIX_REFERENCE_REGISTERS"] = REGISTER_SLOTS + ("@" if name.startswith("macro-") else "")
     def tmux(*args, check=True):
         return subprocess.run(["tmux", "-f", "/dev/null", "-S", str(root/"t.sock"), *args],
                               cwd=workdir, env=env, capture_output=True, text=True, check=check).stdout
@@ -435,7 +457,14 @@ def capture(observer, runtime, root, name, text, keys):
                 raise ValueError(f"{name}: missing shift modifier in {raw_event}")
             events.append({"key": key, **{k: record[k] for k in
                 ("mode", "text", "ranges", "primary", "unnamed", "search", "pending", "count", "document")}})
-            if name.startswith("register-"):
+            if name.startswith("macro-"):
+                if "SHIFT" in raw_event:
+                    events[-1]["shift"] = True
+                events[-1]["macro_recording"] = record["macro_recording"]
+                status = record["macro_status"] or ""
+                if status.startswith(("Recording to register", "Recorded to register", "Register [", "Cannot replay from register", "Invalid macro:", "Register #")):
+                    events[-1]["macro_status"] = status
+            if name.startswith(("macro-", "register-")):
                 events[-1].update({k: record[k] for k in ("registers", "selected_register", "register_prompt")})
                 if name.startswith(("register-search-", "register-selection-queries", "register-copy-values")):
                     events[-1]["last_search_register"] = record["last_search_register"]
@@ -487,9 +516,14 @@ def main():
     parser.add_argument("--runtime", required=True, type=Path)
     parser.add_argument("--seed", type=int, default=250701)
     parser.add_argument("--steps", type=int, default=48)
-    parser.add_argument("--suite", choices=("core", "registers"), default="core")
+    parser.add_argument("--suite", choices=("core", "registers", "macros"), default="core")
     args = parser.parse_args()
-    cases = [*register_cases(), *register_followup_cases()] if args.suite == "registers" else scenarios(args.seed, args.steps)
+    if args.suite == "macros":
+        cases = macro_cases()
+    elif args.suite == "registers":
+        cases = [*register_cases(), *register_followup_cases()]
+    else:
+        cases = scenarios(args.seed, args.steps)
     with tempfile.TemporaryDirectory(prefix="fx-") as tmp:
         result = [capture(args.observer.resolve(strict=True), args.runtime.resolve(strict=True),
                           Path(tmp)/str(i), *scenario)

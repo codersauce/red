@@ -196,6 +196,10 @@ pub(super) async fn run() -> Result<()> {
     helix_selections_follow_rpc_document_apply()
         .await
         .context("Felix RPC document edit")?;
+    #[cfg(feature = "helix")]
+    helix_macro_waits_for_rpc_and_physical_input_discards_its_tail()
+        .await
+        .context("Felix macro RPC continuation")?;
     lazy_initialization_keeps_input_responsive()
         .await
         .context("responsive lazy initialization")?;
@@ -571,6 +575,41 @@ async fn ordered_action_tails_and_user_interruption() -> Result<()> {
     assert!(!h.marker("started", 6).exists());
     assert_eq!(h.screen().matches("tail").count(), 2);
     assert!(h.screen().contains("user"));
+    Ok(())
+}
+
+#[cfg(feature = "helix")]
+async fn helix_macro_waits_for_rpc_and_physical_input_discards_its_tail() -> Result<()> {
+    let mut h = Harness::build(
+        KeyAction::Single(Action::PluginCommand("RpcWait".into())),
+        false,
+        default_buffers(),
+        EditingModel::Helix,
+    )
+    .await?;
+    h.text("Q:RpcWait").await?;
+    h.key(KeyCode::Enter).await?;
+    h.release(1)?;
+    h.until(|h| h.screen().contains("RpcWait done"))
+        .await
+        .context("record original command")?;
+    h.text("iZ").await?;
+    h.key(KeyCode::Escape).await?;
+    h.text("Qu2q").await?;
+    h.until(|h| h.marker("started", 2).exists())
+        .await
+        .context("first replay invocation")?;
+    assert!(!h.screen().contains("Zhello"));
+    h.release(2)?;
+    h.until(|h| h.marker("started", 3).exists())
+        .await
+        .context("second replay invocation")?;
+    assert!(h.screen().contains("Zhello"), "{}", h.screen());
+    h.text("l").await?;
+    h.release(3)?;
+    h.until(|h| h.marker("done", 3).exists() && !h.core.test_rpc_command_pending("slow"))
+        .await?;
+    assert!(!h.screen().contains("ZZhello"), "{}", h.screen());
     Ok(())
 }
 

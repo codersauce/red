@@ -173,7 +173,7 @@ impl Editor {
             )
     }
 
-    fn begin_edit_batch(&mut self) {
+    pub(super) fn begin_edit_batch(&mut self) {
         if self.edit_batch.depth == 0 {
             self.edit_batch.started = Some(Instant::now());
             self.edit_batch.steps = 0;
@@ -230,7 +230,7 @@ impl Editor {
         notification_result.and(event_result).and(render_result)
     }
 
-    async fn finish_edit_batch(
+    pub(super) async fn finish_edit_batch(
         &mut self,
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
@@ -508,6 +508,24 @@ mod tests {
             self.editor.render(&mut full).unwrap();
             assert_eq!(self.frame.cells, full.cells);
         }
+    }
+
+    #[cfg(feature = "helix")]
+    #[tokio::test]
+    async fn cancelling_a_macro_in_insert_finishes_the_felix_transaction() {
+        let mut h = Harness::new("abc\n");
+        h.editor.config.editing_model = crate::config::EditingModel::Helix;
+        h.keys("lQiX\x1bQu").await;
+        assert_eq!(h.editor.current_buffer().contents(), "abc\n");
+        h.editor.edit_batch.cancelled = true;
+        h.keys("q").await;
+        assert_eq!(h.editor.felix_status().as_deref(), Some("NORMAL 1/1"));
+        assert!(!h.editor.transaction_active());
+        assert_eq!(h.editor.current_buffer().contents(), "abc\n");
+        h.keys("q").await;
+        assert_eq!(h.editor.current_buffer().contents(), "aXbc\n");
+        h.keys("u").await;
+        assert_eq!(h.editor.current_buffer().contents(), "abc\n");
     }
 
     #[tokio::test]
