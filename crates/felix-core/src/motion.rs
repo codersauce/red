@@ -193,6 +193,50 @@ fn logical_end(text: RopeSlice<'_>, start: usize) -> usize {
     }
 }
 
+/// Extend or trim the selection to whole LF-delimited lines, including their endings.
+pub(crate) fn select_lines(text: RopeSlice<'_>, range: Range, key: &str, count: usize) -> Range {
+    let first = logical_start(text, range.start());
+    let last = logical_start(text, boundary(text, range.end(), false).max(range.start()));
+    let after_line = |start| {
+        let next = move_lines(text, start, true, 1);
+        if next == start {
+            text.len_chars()
+        } else {
+            next
+        }
+    };
+    let end = after_line(last);
+    match key {
+        "x" => {
+            let whole = range.start() == first && range.end() == end;
+            let additional = if whole {
+                count
+            } else {
+                count.saturating_sub(1)
+            };
+            let head = if additional == 0 {
+                end
+            } else {
+                after_line(move_lines(text, last, true, additional))
+            };
+            Range {
+                anchor: first,
+                head,
+            }
+        }
+        "<a-x>" if first == last => range,
+        "<a-x>" => range.with_bounds(
+            if first == range.start() {
+                first
+            } else {
+                after_line(first)
+            },
+            if end == range.end() { end } else { last },
+        ),
+        _ => range.with_bounds(first, end),
+    }
+}
+
 pub(crate) fn goto(
     text: RopeSlice<'_>,
     r: Range,

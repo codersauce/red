@@ -850,37 +850,8 @@ impl Session {
                 }
                 out
             }),
-            "x" | "X" | "<a-x>" => p.set(selections.transform(text, |r| {
-                let (first, last) = r.lines(text);
-                let start = text.line_to_char(first);
-                let end = text.line_to_char(last + 1);
-                match key {
-                    "x" => {
-                        let extra = usize::from(start == r.start() && end == r.end());
-                        let line = last
-                            .saturating_add(count)
-                            .saturating_add(extra)
-                            .min(text.len_lines());
-                        Range {
-                            anchor: start,
-                            head: text.line_to_char(line),
-                        }
-                    }
-                    "<a-x>" if first == last => r,
-                    "<a-x>" => r.with_bounds(
-                        if r.start() == start {
-                            start
-                        } else {
-                            text.line_to_char(first + 1)
-                        },
-                        if r.end() == end {
-                            end
-                        } else {
-                            text.line_to_char(last)
-                        },
-                    ),
-                    _ => r.with_bounds(start, end),
-                }
+            "x" | "X" | "<a-x>" => p.set(selections.transform(text, |range| {
+                crate::motion::select_lines(text, range, key, count)
             })),
             "C" | "<a-C>" => p.set(crate::motion::copies(
                 text,

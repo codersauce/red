@@ -39,6 +39,8 @@ The completion trace exercises 45 checkpoints with two active selections. Up, Ta
 
 The trace also accepts a snippet at both selections, replaces two successive placeholders, and undoes the changes. Undo after accepting a filtered completion restores the text from the time of the request. Dot repeats the saved completion at the primary cursor and replays ordinary typing at both cursors. The language server independently verifies the resulting document and counts completion requests during repeat. Helix 25.07.1 crashes when advancing from the second replaced placeholder to the final stop in this trace. A Red regression advances to that stop and types at both cursors.
 
+The whole-line selection fixtures cover counts, reversed selections, and files that mix CRLF and LF with a standalone carriage return or Unicode separator inside a line.
+
 The text-object fixtures exercise inner and around selections for words, paragraphs, quotes, and nested delimiters. They include backward selections, Unicode delimiters, unmatched selections in a multi-cursor edit, counted searches, and CRLF paragraph separators.
 
 The Red integration test compares directed selections, primary index, mode, register values, pending prefixes, text, and active document at each event. To replay the manual workflow in disposable files, run `sh scripts/felix/try-workflow.sh "$PWD/target/debug/red"`.

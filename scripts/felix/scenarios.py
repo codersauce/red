@@ -80,6 +80,12 @@ def scenarios(seed, steps):
         list("3ljjjkkkvjj") + ["<esc>"] + list("ggllgjgjgk"))
     yield "logical-separators", "ab\vcd\u2028ef\rgh\r\n\t世界ok\u0085qr\nlast", (
         list("4lghglgg2gggsglgjgjgkgkgeghgg2j2k"))
+    mixed_endings = "p\u2028abcdef\r\tq\v\u2029z\x85last\r\nend\n"
+    yield "mixed-ending-line-selection", mixed_endings, (
+        list("2ggxXx3xgg3lxgjgkgsglghx") + ["<a-x>"] + list("gg3lXv2j") + ["<a-x>"])
+    yield "mixed-ending-reverse-selection", mixed_endings, (
+        list("2gg12lvjgjgkgjgjk") + ["<esc>"] + list("xgggeghgsgl"))
+    yield "mixed-ending-counted-motion", mixed_endings, list("5ljjkk3gj2gkgsgl2gg4ljjkkgeghgl")
     yield "vertical-goal", "abcdef\nxy\nuvwxyz\n", list("4ljjkkvjj") + ["<esc>"]
     yield "repeat-bracketed-paste", "ab cd\n", ["i", "X", {"paste":"é😀"}, "Y", "<esc>", ".", "u", "u", "u", "u", "U"]
     yield "bracketed-paste-modes", "one two\r\n", ["2", {"paste":"x\ny"}, "u", "v", "l", {"paste":"Z"}, "u"]
