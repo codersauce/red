@@ -233,6 +233,30 @@ impl Editor {
         ))
     }
 
+    pub(super) fn felix_completion_dismissal(&self, event: &Event) -> Option<KeyAction> {
+        let Event::Key(key) = event else { return None };
+        if self.config.editing_model != crate::config::EditingModel::Helix
+            || !self.is_insert()
+            || self.panel_manager.focused_panel_id().is_some()
+            || !self.current_dialog.as_ref()?.accepts_completion_updates()
+        {
+            return None;
+        }
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                Some(KeyAction::Single(Action::CloseDialog))
+            }
+            (KeyCode::Esc, KeyModifiers::NONE) => Some(KeyAction::Multiple(vec![
+                Action::CloseDialog,
+                Action::FelixInput {
+                    key: "<esc>".into(),
+                    owner: self.felix_owner()?,
+                },
+            ])),
+            _ => None,
+        }
+    }
+
     pub(super) fn felix_input_action(&mut self, key: &KeyEvent) -> Option<KeyAction> {
         if !self.felix.session.awaiting_input() {
             let bindings = if self.felix.session.mode == felix_core::Mode::Insert {

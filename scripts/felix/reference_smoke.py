@@ -8,6 +8,7 @@ from pathlib import Path
 import platform
 import re
 import subprocess
+import sys
 import tarfile
 import tempfile
 import time
@@ -25,10 +26,10 @@ ARCHIVES = {
 }
 
 
-def run_trace(bundle, root, executable=None, trace=None, red=False, paging=False, repeat=False):
+def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="edit"):
     root.mkdir()
-    fixture = root / "example.txt"
-    fixture.write_text("".join(f"ROW-{number:03}\n" for number in range(1, 41)) if paging else "foo foo\n")
+    fixture = root / ("example.rs" if scenario == "completion" else "example.txt")
+    fixture.write_text("".join(f"ROW-{number:03}\n" for number in range(1, 41)) if scenario == "paging" else "foo foo\n")
     other = root / "other.txt"
     other.write_text("other buffer\n")
     env = {
@@ -43,15 +44,30 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, paging=False
         "SHELL": "/bin/sh",
     }
 
+    state = root / "lsp-state.json"
+    if scenario == "completion":
+        server = Path(__file__).resolve().parents[1] / "edit_replay_lsp.py"
+        args = [str(server), "--mode", "incremental", "--state", str(state), "--completion"]
+        command = f"command = {json.dumps(sys.executable)}\nargs = {json.dumps(args)}\n"
+    if scenario == "completion" and not red:
+        config = root / "config/helix"
+        config.mkdir(parents=True)
+        (config / "languages.toml").write_text(
+            '[[language]]\nname = "rust"\nlanguage-servers = ["felix-test"]\n[language-server.felix-test]\n' + command
+        )
+        (config / "config.toml").write_text('[editor]\nauto-completion = false\n')
     if red:
         config = root / "config/red"
         config.mkdir(parents=True)
         # Compare equal document heights. Red's optional breadcrumb plugin
         # can reserve a screen row asynchronously after the document opens.
-        window_config = 'disabled_plugins = ["barbecue"]\n' if paging or repeat else ""
+        window_config = 'disabled_plugins = ["barbecue"]\n' if scenario in ("paging", "repeat") else ""
         (config / "config.toml").write_text(
             window_config + 'editing_model = "helix"\ndisable_ai = true\nsplash = false\n'
-            'show_whats_new = false\nfetch_release_notes = false\n[lsp]\nenabled = false\n'
+            'show_whats_new = false\nfetch_release_notes = false\n[lsp]\n'
+            + ('enabled = true\n[completion]\nauto_trigger = false\n[lsp.servers.rust]\n'
+               'language_id = "rust"\nfile_extensions = ["rs"]\nroot_markers = []\n' + command
+               if scenario == "completion" else 'enabled = false\n')
         )
 
     if trace is not None:
@@ -65,7 +81,8 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, paging=False
 
     checkpoints = []
 
-    def observe(label, line, mode, sels="1/2 sels", name="example.txt", copies=1):
+    def observe(label, line, mode, sels="1/2 sels", name=None, copies=1, menu=None):
+        name = name or fixture.name
         # Reading the tmux screen sends no input to the editor.
         deadline = time.monotonic() + (30 if label == "open" else 5)
         expected_line = f"    1  {line}".rstrip()
@@ -83,11 +100,24 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, paging=False
                            and status[-3:-1] == sels.split())
             if copies > 1:
                 matches &= sum(row.strip() == (f"1 {line}" if red else f"1  {line}") for row in rows) == copies
+            if menu is not None:
+                matches &= ("FelixCandidate" in frame) == menu
             if matches:
                 checkpoints.append({"step": label, "frame": rows})
                 return
             if time.monotonic() >= deadline:
                 raise RuntimeError(f"{label}: expected {line!r} in {mode} mode\n{frame}")
+            time.sleep(0.02)
+
+    def observe_server(text):
+        expected = hashlib.sha256(text.encode()).hexdigest()
+        deadline = time.monotonic() + 15
+        while True:
+            data = json.loads(state.read_text()) if state.exists() else {}
+            if data.get("sha256") == expected:
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"completion server expected {text!r}, last state {data}")
             time.sleep(0.02)
 
     def observe_page(first):
@@ -106,13 +136,34 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, paging=False
     try:
         tmux("new-session", "-d", "-x", "80", "-y", "24", "-s", "oracle",
              str(executable or bundle / "hx"), str(fixture), str(other))
-        if paging:
+        if scenario == "completion":
+            observe("open", "foo foo", "NOR", "1 sel")
+            observe_server("foo foo\n")
+            tmux("send-keys", "-l", "%sfoo")
+            tmux("send-keys", "Enter", "c")
+            observe("change two selections", "", "INS")
+            tmux("send-keys", "C-x")
+            observe("completion before Ctrl-C", "", "INS", menu=True)
+            tmux("send-keys", "C-c")
+            observe("dismiss with Ctrl-C", "", "INS", menu=False)
+            tmux("send-keys", "F")
+            observe("type after dismissal", "F F", "INS", menu=False)
+            observe_server("F F\n")
+            tmux("send-keys", "C-x")
+            observe("completion before Escape", "F F", "INS", menu=True)
+            tmux("send-keys", "Escape")
+            observe("escape from completion", "F F", "NOR", menu=False)
+            tmux("send-keys", "u")
+            observe("undo typing and change", "foo foo", "NOR")
+            observe_server("foo foo\n")
+            return checkpoints
+        if scenario == "paging":
             observe_page(1)
             for key, first in [("PageDown", 23), ("PageDown", 36), ("PageUp", 14), ("PageUp", 1)]:
                 tmux("send-keys", key)
                 observe_page(first)
             return checkpoints
-        if repeat:
+        if scenario == "repeat":
             observe("open", "foo foo", "NOR", "1 sel")
             tmux("send-keys", "i", "X", "Escape")
             observe("record insert", "Xfoo foo", "NOR", "1 sel")
@@ -200,12 +251,15 @@ def main():
             bundle = root / f"helix-{VERSION}-{target}"
             checkpoints = run_trace(bundle, root / "release")
             red_frames = run_trace(bundle, root / "red", args.candidate.resolve(strict=True), red=True) if args.candidate else None
-            pages = run_trace(bundle, root / "release-pages", paging=True)
+            pages = run_trace(bundle, root / "release-pages", scenario="paging")
             red_pages = (run_trace(bundle, root / "red-pages", args.candidate.resolve(strict=True), red=True,
-                                   paging=True) if args.candidate else None)
-            repeats = run_trace(bundle, root / "release-repeat", repeat=True)
+                                   scenario="paging") if args.candidate else None)
+            repeats = run_trace(bundle, root / "release-repeat", scenario="repeat")
             red_repeats = (run_trace(bundle, root / "red-repeat", args.candidate.resolve(strict=True),
-                                     red=True, repeat=True) if args.candidate else None)
+                                     red=True, scenario="repeat") if args.candidate else None)
+            completion = run_trace(bundle, root / "release-completion", scenario="completion")
+            red_completion = (run_trace(bundle, root / "red-completion", args.candidate.resolve(strict=True),
+                                        red=True, scenario="completion") if args.candidate else None)
             records = None
             if args.observer:
                 observer = args.observer.resolve(strict=True)
@@ -220,7 +274,8 @@ def main():
                 verify_records(records)
     print(json.dumps({"release": VERSION, "commit": COMMIT, "archive_sha256": digest,
                       "target": target, "checkpoints": checkpoints, "events": records, "red_checkpoints": red_frames,
-                      "paging": pages, "red_paging": red_pages, "repeat": repeats, "red_repeat": red_repeats}, indent=2))
+                      "paging": pages, "red_paging": red_pages, "repeat": repeats, "red_repeat": red_repeats,
+                      "completion": completion, "red_completion": red_completion}, indent=2))
 
 
 if __name__ == "__main__":

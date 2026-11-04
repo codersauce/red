@@ -17539,6 +17539,11 @@ impl Editor {
             return Ok(self.handle_pane_resize_event(ev));
         }
 
+        #[cfg(feature = "helix")]
+        if let Some(action) = self.felix_completion_dismissal(ev) {
+            return Ok(Some(action));
+        }
+
         if let Some(current_dialog) = &mut self.current_dialog {
             let action = current_dialog.handle_event(ev);
             let allows_passthrough = current_dialog.allows_event_passthrough();

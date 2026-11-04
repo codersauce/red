@@ -24,6 +24,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("full", "incremental"), required=True)
     parser.add_argument("--state", type=Path, required=True)
+    parser.add_argument("--completion", action="store_true", help="serve deterministic completion items")
     args = parser.parse_args()
     state = dict(opened=False, notifications=0, full=0, incremental=0, text_bytes=0)
     document = ""
@@ -55,7 +56,12 @@ def main():
             method = message.get("method")
             params = message.get("params", {})
             if method == "initialize":
-                reply(message, {"capabilities": {"textDocumentSync": 1 if args.mode == "full" else 2}})
+                capabilities = {"textDocumentSync": 1 if args.mode == "full" else 2}
+                if args.completion:
+                    capabilities["completionProvider"] = {}
+                reply(message, {"capabilities": capabilities})
+            elif method == "textDocument/completion" and args.completion:
+                reply(message, [{"label": "FelixCandidate", "kind": 6}])
             elif method == "textDocument/didOpen":
                 document = params["textDocument"]["text"]
                 version = params["textDocument"]["version"]
