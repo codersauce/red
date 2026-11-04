@@ -43,6 +43,18 @@ B = { t = { PluginCommand = "AgentToggle" }, n = { PluginCommand = "AgentNew" },
 o = { e = { ExploreCommand = "toggle" }, f = { ExploreCommand = "follow" }, "*" = { ExploreCommand = "follow" }, s = { ExploreCommand = "skeleton" }, d = { ExploreCommand = "definition" }, t = { ExploreCommand = "type" }, j = { ExploreCommand = "next" }, k = { ExploreCommand = "prev" }, b = { ExploreCommand = "back" }, n = { ExploreCommand = "forward" }, r = { ExploreCommand = "refresh" }, R = { ExploreCommand = "index" }, p = { ExploreCommand = "pr" }, "?" = { ExploreCommand = "help" }, q = { ExploreCommand = "close" } }
 
 [normal.Ctrl-w]
+"Ctrl-h" = "MoveWindowLeft"
+Left = "MoveWindowLeft"
+"Ctrl-j" = "MoveWindowDown"
+Down = "MoveWindowDown"
+"Ctrl-k" = "MoveWindowUp"
+Up = "MoveWindowUp"
+"Ctrl-l" = "MoveWindowRight"
+Right = "MoveWindowRight"
+"Ctrl-s" = "SplitHorizontal"
+"Ctrl-v" = "SplitVertical"
+"Ctrl-q" = "CloseWindow"
+"Ctrl-o" = "OnlyWindow"
 H = { FelixSwapWindow = "Left" }
 J = { FelixSwapWindow = "Down" }
 K = { FelixSwapWindow = "Up" }
@@ -57,7 +69,7 @@ s = "SplitHorizontal"
 v = "SplitVertical"
 q = "CloseWindow"
 o = "OnlyWindow"
-n = { s = "SplitHorizontalNewBuffer", v = "SplitVerticalNewBuffer" }
+n = { s = "SplitHorizontalNewBuffer", "Ctrl-s" = "SplitHorizontalNewBuffer", v = "SplitVerticalNewBuffer", "Ctrl-v" = "SplitVerticalNewBuffer" }
 e = { h = "MoveWindowToLeft", j = "MoveWindowToBottom", k = "MoveWindowToTop", l = "MoveWindowToRight" }
 
 [insert]

@@ -4,6 +4,7 @@ mod insert;
 mod lines;
 use crate::search::{Prompt, Query};
 use crate::{Range, Selections, boundary};
+pub use lines::open_line_site;
 use ropey::RopeSlice;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -93,6 +94,9 @@ pub struct Context<'a> {
     pub register: &'a [String],
     pub tab_width: usize,
     pub indent: &'a str,
+    /// Language indentation in display columns, sorted by original break position.
+    pub newline_indents: &'a [(usize, usize)],
+    pub comment_tokens: &'a [&'a str],
     pub page_height: usize,
     pub viewport_start: usize,
     pub scrolloff: usize,
@@ -106,6 +110,8 @@ impl Default for Context<'_> {
             register: &[],
             tab_width: 4,
             indent: "    ",
+            newline_indents: &[],
+            comment_tokens: &[],
             page_height: 22,
             viewport_start: 0,
             scrolloff: 5,
@@ -115,6 +121,33 @@ impl Default for Context<'_> {
 }
 
 impl Context<'_> {
+    fn indentation_at(&self, pos: usize, fallback_columns: usize) -> String {
+        let columns = self
+            .newline_indents
+            .binary_search_by_key(&pos, |&(pos, _)| pos)
+            .map_or(fallback_columns, |i| self.newline_indents[i].1);
+        let width = if self.indent == "\t" {
+            self.tab_width
+        } else {
+            self.indent.len()
+        };
+        self.indent.repeat(columns / width.max(1))
+    }
+
+    fn comment_at(&self, text: RopeSlice<'_>, pos: usize) -> Option<&str> {
+        self.comment_tokens
+            .iter()
+            .copied()
+            .filter(|token| {
+                !token.is_empty()
+                    && text
+                        .chars_at(pos)
+                        .take(token.chars().count())
+                        .eq(token.chars())
+            })
+            .max_by_key(|token| token.len())
+    }
+
     fn row_start(&self, text: RopeSlice<'_>, pos: usize, delta: isize) -> usize {
         if let Some(resolve) = self.visual_motion {
             return resolve(pos, delta, Some(0)).0;
@@ -169,8 +202,7 @@ pub struct Session {
 pub enum HostAction {
     Undo(usize),
     Redo(usize),
-    NextBuffer,
-    PreviousBuffer,
+    SwitchBuffer { forward: bool, count: usize },
     CommandLine,
     References,
     RepeatInsert(usize),
@@ -639,6 +671,20 @@ impl Session {
         !matches!(self.pending, Pending::None)
     }
 
+    /// Give the document's input back to the host. A live search preview restores
+    /// its pre-prompt selection and viewport just as Escape would.
+    pub fn leave_document_input(&mut self) -> Option<(Selections, usize)> {
+        self.count = None;
+        match std::mem::take(&mut self.pending) {
+            Pending::Regex {
+                original,
+                viewport_start,
+                ..
+            } => Some((original, viewport_start)),
+            _ => None,
+        }
+    }
+
     pub fn cancel_pending(&mut self) {
         self.pending = Pending::None;
         self.count = None;
@@ -848,9 +894,13 @@ impl Session {
                 p.next.pending = Pending::None;
                 p.save_jump = matches!(key, "g" | "e").then(|| selections.clone());
                 match key {
-                    "n" => p.host = Some(HostAction::NextBuffer),
-                    "p" => p.host = Some(HostAction::PreviousBuffer),
-                    "g" | "e" | "h" | "l" | "s" => p.set(selections.transform(text, |r| {
+                    "n" | "p" => {
+                        p.host = Some(HostAction::SwitchBuffer {
+                            forward: key == "n",
+                            count,
+                        })
+                    }
+                    "g" | "e" | "h" | "l" | "s" | "|" => p.set(selections.transform(text, |r| {
                         crate::motion::goto(text, r, key, self.count, extend)
                     })),
                     "j" | "k" => p.vertical(
@@ -1115,7 +1165,7 @@ impl Session {
             "U" => p.host = Some(HostAction::Redo(count)),
             ":" => p.host = Some(HostAction::CommandLine),
             ">" | "<" | "J" | "<a-J>" => p.edit_lines(text, selections, key, count, context),
-            "o" | "O" => p.open_lines(text, selections, key == "o", count),
+            "o" | "O" => p.open_lines(text, selections, key == "o", count, context),
             "i" | "a" | "I" | "A" => p.enter_insert(text, selections, key),
             "h" | "l" | "<left>" | "<right>" => {
                 let forward = key == "l" || key == "<right>";
@@ -1156,7 +1206,7 @@ impl Session {
                 )
             })),
             "G" if self.count.is_some() => p.set(selections.transform(text, |r| {
-                crate::motion::goto(text, r, "g", self.count, extend)
+                crate::motion::goto(text, r, "g", self.count, false)
             })),
             "(" | ")" => {
                 let n = p.ranges.len();

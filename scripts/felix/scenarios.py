@@ -38,6 +38,31 @@ def pending_input_cases():
         list("%sa") + ["<enter>"] + list("fb2") + ["<a-.>", "2", "r", "<a-x>", "u"])
 
 
+def counted_command_cases():
+    corpus = "ab X ab X!\r\n  e\u0301界 b X\n\tlast X\n"
+    for mode in ("normal", "select"):
+        select = ["v"] if mode == "select" else []
+        # Each group begins at an interior grapheme and restores Normal mode
+        # before the next command so Select variants really receive its keymap.
+        restore = ["<esc>"] + list("gg2l")
+        motions = ["h", "l", "j", "k", "<left>", "<right>", "<up>", "<down>",
+                   "w", "W", "b", "B", "e", "E", "<home>", "<end>", "G",
+                   "gg", "ge", "gh", "gl", "gs", "g|", "gj", "gk", "fX", "tX", "FX", "TX",
+                   "<pageup>", "<pagedown>", "<c-f>", "<c-b>", "<c-u>", "<c-d>"]
+        keys = []
+        for motion in motions:
+            keys += restore + select + ["2"] + ([motion] if motion.startswith("<") else list(motion))
+        yield f"counted-command-motion-{mode}", corpus, keys
+        edits = [["~"], ["`"], ["<a-`>"], [">"], ["<"], ["J"], ["<a-J>"],
+                 ["r", "X"], ["d"], ["<a-d>"], ["p"], ["P"], ["R"]]
+        keys = []
+        for edit in edits:
+            keys += restore + ["y"] + select + ["2"] + edit + ["<esc>", "u"]
+        yield f"counted-command-edit-{mode}", corpus, keys
+    yield "insert-word-delete-aliases", "ab cd ef\r\n", (
+        list("3li") + ["<a-delete>", "<a-backspace>", "<esc>", "u"]
+        + list("3li") + ["<a-d>", "<c-w>", "<esc>", "u"])
+
 def selection_cases():
     enter = ["<enter>"]
     for mode, toggle in (("normal", []), ("select", ["v"])):
@@ -139,6 +164,7 @@ def scenarios(seed, steps):
         keys += list("2g9l3m4ll") + ["<esc>"] + list("123456789012345") + ["<esc>"]
         keys += list("g2gm2i(ggf2r3") + ["<esc>"]
         yield f"cancel-arguments-{mode}", "abc 123 abc\nline two\n", keys
+    yield from counted_command_cases()
     yield from pending_input_cases()
     yield from selection_cases()
     yield "typed-selection", "abcd\n", list("eliX") + ["<esc>"] + list("uU")
@@ -247,6 +273,8 @@ def capture(observer, runtime, root, name, text, keys):
                 key = "<paste>"
                 raw = b"\x1b[200~" + paste.encode() + b"\x1b[201~"
                 tmux("send-keys", "-t", "h", "-H", *(format(byte, "02x") for byte in raw))
+            elif key in ("<a-delete>", "<a-backspace>"):
+                tmux("send-keys", "-t", "h", "M-DC" if key == "<a-delete>" else "M-BSpace")
             elif key.startswith("<a-"):
                 raw = b"\x1b" + key[3:-1].encode()
                 tmux("send-keys","-t","h","-H",*[format(byte,"02x") for byte in raw])
@@ -274,6 +302,7 @@ def capture(observer, runtime, root, name, text, keys):
             raw_event = record["event"]
             special = {"<backspace>": "Backspace", "<pageup>": "PageUp", "<pagedown>": "PageDown", "<esc>": "Esc", "<enter>": "Enter", "<tab>": "Tab", "<backtab>": "BackTab", "<a-;>": "Char(';')", "<a-,>": "Char(',')"}
             special.update(ARROW_AND_EDIT_KEYS)
+            special.update({"<a-delete>": "Delete", "<a-backspace>": "Backspace"})
             ch = key[3:-1] if key.startswith(("<a-", "<c-")) else key
             code = special.get(key, f"Char('{ch}')")
             if paste is not None:

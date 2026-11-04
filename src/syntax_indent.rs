@@ -21,7 +21,7 @@ use crate::{
     unicode_utils::display_width_with_tabs,
 };
 
-const MAX_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const MAX_BYTES: usize = 2 * 1024 * 1024;
 const MAX_EVENTS: usize = 100_000;
 const PARSE_BUDGET: Duration = Duration::from_millis(25);
 const QUERY_BUDGET: Duration = Duration::from_millis(15);

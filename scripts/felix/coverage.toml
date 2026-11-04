@@ -8,8 +8,9 @@ name = "Modes and pending input"
 cases = ["typed-selection", "reverse-at-eof", "empty-rope", "cancel-arguments-normal", "cancel-arguments-select",
          "modified-arguments-normal", "modified-arguments-select", "line-ending-arguments-normal", "line-ending-arguments-select",
          "count-recovery-normal", "count-recovery-select", "repeat-argument-normal", "repeat-argument-select",
-         "paste-pending-normal", "paste-pending-select", "repeat-multiple-finds"]
-remaining = ["Command-by-command count coverage and asynchronous focus changes while awaiting an argument"]
+         "paste-pending-normal", "paste-pending-select", "repeat-multiple-finds", "counted-command-motion-normal", "counted-command-motion-select",
+         "counted-command-edit-normal", "counted-command-edit-select"]
+remaining = ["Counted command inventory audit"]
 
 [[area]]
 name = "Movement and navigation"
@@ -43,14 +44,14 @@ remaining = []
 [[area]]
 name = "Editing and clipboard"
 cases = ["yank-paste-replace", "counted-register-edits", "bracketed-paste-modes", "reverse-register-edits", "empty-register", "whole-line-change", "indent-join"]
-terminal = ["clipboard"]
-remaining = ["Language-specific indentation and joins"]
+terminal = ["clipboard", "rust-edit"]
+remaining = []
 
 [[area]]
 name = "Insert behavior"
-cases = ["open-line", "auto-pairs", "insert-controls", "newline-pairs", "newline-whitespace", "mixed-insert-aliases"]
-terminal = ["snippet-stops", "completion"]
-remaining = ["Completion preview layout in decorated and split views", "Language-specific smart Tab"]
+cases = ["open-line", "auto-pairs", "insert-controls", "newline-pairs", "newline-whitespace", "mixed-insert-aliases", "insert-word-delete-aliases"]
+terminal = ["snippet-stops", "completion", "rust-edit", "split-completion"]
+remaining = ["Completion preview layout in decorated views"]
 
 [[area]]
 name = "Undo and repeat"

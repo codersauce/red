@@ -196,6 +196,11 @@ impl Plan {
                 .reversed()
                 .take_while(|c| c.is_whitespace())
                 .count();
+            let leading = prefix
+                .chars()
+                .take_while(|c| matches!(c, ' ' | '\t'))
+                .count();
+            let token = ctx.comment_at(text, line + leading);
             let (start, end, mut insert) = if trailing == prefix.len_chars() {
                 (line, line, newline.to_owned())
             } else {
@@ -206,12 +211,11 @@ impl Plan {
                     .fold(0, |col, ch| {
                         col + if ch == '\t' { width - col % width } else { 1 }
                     });
-                let unit = if ctx.indent == "\t" {
-                    width
+                let indent = if let Some(token) = token {
+                    format!("{}{token} ", text.slice(line..line + leading))
                 } else {
-                    ctx.indent.len().max(1)
+                    ctx.indentation_at(pos, columns)
                 };
-                let indent = ctx.indent.repeat(columns / unit);
                 (
                     (pos - trailing).max(previous_cursor),
                     pos,
@@ -233,7 +237,7 @@ impl Plan {
                             | ('`', '`')
                     )
                 });
-            let inner = if paired {
+            let inner = if paired && token.is_none() {
                 let outer = insert.clone();
                 insert.push_str(ctx.indent);
                 let inner = insert.chars().count();
@@ -312,9 +316,10 @@ impl Plan {
             "<up>" | "<down>" => {
                 self.visual_vertical(text, selections, if key == "<down>" { 1 } else { -1 }, ctx)
             }
-            "<backspace>" | "<c-h>" | "<delete>" | "<c-d>" | "<c-w>" | "<a-d>" | "<c-u>"
-            | "<c-k>" => {
-                let forward = matches!(key, "<delete>" | "<c-d>" | "<a-d>" | "<c-k>");
+            "<backspace>" | "<c-h>" | "<delete>" | "<c-d>" | "<c-w>" | "<a-d>"
+            | "<a-backspace>" | "<a-delete>" | "<c-u>" | "<c-k>" => {
+                let forward =
+                    matches!(key, "<delete>" | "<c-d>" | "<a-d>" | "<a-delete>" | "<c-k>");
                 let mut append_eol = false;
                 for (i, &r) in selections.ranges().iter().enumerate() {
                     let pos = r.cursor(text);
@@ -333,8 +338,8 @@ impl Plan {
                         }
                         "<c-k>" if pos == end => boundary(text, end, true),
                         "<c-k>" => end,
-                        "<c-w>" => motion::word(text, r, "b", 1, false).start(),
-                        "<a-d>" => motion::word(text, r, "e", 1, false).end(),
+                        "<c-w>" | "<a-backspace>" => motion::word(text, r, "b", 1, false).start(),
+                        "<a-d>" | "<a-delete>" => motion::word(text, r, "e", 1, false).end(),
                         _ => boundary(text, pos, forward),
                     };
                     if forward && r.head > r.anchor {

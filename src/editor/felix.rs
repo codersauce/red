@@ -51,6 +51,12 @@ impl Input<'static> {
 pub(super) type Owner = (BufferId, WindowId, u64, u64);
 
 #[derive(Default)]
+struct FelixLanguageEdit {
+    indents: Vec<(usize, usize)>,
+    tokens: &'static [&'static str],
+}
+
+#[derive(Default)]
 pub(super) struct FelixHost {
     session: Session,
     native_prefix_owner: Option<Owner>,
@@ -60,6 +66,9 @@ pub(super) struct FelixHost {
     indent: HashMap<BufferId, String>,
     selections: HashMap<(BufferId, WindowId), Selections>,
     generation: u64,
+    // A Felix plan already specifies the active selections. Map other views and
+    // jumps once against the committed text, using edits in application order.
+    pending_rebase: Option<Vec<AppliedTextEdit>>,
     unnamed: Vec<String>,
     clipboard: Vec<String>,
     search: Vec<String>,
@@ -81,8 +90,29 @@ pub(super) struct FilterSavepoint {
 pub(super) struct CompletionPreview {
     owner: Owner,
     pub(super) text: ropey::Rope,
+    original: ropey::Rope,
+    replacements: Vec<std::ops::Range<usize>>,
+    replacement_len: usize,
     pub(super) carets: Vec<usize>,
     pub(super) primary: usize,
+}
+
+impl CompletionPreview {
+    pub(super) fn projected_line(&self, line: usize) -> Option<usize> {
+        let pos = self.original.try_line_to_char(line).ok()?;
+        let mut mapped = pos;
+        for range in &self.replacements {
+            if pos <= range.start {
+                break;
+            }
+            mapped -= range.len().min(pos - range.start);
+            mapped += self.replacement_len;
+            if pos < range.end {
+                break;
+            }
+        }
+        Some(self.text.char_to_line(mapped))
+    }
 }
 
 fn felix_display_col(
@@ -175,6 +205,10 @@ impl Editor {
     }
 
     pub(super) fn rebase_felix_views(&mut self, edits: &[AppliedTextEdit]) {
+        if let Some(pending) = &mut self.felix.pending_rebase {
+            pending.extend_from_slice(edits);
+            return;
+        }
         let buffer = self.current_buffer();
         let id = buffer.id();
         let snapshot = buffer.contents_snapshot();
@@ -320,14 +354,18 @@ impl Editor {
             carets.push(range.start - removed + index * length + cursor);
             removed += range.len();
         }
-        for range in ranges.into_iter().rev() {
+        let original = text.clone();
+        for range in ranges.iter().rev() {
             let at = range.start;
-            text.remove(range);
+            text.remove(range.clone());
             text.insert(at, value);
         }
         Some(CompletionPreview {
             owner: self.felix_owner()?,
             text,
+            original,
+            replacements: ranges,
+            replacement_len: length,
             carets,
             primary: state.primary_index(),
         })
@@ -342,7 +380,7 @@ impl Editor {
         window: &crate::window::Window,
     ) -> Option<&CompletionPreview> {
         let preview = self.felix.preview.as_ref()?;
-        (window.id == preview.owner.1
+        (self.buffer_manager[window.buffer_index].id() == preview.owner.0
             && self.felix_owner() == Some(preview.owner)
             && self
                 .current_dialog
@@ -414,6 +452,29 @@ impl Editor {
         // A failed or empty clipboard operation also ends its key sequence.
         self.felix.session.cancel_pending();
         result
+    }
+
+    pub(super) fn cancel_unfocused_felix_input(&mut self) {
+        if !self.felix.session.awaiting_input() && self.felix.session.count().is_none() {
+            return;
+        }
+        if self.current_dialog.is_none()
+            && self.panel_manager.focused_panel_id().is_none()
+            && !self.workspace_manager.is_active()
+        {
+            return;
+        }
+        if let Some((selections, top)) = self.felix.session.leave_document_input() {
+            let text = self.current_buffer().contents_snapshot();
+            let (line, col) = felix_display_col(
+                text.slice(..),
+                top.min(text.len_chars()),
+                self.indentation().tab_width,
+            );
+            self.vtop = line;
+            self.skipcol = if self.wrap { col } else { 0 };
+            self.set_felix_active_selection(selections);
+        }
     }
 
     /// Route the tail of a Red-owned document binding without starting a Vim count.
@@ -499,24 +560,20 @@ impl Editor {
             KeyCode::Char(ch) => ch.to_string(),
             KeyCode::Esc => "<esc>".into(),
             KeyCode::Enter => "<enter>".into(),
-            KeyCode::Tab
-                if key.modifiers.contains(KeyModifiers::SHIFT)
-                    && self.felix.session.prompt().is_some() =>
+            KeyCode::Tab if key.modifiers == KeyModifiers::SHIFT => "<backtab>".into(),
+            code if key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                "<backtab>".into()
-            }
-            code @ (KeyCode::Left | KeyCode::Right | KeyCode::Backspace | KeyCode::Delete)
-                if self.felix.session.prompt().is_some()
-                    && key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                let modifier = if key.modifiers.contains(KeyModifiers::CONTROL) {
-                    "c"
-                } else {
-                    "a"
+                let prefix = match (
+                    key.modifiers.contains(KeyModifiers::CONTROL),
+                    key.modifiers.contains(KeyModifiers::ALT),
+                ) {
+                    (true, true) => "c-a",
+                    (true, false) => "c",
+                    _ => "a",
                 };
-                format!("<{modifier}-{code:?}>").to_lowercase()
+                format!("<{prefix}-{code:?}>").to_lowercase()
             }
             KeyCode::Backspace => "<backspace>".into(),
             KeyCode::Left => "<left>".into(),
@@ -560,6 +617,86 @@ impl Editor {
         self.move_to_insert_text_position(pos);
     }
 
+    /// Evaluate Red's indentation queries on the text with every proposed break in place.
+    /// The syntax cache checks its source as well as its revision. The document and its
+    /// undo history are untouched until the host accepts the resulting edit plan.
+    fn felix_break_indents(
+        &mut self,
+        rope: &ropey::Rope,
+        initial: &Selections,
+        key: &str,
+        language: &str,
+        indentation: Indentation,
+    ) -> Vec<(usize, usize)> {
+        if !matches!(key, "<enter>" | "<c-j>" | "o" | "O")
+            || rope.len_bytes() > crate::syntax_indent::MAX_BYTES
+        {
+            return Vec::new();
+        }
+        let text = rope.slice(..);
+        let mut sites: Vec<_> = initial
+            .ranges()
+            .iter()
+            .map(|&range| match key {
+                "o" | "O" => felix_core::open_line_site(text, range, key == "o").0,
+                _ => range.cursor(text),
+            })
+            .collect();
+        sites.sort_unstable();
+        sites.dedup();
+        let mut source = rope.clone();
+        for &at in sites.iter().rev() {
+            source.insert(at, "\n");
+        }
+        let lines: Vec<_> = sites
+            .iter()
+            .enumerate()
+            .map(|(i, at)| source.char_to_line(at + i + 1))
+            .collect();
+        let source = source.to_string();
+        let id = self.current_buffer().id();
+        let revision = self.current_buffer().revision();
+        let unit = &self.felix.indent[&id];
+        let shift_width = if unit == "\t" {
+            indentation.tab_width
+        } else {
+            unit.len()
+        };
+        sites
+            .into_iter()
+            .zip(lines)
+            .filter_map(|(at, line)| {
+                let syntax = self
+                    .syntax_indentation
+                    .indent(crate::syntax_indent::IndentRequest {
+                        id,
+                        revision,
+                        language,
+                        source: &source,
+                        line,
+                        shift_width,
+                        tab_width: indentation.tab_width,
+                        reason: crate::syntax_indent::IndentReason::NewLine,
+                    });
+                let decision = if syntax == IndentDecision::Keep {
+                    indent::indent_for_line(
+                        Some(language),
+                        &source,
+                        line,
+                        shift_width,
+                        indentation.tab_width,
+                    )
+                } else {
+                    syntax
+                };
+                match decision {
+                    IndentDecision::Columns(columns) => Some((at, columns)),
+                    IndentDecision::Keep => None,
+                }
+            })
+            .collect()
+    }
+
     fn plan_felix_key(
         &self,
         text: ropey::RopeSlice<'_>,
@@ -567,6 +704,7 @@ impl Editor {
         key: &str,
         register: &[String],
         tab_width: usize,
+        language: &FelixLanguageEdit,
     ) -> felix_core::Plan {
         let viewport_line = self.vtop.min(text.len_lines() - 1);
         let display_offset = |line, col| {
@@ -600,15 +738,33 @@ impl Editor {
             })
             .unwrap_or((offset, goal.unwrap_or(col)))
         };
+        let visual_rows = self.wrap
+            || (matches!(
+                key,
+                "j" | "k"
+                    | "<down>"
+                    | "<up>"
+                    | "<pagedown>"
+                    | "<pageup>"
+                    | "<c-u>"
+                    | "<c-d>"
+                    | "<c-f>"
+                    | "<c-b>"
+                    | "n"
+                    | "N"
+            ) || self.felix.session.prompt().is_some())
+                && self.active_has_markdown_tables();
         let context = felix_core::Context {
             search_history: &self.felix.search,
             register,
             tab_width,
             indent: &self.felix.indent[&self.current_buffer().id()],
+            newline_indents: &language.indents,
+            comment_tokens: language.tokens,
             page_height: self.vheight(),
             viewport_start: display_offset(viewport_line, self.skipcol),
             scrolloff: self.config.scrolloff.unwrap_or(5),
-            visual_motion: self.wrap.then_some(&visual_motion),
+            visual_motion: visual_rows.then_some(&visual_motion),
         };
         self.felix.session.plan(text, initial, key, &context)
     }
@@ -646,6 +802,32 @@ impl Editor {
             felix_core::detect_indent(text)
                 .unwrap_or_else(|| indentation.whitespace_for_columns(indentation.shift_width))
         });
+        let mut language = FelixLanguageEdit::default();
+        let key = match input {
+            Input::Key(key) => Some(key),
+            Input::Replay(step) => match step.event {
+                felix_core::InsertEvent::Key(key) => Some(key.as_str()),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some((key, id)) = key
+            .filter(|key| match self.felix.session.mode {
+                felix_core::Mode::Insert => matches!(*key, "<enter>" | "<c-j>"),
+                _ => matches!(*key, "o" | "O" | "J" | "<a-J>"),
+            })
+            .filter(|_| !self.felix.session.awaiting_input())
+            .and_then(|key| self.current_language_id().map(|id| (key, id)))
+        {
+            language.tokens = match id.as_str() {
+                "rust" => &["///", "//!", "//"],
+                "javascript" | "typescript" | "jsx" | "tsx" => &["//"],
+                "bash" | "sh" | "fish" | "toml" | "yaml" | "python" | "py" | "powershell" => &["#"],
+                "lua" => &["--"],
+                _ => &[],
+            };
+            language.indents = self.felix_break_indents(&rope, &initial, key, &id, indentation);
+        }
         let mut plan = match input {
             Input::Key(key) => self.plan_felix_key(
                 text,
@@ -653,6 +835,7 @@ impl Editor {
                 key,
                 &self.felix.unnamed,
                 indentation.tab_width,
+                &language,
             ),
             Input::Replay(step) => match step.event {
                 felix_core::InsertEvent::Key(key) => self.plan_felix_key(
@@ -661,6 +844,7 @@ impl Editor {
                     key,
                     &self.felix.unnamed,
                     indentation.tab_width,
+                    &language,
                 ),
                 felix_core::InsertEvent::Completion(change) => {
                     self.felix.session.replay_completion(text, &initial, change)
@@ -674,6 +858,7 @@ impl Editor {
                     "y",
                     &self.felix.unnamed,
                     indentation.tab_width,
+                    &language,
                 );
                 let values = if primary {
                     vec![text
@@ -727,7 +912,14 @@ impl Editor {
                 if let Input::ClipboardPaste(placement) = input {
                     self.felix.session.paste(text, &initial, values, placement)
                 } else {
-                    self.plan_felix_key(text, &initial, "R", values, indentation.tab_width)
+                    self.plan_felix_key(
+                        text,
+                        &initial,
+                        "R",
+                        values,
+                        indentation.tab_width,
+                        &language,
+                    )
                 }
             }
         };
@@ -806,6 +998,9 @@ impl Editor {
         }
         if !plan.edits.is_empty() {
             self.felix.selections.remove(&id);
+            if plan.edits.len() > 1 {
+                self.felix.pending_rebase = Some(Vec::with_capacity(plan.edits.len()));
+            }
         }
         for edit in plan.edits.iter().rev() {
             let buffer = self.current_buffer();
@@ -814,6 +1009,9 @@ impl Editor {
                 buffer.char_idx_to_position(edit.end),
             );
             self.replace_range(range, &edit.insert);
+        }
+        if let Some(edits) = self.felix.pending_rebase.take() {
+            self.rebase_felix_views(&edits);
         }
         let after = self.current_buffer().contents_snapshot();
         let selections = plan.selections(after.slice(..));
@@ -862,14 +1060,11 @@ impl Editor {
                         }
                     }
                 }
-                HostAction::NextBuffer | HostAction::PreviousBuffer => {
+                HostAction::SwitchBuffer { forward, count } => {
                     let len = self.buffer_manager.len();
                     let current = self.buffer_manager.active_index();
-                    let delta = if request == HostAction::NextBuffer {
-                        1
-                    } else {
-                        len - 1
-                    };
+                    let step = count % len;
+                    let delta = if forward { step } else { len - step };
                     self.set_current_buffer(frame, (current + delta) % len)
                         .await?;
                     self.felix.session = Session::default();
@@ -1146,7 +1341,17 @@ impl Editor {
         let rope = buffer.contents_snapshot();
         let text = rope.slice(..);
         let tab_width = self.tab_width_for_buffer_index(window.buffer_index);
-        for range in sel.ranges() {
+        let layout = self.layout_for_window(window);
+        let (Some(first), Some(last)) = (layout.rows.first(), layout.rows.last()) else {
+            return;
+        };
+        let visible = rope.line_to_char(first.line)..rope.line_to_char(last.line + 1);
+        let ranges = sel.ranges();
+        let first_range = ranges.partition_point(|r| r.end() < visible.start);
+        for range in ranges[first_range..]
+            .iter()
+            .take_while(|r| r.start() <= visible.end)
+        {
             if range.end() > rope.len_chars() {
                 continue;
             }
@@ -1179,7 +1384,7 @@ impl Editor {
                 // Helix can select a newline and can place a cursor at EOF.
                 let points_for = |left, right| {
                     let mut points =
-                        self.display_col_range_points_in_window(window, row, left, right);
+                        self.display_col_range_points_in_layout(window, &layout, row, left, right);
                     let eol = crate::config::EditingModel::Helix.source_width(line, tab_width);
                     if let Some((x, y)) = (left <= eol && right > eol)
                         .then(|| self.buffer_to_window_coords(window, grapheme_len(line), row))
@@ -1230,12 +1435,16 @@ mod tests {
     use serde_json::{json, Value};
 
     fn fixture_editor(text: &str) -> (Editor, RenderBuffer, Runtime) {
+        named_fixture_editor("example.txt", text)
+    }
+
+    fn named_fixture_editor(name: &str, text: &str) -> (Editor, RenderBuffer, Runtime) {
         let mut config =
             Config::from_user_toml_with_overrides("editing_model = 'helix'", &[]).unwrap();
         config.lsp.enabled = false;
         let lsp = Box::new(crate::LspManager::new(config.lsp.clone()));
         let buffers = vec![
-            Buffer::new(Some("example.txt".into()), text.into()),
+            Buffer::new(Some(name.into()), text.into()),
             Buffer::new(Some("other.txt".into()), "other buffer\n".into()),
         ];
         let mut editor = Editor::with_size(lsp, 80, 24, config, Theme::default(), buffers).unwrap();
@@ -1310,6 +1519,10 @@ mod tests {
     #[tokio::test]
     async fn preview_leaves_unicode_document_and_undo_untouched_and_rejects_stale_selections() {
         let (mut editor, mut frame, mut runtime) = fixture_editor("😀foo foo\n");
+        editor
+            .execute(&Action::AddSampleInlineComment, &mut frame, &mut runtime)
+            .await
+            .unwrap();
         for key in ["%", "s", "f", "o", "o", "<enter>", "c", "F"] {
             let owner = editor.felix_owner().unwrap();
             editor
@@ -1317,6 +1530,14 @@ mod tests {
                 .await
                 .unwrap();
         }
+        editor.render(&mut frame).unwrap();
+        let window = editor.active_window_with_editor_view().unwrap();
+        let comment = editor
+            .layout_for_window(&window)
+            .inline_comments
+            .last()
+            .unwrap()
+            .row;
         let owner = editor.felix_owner();
         let selection = editor.felix_active_selection().cloned();
         let item = serde_json::from_value(json!({
@@ -1345,6 +1566,8 @@ mod tests {
             editor.felix.preview.as_ref().unwrap().text.to_string(),
             "😀a\nλ a\nλ\n"
         );
+        let (_, y) = editor.render_cursor_position().unwrap();
+        assert!(y > editor.window_to_terminal_y(&window, comment));
         assert_eq!(editor.felix_owner(), owner);
         assert_eq!(editor.felix_active_selection(), selection.as_ref());
         assert_eq!(editor.current_buffer().contents(), "😀F F\n");
@@ -1364,6 +1587,60 @@ mod tests {
             editor.felix_completion_key(&enter),
             Some(KeyAction::Single(Action::CloseDialog))
         ));
+    }
+
+    #[tokio::test]
+    async fn search_and_move_through_projected_table_with_inline_comment() {
+        let source =
+            "before\n| A | Name |\n| --- | --- |\n| 界 | target |\n| x | second |\nafter\n";
+        let (mut editor, mut frame, mut runtime) = named_fixture_editor("example.md", source);
+        for wrap in [false, true] {
+            editor.wrap = wrap;
+            for key in ["g", "g", "/", "t", "a", "r", "g", "e", "t", "<enter>"] {
+                let owner = editor.felix_owner().unwrap();
+                editor
+                    .execute_felix(Input::Key(key), owner, &mut frame, &mut runtime)
+                    .await
+                    .unwrap();
+            }
+            let window = editor.active_window_with_editor_view().unwrap();
+            let selection = editor.felix_active_selection().unwrap().primary();
+            assert_eq!(
+                editor
+                    .current_buffer()
+                    .contents_snapshot()
+                    .slice(selection.start()..selection.end()),
+                "target"
+            );
+            editor
+                .execute(&Action::AddSampleInlineComment, &mut frame, &mut runtime)
+                .await
+                .unwrap();
+            editor.render(&mut frame).unwrap();
+            let layout = editor.layout_for_window(&window);
+            assert!(layout
+                .rows
+                .iter()
+                .any(|row| row.line == 3 && row.projection.is_some()));
+            assert!(layout
+                .inline_comments
+                .iter()
+                .any(|comment| comment.line == 3));
+            let (x, y) = editor.render_cursor_position().unwrap();
+            assert_eq!(frame.cells[y * frame.width + x].c, 't');
+            for key in ["j", "k"] {
+                let owner = editor.felix_owner().unwrap();
+                editor
+                    .execute_felix(Input::Key(key), owner, &mut frame, &mut runtime)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    editor.cursor_text_position().line,
+                    if key == "j" { 4 } else { 3 }
+                );
+            }
+            assert_eq!(editor.current_buffer().contents(), source);
+        }
     }
 
     #[tokio::test]
@@ -1957,6 +2234,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn asynchronous_picker_cancels_document_arguments_counts_and_search_previews() {
+        let (mut editor, mut frame, mut runtime) = fixture_editor("start and target\n");
+        let key = |ch| Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        for prefix in ["2", "2f", "mi", "/target"] {
+            for ch in prefix.chars() {
+                editor.test_execute_event(key(ch)).await.unwrap();
+            }
+            editor
+                .execute(&Action::FilePicker, &mut frame, &mut runtime)
+                .await
+                .unwrap();
+            assert!(editor.current_dialog.is_some());
+            editor
+                .test_execute_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+                .await
+                .unwrap();
+            assert!(editor.current_dialog.is_none());
+            assert!(!editor.felix.session.awaiting_input());
+            assert_eq!(editor.felix.session.count(), None);
+            editor.test_execute_event(key('l')).await.unwrap();
+            assert_eq!(editor.cx, 1, "{prefix}");
+            editor.test_execute_event(key('h')).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn native_prefix_cannot_open_a_picker_after_a_document_switch() {
         let (mut editor, mut frame, _) = fixture_editor("first document\n");
         let key = |ch| Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
@@ -2050,7 +2353,11 @@ mod tests {
                     } else {
                         KeyModifiers::CONTROL
                     };
-                    KeyCode::Char(token.chars().nth(3).unwrap())
+                    match &token[3..token.len() - 1] {
+                        "backspace" => KeyCode::Backspace,
+                        "delete" => KeyCode::Delete,
+                        _ => KeyCode::Char(token.chars().nth(3).unwrap()),
+                    }
                 }
                 "<backspace>" => KeyCode::Backspace,
                 "<up>" => KeyCode::Up,

@@ -33,8 +33,8 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
     root.mkdir()
     workdir = root / "work"
     workdir.mkdir()
-    completion = scenario in ("completion", "completion-repeat", "snippet-stops")
-    fixture = root / ("example.rs" if completion else "example.txt")
+    completion = scenario in ("completion", "completion-repeat", "snippet-stops", "split-completion")
+    fixture = root / ("example.rs" if completion or scenario == "rust-edit" else "example.txt")
     split_search = scenario in ("split-search", "wrapped-split-search")
     wrapped = scenario == "wrapped-split-search"
     horizontal = scenario == "horizontal"
@@ -42,6 +42,8 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
     if horizontal:
         fixture.write_text("a👩‍💻B\t界C" + "0123456789" * 8 + "\n" + ruler
                            + "\n" + "." * 22 + "👩‍💻Z\n")
+    elif scenario == "rust-edit":
+        fixture.write_text("/// one\n/// two\n//! three\n//! four\nfn main() {\n    do_work();\n}\n")
     elif scenario == "clipboard":
         fixture.write_text("a bb\n")
     elif wrapped:
@@ -99,13 +101,15 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
         # Compare equal document heights. Red's optional breadcrumb plugin
         # can reserve a screen row asynchronously after the document opens.
         window_config = 'disabled_plugins = ["barbecue"]\n' if split_search or horizontal or scenario in ("paging", "repeat", "prefix-count") else ""
+        if scenario == "rust-edit":
+            window_config = 'disabled_plugins = ["indent_guides"]\n'
         if wrapped:
             window_config += "wrap = true\n"
         (config / "config.toml").write_text(
             window_config + 'editing_model = "helix"\ndisable_ai = true\nsplash = false\n'
             'show_whats_new = false\nfetch_release_notes = false\n[lsp]\n'
             + ('enabled = true\n[completion]\nauto_trigger = false\n'
-               + ('buffer_words = false\n' if scenario in ("completion-repeat", "snippet-stops") else "")
+               + ('buffer_words = false\n' if scenario in ("completion-repeat", "snippet-stops", "split-completion") else "")
                + '[lsp.servers.rust]\n'
                'language_id = "rust"\nfile_extensions = ["rs"]\nroot_markers = []\n' + command
                if completion else 'enabled = false\n')
@@ -123,11 +127,11 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
 
     checkpoints = []
 
-    def observe(label, line, mode, sels="1/2 sels", name=None, copies=1, menu=None, cursor=None, message=None):
+    def observe(label, line, mode, sels="1/2 sels", name=None, copies=1, menu=None, cursor=None, message=None, row=1):
         name = name or fixture.name
         # Reading the tmux screen sends no input to the editor.
         deadline = time.monotonic() + (30 if label == "open" else 5)
-        expected_line = f"    1  {line}".rstrip()
+        expected_line = f"{row:5}  {line}".rstrip()
         while True:
             frame = tmux("capture-pane", "-p", "-t", "oracle:0.0").stdout
             rows = frame.splitlines()
@@ -135,7 +139,7 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
             if red:
                 count = "1/1" if sels == "1 sel" else sels.split()[0]
                 want_mode = {"NOR": "NORMAL", "INS": "INSERT"}[mode]
-                matches = (any(row.strip() == f"1 {line}".rstrip() for row in rows)
+                matches = (any(content.strip() == f"{row} {line}".rstrip() for content in rows)
                            and status[:2] == [want_mode, count] and any(name in part for part in status))
             else:
                 matches = (expected_line in rows and status[:2] == [mode, f"~/{name}"]
@@ -322,6 +326,21 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
             tmux("resize-window", "-x", "80", "-y", "24", "-t", "oracle:0")
             check_prompt("reveal query after resize", "12345 12345 12345 12345 12界xy", 37)
             return checkpoints
+        if scenario == "rust-edit":
+            observe("open", "/// one", "NOR", "1 sel")
+            tmux("send-keys", "4", "x", "J")
+            observe("join matching comment leaders", "/// one two //! three four", "NOR", "1 sel")
+            tmux("send-keys", "u", "g", "g", "A", "Enter", "x")
+            observe("continue Rust documentation", "/// x", "INS", "1 sel", row=2)
+            tmux("send-keys", "Escape")
+            observe("leave comment", "/// x", "NOR", "1 sel", row=2)
+            tmux("send-keys", "u", "5", "g", "g", "A", "Enter", "x")
+            observe("indent after block opener", "    x", "INS", "1 sel", row=6)
+            tmux("send-keys", "Escape")
+            observe("leave block", "    x", "NOR", "1 sel", row=6)
+            tmux("send-keys", "u", "6", "g", "g", "g", "s", "l", "i", "Tab", "X")
+            observe("smart Tab to end of identifier", "    do_workX();", "INS", "1 sel", row=6)
+            return checkpoints
         if scenario == "snippet-stops":
             observe("open", "foo foo", "NOR", "1 sel")
             observe_server("foo foo\n")
@@ -344,6 +363,24 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
             tmux("send-keys", "X", "Tab", "Y")
             observe("skip replaced children", "X:Y X:Y", "INS")
             observe_server("X:Y X:Y\n")
+            return checkpoints
+        if scenario == "split-completion":
+            observe("open", "foo foo", "NOR", "1 sel")
+            observe_server("foo foo\n")
+            tmux("send-keys", "C-w", "s")
+            observe("open shared split", "foo foo", "NOR", "1 sel", copies=2)
+            tmux("send-keys", "A", "Space", "F", "C-x")
+            observe("request in split", "foo foo F", "INS", "1 sel", copies=2, menu=True)
+            tmux("send-keys", "C-n")
+            observe("preview in both views", "foo foo FelixCandidate", "INS", "1 sel", copies=2, menu=True)
+            observe_server("foo foo F\n")
+            tmux("send-keys", "C-c")
+            observe("restore both panes", "foo foo F", "INS", "1 sel", copies=2, menu=False)
+            tmux("send-keys", "C-x")
+            observe("request again", "foo foo F", "INS", "1 sel", menu=True)
+            tmux("send-keys", "C-n", "Enter")
+            observe("commit in both panes", "foo foo FelixCandidate", "INS", "1 sel", copies=2, menu=False)
+            observe_server("foo foo FelixCandidate\n")
             return checkpoints
         if scenario == "completion-repeat":
             observe("open", "foo foo", "NOR", "1 sel")
@@ -653,7 +690,8 @@ def main():
             additional_traces = {}
             for scenario, directory in (("split-search", "split"), ("wrapped-split-search", "wrap"),
                                         ("selection-errors", "sel"), ("clipboard", "clip"),
-                                        ("completion-repeat", "cr"), ("snippet-stops", "st")):
+                                        ("completion-repeat", "cr"), ("snippet-stops", "st"), ("rust-edit", "rs"),
+                                        ("split-completion", "sc")):
                 key = scenario.replace("-", "_")
                 additional_traces[key] = run_trace(bundle, root / f"release-{directory}", scenario=scenario)
                 additional_traces[f"red_{key}"] = (run_trace(bundle, root / f"red-{directory}",

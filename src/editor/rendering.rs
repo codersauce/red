@@ -2361,10 +2361,17 @@ impl Editor {
             skipcol: window.skipcol,
             break_indent: self.break_indent_options_for_buffer_index(window.buffer_index),
         };
-        Some((
-            super::display_layout::layout_lines(&lines, count, config),
-            lines,
-        ))
+        let messages = self.inline_comment_display_messages_for_window(
+            window.id,
+            &self.buffer_manager[window.buffer_index],
+        );
+        let comments = messages
+            .iter()
+            .filter_map(|(line, message)| Some((preview.projected_line(*line)?, message.as_str())))
+            .collect::<Vec<_>>();
+        let layout = super::display_layout::layout_lines(&lines, count, config)
+            .with_inline_comments(&comments, config.content_width, config.height);
+        Some((layout, lines))
     }
 
     #[cfg(feature = "helix")]
@@ -2445,6 +2452,9 @@ impl Editor {
                 &self.theme,
             );
         }
+        for comment in &layout.inline_comments {
+            self.render_inline_comment_row_in_window(frame, window, comment);
+        }
         let background = self.theme.style.clone();
         for row in layout.screen_height()..source_layout.screen_height() {
             self.fill_line_in_window(
@@ -2454,6 +2464,9 @@ impl Editor {
                 width,
                 &background,
             );
+        }
+        if !window.active {
+            return Ok(());
         }
         if let Some(preview) = self.felix_preview(window) {
             for &caret in &preview.carets {
@@ -3666,11 +3679,21 @@ impl Editor {
         start_col: usize,
         end_col: usize,
     ) -> Vec<Point> {
+        let layout = self.layout_for_window(window);
+        self.display_col_range_points_in_layout(window, &layout, line_index, start_col, end_col)
+    }
+
+    pub(super) fn display_col_range_points_in_layout(
+        &self,
+        window: &crate::window::Window,
+        layout: &DisplayLayout,
+        line_index: usize,
+        start_col: usize,
+        end_col: usize,
+    ) -> Vec<Point> {
         if end_col <= start_col {
             return Vec::new();
         }
-
-        let layout = self.layout_for_window(window);
         let gutter_width = self.gutter_width_for_window(window);
         let content_start = gutter_width + 1;
         let content_width = self.window_content_width(window);

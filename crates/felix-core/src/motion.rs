@@ -138,15 +138,6 @@ pub(crate) fn word(
     }
 }
 
-pub(crate) fn line_end(text: RopeSlice<'_>, line: usize) -> usize {
-    let end = text.line_to_char(line + 1);
-    if end > text.line_to_char(line) && text.char(end - 1) == '\n' {
-        boundary(text, end, false)
-    } else {
-        end
-    }
-}
-
 // Ropey also indexes standalone CR, VT, FF, NEL and Unicode separators.
 // Helix's release indexes LF, with CRLF forming one cursor stop.
 pub(crate) fn logical_start(text: RopeSlice<'_>, pos: usize) -> usize {
@@ -266,6 +257,17 @@ pub(crate) fn goto(
             } else {
                 move_lines(text, 0, true, count.unwrap_or(1).saturating_sub(1)).min(last)
             }
+        }
+        "|" => {
+            let end = logical_end(text, start);
+            let mut pos = start;
+            for _ in 1..count.unwrap_or(1) {
+                if pos >= end {
+                    break;
+                }
+                pos = boundary(text, pos, true);
+            }
+            pos
         }
         "h" => start,
         "l" => boundary(text, logical_end(text, start), false).max(start),

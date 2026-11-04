@@ -17510,8 +17510,11 @@ impl Editor {
             self.note_user_input();
         }
         #[cfg(feature = "helix")]
-        if let Some(action) = self.felix_native_prefix_event(ev) {
-            return Ok(Some(action));
+        {
+            self.cancel_unfocused_felix_input();
+            if let Some(action) = self.felix_native_prefix_event(ev) {
+                return Ok(Some(action));
+            }
         }
         if let Some(action) = self.handle_keyboard_shortcuts_event(ev, runtime) {
             return Ok(Some(action));
