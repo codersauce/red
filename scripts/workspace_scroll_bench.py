@@ -22,6 +22,7 @@ import termios
 import threading
 import time
 
+sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from perf_trace import STARTUP, TIMING
 
@@ -210,12 +211,14 @@ class Driver:
             time.sleep(0.4)
             self.send(b"\x1b")
             time.sleep(0.1)
-            self.send(self.mouse(0, 15, 8) + self.mouse(0, 15, 8, True))
+            editor_x = self.args.cols * 3 // 4
+            self.send(self.mouse(0, editor_x, 8) + self.mouse(0, editor_x, 8, True))
             time.sleep(0.2)
         if self.args.layout == "workspace":
             self.command("NeoTree")
             time.sleep(0.4)
-        self.x = 65 if self.args.layout == "workspace" else 15
+        # Both docked panels occupy the left side of the fixture.
+        self.x = self.args.cols * 3 // 4 if self.args.layout != "editor" else 15
         self.y = 8
         self.send(self.mouse(0, self.x, self.y) + self.mouse(0, self.x, self.y, True))
         time.sleep(0.2)

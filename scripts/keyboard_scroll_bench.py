@@ -81,6 +81,7 @@ class Driver(base.Driver):
 
     def keyboard_phase(self, name):
         self.position(name)
+        has_felix_trace = self.args.model == "helix" and "felix:plan" in self.read_log()
         offset = self.log.stat().st_size
         byte_start = self.bytes
         cpu_start = base.cpu_seconds(self.process.pid)
@@ -135,6 +136,12 @@ class Driver(base.Driver):
         compact["spans"] = {key: value for key, value in timings.items()
                             if key in ("event key", "navigation:publish", "render:motion_delta", "render:motion_frame", "render:editor_windows", "render:full", "highlight:miss", "notify cursor:moved", "notify viewport:changed")}
         print(name, json.dumps(compact), flush=True)
+        if self.args.perf_mode == "trace" and result["handled_key_events"] != self.args.presses:
+            raise RuntimeError(f"{name}: missing handled key events")
+        if has_felix_trace and timings.get("felix:plan", {}).get("count", 0) != self.args.presses:
+            raise RuntimeError(f"{name}: keys did not all reach the Felix document window")
+        if name == "inside" and not result["synchronized_output_end"]:
+            raise RuntimeError("inside: motion produced no completed screen update")
         return result
 
 
