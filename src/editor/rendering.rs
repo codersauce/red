@@ -1877,6 +1877,12 @@ impl Editor {
 
         let snapshots = buffer.snapshot_rows(&rows);
         self.render_window_rows(buffer, active_window_id, &rows)?;
+        #[cfg(feature = "helix")]
+        if self.config.editing_model == crate::config::EditingModel::Helix {
+            if let Some(window) = self.window_manager.window_at_index(active_window_id) {
+                self.render_felix_selections(buffer, window, Some(&rows));
+            }
+        }
         self.draw_statusline(buffer);
         self.draw_commandline(buffer);
         self.update_terminal_cursor_surface(buffer, new_cursor_position);
@@ -3255,7 +3261,7 @@ impl Editor {
         self.render_matching_brackets_in_window(buffer, window, None);
 
         #[cfg(feature = "helix")]
-        self.render_felix_selections(buffer, window);
+        self.render_felix_selections(buffer, window, None);
 
         let multi_cursor_ranges = self
             .multi_cursor_render_ranges(self.buffer_manager[window.buffer_index].id(), window.id);

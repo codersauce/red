@@ -828,6 +828,7 @@ impl Editor {
             };
             language.indents = self.felix_break_indents(&rope, &initial, key, &id, indentation);
         }
+        let plan_span = perf::PerfSpan::start("felix:plan");
         let mut plan = match input {
             Input::Key(key) => self.plan_felix_key(
                 text,
@@ -923,6 +924,15 @@ impl Editor {
                 }
             }
         };
+        drop(plan_span);
+        let local_key = matches!(input, Input::Key(_))
+            && plan.host.is_none()
+            && self.felix.session.mode == plan.next.mode
+            && !self.felix.session.awaiting_input()
+            && !plan.next.awaiting_input()
+            && plan.message.is_none()
+            && self.felix.preview.is_none()
+            && self.current_dialog.is_none();
         let viewport = plan
             .viewport_start
             .map(|offset| felix_display_col(text, offset, indentation.tab_width));
@@ -1002,6 +1012,7 @@ impl Editor {
                 self.felix.pending_rebase = Some(Vec::with_capacity(plan.edits.len()));
             }
         }
+        let apply_span = perf::PerfSpan::start("felix:apply");
         for edit in plan.edits.iter().rev() {
             let buffer = self.current_buffer();
             let range = TextRange::new(
@@ -1013,6 +1024,8 @@ impl Editor {
         if let Some(edits) = self.felix.pending_rebase.take() {
             self.rebase_felix_views(&edits);
         }
+        drop(apply_span);
+        let selection_span = perf::PerfSpan::start("felix:select");
         let after = self.current_buffer().contents_snapshot();
         let selections = plan.selections(after.slice(..));
         self.felix.selections.insert(id, selections.clone());
@@ -1036,6 +1049,7 @@ impl Editor {
         } else {
             self.place_felix_cursor(&selections);
         }
+        drop(selection_span);
         if matches!(
             plan.history,
             History::Atomic | History::Commit | History::Checkpoint | History::InsertPaste
@@ -1157,6 +1171,30 @@ impl Editor {
         }
         if matches!(input, Input::Replay(_)) {
             Ok(())
+        } else if local_key && !plan.edits.is_empty() {
+            // An edit can be visible in several windows on the same buffer.
+            self.render_edited_window_rows(frame)
+        } else if local_key && initial != selections {
+            // Wider selections can change rows outside both caret positions.
+            // The row delta is safe only when both overlays fit their caret cell.
+            let one_caret = |s: &Selections| {
+                s.ranges().len() == 1 && s.primary().end() - s.primary().start() <= 1
+            };
+            self.check_bounds();
+            self.sync_to_window();
+            let old_line = text.char_to_line(initial.primary().start());
+            let new_line = text.char_to_line(selections.primary().start());
+            if one_caret(&initial)
+                && one_caret(&selections)
+                && self.can_render_cursor_motion_delta()
+                && !self.has_multi_cursor_session()
+                && !self.has_inline_comments(id.0)
+                && !self.cursor_line_wraps(old_line, new_line)
+            {
+                self.render_cursor_motion_delta(frame)
+            } else {
+                self.render_motion_frame(frame)
+            }
         } else {
             self.render(frame)
         }
@@ -1312,6 +1350,17 @@ impl Editor {
         }
     }
 
+    // A cursor-line highlight can cover several screen rows on either side of a move.
+    fn cursor_line_wraps(&self, old_line: usize, new_line: usize) -> bool {
+        self.wrap
+            && self.window_manager.active_window().is_some_and(|window| {
+                self.layout_for_window(window)
+                    .rows
+                    .iter()
+                    .any(|row| !row.first_segment && (row.line == old_line || row.line == new_line))
+            })
+    }
+
     pub(super) fn felix_status(&self) -> Option<String> {
         let (doc, view, _, _) = self.felix_owner()?;
         let (primary, total) = self
@@ -1333,6 +1382,7 @@ impl Editor {
         &self,
         frame: &mut RenderBuffer,
         window: &crate::window::Window,
+        terminal_rows: Option<&[usize]>,
     ) {
         let buffer = &self.buffer_manager[window.buffer_index];
         let Some(sel) = self.felix.selections.get(&(buffer.id(), window.id)) else {
@@ -1398,6 +1448,9 @@ impl Editor {
                             points.push(point);
                         }
                     }
+                    if let Some(rows) = terminal_rows {
+                        points.retain(|point| rows.binary_search(&point.y).is_ok());
+                    }
                     points
                 };
                 if left < right {
@@ -1453,6 +1506,27 @@ mod tests {
         let frame = RenderBuffer::new(80, 24, &Style::default());
         let runtime = Runtime::new();
         (editor, frame, runtime)
+    }
+
+    #[tokio::test]
+    async fn cursor_row_repaint_matches_full_frame_including_the_previous_selection() {
+        let (mut editor, mut frame, mut runtime) = fixture_editor("ab界c\nsecond\n");
+        editor.render(&mut frame).unwrap();
+        for key in ["l", "l", "j", "k", "h"] {
+            let before = frame.cells.clone();
+            let old_cursor = editor.last_rendered_cursor_position;
+            let owner = editor.felix_owner().unwrap();
+            editor
+                .execute_felix(Input::Key(key), owner, &mut frame, &mut runtime)
+                .await
+                .unwrap();
+            editor.render(&mut frame).unwrap();
+            let expected = frame.cells.clone();
+            frame.cells = before;
+            editor.last_rendered_cursor_position = old_cursor;
+            editor.render_cursor_motion_delta(&mut frame).unwrap();
+            assert_eq!(frame.cells, expected, "after {key}");
+        }
     }
 
     #[tokio::test]
@@ -2175,7 +2249,7 @@ mod tests {
         editor.set_felix_active_selection(state);
         let window = editor.active_window_with_editor_view().unwrap();
         let mut frame = RenderBuffer::new(80, 24, &Style::default());
-        editor.render_felix_selections(&mut frame, &window);
+        editor.render_felix_selections(&mut frame, &window, None);
         let row = window.position.y + editor.window_content_top(&window);
         let col = window.position.x + editor.gutter_width_for_window(&window) + 1;
         let selected = &frame.cells[row * frame.width + col].style;
