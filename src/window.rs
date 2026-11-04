@@ -1877,9 +1877,41 @@ impl WindowManager {
         Some(())
     }
 
-    /// Moves the active window to the requested full-height or full-width outer edge.
-    ///
-    /// Returns `None` when there is only one window or the active window already
+    /// Rotate the immediate container of the focused leaf, preserving both
+    /// children, their share of the available space, and stable view IDs.
+    #[cfg(feature = "helix")]
+    pub fn transpose_active_split(&mut self) -> Option<()> {
+        fn transpose(node: &mut Split, active: WindowId) -> bool {
+            let (a, b, ratio, vertical) = match node {
+                Split::Window(_) => return false,
+                Split::Horizontal { top, bottom, ratio } => (top, bottom, *ratio, false),
+                Split::Vertical { left, right, ratio } => (left, right, *ratio, true),
+            };
+            if !matches!(**a,Split::Window(ref w) if w.id==active)
+                && !matches!(**b,Split::Window(ref w) if w.id==active)
+            {
+                return transpose(a, active) || transpose(b, active);
+            }
+            *node = if vertical {
+                Split::Horizontal {
+                    top: a.clone(),
+                    bottom: b.clone(),
+                    ratio,
+                }
+            } else {
+                Split::Vertical {
+                    left: a.clone(),
+                    right: b.clone(),
+                    ratio,
+                }
+            };
+            true
+        }
+        let active = self.active_stable_window_id()?;
+        let (origin, size) = self.layout_geometry()?;
+        transpose(&mut self.root, active).then(|| self.root.layout(origin, size))
+    }
+
     /// Exchange neighboring leaf views while preserving the split tree and its geometry.
     #[cfg(feature = "helix")]
     pub fn swap_adjacent(&mut self, direction: Direction) -> Option<()> {
@@ -1896,6 +1928,9 @@ impl WindowManager {
         Some(())
     }
 
+    /// Moves the active window to the requested full-height or full-width outer edge.
+    ///
+    /// Returns `None` when there is only one window or the active window already
     /// occupies the requested edge.
     pub fn move_window_to_edge(&mut self, direction: Direction) -> Option<()> {
         let active_window = self.active_window()?;

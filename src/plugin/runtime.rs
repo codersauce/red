@@ -18636,6 +18636,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn felix_native_neotree_lists_watches_and_opens_relative_to_the_document_directory() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("neotree", include_str!("../../plugins/neotree.hk"))
+            .await
+            .unwrap();
+        runtime
+            .execute_command("NeoTreeDocumentDirectory")
+            .await
+            .unwrap();
+        let requests = |runtime: &Runtime| {
+            std::iter::from_fn(|| runtime.try_recv_request()).collect::<Vec<_>>()
+        };
+        let windows = requests(&runtime)
+            .into_iter()
+            .find_map(|r| match r {
+                PluginRequest::GetWindows { request_id } => Some(request_id),
+                _ => None,
+            })
+            .unwrap();
+        runtime
+            .resolve_request(
+                windows,
+                json!({"windows":[{"active":true,"buffer_path":"src/main.rs"}]}),
+            )
+            .await
+            .unwrap();
+        let cwd = requests(&runtime)
+            .into_iter()
+            .find_map(|r| match r {
+                PluginRequest::GetConfig { request_id, .. } => Some(request_id),
+                _ => None,
+            })
+            .unwrap();
+        runtime
+            .resolve_request(cwd, json!({"value":"/repo"}))
+            .await
+            .unwrap();
+        let initial = requests(&runtime);
+        assert!(initial
+            .iter()
+            .any(|r| matches!(r, PluginRequest::GetGitStatus{path,..} if path == "/repo/src")));
+        let listing = initial
+            .into_iter()
+            .find_map(|r| match r {
+                PluginRequest::ListDirectory { path, request_id } if path == "/repo/src" => {
+                    Some(request_id)
+                }
+                _ => None,
+            })
+            .unwrap();
+        runtime
+            .resolve_request(
+                listing,
+                json!({"path":"/repo/src","entries":[
+            {"name":"sibling.rs","path":"/repo/src/sibling.rs","kind":"file"}], "error":null}),
+            )
+            .await
+            .unwrap();
+        let rendered = requests(&runtime);
+        assert!(rendered
+            .iter()
+            .any(|r| matches!(r, PluginRequest::WatchDirectory{path,..} if path == "/repo/src")));
+        let row = rendered
+            .into_iter()
+            .find_map(|r| match r {
+                PluginRequest::UpdatePanel { rows, .. } => {
+                    rows.into_iter().find(|row| row.id == "./sibling.rs")
+                }
+                _ => None,
+            })
+            .unwrap();
+        runtime
+            .notify("panel:event:neotree", json!({"action":"i","row":row}))
+            .await
+            .unwrap();
+        assert!(requests(&runtime).into_iter().any(|r| matches!(r, PluginRequest::FileOperation{operation,..} if operation["path"] == "./src/sibling.rs")));
+        runtime
+            .notify(
+                "panel:event:neotree",
+                json!({"action":"activate","row":row}),
+            )
+            .await
+            .unwrap();
+        assert!(requests(&runtime).into_iter().any(|r| matches!(r, PluginRequest::OpenLocation{location,..} if location.path == "/repo/src/sibling.rs")));
+        runtime.execute_command("NeoTree").await.unwrap();
+        assert!(requests(&runtime)
+            .into_iter()
+            .any(|r| matches!(r, PluginRequest::ListDirectory { path,.. } if path == ".")));
+    }
+
+    #[tokio::test]
     async fn neotree_renders_a_panel_expands_directories_and_opens_files() {
         drain_requests();
 

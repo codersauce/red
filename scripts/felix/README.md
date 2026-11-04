@@ -117,3 +117,21 @@ Press `Q` to start recording in the default register (`@`), press `Q` to finish,
 Run `scenarios.py --suite macros --observer <hx> --runtime <runtime>` and compare the output with `fixtures/macros.json` in this directory. The 17 cases check 230 physical inputs against Helix 25.07.1. Both `cargo test -p felix-core --test reference reference_macros` and `cargo test --features helix --lib macros_match_reference_at_every_key` replay that corpus. The paired terminal smoke checks the recording indicator, document switching, counted replay, and individual undo steps.
 
 A recording stores physical keys. A nested replay stores the invocation, and a bracketed paste edits the document without adding its contents to the recording. Red applies its 10,000-key playback limit across the entire counted and nested invocation. Input in a sensitive dialog is excluded. A replay that reaches a focused panel or the workspace manager stops before sending it another key.
+
+### M2 broad compatibility
+
+Each generator starts the pinned Helix observer in disposable workspaces. Point `HX` at the observer and `HX_RUNTIME` at the extracted 25.07.1 release runtime. The same captures run against Red through its document input dispatcher.
+
+```sh
+out=$(mktemp -d)
+for suite in registers macros structure shell navigation comments; do
+  python3 scripts/felix/scenarios.py --observer "$HX" --runtime "$HX_RUNTIME" --suite "$suite" > "$out/$suite.json"
+  cmp "scripts/felix/fixtures/$suite.json" "$out/$suite.json"
+done
+cargo test --locked -p felix-core
+cargo test --locked -p red --features helix --lib editor::felix -- --test-threads=1
+```
+
+The paired terminal traces `broad`, `syntax-native`, `embedded` and `history-view` combine multiple commands. They surround two selected words, pipe them through a shell and undo the edit, and exercise a Rust function text object, expansion inside a Markdown code fence, comment toggling, visible word jumps and chronological undo across branches. The NeoTree plugin and language-server tests run through the full Red test suite.
+
+Shell commands run in Red’s working directory. Each pipe or predicate receives the corresponding selection on stdin. Insert and append run once and reuse the result. Red collects all outputs before applying an undoable edit and limits output to 8 MiB per stream and across the collected fragments. Moving or editing during a command invalidates the result. In the originating document, Ctrl-C cancels the command and its queued macro continuation. On Unix, cancellation terminates the process group. On Windows, Red terminates the immediate shell process. The live shell fixture uses POSIX commands on macOS and Linux.

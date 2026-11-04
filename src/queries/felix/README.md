@@ -1,0 +1,5 @@
+Text-object queries from Helix 25.07.1, commit `a05c151bb6e8e9c65ec390b0ae2afe7a5efd619b`, under the included MPL-2.0 license. Trailing whitespace is normalized. Files correspond to `runtime/queries/<language>/textobjects.scm`. Felix composes the declared inherited queries for Red’s bundled and configurable grammars.
+
+Red’s JavaScript, JSX, TypeScript and TSX grammars name the expression node `function_expression`. The shared ECMA query uses that spelling.
+
+Named objects and their motions query the document’s root grammar, as in Helix 25.07.1. Structural selections and matching pairs also use injected trees. Red shares the highlighter’s configured injection queries and language aliases. These support captured language names and static language properties, including nested Markdown fences. Red’s bundled Markdown injection query covers inline content and fences with a recognized language. Static queries can also tag front matter with an installed YAML or TOML grammar. Helix’s shebang-based language detection and its ability to combine disjoint injection ranges into one tree require additional support in Red.

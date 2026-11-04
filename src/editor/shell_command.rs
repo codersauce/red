@@ -237,7 +237,7 @@ fn expand_shell_command(
 }
 
 #[cfg(unix)]
-fn shell_invocation(shell: Option<OsString>) -> (OsString, &'static str) {
+pub(super) fn shell_invocation(shell: Option<OsString>) -> (OsString, &'static str) {
     (
         shell
             .filter(|value| !value.is_empty())
@@ -247,7 +247,7 @@ fn shell_invocation(shell: Option<OsString>) -> (OsString, &'static str) {
 }
 
 #[cfg(windows)]
-fn shell_invocation(shell: Option<OsString>) -> (OsString, &'static str) {
+pub(super) fn shell_invocation(shell: Option<OsString>) -> (OsString, &'static str) {
     (
         shell
             .filter(|value| !value.is_empty())
@@ -257,7 +257,7 @@ fn shell_invocation(shell: Option<OsString>) -> (OsString, &'static str) {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn shell_invocation(shell: Option<OsString>) -> (OsString, &'static str) {
+pub(super) fn shell_invocation(shell: Option<OsString>) -> (OsString, &'static str) {
     (
         shell
             .filter(|value| !value.is_empty())

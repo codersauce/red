@@ -353,6 +353,20 @@ impl LanguageRegistry {
         })
     }
 
+    pub(crate) fn id_for_injection_name(&self, name: &str) -> Option<&str> {
+        let name = name.trim().to_ascii_lowercase();
+        let name = name.split_whitespace().next()?;
+        self.aliases
+            .get(name)
+            .or_else(|| self.extensions.get(name.trim_start_matches('.')))
+            .map(String::as_str)
+    }
+
+    #[cfg(feature = "helix")]
+    pub(crate) fn injections(&self, id: &str) -> Option<&str> {
+        self.languages.get(id)?.injection_query.as_deref()
+    }
+
     /// Returns the Tree-sitter grammar for one language, when Red has one.
     pub(crate) fn grammar(&self, id: &str) -> Option<Language> {
         let definition = self.languages.get(id)?;
@@ -509,10 +523,9 @@ struct Injection {
     content_end: usize,
 }
 
-struct RawInjection {
-    language_name: String,
-    content_start: usize,
-    content_end: usize,
+pub(crate) struct RawInjection {
+    pub(crate) language_name: String,
+    pub(crate) content: tree_sitter::Range,
 }
 
 struct CachedHighlight {
@@ -587,7 +600,7 @@ impl GitCommitStyles {
     }
 }
 
-const MAX_INJECTION_DEPTH: usize = 3;
+pub(crate) const MAX_INJECTION_DEPTH: usize = 3;
 const MAX_CACHED_HIGHLIGHT_BYTES: usize = 64 * 1024;
 const MAX_CACHED_HIGHLIGHT_SPANS: usize = 4_096;
 
@@ -838,13 +851,7 @@ impl Highlighter {
     }
 
     pub fn language_id_for_name(&self, name: &str) -> Option<&str> {
-        let name = name.trim().to_ascii_lowercase();
-        let name = name.split_whitespace().next().unwrap_or_default();
-        self.registry
-            .aliases
-            .get(name)
-            .map(String::as_str)
-            .or_else(|| self.language_id_for_extension(name))
+        self.registry.id_for_injection_name(name)
     }
 
     /// Returns canonical editor languages in display order, excluding the
@@ -1483,8 +1490,8 @@ impl Highlighter {
                 let language_id = self.language_id_for_name(&injection.language_name)?;
                 Some(Injection {
                     language_id: language_id.to_string(),
-                    content_start: injection.content_start,
-                    content_end: injection.content_end,
+                    content_start: injection.content.start_byte,
+                    content_end: injection.content.end_byte,
                 })
             })
             .collect::<Vec<_>>();
@@ -2239,9 +2246,25 @@ fn collect_injections(
     root_node: tree_sitter::Node<'_>,
     code: &str,
 ) -> Vec<RawInjection> {
+    collect_injections_with_options(
+        query,
+        root_node,
+        code,
+        tree_sitter::QueryCursorOptions::new(),
+        usize::MAX,
+    )
+}
+
+pub(crate) fn collect_injections_with_options(
+    query: &Query,
+    root_node: tree_sitter::Node<'_>,
+    code: &str,
+    options: tree_sitter::QueryCursorOptions<'_>,
+    limit: usize,
+) -> Vec<RawInjection> {
     let mut injections = Vec::new();
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(query, root_node, code.as_bytes());
+    let mut matches = cursor.matches_with_options(query, root_node, code.as_bytes(), options);
 
     while let Some(mat) = matches.next() {
         let mut language_name = query
@@ -2260,21 +2283,22 @@ fn collect_injections(
                     }
                 }
                 "injection.content" => {
-                    content = Some((capture.node.start_byte(), capture.node.end_byte()));
+                    content = Some(capture.node.range());
                 }
                 _ => {}
             }
         }
 
-        let (Some(language_name), Some((content_start, content_end))) = (language_name, content)
-        else {
+        let (Some(language_name), Some(content)) = (language_name, content) else {
             continue;
         };
 
+        if injections.len() >= limit {
+            break;
+        }
         injections.push(RawInjection {
             language_name: language_name.to_string(),
-            content_start,
-            content_end,
+            content,
         });
     }
 
@@ -5184,7 +5208,7 @@ mod tests {
         assert_eq!(injections.len(), 1);
         assert_eq!(injections[0].language_name, "javascript");
         assert_eq!(
-            &code[injections[0].content_start..injections[0].content_end],
+            &code[injections[0].content.start_byte..injections[0].content.end_byte],
             "const answer = true;\n"
         );
     }

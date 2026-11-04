@@ -315,9 +315,27 @@ The first register change has four testable parts, in this order:
 
 The first register slice, `52aa8438`, passed Linux with the committed lockfile. Its artifact contains 232 register inputs, 4,044 fixed M1 inputs and 4,676 extended inputs. [Linux conformance run](https://github.com/codersauce/red/actions/runs/41887329947)
 
-The second register slice adds named search histories, copying between registers, and the primary-selection clipboard. The dedicated corpus now compares 366 inputs across 16 cases. The macro slice implements document recording with `Q` and counted replay with `q`, including nested register calls. It adds 230 differential inputs across 17 cases and a paired terminal test spanning two documents. The next group is syntax-aware selections and text objects, followed by closest-pair and surround editing. [Register comparison instructions](../scripts/felix/README.md#m2-register-comparisons)
+The second register slice adds named search histories, copying between registers, and the primary-selection clipboard. The dedicated corpus now compares 366 inputs across 16 cases. The macro slice implements document recording with `Q` and counted replay with `q`, including nested register calls. It adds 230 differential inputs across 17 cases and a paired terminal test spanning two documents. [Register comparison instructions](../scripts/felix/README.md#m2-register-comparisons)
 
 Include the already reserved M2 bindings and actions in that inventory: current-document-directory NeoTree, changed-file navigation, symbol-reference selections, comment toggles, and syntax navigation/selections. Each group extends the same manifest, live differential suite, production integration, and visible-behavior checks. Independent groups may proceed concurrently once their prerequisites exist. M2 remains scoped to document windows; release scheduling does not delay it.
+
+### Broad compatibility spike
+
+The candidate keeps editing in document windows behind the `helix` feature. These command families form one review and verification batch.
+
+| Area | Behavior in the candidate | Evidence |
+| --- | --- | --- |
+| Syntax selections and text objects | Expand and shrink the syntax node, select siblings and children, move to parent boundaries, and navigate or select captures such as functions, parameters, comments, types, tests and entries. Red uses the pinned Helix queries with its Tree-sitter grammars. Node selections also enter recognized embedded languages, including Rust and JavaScript fences in Markdown. | Structural per-key comparisons, query compilation, Rust terminal edit |
+| Surrounds | `ms` adds a pair, `mr` previews and replaces it, and `md` removes it. Counts, direction, overlapping selections, and the closest-pair object are covered. | Standalone Felix and Red per-key comparisons, multi-selection terminal edit |
+| Shell commands | `|` replaces selections, `Alt-|` pipes without editing, `!` and `Alt-!` insert and append output, and `$` keeps selections that pass a predicate. The prompt shares Helix’s shell history register. | Per-key comparison, real subprocesses, stale-document and cancellation tests, terminal undo |
+| Navigation, history and views | Paragraphs, blank lines, visible-word jumps, viewport placement, selection alignment and rotation, chronological history across undo branches, diagnostics, Git hunks, split transposition, and opening a selected path in a split. LSP jumps open one destination directly and show multiple destinations in Red’s picker. | Navigation per-key comparison and service-backed Red tests |
+| Native document commands | `Space E` opens NeoTree at the document directory. `Space g` opens changed files. `Space h` selects document highlights. `Space c`, `Space C`, and `Space Alt-c` toggle comments. Bare `=` formats the selected range via LSP. | Disposable Git repository, NeoTree plugin tests, LSP highlights, comment comparisons |
+
+Embedded syntax follows Red’s configured injections, to a maximum of three nested layers. Shebang language detection and treating disjoint injected fragments as one parse tree remain open compatibility cases. Word jumps use the pinned default label alphabet. Git hunk boundaries follow Red’s line-diff implementation, including its handling of repeated lines. The four new fixtures contain 817 physical inputs across 58 cases. The side-by-side suite covers editing behavior. Red’s own tests cover its picker, plugin, and asynchronous request lifecycles. Acceptance also requires the feature matrix, performance measurements, and Linux conformance with the committed dependency lock. [Verification commands](../scripts/felix/README.md#m2-broad-compatibility)
+
+**Local verification, November 4, 2026.** On macOS the spike passed 4,172 Red tests with Helix compiled in, 4,106 with it excluded, and 17 standalone Felix tests. The Red suites each skipped three opt-in benchmarks. The 21 paired terminal traces and the fixed and extended M1 corpora passed alongside the M2 fixtures. The extended seed was 261104 (4,694 inputs). Clippy passed for both configurations. The integrated run also exercises Vim visual-block dot-repeat on its original 2 MiB stack.
+
+All 24 input-latency limits and five undo, paste, and selection-scaling limits passed. In a development build, median run p95 on the visible README image measured 10.10 ms for typing and 3.57 ms for vertical movement, compared with 10.55 ms and 3.71 ms on the preceding macro commit. These checks used the local registry-compatible lockfile. Linux conformance with the repository lockfile is the remaining remote check.
 
 ## Implementation handoff
 

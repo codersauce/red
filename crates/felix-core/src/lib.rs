@@ -253,8 +253,11 @@ pub use motion::cell_width;
 mod registers;
 mod repeat;
 mod search;
-pub use command::open_line_site;
-pub use command::{Context, Edit, History, HostAction, Mode, Paste, Plan, Session, VisualLines};
+pub use command::{
+    CommentMode, Context, Edit, History, HostAction, Mode, Paste, Plan, Session, VisualLines,
+};
+pub use command::{Navigation, Shell, Structure, SyntaxPairs, open_line_site};
+pub use motion::match_bracket as matching_plain_bracket;
 pub use registers::Registers;
 pub use repeat::{CompletionChange, InsertEvent, LastInsert, ReplayStep};
 

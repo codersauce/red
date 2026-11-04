@@ -2673,7 +2673,23 @@ pub enum Action {
     #[cfg(feature = "helix")]
     FelixDocumentDiagnostics,
     #[cfg(feature = "helix")]
+    FelixChangedFiles,
+    #[cfg(feature = "helix")]
+    FelixFormatRange,
+    #[cfg(feature = "helix")]
+    FelixSymbolHighlights,
+    #[cfg(feature = "helix")]
+    FelixToggleComments,
+    #[cfg(feature = "helix")]
+    FelixLineComments,
+    #[cfg(feature = "helix")]
+    FelixBlockComments,
+    #[cfg(feature = "helix")]
     FelixSwapWindow(crate::window::Direction),
+    #[cfg(feature = "helix")]
+    FelixTransposeWindow,
+    #[cfg(feature = "helix")]
+    FelixSplitAtFile(bool),
     #[cfg(feature = "helix")]
     FelixCopyBetweenRegisters,
     #[cfg(feature = "helix")]
@@ -12770,16 +12786,12 @@ impl Editor {
                         &msg,
                         InboundMessage::Notification(ParsedNotification::Progress(_))
                     );
-                    let completed_definition =
-                        if method.as_deref() == Some("textDocument/definition") {
-                            match &msg {
-                                InboundMessage::Message(response) => Some(response.id),
-                                InboundMessage::RequestError { id, .. } => Some(*id),
-                                _ => None,
-                            }
-                        } else {
-                            None
-                        };
+                    let completed_definition = match &msg {
+                        InboundMessage::Message(response) => Some(response.id),
+                        InboundMessage::RequestError { id, .. } => Some(*id),
+                        _ => None,
+                    }
+                    .filter(|id| self.pending_definition_requests.contains(id));
                     if let Some(action) = self.handle_lsp_message(&msg, method) {
                         // TODO: handle quit
                         let generation_before = self.render_generation;
@@ -14650,6 +14662,10 @@ impl Editor {
         }
         Box::pin(self.drain_agent_pane_effects(runtime)).await?;
         needs_render |= self.service_shell_commands(runtime).await;
+        #[cfg(feature = "helix")]
+        if self.felix_shell_ready() {
+            needs_render |= Box::pin(self.service_felix_shell(buffer, runtime)).await?;
+        }
         needs_render |= self.service_explore_background();
         needs_render |= self.service_red_update();
         self.resume_rpc_actions(buffer, runtime).await?;
@@ -14717,6 +14733,11 @@ impl Editor {
             });
         }
 
+        #[cfg(feature = "helix")]
+        if self.interrupt_felix_shell(&ev) {
+            self.render(buffer)?;
+            return Ok(ProcessedEvent::default());
+        }
         let sensitive_input = self
             .current_dialog
             .as_ref()
@@ -16415,8 +16436,38 @@ impl Editor {
         )
     }
 
-    fn paste_formatting_action(&mut self, response: &ResponseMessage) -> Option<Action> {
+    fn discard_range_format_request(&mut self, id: i64) -> bool {
+        #[cfg(feature = "helix")]
+        if self.felix_format_request(id).is_some() {
+            return true;
+        }
+        self.pending_lsp_paste_formats.remove(&id).is_some()
+    }
+
+    fn range_formatting_action(&mut self, response: &ResponseMessage) -> Option<Action> {
+        #[cfg(feature = "helix")]
+        if let Some(owner) = self.felix_format_request(response.id) {
+            if !self.felix_native_owner_is_current(owner) {
+                return None;
+            }
+            let source = self.current_buffer();
+            let pending = PendingLspEdit {
+                buffer_id: source.id(),
+                revision: source.revision(),
+                uri: source.uri().ok().flatten()?,
+            };
+            return self.apply_range_format_response(response, pending, "format selection");
+        }
         let pending = self.pending_lsp_paste_formats.remove(&response.id)?;
+        self.apply_range_format_response(response, pending, "format pasted text")
+    }
+
+    fn apply_range_format_response(
+        &self,
+        response: &ResponseMessage,
+        pending: PendingLspEdit,
+        label: &str,
+    ) -> Option<Action> {
         if !self.pending_lsp_edit_is_current(&pending) || response.result.is_null() {
             return None;
         }
@@ -16424,7 +16475,7 @@ impl Editor {
             Ok(edits) if !edits.is_empty() => edits,
             Ok(_) => return None,
             Err(error) => {
-                log!("invalid LSP paste formatting response: {error}");
+                log!("invalid LSP range formatting response: {error}");
                 return None;
             }
         };
@@ -16440,7 +16491,7 @@ impl Editor {
                 }],
                 vec![(uri, pending.revision)],
                 None,
-                "format pasted text".to_string(),
+                label.to_string(),
                 None,
                 None,
                 None,
@@ -17017,6 +17068,10 @@ impl Editor {
         msg: &InboundMessage,
         method: Option<String>,
     ) -> Option<Action> {
+        #[cfg(feature = "helix")]
+        if let Some(result) = self.felix_definition_response(msg) {
+            return result;
+        }
         if self.handle_agent_lsp_message(msg) {
             return None;
         }
@@ -17096,6 +17151,12 @@ impl Editor {
                         }
                     }
 
+                    #[cfg(feature = "helix")]
+                    if method == "textDocument/documentHighlight"
+                        && self.apply_felix_highlights(msg)
+                    {
+                        return Some(Action::Refresh);
+                    }
                     if method == "textDocument/references" {
                         if let Some(request_id) = self.pending_plugin_references.remove(&msg.id) {
                             let payload = match self.plugin_references_payload(msg) {
@@ -17122,7 +17183,7 @@ impl Editor {
                     }
 
                     if method == "textDocument/rangeFormatting" {
-                        return self.paste_formatting_action(msg);
+                        return self.range_formatting_action(msg);
                     }
 
                     if method == "textDocument/codeAction" {
@@ -17272,7 +17333,7 @@ impl Editor {
                 log!("got an error: {error_msg:?}");
                 let id = error_msg.id?;
                 if method.as_deref() == Some("textDocument/rangeFormatting")
-                    && self.pending_lsp_paste_formats.remove(&id).is_some()
+                    && self.discard_range_format_request(id)
                 {
                     return None;
                 }
@@ -17294,6 +17355,12 @@ impl Editor {
                             plugin_inlay_hints_error(request_id, &error_msg.message),
                         ));
                     }
+                }
+                #[cfg(feature = "helix")]
+                if method.as_deref() == Some("textDocument/documentHighlight")
+                    && self.finish_felix_highlight_error(id, &error_msg.message)
+                {
+                    return Some(Action::Refresh);
                 }
                 if let Some(request_id) = self.take_pending_plugin_request(method.as_deref()?, id) {
                     return Some(Action::ResolvePluginRequest(
@@ -17376,7 +17443,7 @@ impl Editor {
             }
             InboundMessage::RequestError { id, error } => {
                 if method.as_deref() == Some("textDocument/rangeFormatting")
-                    && self.pending_lsp_paste_formats.remove(id).is_some()
+                    && self.discard_range_format_request(*id)
                 {
                     log!("paste formatting request failed: {error}");
                     return None;
@@ -17399,6 +17466,12 @@ impl Editor {
                             plugin_inlay_hints_error(request_id, &error.to_string()),
                         ));
                     }
+                }
+                #[cfg(feature = "helix")]
+                if method.as_deref() == Some("textDocument/documentHighlight")
+                    && self.finish_felix_highlight_error(*id, &error.to_string())
+                {
+                    return Some(Action::Refresh);
                 }
                 if let Some(request_id) = method
                     .as_deref()
@@ -22398,99 +22471,11 @@ impl Editor {
         tracking: bool,
         add_to_history: &mut bool,
     ) -> anyhow::Result<Option<(bool, bool)>> {
+        #[cfg(feature = "helix")]
+        if let Some(future) = self.felix_document_action(action, buffer, runtime) {
+            return Ok(Some((true, future.await?)));
+        }
         match action {
-            #[cfg(feature = "helix")]
-            Action::FelixInput { key, owner } => {
-                self.execute_felix(felix::Input::Key(key), *owner, buffer, runtime)
-                    .await?;
-                return Ok(Some((true, false)));
-            }
-            #[cfg(feature = "helix")]
-            Action::FelixCompletionKey {
-                item,
-                key,
-                owner,
-                resolve,
-            } => {
-                if self.felix_owner() != Some(*owner) {
-                    return Ok(Some((true, false)));
-                }
-                if *resolve
-                    && self
-                        .resolve_completion_item(item, None, Some((*owner, *key)))
-                        .await?
-                {
-                    self.close_completion_popup();
-                    self.completion_snapshot = None;
-                } else {
-                    self.apply_completion(item, None, runtime).await?;
-                    if self.is_insert()
-                        && self
-                            .felix_owner()
-                            .is_some_and(|now| (now.0, now.1) == (owner.0, owner.1))
-                    {
-                        if let Some(action) = self.felix_input_action(key) {
-                            let quit = Box::pin(self.handle_key_action(
-                                &Event::Key(*key),
-                                &action,
-                                buffer,
-                                runtime,
-                            ))
-                            .await?;
-                            return Ok(Some((true, quit)));
-                        }
-                    }
-                }
-                self.render(buffer)?;
-                return Ok(Some((true, false)));
-            }
-            #[cfg(feature = "helix")]
-            Action::FelixPreviewCompletion => {
-                self.refresh_felix_preview();
-                self.render(buffer)?;
-                return Ok(Some((true, false)));
-            }
-            #[cfg(feature = "helix")]
-            Action::FelixDocumentDiagnostics => {
-                self.open_document_diagnostics_picker();
-                self.render(buffer)?;
-                return Ok(Some((true, false)));
-            }
-            #[cfg(feature = "helix")]
-            Action::FelixSwapWindow(direction) => {
-                self.update_window_layout(|windows| windows.swap_adjacent(*direction));
-                self.render(buffer)?;
-                return Ok(Some((true, false)));
-            }
-            #[cfg(feature = "helix")]
-            Action::FelixPaste { text, owner } => {
-                self.execute_felix(felix::Input::Bracketed(text), *owner, buffer, runtime)
-                    .await?;
-                return Ok(Some((true, false)));
-            }
-            #[cfg(feature = "helix")]
-            Action::FelixCopyBetweenRegisters => {
-                if let Some(owner) = self.felix_owner() {
-                    self.execute_felix(
-                        felix::Input::Key("<copy-between-registers>"),
-                        owner,
-                        buffer,
-                        runtime,
-                    )
-                    .await?;
-                }
-                return Ok(Some((true, false)));
-            }
-            #[cfg(feature = "helix")]
-            Action::FelixClipboardBefore
-            | Action::FelixClipboardAfter
-            | Action::FelixClipboardYank
-            | Action::FelixClipboardYankPrimary
-            | Action::FelixClipboardReplace => {
-                self.execute_felix_clipboard(action, buffer, runtime)
-                    .await?;
-                return Ok(Some((true, false)));
-            }
             Action::MousePress {
                 column,
                 row,
@@ -27896,6 +27881,12 @@ impl Editor {
         render_buffer: &mut RenderBuffer,
         index: usize,
     ) -> anyhow::Result<()> {
+        #[cfg(feature = "helix")]
+        if self.config.editing_model == crate::config::EditingModel::Helix
+            && index != self.buffer_manager.active_index()
+        {
+            self.note_felix_buffer_departure();
+        }
         let vtop = self.vtop;
         let pos = (self.cx, self.cy);
 
@@ -31027,6 +31018,10 @@ impl Editor {
             .current_buffer_mut()
             .undo_history
             .commit_transaction(after_cursor);
+        #[cfg(feature = "helix")]
+        if committed && self.config.editing_model == crate::config::EditingModel::Helix {
+            self.felix_mark_modified();
+        }
         self.current_buffer_mut().refresh_dirty();
         committed
     }

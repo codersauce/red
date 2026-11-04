@@ -3,6 +3,11 @@
 //! Tree-sitter ranges use UTF-8 bytes. This service converts them to the editor's
 //! Unicode-scalar coordinates before exposing a result, and never mutates a buffer.
 
+#[cfg(feature = "helix")]
+mod felix;
+#[cfg(feature = "helix")]
+pub(crate) use felix::FelixSyntax;
+
 use std::{
     collections::{HashMap, HashSet},
     ops::Range,
@@ -102,6 +107,8 @@ struct Capture {
 }
 
 struct DocumentCaptures {
+    #[cfg(feature = "helix")]
+    felix_layers: Option<felix::FelixSyntax>,
     revision: u64,
     language_id: String,
     contents: Arc<str>,
@@ -121,6 +128,10 @@ enum SearchGoal {
 pub(crate) struct SyntaxTextObjectService {
     registry: Arc<LanguageRegistry>,
     queries: HashMap<(String, SyntaxObjectKind), Arc<Query>>,
+    #[cfg(feature = "helix")]
+    felix_queries: HashMap<String, Query>,
+    #[cfg(feature = "helix")]
+    felix_injection_queries: HashMap<String, Query>,
     documents: HashMap<BufferId, DocumentCaptures>,
 }
 
@@ -129,6 +140,10 @@ impl SyntaxTextObjectService {
         Self {
             registry,
             queries: HashMap::new(),
+            #[cfg(feature = "helix")]
+            felix_queries: HashMap::new(),
+            #[cfg(feature = "helix")]
+            felix_injection_queries: HashMap::new(),
             documents: HashMap::new(),
         }
     }
@@ -136,6 +151,10 @@ impl SyntaxTextObjectService {
     pub(crate) fn reset(&mut self, registry: Arc<LanguageRegistry>) {
         self.registry = registry;
         self.queries.clear();
+        #[cfg(feature = "helix")]
+        self.felix_queries.clear();
+        #[cfg(feature = "helix")]
+        self.felix_injection_queries.clear();
         self.documents.clear();
     }
 
@@ -308,13 +327,13 @@ impl SyntaxTextObjectService {
             document.revision == buffer.revision() && document.language_id == language_id
         });
         if !current {
-            let contents: Arc<str> = Arc::from(buffer.contents());
-            if contents.len() > MAX_STRUCTURAL_DOCUMENT_BYTES {
+            if buffer.contents_snapshot().len_bytes() > MAX_STRUCTURAL_DOCUMENT_BYTES {
                 return Err(anyhow!(
                     "structural navigation is unavailable for documents larger than {} bytes",
                     MAX_STRUCTURAL_DOCUMENT_BYTES
                 ));
             }
+            let contents: Arc<str> = Arc::from(buffer.contents());
             let mut parser = Parser::new();
             parser
                 .set_language(language)
@@ -336,6 +355,8 @@ impl SyntaxTextObjectService {
             self.documents.insert(
                 id,
                 DocumentCaptures {
+                    #[cfg(feature = "helix")]
+                    felix_layers: None,
                     revision: buffer.revision(),
                     language_id: language_id.to_string(),
                     contents,

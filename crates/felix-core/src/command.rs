@@ -1,11 +1,18 @@
 //! Document commands produce edits in original document coordinates. The host
 //! commits them in reverse order, then resolves the new selection against its Rope.
+mod comments;
 mod insert;
+pub use comments::CommentMode;
 mod lines;
+mod navigation;
+pub use navigation::Navigation;
+mod shell;
+mod surround;
 use crate::search::{Prompt, Query};
 use crate::{Range, Selections, boundary};
 pub use lines::open_line_site;
 use ropey::RopeSlice;
+pub use shell::Shell;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Mode {
@@ -20,6 +27,14 @@ enum Pending {
     #[default]
     None,
     Goto,
+    WordLabels {
+        words: std::sync::Arc<[Range]>,
+        group: Option<usize>,
+    },
+    View,
+    Bracket {
+        forward: bool,
+    },
     SelectRegister,
     CopyFrom,
     CopyInto {
@@ -31,6 +46,19 @@ enum Pending {
     },
     Replace,
     Match,
+    Shell {
+        kind: Shell,
+        input: Prompt,
+    },
+    Surround {
+        action: char,
+        count: usize,
+    },
+    ReplacePair {
+        positions: Vec<(usize, usize)>,
+        original: Selections,
+        viewport_start: usize,
+    },
     Object {
         around: bool,
         count: usize,
@@ -75,8 +103,19 @@ enum ArgumentMotion {
     },
 }
 
+#[derive(Debug, Clone, Copy)]
+enum RecordedMotion {
+    Argument(ArgumentMotion),
+    Structure(Structure),
+}
+
 impl ArgumentMotion {
-    fn apply(self, text: RopeSlice<'_>, selections: &Selections) -> Selections {
+    fn apply(
+        self,
+        text: RopeSlice<'_>,
+        selections: &Selections,
+        context: &Context<'_>,
+    ) -> Selections {
         selections.transform(text, |range| match self {
             Self::Find {
                 command,
@@ -87,7 +126,9 @@ impl ArgumentMotion {
             Self::Object { ch, count, around } => match ch {
                 'p' => crate::motion::paragraph(text, range, count, around),
                 'w' | 'W' => crate::motion::word_object(text, range, ch == 'W', around),
-                _ => crate::motion::pair_object(text, range, ch, around, count),
+                _ => {
+                    crate::motion::pair_object(text, range, ch, around, count, context.syntax_pairs)
+                }
             },
         })
     }
@@ -152,8 +193,15 @@ fn visual_target(
     (layout.offset(start..end, row, col), (0, col))
 }
 
+/// Resolve the nth enclosing delimiter using the document syntax tree.
+pub trait SyntaxPairs {
+    fn closest(&self, text: RopeSlice<'_>, range: Range, count: usize) -> Option<(usize, usize)>;
+    fn matching(&self, text: RopeSlice<'_>, position: usize) -> Option<usize>;
+}
+
 /// Document settings and register contents supplied by the current host.
 pub struct Context<'a> {
+    pub syntax_pairs: Option<&'a dyn SyntaxPairs>,
     /// Search register entries, oldest first.
     pub search_history: &'a [String],
     /// Fragments requested by Session::register_to_read for this input.
@@ -173,6 +221,7 @@ pub struct Context<'a> {
 impl Default for Context<'_> {
     fn default() -> Self {
         Self {
+            syntax_pairs: None,
             search_history: &[],
             register: None,
             tab_width: 4,
@@ -262,21 +311,58 @@ pub struct Session {
     count: Option<usize>,
     // Helix carries the preferred wrap row and screen column across both kinds of vertical motion.
     goals: Vec<(usize, usize)>,
+    sticky_view: bool,
     restore_append: bool,
-    last_motion: Option<ArgumentMotion>,
+    last_motion: Option<RecordedMotion>,
+}
+
+/// Structural commands resolved against the host's current syntax tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Structure {
+    Expand,
+    Shrink,
+    Children,
+    Siblings,
+    Next,
+    Previous,
+    ParentStart,
+    ParentEnd,
+    Object {
+        key: char,
+        around: bool,
+    },
+    Motion {
+        key: char,
+        forward: bool,
+        count: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostAction {
     Undo(usize),
     Redo(usize),
-    SwitchBuffer { forward: bool, count: usize },
+    SwitchBuffer {
+        forward: bool,
+        count: usize,
+    },
     CommandLine,
     References,
     RepeatInsert(usize),
-    ReplayMacro { register: char, count: usize },
+    ReplayMacro {
+        register: char,
+        count: usize,
+    },
     SyntaxParentEnd,
-    Jump { forward: bool, count: usize },
+    Navigate(Navigation),
+    Structure {
+        action: Structure,
+        repetitions: usize,
+    },
+    Jump {
+        forward: bool,
+        count: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -308,8 +394,11 @@ pub struct Plan {
     pub search: Option<String>,
     pub search_name: char,
     pub host: Option<HostAction>,
+    pub shell: Option<(Shell, String)>,
     record_macro: Option<char>,
     pub save_jump: Option<Selections>,
+    /// Selection to restore on undo when a command displayed an intermediate preview.
+    pub history_selection: Option<Selections>,
     /// New top display row, as a document character offset.
     pub viewport_start: Option<usize>,
     pub message: Option<String>,
@@ -347,6 +436,14 @@ fn register_text(value: &str, newline: &str, count: usize) -> Result<String, &'s
 }
 
 impl Plan {
+    fn structure(&mut self, action: Structure) {
+        self.next.last_motion = Some(RecordedMotion::Structure(action));
+        self.host = Some(HostAction::Structure {
+            action,
+            repetitions: 1,
+        });
+    }
+
     pub fn apply_macro_recording(&mut self, recorder: &mut crate::MacroRecorder) {
         let Some(register) = self.record_macro.take() else {
             return;
@@ -653,8 +750,10 @@ impl Session {
             search: None,
             search_name: self.selected_register.unwrap_or('/'),
             host: None,
+            shell: None,
             record_macro: None,
             save_jump: None,
+            history_selection: None,
             viewport_start: None,
             message: None,
             ranges: selections.ranges.clone(),
@@ -690,9 +789,11 @@ impl Session {
         selections: &Selections,
         value: &str,
     ) -> Plan {
-        if matches!(self.pending, Pending::Regex { .. }) {
+        if matches!(self.pending, Pending::Regex { .. } | Pending::Shell { .. }) {
             let mut plan = self.unchanged(selections);
-            if let Pending::Regex { input, .. } = &mut plan.next.pending {
+            if let Pending::Regex { input, .. } | Pending::Shell { input, .. } =
+                &mut plan.next.pending
+            {
                 input.paste(value);
             }
             return plan;
@@ -793,15 +894,24 @@ impl Session {
 
     pub fn prompt_history_hint<'a>(&'a self, history: &'a [String]) -> Option<&'a str> {
         match &self.pending {
-            Pending::Regex { input, .. } => input.history(history).last().map(String::as_str),
+            Pending::Regex { input, .. } | Pending::Shell { input, .. } => {
+                input.history(history).last().map(String::as_str)
+            }
             _ => None,
         }
     }
 
     /// Ask the host for values only when the key consumes a register.
     pub fn register_to_read(&self, key: &str) -> Option<char> {
+        if self.mode != Mode::Insert
+            && matches!(self.pending, Pending::None)
+            && matches!(key, "|" | "<a-|>" | "!" | "<a-!>" | "$")
+        {
+            return Some('|');
+        }
         match (&self.pending, self.mode) {
             (Pending::CopyFrom | Pending::InsertRegister { .. }, _) => argument_character(key),
+            (Pending::Shell { input, .. }, _) if input.await_register => argument_character(key),
             (Pending::None, Mode::Normal | Mode::Select) if matches!(key, "n" | "N") => Some(
                 self.selected_register
                     .unwrap_or(self.last_search_register()),
@@ -822,6 +932,7 @@ impl Session {
     /// The active prompt label, text and UTF-8 byte offset of its caret.
     pub fn prompt(&self) -> Option<(&'static str, &str, usize)> {
         match &self.pending {
+            Pending::Shell { kind, input } => Some((kind.label(), &input.line, input.cursor)),
             Pending::Regex { kind, input, .. } => Some((kind.label(), &input.line, input.cursor)),
             _ => None,
         }
@@ -830,22 +941,53 @@ impl Session {
     /// Visible history completions and the highlighted index in the active prompt.
     pub fn prompt_completions(&self) -> Option<(&[String], Option<usize>)> {
         match &self.pending {
-            Pending::Regex { input, .. } => Some((input.candidates(), input.selected)),
+            Pending::Regex { input, .. } | Pending::Shell { input, .. } => {
+                Some((input.candidates(), input.selected))
+            }
             _ => None,
         }
     }
 
+    /// Skip tree preparation until a command actually requests a syntax-aware pair.
+    pub fn uses_syntax_pairs(&self, key: &str) -> bool {
+        (argument_character(key) == Some('m')
+            && matches!(
+                self.pending,
+                Pending::Match
+                    | Pending::Object { .. }
+                    | Pending::Surround {
+                        action: 'r' | 'd',
+                        ..
+                    }
+            ))
+            || (key == "<a-.>"
+                && matches!(self.pending, Pending::None)
+                && matches!(
+                    self.last_motion,
+                    Some(RecordedMotion::Argument(ArgumentMotion::Object {
+                        ch: 'm',
+                        ..
+                    }))
+                ))
+    }
+
     pub fn awaiting_input(&self) -> bool {
-        !matches!(self.pending, Pending::None)
+        self.sticky_view || !matches!(self.pending, Pending::None)
     }
 
     /// Give the document's input back to the host. A live search preview restores
     /// its pre-prompt selection and viewport just as Escape would.
     pub fn leave_document_input(&mut self) -> Option<(Selections, usize)> {
+        self.sticky_view = false;
         self.count = None;
         self.selected_register = None;
         match std::mem::take(&mut self.pending) {
             Pending::Regex {
+                original,
+                viewport_start,
+                ..
+            }
+            | Pending::ReplacePair {
                 original,
                 viewport_start,
                 ..
@@ -855,6 +997,7 @@ impl Session {
     }
 
     pub fn cancel_pending(&mut self) {
+        self.sticky_view = false;
         self.pending = Pending::None;
         self.count = None;
         self.selected_register = None;
@@ -882,7 +1025,14 @@ impl Session {
         // Prefix maps still accept counts. Prompts and commands waiting for
         // a character (such as f and r) consume a digit as their argument.
         if self.mode != Mode::Insert
-            && matches!(self.pending, Pending::None | Pending::Goto | Pending::Match)
+            && matches!(
+                self.pending,
+                Pending::None
+                    | Pending::Goto
+                    | Pending::Match
+                    | Pending::Bracket { .. }
+                    | Pending::View
+            )
             && let [digit] = key.as_bytes()
             && p.next.push_count_digit(char::from(*digit))
         {
@@ -891,7 +1041,16 @@ impl Session {
         if !matches!(self.pending, Pending::None) || !matches!(key, "g" | "m" | ".") {
             p.next.selected_register = None;
         }
+        if matches!(self.pending, Pending::View)
+            || (self.sticky_view && matches!(self.pending, Pending::None))
+        {
+            return self.view_command(text, selections, key, context, p);
+        }
         match &self.pending {
+            Pending::WordLabels { words, group } => {
+                p.word_label_key(text, selections, words, *group, key);
+                return p;
+            }
             Pending::CopyFrom => {
                 p.next.pending = Pending::None;
                 if let Some(source) = argument_character(key) {
@@ -1038,6 +1197,10 @@ impl Session {
                 }
                 return p;
             }
+            Pending::Shell { kind, input } => {
+                p.shell_key(*kind, input, key, text, selections, context.register);
+                return p;
+            }
             Pending::Match => {
                 p.next.pending = Pending::None;
                 p.next.count = None;
@@ -1047,25 +1210,101 @@ impl Session {
                         count,
                     };
                 }
+                if matches!(key, "s" | "r" | "d") {
+                    p.next.pending = Pending::Surround {
+                        action: key.chars().next().unwrap(),
+                        count,
+                    };
+                }
                 if key == "m" {
                     p.set(selections.transform(text, |r| {
                         let pos = r.cursor(text);
-                        crate::motion::match_bracket(text, pos)
+                        context
+                            .syntax_pairs
+                            .map_or_else(
+                                || crate::motion::match_bracket(text, pos),
+                                |pairs| pairs.matching(text, pos),
+                            )
                             .map_or(r, |target| r.move_to(text, target, extend))
                     }));
+                }
+                return p;
+            }
+            Pending::Surround { action, count } => {
+                p.next.pending = Pending::None;
+                if *action == 's' && key == "<enter>" {
+                    let newline = document_newline(text);
+                    p.add_surround(selections, newline, newline);
+                } else if let Some(ch) = argument_character(key) {
+                    if *action == 's' {
+                        let (open, close) = crate::motion::brackets(ch).unwrap_or((ch, ch));
+                        p.add_surround(selections, &open.to_string(), &close.to_string());
+                    } else {
+                        match surround::positions(
+                            text,
+                            selections,
+                            ch,
+                            *count,
+                            context.syntax_pairs,
+                        ) {
+                            Ok(positions) if *action == 'r' => {
+                                p.ranges = positions
+                                    .iter()
+                                    .flat_map(|&(open, close)| {
+                                        [Range::at(text, open), Range::at(text, close)]
+                                    })
+                                    .collect();
+                                p.primary = selections.primary_index() * 2;
+                                p.next.pending = Pending::ReplacePair {
+                                    positions,
+                                    original: selections.clone(),
+                                    viewport_start: context.viewport_start,
+                                };
+                            }
+                            Ok(positions) => p.edit_pairs(&positions, None),
+                            Err(error) => p.message = Some(error.into()),
+                        }
+                    }
+                }
+                return p;
+            }
+            Pending::ReplacePair {
+                positions,
+                original,
+                ..
+            } => {
+                p.next.pending = Pending::None;
+                p.set(original.clone());
+                if let Some(ch) = argument_character(key) {
+                    p.history_selection = Some(original.clone());
+                    p.edit_pairs(
+                        positions,
+                        Some(crate::motion::brackets(ch).unwrap_or((ch, ch))),
+                    );
                 }
                 return p;
             }
             Pending::Object { around, count } => {
                 p.next.pending = Pending::None;
                 if let Some(ch) = argument_character(key) {
+                    if ch == 'g' {
+                        p.host = Some(HostAction::Navigate(Navigation::ChangeObject));
+                        return p;
+                    }
+                    if matches!(ch, 'f' | 't' | 'a' | 'c' | 'T' | 'e') {
+                        p.structure(Structure::Object {
+                            key: ch,
+                            around: *around,
+                        });
+                        return p;
+                    }
                     let motion = ArgumentMotion::Object {
                         ch,
                         count: *count,
                         around: *around,
                     };
-                    p.set(motion.apply(text, selections));
-                    p.next.last_motion = Some(motion);
+                    p.set(motion.apply(text, selections, context));
+                    p.next.last_motion = Some(RecordedMotion::Argument(motion));
                 }
                 return p;
             }
@@ -1107,8 +1346,41 @@ impl Session {
                     count: *count,
                     extend,
                 };
-                p.set(motion.apply(text, selections));
-                p.next.last_motion = Some(motion);
+                p.set(motion.apply(text, selections, context));
+                p.next.last_motion = Some(RecordedMotion::Argument(motion));
+                return p;
+            }
+            Pending::View => unreachable!("view prefix handled above"),
+            Pending::Bracket { forward } => {
+                p.next.pending = Pending::None;
+                p.next.count = None;
+                if let Some(ch @ ('f' | 't' | 'a' | 'c' | 'T' | 'e')) = argument_character(key) {
+                    p.structure(Structure::Motion {
+                        key: ch,
+                        forward: *forward,
+                        count,
+                    });
+                }
+                match key {
+                    "p" => p.set(selections.transform(text, |r| {
+                        navigation::paragraph(text, r, *forward, count, extend)
+                    })),
+                    " " => p.insert_blank_lines(text, selections, *forward, count),
+                    "d" | "D" => {
+                        p.host = Some(HostAction::Navigate(Navigation::Diagnostic {
+                            forward: *forward,
+                            edge: key == "D",
+                        }))
+                    }
+                    "g" | "G" => {
+                        p.host = Some(HostAction::Navigate(Navigation::Change {
+                            forward: *forward,
+                            edge: key == "G",
+                            count,
+                        }))
+                    }
+                    _ => {}
+                }
                 return p;
             }
             Pending::Goto => {
@@ -1116,6 +1388,20 @@ impl Session {
                 p.next.pending = Pending::None;
                 p.save_jump = matches!(key, "g" | "e").then(|| selections.clone());
                 match key {
+                    "w" => p.start_word_labels(text, selections.primary(), context),
+                    "t" | "c" | "b" => p.goto_window(text, selections, key, count, context),
+                    "a" => p.host = Some(HostAction::Navigate(Navigation::Alternate)),
+                    "m" => p.host = Some(HostAction::Navigate(Navigation::ModifiedBuffer)),
+                    "." => p.host = Some(HostAction::Navigate(Navigation::LastEdit)),
+                    "f" => p.host = Some(HostAction::Navigate(Navigation::File)),
+                    "d" | "D" | "i" | "y" => {
+                        p.host = Some(HostAction::Navigate(Navigation::Definition(match key {
+                            "D" => "textDocument/declaration",
+                            "i" => "textDocument/implementation",
+                            "y" => "textDocument/typeDefinition",
+                            _ => "textDocument/definition",
+                        })))
+                    }
                     "n" | "p" => {
                         p.host = Some(HostAction::SwitchBuffer {
                             forward: key == "n",
@@ -1156,6 +1442,19 @@ impl Session {
         }
         p.save_jump = (key == "G" && self.count.is_some()).then(|| selections.clone());
         match key {
+            "z" | "Z" => {
+                p.next.count = self.count;
+                p.next.sticky_view = key == "Z";
+                p.next.pending = Pending::View;
+            }
+            "<a-u>" | "<a-U>" => {
+                p.host = Some(HostAction::Navigate(Navigation::History {
+                    later: key == "<a-U>",
+                    count,
+                }))
+            }
+            "<a-(>" | "<a-)>" => p.rotate_contents(text, selections, key == "<a-)>", self.count),
+            "&" => p.align(text, selections, context.tab_width),
             "<c-s>" => p.save_jump = Some(selections.clone()),
             "<c-o>" | "<c-i>" | "<tab>" => {
                 p.host = Some(HostAction::Jump {
@@ -1164,6 +1463,26 @@ impl Session {
                 })
             }
             "." => p.host = Some(HostAction::RepeatInsert(count)),
+            "|" | "<a-|>" | "!" | "<a-!>" | "$" => {
+                let kind = match key {
+                    "|" => Shell::Pipe,
+                    "<a-|>" => Shell::PipeTo,
+                    "!" => Shell::Insert,
+                    "<a-!>" => Shell::Append,
+                    _ => Shell::Keep,
+                };
+                let history = context
+                    .register
+                    .unwrap_or_default()
+                    .iter()
+                    .rev()
+                    .cloned()
+                    .collect();
+                p.next.pending = Pending::Shell {
+                    kind,
+                    input: Prompt::new(Query::Select, std::borrow::Cow::Owned(history)),
+                };
+            }
             "Q" => p.record_macro = Some(self.selected_register.unwrap_or('@')),
             "q" => {
                 p.host = Some(HostAction::ReplayMacro {
@@ -1173,6 +1492,20 @@ impl Session {
             }
             "<copy-between-registers>" => p.next.pending = Pending::CopyFrom,
             "\"" => p.next.pending = Pending::SelectRegister,
+            "[" | "]" => {
+                p.next.count = self.count;
+                p.next.pending = Pending::Bracket {
+                    forward: key == "]",
+                };
+            }
+            "<a-o>" | "<a-up>" => p.structure(Structure::Expand),
+            "<a-i>" | "<a-down>" => p.structure(Structure::Shrink),
+            "<a-I>" | "<a-s-down>" => p.structure(Structure::Children),
+            "<a-a>" => p.structure(Structure::Siblings),
+            "<a-n>" | "<a-right>" => p.structure(Structure::Next),
+            "<a-p>" | "<a-left>" => p.structure(Structure::Previous),
+            "<a-e>" => p.structure(Structure::ParentEnd),
+            "<a-b>" => p.structure(Structure::ParentStart),
             "g" => p.next.pending = Pending::Goto,
             "m" => p.next.pending = Pending::Match,
             "/" | "?" | "s" | "S" | "K" | "<a-K>" => {
@@ -1205,16 +1538,21 @@ impl Session {
                 };
             }
             "<a-.>" => {
-                if let Some(motion) = self.last_motion {
+                if let Some(RecordedMotion::Argument(motion)) = self.last_motion {
                     let mut current = selections.clone();
                     for _ in 0..count {
-                        let next = motion.apply(text, &current);
+                        let next = motion.apply(text, &current, context);
                         if next == current {
                             break;
                         }
                         current = next;
                     }
                     p.set(current);
+                } else if let Some(RecordedMotion::Structure(action)) = self.last_motion {
+                    p.host = Some(HostAction::Structure {
+                        action,
+                        repetitions: count,
+                    });
                 }
             }
             "R" => p.replace_from_register(text, selections, register, count),
@@ -1538,6 +1876,10 @@ impl Session {
 impl Session {
     pub fn pending_keys(&self) -> &[&'static str] {
         match self.pending {
+            Pending::Bracket { forward: true } => &["]"],
+            Pending::Bracket { forward: false } => &["["],
+            Pending::View if self.sticky_view => &[],
+            Pending::View => &["z"],
             Pending::Goto => &["g"],
             Pending::Match => &["m"],
             _ => &[],

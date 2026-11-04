@@ -61,6 +61,50 @@ def register_followup_cases():
         '<f12>', '_', '/', '<f12>', '/', 'a']
 
 
+def structure_cases():
+    rust = "fn first(one: i32, two: i32) { say(\"a)b\", two); }\n// café\nstruct Last { value: i32 }\nfn second() {}\n"
+    js = "const obj = { a: 1, b: 2 };\nfunction go(x) { return x; }\n"
+    data = '{"a": [1, 2], "b": {"c": 3}}\n'
+    yield "structure-rust-expand", rust, list("4l") + ["<a-o>"] * 4 + ["<a-i>"] * 5
+    yield "structure-rust-repeat", rust, ["]", "f", "<a-.>", "g", "g", "4", "l", "<a-o>", "2", "<a-.>", "<a-i>", "2", "<a-.>"]
+    yield "structure-rust-siblings", rust, list("4l") + ["<a-o>", "<a-n>", "<a-p>", "<a-a>", "<a-I>"]
+    yield "structure-rust-arrows", rust, ["4", "l", "<a-up>", "<a-right>", "<a-left>", "<a-s-down>", "<a-down>"]
+    yield "structure-rust-match", rust, list("36lmmmmgg9lmmvmm")
+    yield "structure-rust-bounds", rust, list("8l") + ["<a-b>", "<a-b>", "<a-e>", "v", "<a-b>", "<a-e>"]
+    yield "structure-rust-objects", rust, list("9lmia2maamafmif") + ["<a-;>"] + list("mafgemif")
+    yield "structure-rust-motions", rust, list("]f]f[fgg2]fgg]a]a[a]c]tvggeg[t")
+    yield "structure-rust-type-comment", rust, list("jj3lmatmitk3lmact")
+    yield "structure-json-entries", data, list("2lmiegg]e]e[e") + ["<a-o>", "<a-a>", "<a-i>"]
+    yield "structure-js-function", js, list("j4lmafmif") + ["<a-b>", "<a-e>", "<a-p>"]
+    yield "structure-rust-closest", rust, list("36lmimgg36lmamgg36lmrm[umdmu")
+    for extension, source, kind in [
+        ("jsx", "function View() { return <span />; }\n", "f"),
+        ("ts", "interface Box { value: number; }\n", "t"),
+        ("tsx", "function View() { return <span />; }\n", "f"),
+        ("sh", "hello() { echo hi; }\n", "f"),
+        ("fish", "function hello\n  echo hi\nend\n", "f"),
+        ("lua", "function hello() return 1 end\n", "f"),
+        ("yaml", "first: one\nsecond: two\n", "e"),
+        ("toml", "first = 1\nsecond = 2\n", "e"),
+    ]:
+        yield f"structure-{extension}-captures", source, list(f"2lma{kind}gg2lmi{kind}gg]{kind}")
+    yield "structure-plain-eof-errors", "a", list("md(mr(")
+    yield "structure-plain-quotes", "'ab' def\n", list("md'lmi'mr'") + ["<esc>"]
+    fences = "é intro\n" + "`" * 3 + "rust\nfn main() { foo(bar); }\n" + "`" * 3 + "\n\nbetween\n" + "`" * 3 + "js\nconst x = fun(abc);\n" + "`" * 3 + "\n"
+    yield "structure-md-fences", fences, list("2j17l") + ["<a-o>", "<a-o>", "<a-n>", "<a-p>", "<a-i>", "<a-a>"] + list("gg7j15l") + ["<a-o>", "d", "u"]
+    yield "structure-md-edits", fences, list("iÎ") + ["<esc>", "g", "g", "2", "j", "1", "7", "l", "<a-o>"] + list("dummgg7j15lmim")
+    nested = "~~~~markdown\n" + "`" * 3 + "rust\nfn main() { foo(bar); }\n" + "`" * 3 + "\n~~~~\n"
+    yield "structure-md-nested", nested, list("2j17l") + ["<a-o>", "<a-I>", "<a-o>", "<a-n>"] + list("gg2j17lmimmdmu")
+    yield "structure-md-boundaries", fences, list("2j17l") + ["<a-o>"] * 9 + ["<a-i>"] * 10 + list("gg2j17lmm") + ["<a-e>", "<a-b>", "<a-I>"]
+    yield "structure-plain-add", "aéf xyz\n", list("vllms)uU") + ["<a-;>"] + list("ms«u")
+    yield "structure-plain-newline", "ab\r\ncd\r\n", list("vllms") + ["<enter>"] + list("uU")
+    yield "structure-plain-count", "({[abc]}) tail\n", list("4l2mimgg4l2mrm<uUgg4lmdmumdm")
+    yield "structure-plain-errors", "(abc) (def)\n", list("lmd]mr(") + ["<esc>"] + list("ggmd'mr'") + ["<esc>"]
+    yield "structure-plain-closest", "one (two [αbc]) end\n", list("10lmimgg10l2mamgg10lmdmu")
+    yield "structure-plain-multirange", "(aa) (aa)\n", list("%saa") + ["<enter>"] + list("ms[uUmd[umr([u")
+    yield "structure-plain-overlap", "(aa bb)\n", list("%s[a-b]+") + ["<enter>"] + list("md(umr(]u")
+
+
 def macro_cases():
     text = "one two three four\nred blue green\n"
     yield "macro-default-count-undo", text, list("QlrXQ2quuU")
@@ -363,14 +407,18 @@ ARROW_AND_EDIT_KEYS = {f"<{name}>": name.title()
 CSI_U = {"<c-i>": "105;5", "<c-h>": "104;5", "<c-j>": "106;5", "<s-backspace>": "127;2"}
 
 
-def capture(observer, runtime, root, name, text, keys):
+def capture(observer, runtime, root, name, text, keys, file_extension=None):
     # Helix abbreviates paths inside its working directory before folding HOME.
     # Keep documents in HOME and launch from its child so snapshots always use ~/.
     root = root.resolve()
     root.mkdir()
     workdir = root / "work"
     workdir.mkdir()
-    path = root / "example.txt"
+    extension = "txt"
+    if name.startswith("structure-"):
+        language = name.split("-")[1]
+        extension = {"rust": "rs", "plain": "txt"}.get(language, language)
+    path = root / f"example.{file_extension or extension}"
     path.write_bytes(text.encode())
     trace = root / "trace.jsonl"
     wrap_width = 20 if name.startswith("wrapped-") or name in ("search-wrapped-viewport", "page-wrapped-continuations") else None
@@ -390,15 +438,17 @@ def capture(observer, runtime, root, name, text, keys):
            "FELIX_REFERENCE_TRACE": str(trace), "XDG_CONFIG_HOME": str(root/"config")}
     if name.startswith(("register-", "macro-")):
         env["FELIX_REFERENCE_REGISTERS"] = REGISTER_SLOTS + ("@" if name.startswith("macro-") else "")
+    if name.startswith("shell-"):
+        env["FELIX_REFERENCE_REGISTERS"] = "|"
     def tmux(*args, check=True):
         return subprocess.run(["tmux", "-f", "/dev/null", "-S", str(root/"t.sock"), *args],
                               cwd=workdir, env=env, capture_output=True, text=True, check=check).stdout
     try:
         tmux("new-session", "-d", "-s", "h", "-x", "80", "-y", "24", str(observer), str(path))
         deadline = time.monotonic() + 20
-        while "example.txt" not in tmux("capture-pane", "-pt", "h"):
+        while path.name not in tmux("capture-pane", "-pt", "h"):
             if time.monotonic() >= deadline:
-                raise TimeoutError(f"{name}: Helix did not open example.txt")
+                raise TimeoutError(f"{name}: Helix did not open {path.name}")
             time.sleep(.02)
         events = []
         trace_offset = 0
@@ -413,6 +463,10 @@ def capture(observer, runtime, root, name, text, keys):
                 tmux("send-keys", "-t", "h", "-H", *(format(byte, "02x") for byte in raw))
             elif key in CSI_U:
                 raw = ("\x1b[" + CSI_U[key] + "u").encode()
+                tmux("send-keys", "-t", "h", "-H", *(format(byte, "02x") for byte in raw))
+            elif key in ("<a-up>", "<a-down>", "<a-right>", "<a-left>", "<a-s-down>"):
+                suffix = {"up": "A", "down": "B", "right": "C", "left": "D"}[key[3:-1].removeprefix("s-")]
+                raw = ("\x1b[1;" + ("4" if "-s-" in key else "3") + suffix).encode()
                 tmux("send-keys", "-t", "h", "-H", *(format(byte, "02x") for byte in raw))
             elif key in ("<a-delete>", "<a-backspace>"):
                 tmux("send-keys", "-t", "h", "M-DC" if key == "<a-delete>" else "M-BSpace")
@@ -442,21 +496,34 @@ def capture(observer, runtime, root, name, text, keys):
             record = json.loads(line)
             raw_event = record["event"]
             special = {"<backspace>": "Backspace", "<pageup>": "PageUp", "<pagedown>": "PageDown", "<esc>": "Esc", "<enter>": "Enter", "<tab>": "Tab", "<backtab>": "BackTab", "<a-;>": "Char(';')", "<a-,>": "Char(',')"}
+            special.update({f"<a-{arrow}>": arrow.title() for arrow in ("up", "down", "right", "left")})
+            special["<a-s-down>"] = "Down"
             special["<f12>"] = "F(12)"
             special.update(ARROW_AND_EDIT_KEYS)
             special.update({"<a-delete>": "Delete", "<a-backspace>": "Backspace", "<s-backspace>": "Backspace"})
             ch = key[3:-1] if key.startswith(("<a-", "<c-")) else key
-            code = special.get(key, f"Char('{ch}')")
+            code = special.get(key, "Char('\\'')" if ch == "'" else f"Char('{ch}')")
             if paste is not None:
                 if record["paste"] != paste:
                     raise ValueError(f"{name}: input {index+1} expected paste {paste!r}, observed {raw_event}")
             elif (f"code: {code}," not in raw_event and
                   not (len(ch) == 1 and f"code: Char('\\u{{{ord(ch):x}}}')," in raw_event)) or ("ALT" in raw_event) != key.startswith("<a-") or ("CONTROL" in raw_event) != key.startswith("<c-"):
                 raise ValueError(f"{name}: input {index+1} expected {key}, observed {raw_event}")
-            if key == "<s-backspace>" and "SHIFT" not in raw_event:
+            if key in ("<s-backspace>", "<a-s-down>") and "SHIFT" not in raw_event:
                 raise ValueError(f"{name}: missing shift modifier in {raw_event}")
             events.append({"key": key, **{k: record[k] for k in
                 ("mode", "text", "ranges", "primary", "unnamed", "search", "pending", "count", "document")}})
+            if name.startswith("structure-") and record["macro_status"] in {
+                "Surround pair not found around all cursors", "Cursors overlap for a single surround pair range",
+                "Cursor range exceeds text length", "Cursor on ambiguous surround pair",
+            }:
+                events[-1]["surround_error"] = record["macro_status"]
+            if name.startswith("shell-"):
+                prompt = record["prompt"]
+                events[-1]["shell_prompt"] = {k: prompt[k] for k in ("line", "cursor")} if prompt else None
+                events[-1]["shell_history"] = record["registers"]["|"]
+                if key == "<enter>" and (record["macro_status"] or "").startswith(("Shell command failed", "No selections remaining")):
+                    events[-1]["shell_error"] = record["macro_status"]
             if name.startswith("macro-"):
                 if "SHIFT" in raw_event:
                     events[-1]["shift"] = True
@@ -511,19 +578,24 @@ def dump_suite(commit, seed, cases):
 
 
 def main():
+    from broad_cases import comment_cases, navigation_cases, shell_cases
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--observer", required=True, type=Path)
     parser.add_argument("--runtime", required=True, type=Path)
     parser.add_argument("--seed", type=int, default=250701)
     parser.add_argument("--steps", type=int, default=48)
-    parser.add_argument("--suite", choices=("core", "registers", "macros"), default="core")
+    suites = {
+        "registers": lambda: [*register_cases(), *register_followup_cases()],
+        "macros": macro_cases,
+        "structure": structure_cases,
+        "shell": shell_cases,
+        "navigation": navigation_cases,
+        "comments": comment_cases,
+    }
+    parser.add_argument("--suite", choices=["core", *suites], default="core")
     args = parser.parse_args()
-    if args.suite == "macros":
-        cases = macro_cases()
-    elif args.suite == "registers":
-        cases = [*register_cases(), *register_followup_cases()]
-    else:
-        cases = scenarios(args.seed, args.steps)
+    cases = scenarios(args.seed, args.steps) if args.suite == "core" else suites[args.suite]()
     with tempfile.TemporaryDirectory(prefix="fx-") as tmp:
         result = [capture(args.observer.resolve(strict=True), args.runtime.resolve(strict=True),
                           Path(tmp)/str(i), *scenario)

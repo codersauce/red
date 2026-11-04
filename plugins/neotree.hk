@@ -182,6 +182,12 @@ struct NeoTreeStatusEntry {
     status: String,
 }
 
+struct WorkspaceTree {
+    view: NeoTreeStoredSession,
+    clipboard: [ClipboardEntry],
+    trash_history: [TrashBatch],
+}
+
 struct NeoTreeState {
     created: bool,
     expanded: [String],
@@ -199,6 +205,12 @@ struct NeoTreeState {
     cwd_request: i64,
     windows_request: i64,
     cwd: String,
+    document_root: String,
+    workspace_root: String,
+    root_request: i64,
+    workspace: Option<WorkspaceTree>,
+    operation_request: i64,
+    search_request: i64,
     current_file: String,
     selected: [String],
     clipboard: [ClipboardEntry],
@@ -249,6 +261,12 @@ fn initial_state() -> NeoTreeState {
         cwd_request: 0,
         windows_request: 0,
         cwd: ".",
+        document_root: "",
+        workspace_root: "",
+        root_request: 0,
+        workspace: None,
+        operation_request: 0,
+        search_request: 0,
         current_file: "",
         selected: [],
         clipboard: [],
@@ -297,7 +315,111 @@ fn neotree() {
     show();
 }
 
+// All rows use logical ./ paths. A directory-scoped tree translates paths
+// only at the filesystem boundary, so search, navigation and file operations
+// share the same root without changing the editor's working directory.
+fn tree_file_path(path: String) -> String {
+    let root = state().document_root;
+    if root == "" || path == "" { return path; }
+    if path == "." { return root; }
+    if red::starts_with(path, "/") || red::slice(path, 1, 3) == ":/" { return path; }
+    let relative = path;
+    if red::starts_with(relative, "./") { relative = red::slice(relative, 2); }
+    if root == "/" { return "/" + relative; }
+    return path_join(root, relative);
+}
+
+// Mutations use Red's workspace-confined FileOperation API. Outside the
+// workspace the host rejects the absolute path with its normal explanation.
+fn tree_operation_path(path: String) -> String {
+    if state().document_root == "" { return path; }
+    let absolute = tree_file_path(path);
+    let workspace = normalize_path(state().workspace_root);
+    if normalize_path(absolute) == workspace { return "."; }
+    let prefix = workspace + "/";
+    if workspace == "/" { prefix = "/"; }
+    if red::starts_with(absolute, prefix) { return "./" + red::slice(absolute, red::len(prefix)); }
+    return absolute;
+}
+
+fn tree_operation_paths(paths: [String]) -> [String] {
+    let result: [String] = [];
+    for path in paths { result.push(tree_operation_path(path)); }
+    return result;
+}
+
+fn logical_tree_path(path: String) -> String {
+    if state().document_root == "" { return path; }
+    if normalize_path(path) == normalize_path(state().document_root) { return "."; }
+    return tree_path_for_file(path, state().document_root);
+}
+
+#[red::command(
+    name = "NeoTreeDocumentDirectory",
+    title = "File tree at current document",
+    category = "File",
+    description = "Open the file tree rooted in the current document's directory",
+    scope = "global",
+)]
+fn neotree_document_directory() {
+    if state().created { close(); }
+    red::state_patch(NeoTreeState { root_request: red::request("GetWindows", document_root_windows) });
+}
+
+fn document_root_windows(event: TreeWindowsResult, request_id: i64) {
+    if state().root_request != request_id { return; }
+    let file = "";
+    for window in event.windows {
+        if window.active { file = red::string(window.buffer_path, ""); }
+    }
+    red::state_patch(NeoTreeState { current_file: file, root_request: red::request("GetConfig", document_root_cwd, "cwd") });
+}
+
+fn document_root_cwd(event: CwdValueEvent, request_id: i64) {
+    if state().root_request != request_id { return; }
+    let cwd = normalize_path(red::string(event.value, "."));
+    let file = normalize_path(state().current_file);
+    let root = cwd;
+    if file != "" {
+        if !red::starts_with(file, "/") && red::slice(file, 1, 3) != ":/" {
+            if red::starts_with(file, "./") { file = red::slice(file, 2); }
+            if cwd == "/" { file = "/" + file; } else { file = path_join(cwd, file); }
+        }
+        root = path_parent(file);
+        if root == "." && red::starts_with(file, "/") { root = "/"; }
+        if red::len(root) == 2 && red::slice(root, 1) == ":" { root = root + "/"; }
+    }
+    reset_root_state(root);
+    red::state_patch(NeoTreeState { cwd: root, workspace_root: cwd, current_file: file });
+    show_panel(true);
+}
+
+fn reset_root_state(root: String) {
+    let previous = state();
+    let workspace = previous.workspace;
+    if previous.document_root == "" {
+        workspace = Some(WorkspaceTree {
+            view: NeoTreeStoredSession { expanded: previous.expanded, selected: previous.selected },
+            clipboard: previous.clipboard,
+            trash_history: previous.trash_history,
+        });
+    }
+    red::state_set(initial_state());
+    if root == "" {
+        if let Some(saved) = workspace {
+            red::state_patch(NeoTreeState {
+                expanded: saved.view.expanded, selected: saved.view.selected,
+                clipboard: saved.clipboard, trash_history: saved.trash_history,
+            });
+        }
+    } else {
+        red::state_patch(NeoTreeState { document_root: root, workspace: workspace });
+    }
+}
+
 fn show() {
+    if state().document_root != "" { reset_root_state(""); }
+    red::state_patch(NeoTreeState { root_request: 0 });
     show_panel(true);
 }
 
@@ -320,8 +442,10 @@ fn show_panel(focus: bool) {
         red::execute("FocusPanel", "neotree");
     }
 
-    red::state_patch(NeoTreeState { cwd_request: red::request("GetConfig", cwd_loaded, "cwd") });
-    red::state_patch(NeoTreeState { windows_request: red::request("GetWindows", windows_loaded) });
+    if state().document_root == "" {
+        red::state_patch(NeoTreeState { cwd_request: red::request("GetConfig", cwd_loaded, "cwd") });
+        red::state_patch(NeoTreeState { windows_request: red::request("GetWindows", windows_loaded) });
+    }
     request_directory(".");
     request_git_status();
 }
@@ -372,6 +496,10 @@ fn deactivate() {
 
 #[red::lifecycle("before_exit")]
 fn before_exit(snapshot: Json) {
+    if let Some(saved) = state().workspace {
+        red::execute("SetStorage", "pane_session", saved.view);
+        return;
+    }
     red::execute("SetStorage", "pane_session", NeoTreeStoredSession {
         expanded: state().expanded,
         selected: state().selected,
@@ -463,7 +591,7 @@ fn panel_event(event: NeoTreePanelEvent) {
             toggle_directory(row.path);
         } else if row.kind == "file" {
             red::execute("OpenLocation", Location {
-                path: row.path,
+                path: tree_file_path(row.path),
                 line: 0,
                 column: 0,
             });
@@ -500,7 +628,7 @@ fn panel_event(event: NeoTreePanelEvent) {
     if event.action == "i" {
         red::request("FileOperation", stat_loaded, PathOperation {
             kind: "stat",
-            path: row.path,
+            path: tree_operation_path(row.path),
         });
         return;
     }
@@ -594,16 +722,18 @@ fn run_tree_search() {
     if query == "" {
         return;
     }
-    red::request(
+    let search = red::request(
         "SearchWorkspacePaths",
         tree_search_loaded,
         red::string(state().cwd, "."),
         query,
         state().search_mode == "D"
     );
+    red::state_patch(NeoTreeState { search_request: search });
 }
 
-fn tree_search_loaded(result: TreeSearchResult) {
+fn tree_search_loaded(result: TreeSearchResult, request_id: i64) {
+    if request_id != state().search_request { return; }
     if state().search_mode == ""
         || result.query != red::trim(state().search_query)
         || result.directories_only != (state().search_mode == "D") {
@@ -634,7 +764,7 @@ fn finish_tree_search(row: TreePanelRow, reveal_only: bool) {
         }
     }
     if row.kind == "file" && !reveal_only {
-        red::execute("OpenLocation", Location { path: row.path, line: 0, column: 0 });
+        red::execute("OpenLocation", Location { path: tree_file_path(row.path), line: 0, column: 0 });
         close();
         return;
     }
@@ -745,18 +875,20 @@ fn path_prompt_submitted(value: String) {
 }
 
 fn request_path_operation(operation: PathOperation) {
-    red::request("FileOperation", operation_loaded, operation);
+    red::state_patch(NeoTreeState { operation_request: red::request("FileOperation", operation_loaded, PathOperation { kind: operation.kind, path: tree_operation_path(operation.path) }) });
 }
 
 fn request_move_operation(operation: MoveOperation) {
-    red::request("FileOperation", operation_loaded, operation);
+    red::state_patch(NeoTreeState { operation_request: red::request("FileOperation", operation_loaded, MoveOperation { kind: operation.kind, source: tree_operation_path(operation.source), destination: tree_operation_path(operation.destination) }) });
 }
 
 fn request_paths_operation(operation: PathsOperation) {
-    red::request("FileOperation", operation_loaded, operation);
+    red::state_patch(NeoTreeState { operation_request: red::request("FileOperation", operation_loaded, PathsOperation { kind: operation.kind, paths: tree_operation_paths(operation.paths) }) });
 }
 
-fn operation_loaded(result: FileOperationResult) {
+fn operation_loaded(result: FileOperationResult, request_id: i64) {
+    if state().operation_request != request_id { return; }
+    red::state_patch(NeoTreeState { operation_request: 0 });
     let kind = red::string(state().pending_kind, "operation");
     if !red::bool(result.ok, false) {
         red::state_patch(NeoTreeState { select_created_file: false });
@@ -767,6 +899,13 @@ fn operation_loaded(result: FileOperationResult) {
     let created_file = "";
     if red::bool(state().select_created_file, false) && red::len(result.created) > 0 {
         created_file = result.created[0];
+        if state().document_root != "" {
+            if red::starts_with(created_file, "./") { created_file = red::slice(created_file, 2); }
+            let workspace = state().workspace_root;
+            if workspace == "/" { created_file = "/" + created_file; }
+            else { created_file = path_join(workspace, created_file); }
+            created_file = logical_tree_path(created_file);
+        }
     }
     if kind == "trash" && red::bool(result.undo_supported, false) {
         red::state_patch(NeoTreeState { trash_history: red::push(state().trash_history, TrashBatch {
@@ -851,13 +990,15 @@ fn restore_last_trash() {
     let batch = history[red::len(history) - 1];
     red::state_patch(NeoTreeState { pending_kind: "restore" });
     red::state_patch(NeoTreeState { pending_paths: batch.paths });
-    red::request("FileOperation", restore_loaded, PathsOperation {
+    red::state_patch(NeoTreeState { operation_request: red::request("FileOperation", restore_loaded, PathsOperation {
         kind: "undo_trash",
-        paths: batch.paths,
-    });
+        paths: tree_operation_paths(batch.paths),
+    }) });
 }
 
-fn restore_loaded(result: FileOperationResult) {
+fn restore_loaded(result: FileOperationResult, request_id: i64) {
+    if state().operation_request != request_id { return; }
+    red::state_patch(NeoTreeState { operation_request: 0 });
     if !red::bool(result.ok, false) {
         red::execute("Print", "Neo-tree restore failed: " + optional_text(result.error, "unknown error"));
         return;
@@ -930,14 +1071,16 @@ fn run_next_paste() {
         return;
     }
     let entry = queue[index];
-    red::request("FileOperation", paste_loaded, MoveOperation {
+    red::state_patch(NeoTreeState { operation_request: red::request("FileOperation", paste_loaded, MoveOperation {
         kind: entry.action,
-        source: entry.source,
-        destination: entry.destination,
-    });
+        source: tree_operation_path(entry.source),
+        destination: tree_operation_path(entry.destination),
+    }) });
 }
 
-fn paste_loaded(result: FileOperationResult) {
+fn paste_loaded(result: FileOperationResult, request_id: i64) {
+    if state().operation_request != request_id { return; }
+    red::state_patch(NeoTreeState { operation_request: 0 });
     if !red::bool(result.ok, false) {
         red::execute("Print", "Neo-tree paste stopped: " + optional_text(result.error, "unknown error"));
         reset_tree();
@@ -1037,7 +1180,7 @@ fn request_directory(path: String) {
     for entry in state().pending_directories {
         if entry.path != path { pending.push(entry); }
     }
-    let request_id = red::request("ListDirectory", directory_loaded, path);
+    let request_id = red::request("ListDirectory", directory_loaded, tree_file_path(path));
     red::state_patch(NeoTreeState {
         pending_directories: red::push(pending, PendingDirectory { path: path, request_id: request_id }),
     });
@@ -1051,7 +1194,7 @@ fn request_git_status() {
     }
     red::execute("CancelTimeout", state().git_refresh_timer);
     red::state_patch(NeoTreeState {
-        git_request: red::request("GetGitStatus", git_status_loaded, "."),
+        git_request: red::request("GetGitStatus", git_status_loaded, tree_file_path(".")),
         git_timer: red::execute("SetTimeout", 1000),
         git_refresh_timer: "",
         git_refresh_pending: false,
@@ -1071,12 +1214,20 @@ fn directory_loaded(listing: DirectoryListing, request_id: i64) {
     }
     if !state().created || !current { return; }
     red::state_patch(NeoTreeState { pending_directories: pending });
+    let path = logical_tree_path(listing.path);
     if let Some(error) = listing.error {
-        set_children_notice(listing.path, children_for(listing.path), false, "Cannot read · R retry");
+        set_children_notice(path, children_for(path), false, "Cannot read · R retry");
         red::execute("PrintWarning", "Cannot read " + listing.path + ": " + error);
     } else {
-        set_children(listing.path, listing.entries, red::bool(listing.truncated, false));
-        watch_directory(listing.path);
+        let entries = listing.entries;
+        if state().document_root != "" {
+            entries = [];
+            for entry in listing.entries {
+                entries.push(DirectoryEntry { name: entry.name, path: path + "/" + entry.name, kind: entry.kind });
+            }
+        }
+        set_children(path, entries, red::bool(listing.truncated, false));
+        watch_directory(path);
     }
 
     if red::string(state().reveal_target, "") != "" {
@@ -1149,9 +1300,10 @@ fn cancel_git_status() {
 }
 
 fn directory_changed(event: DirectoryChangedEvent) {
-    if !state().created || !is_watched(event.path) { return; }
+    let path = logical_tree_path(event.path);
+    if !state().created || !is_watched(path) { return; }
     red::execute("InvalidateWorkspacePaths", red::string(state().cwd, "."));
-    request_directory(event.path);
+    request_directory(path);
     schedule_git_refresh();
     if state().search_query != "" {
         run_tree_search();
@@ -1170,7 +1322,7 @@ fn watch_directory(path: String) {
     });
     red::state_patch(NeoTreeState { watches: watches });
     red::on("filesystem:changed:" + watch_id, directory_changed);
-    red::execute("WatchDirectory", path, watch_id, false, 250);
+    red::execute("WatchDirectory", tree_file_path(path), watch_id, false, 250);
 }
 
 fn is_watched(path: String) -> bool {

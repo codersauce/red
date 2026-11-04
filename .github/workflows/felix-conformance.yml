@@ -66,7 +66,7 @@ jobs:
           cargo tree --locked -p red --edges normal --prefix none > "$RUNNER_TEMP/red-tree"
           if grep -Eq '^felix-core v[0-9]' "$RUNNER_TEMP/red-tree"; then exit 1; fi
           cargo clippy --locked -p red --all-targets -- -D warnings
-          cargo test --locked -p red --lib --test completion -- --test-threads=1
+          cargo test --locked -p red --lib --test completion --test editing -- --test-threads=1
       - name: Fetch release and build candidate
         env:
           GH_TOKEN: ${{ github.token }}
@@ -104,13 +104,14 @@ jobs:
           python3 scripts/felix/scenarios.py --observer reference/target/debug/hx --runtime helix-25.07.1-x86_64-linux/runtime --steps 48 --seed 250701 > "$FELIX_SCENARIOS"
           python3 scripts/felix/check_coverage.py "$FELIX_SCENARIOS" --terminal evidence/terminal.json >> "$GITHUB_STEP_SUMMARY"
           cmp scripts/felix/fixtures/motions.json "$FELIX_SCENARIOS"
-          python3 scripts/felix/scenarios.py --observer reference/target/debug/hx --runtime helix-25.07.1-x86_64-linux/runtime --suite registers > evidence/registers.json
-          cmp scripts/felix/fixtures/registers.json evidence/registers.json
-          python3 scripts/felix/scenarios.py --observer reference/target/debug/hx --runtime helix-25.07.1-x86_64-linux/runtime --suite macros > evidence/macros.json
-          cmp scripts/felix/fixtures/macros.json evidence/macros.json
+          for suite in registers macros structure shell navigation comments; do
+            python3 scripts/felix/scenarios.py --observer reference/target/debug/hx --runtime helix-25.07.1-x86_64-linux/runtime --suite "$suite" > "evidence/$suite.json"
+            cmp "scripts/felix/fixtures/$suite.json" "evidence/$suite.json"
+          done
           cargo clippy --locked --all-targets --all-features -- -D warnings
           cargo test --locked -p felix-core
-          cargo test --locked -p red --features helix --lib --test completion --test mouse_selection_detached --test lsp_save -- --test-threads=1
+          cargo test --locked -p red --features helix --lib --test completion --test editing --test mouse_selection_detached --test lsp_save -- --test-threads=1
+          cargo test --locked -p red --features helix --test lsp_lazy
           cargo test --locked -p red --features helix --test detach helix_primary_clipboard
           cargo test --locked -p red --features helix --test rpc_connection
       - name: Exercise native primary and system clipboards on an isolated X display
@@ -134,8 +135,8 @@ jobs:
           git rev-parse HEAD > evidence/candidate-commit.txt
           git -C reference rev-parse HEAD > evidence/reference-commit.txt
           sha256sum Cargo.lock "$ARCHIVE" reference/target/debug/hx target/debug/red \
-            scripts/felix/helix-observer.patch scripts/felix/coverage.toml \
-            scripts/felix/fixtures/{motions,registers,macros}.json scripts/felix/*baseline.json \
+            scripts/felix/helix-observer.patch scripts/felix/coverage.toml scripts/felix/broad_cases.py \
+            scripts/felix/fixtures/{motions,registers,macros,structure,navigation,shell,comments}.json scripts/felix/*baseline.json \
             default_config.toml src/editor/felix_bindings.toml > evidence/sha256.txt
       - uses: actions/upload-artifact@v4
         if: always()

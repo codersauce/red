@@ -1581,3 +1581,104 @@ async fn agent_lsp_dropped_call_and_resource_edits_cannot_mutate_buffers() {
         assert!(root.path().join("main.rs").exists());
     }
 }
+
+#[cfg(feature = "helix")]
+mod felix_native {
+    use super::*;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use serde_json::{json, Value};
+
+    fn editor(root: &Path, original: &str, lsp: RecordingLsp) -> Editor {
+        let file = root.join("test.rs");
+        std::fs::write(&file, original).unwrap();
+        let config = Config::from_user_toml_with_overrides("editing_model = 'helix'", &[]).unwrap();
+        let mut editor = Editor::test_with_size(
+            Box::new(lsp),
+            80,
+            24,
+            config,
+            Theme::default(),
+            vec![Buffer::new(
+                Some(file.display().to_string()),
+                original.into(),
+            )],
+        )
+        .unwrap();
+        editor.test_disable_terminal_output();
+        editor
+    }
+
+    async fn keys(editor: &mut Editor, sequence: &str) {
+        for ch in sequence.chars() {
+            editor
+                .test_execute_event(Event::Key(KeyEvent::new(
+                    KeyCode::Char(ch),
+                    KeyModifiers::NONE,
+                )))
+                .await
+                .unwrap();
+        }
+    }
+
+    fn request(events: &Arc<Mutex<Vec<LspEvent>>>, method: &str) -> Value {
+        let events = events.lock().unwrap();
+        let mut params = events.iter().filter_map(|e| match e {
+            LspEvent::SendRequest { method: m, params } if m == method => Some(params),
+            _ => None,
+        });
+        let request = params.next().expect("missing LSP request").clone();
+        assert!(params.next().is_none(), "duplicate LSP request");
+        request
+    }
+
+    #[tokio::test]
+    async fn range_format_requests_directed_utf16_range_and_rejects_stale_edits() {
+        let root = tempfile::tempdir().unwrap();
+        let original = "😀foo bar\r\n";
+        let range = json!({"start":{"line":0,"character":2},"end":{"line":0,"character":4}});
+        for stale in [false, true] {
+            let lsp = RecordingLsp::with_workspace_root(root.path())
+                .with_capabilities(json!({"documentRangeFormattingProvider":true}));
+            lsp.queue_result(
+                "textDocument/rangeFormatting",
+                json!([{"range":range,"newText":"FO"}]),
+            );
+            let events = lsp.events();
+            let mut editor = editor(root.path(), original, lsp);
+            keys(&mut editor, "2lvh=").await;
+            let requested = request(&events, "textDocument/rangeFormatting");
+            assert_eq!(requested["range"], range);
+            assert!(requested["options"]["tabSize"].is_number());
+            if stale {
+                keys(&mut editor, "j").await;
+            }
+            editor.test_service_background().await.unwrap();
+            assert_eq!(
+                editor.test_buffer_contents(),
+                if stale { original } else { "😀FOo bar\r\n" }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn document_highlight_request_becomes_editable_selections() {
+        let root = tempfile::tempdir().unwrap();
+        let lsp = RecordingLsp::with_workspace_root(root.path())
+            .with_capabilities(json!({"documentHighlightProvider":true}));
+        let range = |from, to| json!({"range":{"start":{"line":0,"character":from},"end":{"line":0,"character":to}}});
+        lsp.queue_result(
+            "textDocument/documentHighlight",
+            json!([range(2, 5), range(6, 9)]),
+        );
+        let events = lsp.events();
+        let mut editor = editor(root.path(), "😀foo foo\r\n", lsp);
+        keys(&mut editor, "l h").await;
+        assert_eq!(
+            request(&events, "textDocument/documentHighlight")["position"],
+            json!({"line":0,"character":2})
+        );
+        editor.test_service_background().await.unwrap();
+        keys(&mut editor, "cX").await;
+        assert_eq!(editor.test_buffer_contents(), "😀X X\r\n");
+    }
+}

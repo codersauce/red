@@ -478,15 +478,6 @@ impl LspClient for RecordingLsp {
         Ok(48)
     }
 
-    async fn document_highlight(
-        &mut self,
-        _file: &str,
-        _x: usize,
-        _y: usize,
-    ) -> Result<i64, LspError> {
-        Ok(0)
-    }
-
     async fn document_link(&mut self, _file: &str) -> Result<i64, LspError> {
         Ok(0)
     }
@@ -597,6 +588,16 @@ impl LspClient for RecordingLsp {
         &mut self,
     ) -> Result<Option<(InboundMessage, Option<String>)>, LspError> {
         Ok(self.responses.lock().unwrap().pop_front())
+    }
+
+    fn supports_range_formatting(&self, _file: &str) -> bool {
+        use red::lsp::types::DocumentRangeFormattingProviderCapability::{Options, Simple};
+        matches!(
+            self.capabilities
+                .as_ref()
+                .and_then(|cap| cap.document_range_formatting_provider.as_ref()),
+            Some(Simple(true) | Options(_))
+        )
     }
 
     fn get_server_capabilities(&self) -> Option<&ServerCapabilities> {

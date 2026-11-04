@@ -56,6 +56,21 @@ fn reference_sequences() {
 }
 
 #[test]
+fn reference_navigation() {
+    let mut fixture: Value = serde_json::from_str(include_str!(
+        "../../../scripts/felix/fixtures/navigation.json"
+    ))
+    .unwrap();
+    fixture["cases"].as_array_mut().unwrap().retain(|case| {
+        !case["name"]
+            .as_str()
+            .unwrap()
+            .starts_with("navigation-host-")
+    });
+    replay_suite(&fixture.to_string());
+}
+
+#[test]
 fn reference_registers() {
     replay_suite(include_str!(
         "../../../scripts/felix/fixtures/registers.json"
@@ -65,6 +80,21 @@ fn reference_registers() {
 #[test]
 fn reference_macros() {
     replay_suite(include_str!("../../../scripts/felix/fixtures/macros.json"));
+}
+
+#[test]
+fn reference_surrounds() {
+    let mut fixture: Value = serde_json::from_str(include_str!(
+        "../../../scripts/felix/fixtures/structure.json"
+    ))
+    .unwrap();
+    fixture["cases"].as_array_mut().unwrap().retain(|case| {
+        case["name"]
+            .as_str()
+            .unwrap()
+            .starts_with("structure-plain-")
+    });
+    replay_suite(&fixture.to_string());
 }
 
 // The fixture's physical input tokens use the document grammar. The register
@@ -209,7 +239,10 @@ fn replay_suite(source: &str) {
                     redo.clear();
                 }
                 if !plan.edits.is_empty() && before.is_none() {
-                    before = Some((text.clone(), sel.clone()));
+                    before = Some((
+                        text.clone(),
+                        plan.history_selection.take().unwrap_or_else(|| sel.clone()),
+                    ));
                 }
                 for edit in plan.edits.iter().rev() {
                     text.remove(edit.start..edit.end);
@@ -290,6 +323,9 @@ fn replay_suite(source: &str) {
                 "primary":sel.primary_index(),"pending":session.pending_keys(),"count":session.count(),
                 "search":registers.exists('/').then(||registers.search_history().iter().rev().collect::<Vec<_>>()),
                 "unnamed":registers.stored('"')});
+            if event.get("surround_error").is_some() {
+                actual["surround_error"] = json!(status);
+            }
             if event.get("macro_recording").is_some() {
                 actual["macro_recording"] = json!(recorder.register());
                 if event.get("macro_status").is_some() {

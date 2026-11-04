@@ -4,7 +4,8 @@ use ropey::RopeSlice;
 use std::sync::LazyLock;
 
 impl Range {
-    pub(crate) fn move_to(self, text: RopeSlice<'_>, target: usize, extend: bool) -> Self {
+    /// Move the cursor to a character offset, optionally extending the range.
+    pub fn move_to(self, text: RopeSlice<'_>, target: usize, extend: bool) -> Self {
         if !extend {
             return Self::at(text, target);
         }
@@ -424,7 +425,7 @@ pub(crate) fn word_object(text: RopeSlice<'_>, r: Range, long: bool, around: boo
     }
 }
 
-fn brackets(ch: char) -> Option<(char, char)> {
+pub(crate) fn brackets(ch: char) -> Option<(char, char)> {
     [
         ('(', ')'),
         ('[', ']'),
@@ -466,7 +467,7 @@ fn delimiter_offset(
     None
 }
 
-pub(crate) fn match_bracket(text: RopeSlice<'_>, pos: usize) -> Option<usize> {
+pub fn match_bracket(text: RopeSlice<'_>, pos: usize) -> Option<usize> {
     const SCAN_LIMIT: usize = 10_000;
     let ch = text.get_char(pos)?;
     let (open, close) = brackets(ch)?;
@@ -485,16 +486,41 @@ pub(crate) fn pair_object(
     delimiter: char,
     around: bool,
     count: usize,
+    resolve: Option<&dyn crate::command::SyntaxPairs>,
 ) -> Range {
-    if delimiter.is_ascii_alphanumeric() || r.end() >= text.len_chars() || count == 0 {
-        return r;
+    let pair = if delimiter == 'm' {
+        resolve.map_or_else(
+            || closest_pair(text, r, count),
+            |pairs| pairs.closest(text, r, count),
+        )
+    } else if delimiter.is_ascii_alphanumeric() {
+        None
+    } else {
+        explicit_pair(text, r, delimiter, count)
+    };
+    let Some((start, end)) = pair else { return r };
+    if around {
+        r.with_bounds(start, boundary(text, end, true))
+    } else {
+        r.with_bounds(boundary(text, start, true), end)
+    }
+}
+
+pub(crate) fn explicit_pair(
+    text: RopeSlice<'_>,
+    r: Range,
+    delimiter: char,
+    count: usize,
+) -> Option<(usize, usize)> {
+    if r.end() >= text.len_chars() || count == 0 {
+        return None;
     }
     let (open, close) = brackets(delimiter).unwrap_or((delimiter, delimiter));
     let pos = r.cursor(text);
     let ch = text.char(pos);
     // A quote under the cursor could belong to either side of the object.
     if open == close && ch == open {
-        return r;
+        return None;
     }
     let start = if ch == open {
         Some(pos)
@@ -507,14 +533,42 @@ pub(crate) fn pair_object(
     } else {
         delimiter_offset(text.chars_at(pos + 1), close, open, count).map(|offset| pos + offset)
     };
-    let (Some(start), Some(end)) = (start, end) else {
-        return r;
-    };
-    if around {
-        r.with_bounds(start, boundary(text, end, true))
-    } else {
-        r.with_bounds(boundary(text, start, true), end)
+    start.zip(end)
+}
+
+pub(crate) fn closest_pair(
+    text: RopeSlice<'_>,
+    range: Range,
+    count: usize,
+) -> Option<(usize, usize)> {
+    let mut depth = Vec::new();
+    let mut remaining = count;
+    for (i, ch) in text.chars_at(range.start()).enumerate() {
+        let Some((open, close)) = brackets(ch) else {
+            continue;
+        };
+        if ch == open {
+            depth.push(open);
+        } else if depth.last() == Some(&open) {
+            depth.pop();
+        } else {
+            let pos = range.start() + i;
+            if pos + 1 < range.end() {
+                continue;
+            }
+            if let Some(distance) = delimiter_offset(text.chars_at(pos).reversed(), open, close, 1)
+            {
+                let start = pos - distance;
+                if start <= range.start() {
+                    remaining = remaining.saturating_sub(1);
+                    if remaining == 0 {
+                        return Some((start, pos));
+                    }
+                }
+            }
+        }
     }
+    None
 }
 
 /// Cell width used by Helix 25.07.1 for a single display grapheme.
@@ -530,7 +584,7 @@ pub fn cell_width(grapheme: &str, column: usize, tab_width: usize) -> usize {
     }
 }
 
-fn column_at(text: RopeSlice<'_>, start: usize, pos: usize, tab_width: usize) -> usize {
+pub(crate) fn column_at(text: RopeSlice<'_>, start: usize, pos: usize, tab_width: usize) -> usize {
     let mut col = 0;
     let mut at = start;
     while at < pos {

@@ -31,29 +31,33 @@ pub(super) enum RpcContinuation {
     Semantic(SemanticChange),
 }
 
+pub(super) fn interrupts_replay(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Key(KeyEvent {
+            kind: KeyEventKind::Press | KeyEventKind::Repeat,
+            ..
+        }) | Event::Paste(_)
+            | Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(_)
+                    | MouseEventKind::Up(_)
+                    | MouseEventKind::Drag(_)
+                    | MouseEventKind::ScrollDown
+                    | MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollLeft
+                    | MouseEventKind::ScrollRight,
+                ..
+            })
+    )
+}
+
 impl RpcCommands {
     pub(super) fn started(&mut self, command: plugin::RpcCommandToken) {
         self.latest = Some(command);
     }
 
     pub(super) fn interrupt(&mut self, event: &Event) {
-        if matches!(
-            event,
-            Event::Key(KeyEvent {
-                kind: KeyEventKind::Press | KeyEventKind::Repeat,
-                ..
-            }) | Event::Paste(_)
-                | Event::Mouse(MouseEvent {
-                    kind: MouseEventKind::Down(_)
-                        | MouseEventKind::Up(_)
-                        | MouseEventKind::Drag(_)
-                        | MouseEventKind::ScrollDown
-                        | MouseEventKind::ScrollUp
-                        | MouseEventKind::ScrollLeft
-                        | MouseEventKind::ScrollRight,
-                    ..
-                })
-        ) {
+        if interrupts_replay(event) {
             self.waiting.clear();
         }
     }

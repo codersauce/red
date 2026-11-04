@@ -127,6 +127,8 @@ pub(crate) struct Prompt {
     pub line: String,
     pub cursor: usize,
     history_index: Option<usize>,
+    replacement_start: usize,
+    pub await_register: bool,
     named_history: Option<std::sync::Arc<[String]>>,
     history_candidates: std::sync::Arc<[String]>,
     matches: std::ops::Range<usize>,
@@ -153,6 +155,12 @@ impl Prompt {
         self.named_history.as_deref().unwrap_or(default)
     }
 
+    pub(crate) fn set_shell_candidates(&mut self, start: usize, items: Vec<String>) {
+        self.replacement_start = start;
+        self.matches = 0..items.len();
+        self.history_candidates = items.into();
+    }
+
     pub fn candidates(&self) -> &[String] {
         &self.history_candidates[self.matches.clone()]
     }
@@ -176,8 +184,9 @@ impl Prompt {
             self.selected.map_or(0, |i| (i + 1) % count)
         };
         self.selected = Some(index);
+        self.line.truncate(self.replacement_start);
         self.line
-            .clone_from(&self.history_candidates[self.matches.start + index]);
+            .push_str(&self.history_candidates[self.matches.start + index]);
         self.cursor = self.line.len();
         if !backward && count == 1 && self.line.ends_with(std::path::MAIN_SEPARATOR) {
             self.refilter();

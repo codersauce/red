@@ -829,6 +829,59 @@ impl UndoHistory {
         Some((next + 1, child_count))
     }
 
+    /// Return the undo count and forward path to the chronological neighbour.
+    /// Node order is commit order even when a new edit forks the history.
+    #[cfg(feature = "helix")]
+    pub(crate) fn chronological_path(
+        &self,
+        later: bool,
+        steps: usize,
+    ) -> (usize, Vec<usize>, bool) {
+        let current = self.current.map_or(0, |i| i + 1);
+        let requested = if later {
+            current.saturating_add(steps)
+        } else {
+            current.saturating_sub(steps)
+        };
+        let target = requested.min(self.nodes.len());
+        let clamped = if later {
+            requested > self.nodes.len()
+        } else {
+            steps > current
+        };
+        let mut from = self.current;
+        let mut to = target.checked_sub(1);
+        let mut undo = 0;
+        let mut redo = Vec::new();
+        // Every parent precedes every child in the retained node list.
+        while from != to {
+            if from > to {
+                from = self.nodes[from.expect("current branch has a node")].parent;
+                undo += 1;
+            } else {
+                let node = to.expect("target branch has a node");
+                redo.push(node);
+                to = self.nodes[node].parent;
+            }
+        }
+        redo.reverse();
+        (undo, redo, clamped)
+    }
+
+    #[cfg(feature = "helix")]
+    pub(crate) fn choose_redo_node(&mut self, target: usize) -> bool {
+        let Some(index) = self
+            .children_for(self.current)
+            .iter()
+            .position(|&child| child == target)
+        else {
+            return false;
+        };
+        self.branch_selection
+            .insert(branch_key(self.current), index);
+        true
+    }
+
     fn children_for(&self, parent: Option<usize>) -> &[usize] {
         parent.map_or(&self.root_children, |index| &self.nodes[index].children)
     }

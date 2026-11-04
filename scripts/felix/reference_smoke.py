@@ -34,7 +34,9 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
     workdir = root / "work"
     workdir.mkdir()
     completion = scenario in ("completion", "completion-repeat", "snippet-stops", "split-completion")
-    fixture = root / ("example.rs" if completion or scenario == "rust-edit" else "example.txt")
+    fixture = root / ("example.rs" if completion or scenario in ("rust-edit", "syntax-native") else "example.txt")
+    if scenario == "embedded":
+        fixture = root / "example.md"
     split_search = scenario in ("split-search", "wrapped-split-search")
     wrapped = scenario == "wrapped-split-search"
     horizontal = scenario == "horizontal"
@@ -44,6 +46,10 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
                            + "\n" + "." * 22 + "👩‍💻Z\n")
     elif scenario == "rust-edit":
         fixture.write_text("/// one\n/// two\n//! three\n//! four\nfn main() {\n    do_work();\n}\n")
+    elif scenario == "embedded":
+        fixture.write_text("```rust\nfn main() { foo(bar); }\n```\n")
+    elif scenario == "syntax-native":
+        fixture.write_text("fn main() { answer(); }\n")
     elif scenario == "clipboard":
         fixture.write_text("a bb\n")
     elif wrapped:
@@ -580,6 +586,60 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
             tmux("send-keys", "l", "r", "Q")
             observe("move once in the new split", "fYYZQ foo", "NOR", "1 sel", copies=2)
             return checkpoints
+        if scenario == "embedded":
+            line = "fn main() { foo(bar); }"
+            observe("open", line, "NOR", "1 sel", row=2)
+            tmux("send-keys", "-l", "j17l")
+            tmux("send-keys", "M-o", "d")
+            observe("delete expanded Rust argument inside Markdown", "fn main() { foo(); }", "NOR", "1 sel", row=2)
+            tmux("send-keys", "u")
+            observe("undo inside the fence", line, "NOR", "1 sel", row=2)
+            return checkpoints
+        if scenario == "history-view":
+            observe("open", "foo foo", "NOR", "1 sel")
+            tmux("send-keys", "i", "a", "Escape")
+            observe("first edit", "afoo foo", "NOR", "1 sel")
+            tmux("send-keys", "i", "b", "Escape")
+            observe("second edit", "abfoo foo", "NOR", "1 sel")
+            tmux("send-keys", "u", "i", "c", "Escape")
+            observe("edit on a new branch", "acfoo foo", "NOR", "1 sel")
+            tmux("send-keys", "M-u")
+            observe("earlier across branches", "abfoo foo", "NOR", "1 sel")
+            tmux("send-keys", "M-U")
+            observe("later across branches", "acfoo foo", "NOR", "1 sel")
+            tmux("send-keys", "-l", "gggwaad")
+            observe("delete the word at the visible label", "acfoo", "NOR", "1 sel")
+            return checkpoints
+        if scenario == "syntax-native":
+            line = "fn main() { answer(); }"
+            observe("open", line, "NOR", "1 sel")
+            tmux("send-keys", "-l", "f{lmifd")
+            observe("delete the inner Rust function", "fn main()", "NOR", "1 sel")
+            tmux("send-keys", "u")
+            observe("undo function deletion", line, "NOR", "1 sel")
+            tmux("send-keys", "Space", "c")
+            observe("toggle the Rust line comment", "// " + line, "NOR", "1 sel")
+            tmux("send-keys", "Space", "c")
+            observe("remove the Rust line comment", line, "NOR", "1 sel")
+            return checkpoints
+        if scenario == "broad":
+            observe("open", "foo foo", "NOR", "1 sel")
+            tmux("send-keys", "-l", "%sfoo")
+            tmux("send-keys", "Enter")
+            observe("select both words", "foo foo", "NOR")
+            tmux("send-keys", "-l", "ms(")
+            observe("surround both words", "(foo) (foo)", "NOR")
+            tmux("send-keys", "u")
+            observe("undo surrounds", "foo foo", "NOR")
+            tmux("send-keys", "-l", "|tr a-z A-Z")
+            tmux("send-keys", "Enter")
+            observe("pipe both selections", "FOO FOO", "NOR")
+            tmux("send-keys", "u")
+            observe("undo shell output", "foo foo", "NOR")
+            tmux("send-keys", "-l", "!printf X")
+            tmux("send-keys", "Enter")
+            observe("insert shell output before both selections", "Xfoo Xfoo", "NOR")
+            return checkpoints
         if scenario == "macros":
             observe("open", "foo foo", "NOR", "1 sel")
             tmux("send-keys", "-l", '"aQ')
@@ -735,7 +795,7 @@ def main():
             for scenario, directory in (("split-search", "split"), ("wrapped-split-search", "wrap"),
                                         ("selection-errors", "sel"), ("clipboard", "clip"),
                                         ("completion-repeat", "cr"), ("snippet-stops", "st"), ("rust-edit", "rs"),
-                                        ("split-completion", "sc"), ("registers", "reg"), ("macros", "mac")):
+                                        ("split-completion", "sc"), ("registers", "reg"), ("macros", "mac"), ("broad", "br"), ("syntax-native", "sy"), ("history-view", "hv"), ("embedded", "em")):
                 key = scenario.replace("-", "_")
                 additional_traces[key] = run_trace(bundle, root / f"release-{directory}", scenario=scenario)
                 additional_traces[f"red_{key}"] = (run_trace(bundle, root / f"red-{directory}",

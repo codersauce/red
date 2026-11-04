@@ -1,7 +1,10 @@
 //! Red adapter for document-window Felix sessions.
 
 mod macros;
+mod native;
+mod navigation;
 mod prompt;
+mod shell;
 
 use super::*;
 use crate::theme::SelectionForegroundPriority;
@@ -52,6 +55,8 @@ pub(super) enum Input<'a> {
     Replay(felix_core::ReplayStep<'a>),
     Bracketed(&'a str),
     ClipboardPaste(felix_core::Paste),
+    ShellResult(felix_core::Shell, &'a [Option<String>]),
+    Comment(felix_core::CommentMode),
     ClipboardReplace,
     ClipboardYank { primary: bool },
 }
@@ -73,6 +78,7 @@ pub(super) type Owner = (BufferId, WindowId, u64, u64);
 
 #[derive(Default)]
 struct FelixLanguageEdit {
+    syntax_pairs: Option<crate::textobjects::FelixSyntax>,
     tab_width: usize,
     indents: Vec<(usize, usize)>,
     tokens: &'static [&'static str],
@@ -80,10 +86,19 @@ struct FelixLanguageEdit {
 
 #[derive(Default)]
 pub(super) struct FelixHost {
+    definition_owners: HashMap<i64, Owner>,
     session: Session,
     native_prefix_owner: Option<Owner>,
     pub(super) preview: Option<CompletionPreview>,
+    shell_job: Option<shell::ShellJob>,
+    object_selections: HashMap<(BufferId, WindowId), (u64, Vec<Selections>)>,
+    changed_files_job: Option<(i32, tokio::task::JoinHandle<()>)>,
+    range_format_request: Option<(i64, Owner)>,
+    highlight_request: Option<(i64, Owner)>,
     last_insert: felix_core::LastInsert,
+    modified_docs: HashMap<WindowId, Vec<BufferId>>,
+    accessed_docs: HashMap<WindowId, Vec<BufferId>>,
+    modified_since_access: std::collections::HashSet<BufferId>,
     pub(super) recorder: felix_core::MacroRecorder,
     pub(super) playback: felix_core::MacroReplay,
     jumps: HashMap<WindowId, felix_core::Jumps<BufferId>>,
@@ -229,6 +244,128 @@ impl felix_core::VisualLines for FelixVisualLines<'_> {
 }
 
 impl Editor {
+    /// Build a future only for Felix actions. Keeping its construction here keeps
+    /// recursive Vim block replay within the standard 2 MiB input-thread stack.
+    #[inline(never)]
+    pub(super) fn felix_document_action<'a>(
+        &'a mut self,
+        action: &'a Action,
+        buffer: &'a mut RenderBuffer,
+        runtime: &'a mut Runtime,
+    ) -> Option<BoxFuture<'a, anyhow::Result<bool>>> {
+        match action {
+            Action::FelixInput { key, owner } => Some(Box::pin(async move {
+                self.execute_felix(Input::Key(key), *owner, buffer, runtime)
+                    .await?;
+                Ok(false)
+            })),
+            Action::FelixCompletionKey {
+                item,
+                key,
+                owner,
+                resolve,
+            } => Some(Box::pin(async move {
+                if self.felix_owner() != Some(*owner) {
+                    return Ok(false);
+                }
+                if *resolve
+                    && self
+                        .resolve_completion_item(item, None, Some((*owner, *key)))
+                        .await?
+                {
+                    self.close_completion_popup();
+                    self.completion_snapshot = None;
+                } else {
+                    self.apply_completion(item, None, runtime).await?;
+                    if self.is_insert()
+                        && self
+                            .felix_owner()
+                            .is_some_and(|now| (now.0, now.1) == (owner.0, owner.1))
+                    {
+                        if let Some(action) = self.felix_input_action(key) {
+                            let quit = Box::pin(self.handle_key_action(
+                                &Event::Key(*key),
+                                &action,
+                                buffer,
+                                runtime,
+                            ))
+                            .await?;
+                            return Ok(quit);
+                        }
+                    }
+                }
+                self.render(buffer)?;
+                Ok(false)
+            })),
+            Action::FelixPreviewCompletion => Some(Box::pin(async move {
+                self.refresh_felix_preview();
+                self.render(buffer)?;
+                Ok(false)
+            })),
+            Action::FelixFormatRange
+            | Action::FelixChangedFiles
+            | Action::FelixSymbolHighlights
+            | Action::FelixToggleComments
+            | Action::FelixLineComments
+            | Action::FelixBlockComments => Some(Box::pin(async move {
+                if let Err(error) = self
+                    .felix_native_document_command(action, buffer, runtime)
+                    .await
+                {
+                    self.set_legacy_message(Some(error.to_string()));
+                }
+                self.render(buffer)?;
+                Ok(false)
+            })),
+            Action::FelixDocumentDiagnostics => Some(Box::pin(async move {
+                self.open_document_diagnostics_picker();
+                self.render(buffer)?;
+                Ok(false)
+            })),
+            Action::FelixTransposeWindow => Some(Box::pin(async move {
+                self.update_window_layout(crate::window::WindowManager::transpose_active_split);
+                self.render(buffer)?;
+                Ok(false)
+            })),
+            Action::FelixSplitAtFile(vertical) => Some(Box::pin(async move {
+                self.split_felix_file(*vertical, buffer, runtime).await?;
+                Ok(false)
+            })),
+            Action::FelixSwapWindow(direction) => Some(Box::pin(async move {
+                self.update_window_layout(|windows| windows.swap_adjacent(*direction));
+                self.render(buffer)?;
+                Ok(false)
+            })),
+            Action::FelixPaste { text, owner } => Some(Box::pin(async move {
+                self.execute_felix(Input::Bracketed(text), *owner, buffer, runtime)
+                    .await?;
+                Ok(false)
+            })),
+            Action::FelixCopyBetweenRegisters => Some(Box::pin(async move {
+                if let Some(owner) = self.felix_owner() {
+                    self.execute_felix(
+                        Input::Key("<copy-between-registers>"),
+                        owner,
+                        buffer,
+                        runtime,
+                    )
+                    .await?;
+                }
+                Ok(false)
+            })),
+            Action::FelixClipboardBefore
+            | Action::FelixClipboardAfter
+            | Action::FelixClipboardYank
+            | Action::FelixClipboardYankPrimary
+            | Action::FelixClipboardReplace => Some(Box::pin(async move {
+                self.execute_felix_clipboard(action, buffer, runtime)
+                    .await?;
+                Ok(false)
+            })),
+            _ => None,
+        }
+    }
+
     pub(super) fn felix_active_selection(&self) -> Option<&Selections> {
         let (doc, view, _, _) = self.felix_owner()?;
         self.felix.selections.get(&(doc, view))
@@ -278,6 +415,21 @@ impl Editor {
 
     pub(super) fn felix_prune_views(&mut self) {
         self.felix
+            .shell_job
+            .take_if(|job| self.window_manager.window(job.owner.1).is_none());
+        self.felix
+            .accessed_docs
+            .retain(|view, _| self.window_manager.window(*view).is_some());
+        self.felix
+            .modified_since_access
+            .retain(|doc| self.buffer_manager.iter().any(|b| b.id() == *doc));
+        self.felix
+            .modified_docs
+            .retain(|view, _| self.window_manager.window(*view).is_some());
+        self.felix
+            .object_selections
+            .retain(|(_, view), _| self.window_manager.window(*view).is_some());
+        self.felix
             .selections
             .retain(|(_, view), _| self.window_manager.window(*view).is_some());
         self.felix
@@ -286,6 +438,8 @@ impl Editor {
     }
 
     pub(super) fn felix_forget_document(&mut self, doc: BufferId) {
+        self.felix.shell_job.take_if(|job| job.owner.0 == doc);
+        self.felix.object_selections.retain(|(id, _), _| *id != doc);
         self.felix.indent.remove(&doc);
         for jumps in self.felix.jumps.values_mut() {
             jumps.forget(doc);
@@ -801,7 +955,12 @@ impl Editor {
                     (true, false) => "c",
                     _ => "a",
                 };
-                format!("<{prefix}-{code:?}>").to_lowercase()
+                let shift = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    "-s"
+                } else {
+                    ""
+                };
+                format!("<{prefix}{shift}-{code:?}>").to_lowercase()
             }
             KeyCode::Backspace if key.modifiers == KeyModifiers::SHIFT => "<s-backspace>".into(),
             KeyCode::Backspace => "<backspace>".into(),
@@ -973,6 +1132,7 @@ impl Editor {
             ) || self.felix.session.prompt().is_some())
                 && self.active_has_markdown_tables();
         let context = felix_core::Context {
+            syntax_pairs: language.syntax_pairs.as_ref().map(|pairs| pairs as _),
             search_history: self.felix.registers.search_history(),
             register,
             tab_width,
@@ -1036,6 +1196,24 @@ impl Editor {
             },
             _ => None,
         };
+        if key.is_some_and(|key| self.felix.session.uses_syntax_pairs(key)) {
+            if let Some(lang) =
+                self.highlight_language_id_for_buffer_index(self.buffer_manager.active_index())
+            {
+                let doc = self
+                    .buffer_manager
+                    .active_buffer()
+                    .context("missing syntax document")?;
+                match self.syntax_textobjects.felix_syntax(doc, &lang, &initial) {
+                    Ok(pairs) => language.syntax_pairs = pairs,
+                    Err(error) => {
+                        self.felix.session.cancel_pending();
+                        self.set_legacy_message(Some(error.to_string()));
+                        return self.render(frame);
+                    }
+                }
+            }
+        }
         if let Some((key, id)) = key
             .filter(|key| match self.felix.session.mode {
                 felix_core::Mode::Insert => matches!(*key, "<enter>" | "<c-j>"),
@@ -1094,7 +1272,16 @@ impl Editor {
                     self.felix.session.replay_completion(text, &initial, change)
                 }
             },
+            Input::ShellResult(kind, outputs) => {
+                self.felix.session.shell_result(&initial, kind, outputs)
+            }
             Input::Bracketed(value) => self.felix.session.bracketed_paste(text, &initial, value),
+            Input::Comment(mode) => {
+                let (line, blocks) = native::comment_tokens(self.current_language_id().as_deref());
+                self.felix
+                    .session
+                    .toggle_comments(text, &initial, mode, line, blocks)
+            }
             Input::ClipboardYank { primary } => {
                 let mut plan = self.plan_felix_key(text, &initial, "y", None, false, &language);
                 let values = if primary {
@@ -1127,6 +1314,16 @@ impl Editor {
                 }
             }
         };
+        plan.next.update_shell_completions(
+            |line| shell::completions(line, &self.statusline_git_cache.working_directory),
+            || {
+                self.felix
+                    .registers
+                    .previews()
+                    .map(|(name, value)| format!("{name} {}", value.lines().next().unwrap_or("")))
+                    .collect()
+            },
+        );
         plan.apply_macro_recording(&mut self.felix.recorder);
         // Complete a provider write before changing the document or opening undo history.
         if let Some(values) = plan
@@ -1231,7 +1428,11 @@ impl Editor {
             self.felix.before = None;
         }
         if !plan.edits.is_empty() && self.felix.before.is_none() {
-            self.felix.before = Some(initial.clone());
+            self.felix.before = Some(
+                plan.history_selection
+                    .take()
+                    .unwrap_or_else(|| initial.clone()),
+            );
         }
         if let Some(query) = &plan.search {
             self.felix
@@ -1294,6 +1495,9 @@ impl Editor {
         if matches!(plan.history, History::Checkpoint | History::InsertPaste) {
             self.begin_transaction("Helix edit");
         }
+        if let Some((kind, command)) = plan.shell {
+            plan.message = self.start_felix_shell(kind, command, &initial).err();
+        }
         if let Some(request) = plan.host {
             match request {
                 HostAction::Undo(count) | HostAction::Redo(count) => {
@@ -1308,6 +1512,10 @@ impl Editor {
                             break;
                         }
                     }
+                }
+                HostAction::Navigate(command) => {
+                    // Keep infrequent host navigation off ordinary key-dispatch stack frames.
+                    Box::pin(self.navigate_felix(command, &selections, frame, runtime)).await?
                 }
                 HostAction::SwitchBuffer { forward, count } => {
                     let len = self.buffer_manager.len();
@@ -1353,6 +1561,21 @@ impl Editor {
                                 self.set_felix_active_selection(current);
                             }
                         }
+                    }
+                }
+                HostAction::Structure {
+                    action,
+                    repetitions,
+                } => {
+                    match self.felix_structural_selection(
+                        id,
+                        selections.clone(),
+                        action,
+                        repetitions,
+                    ) {
+                        Ok(Some(updated)) => self.set_felix_active_selection(updated),
+                        Ok(None) => {}
+                        Err(error) => plan.message = Some(error.to_string()),
                     }
                 }
                 HostAction::SyntaxParentEnd => {
@@ -1441,6 +1664,66 @@ impl Editor {
 }
 
 impl Editor {
+    fn felix_structural_selection(
+        &mut self,
+        id: (BufferId, WindowId),
+        mut selection: Selections,
+        action: felix_core::Structure,
+        repetitions: usize,
+    ) -> anyhow::Result<Option<Selections>> {
+        use felix_core::Structure;
+        let Some(lang) =
+            self.highlight_language_id_for_buffer_index(self.buffer_manager.active_index())
+        else {
+            if matches!(action, Structure::Motion { .. }) {
+                anyhow::bail!("Syntax-tree is not available in current buffer");
+            }
+            return Ok(None);
+        };
+        let doc = self
+            .buffer_manager
+            .active_buffer()
+            .context("missing syntax document")?;
+        let (revision, history) = self.felix.object_selections.entry(id).or_default();
+        if doc.revision() != *revision {
+            *revision = doc.revision();
+            history.clear();
+        }
+        let extend = self.felix.session.mode == felix_core::Mode::Select;
+        for _ in 0..repetitions {
+            if action == Structure::Shrink {
+                if let Some(previous) = history.pop() {
+                    let current = selection.ranges();
+                    let contains_previous = previous.ranges().iter().all(|range| {
+                        let index = current.partition_point(|outer| outer.end() <= range.start());
+                        current.get(index).is_some_and(|outer| {
+                            outer.start() <= range.start() && outer.end() >= range.end()
+                        })
+                    });
+                    if contains_previous {
+                        selection = previous;
+                        continue;
+                    }
+                    history.clear();
+                }
+            }
+            let Some(updated) = self
+                .syntax_textobjects
+                .felix_structure(doc, &lang, &selection, action, extend)?
+            else {
+                break;
+            };
+            if updated == selection {
+                break;
+            }
+            if action == Structure::Expand {
+                history.push(selection);
+            }
+            selection = updated;
+        }
+        Ok(Some(selection))
+    }
+
     pub(super) async fn apply_felix_completion(
         &mut self,
         savepoint: Option<&FilterSavepoint>,
@@ -1641,6 +1924,38 @@ impl Editor {
             return;
         };
         let visible = rope.line_to_char(first.line)..rope.line_to_char(last.line + 1);
+        if self
+            .window_manager
+            .active_window()
+            .is_some_and(|w| w.id == window.id)
+        {
+            for (index, range) in self.felix.session.word_labels().iter().enumerate() {
+                let start = range.start();
+                if start >= text.len_chars() {
+                    continue;
+                }
+                for (offset, letter) in [
+                    (start, index / 26),
+                    (felix_core::boundary(text, start, true), index % 26),
+                ] {
+                    let pos = buffer.char_idx_to_position(offset);
+                    let col = self.char_to_grapheme_on_line(pos.character, pos.line);
+                    if let Some((x, y)) = self.buffer_to_window_coords(window, col, pos.line) {
+                        let x = self.window_to_terminal_x(window, x);
+                        let y = self.window_to_terminal_y(window, y);
+                        if terminal_rows.is_some_and(|rows| rows.binary_search(&y).is_err()) {
+                            continue;
+                        }
+                        if let Some(cell) = frame.cells.get_mut(y * frame.width + x) {
+                            cell.c = char::from(b'a' + letter as u8);
+                            cell.text.clear();
+                            cell.text.push(cell.c);
+                            cell.style = self.theme.synthetic_cursor_style(&cell.style);
+                        }
+                    }
+                }
+            }
+        }
         let ranges = sel.ranges();
         let first_range = ranges.partition_point(|r| r.end() < visible.start);
         for range in ranges[first_range..]
@@ -2944,8 +3259,562 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn felix_native_highlights_select_utf16_ranges_and_discard_stale_responses() {
+        let (mut editor, _, _) = named_fixture_editor("example.rs", "😀x x\r\n");
+        chars(&mut editor, "3l").await;
+        let owner = editor.felix_owner().unwrap();
+        editor.felix.highlight_request = Some((23, owner));
+        let highlight = |start, end| {
+            json!({"range":{
+                "start":{"line":0,"character":start},"end":{"line":0,"character":end}
+            }})
+        };
+        let response = ResponseMessage {
+            id: 23,
+            result: json!([
+                highlight(4, 5),
+                highlight(2, 3),
+                highlight(4, 5),
+                highlight(1, 2),
+                highlight(6, 8)
+            ]),
+            request: None,
+        };
+        assert!(editor.apply_felix_highlights(&response));
+        let selected = editor.felix_active_selection().unwrap();
+        assert_eq!(
+            selected.ranges(),
+            &[
+                FelixRange { anchor: 1, head: 2 },
+                FelixRange { anchor: 3, head: 4 }
+            ]
+        );
+        assert_eq!(selected.primary_index(), 1);
+        editor.felix.highlight_request = Some((23, owner));
+        chars(&mut editor, "h").await;
+        let moved = editor.felix_active_selection().unwrap().clone();
+        assert!(editor.apply_felix_highlights(&response));
+        assert_eq!(editor.felix_active_selection().unwrap(), &moved);
+        assert!(!editor.apply_felix_highlights(&response));
+        editor.felix.highlight_request = Some((24, editor.felix_owner().unwrap()));
+        assert!(!editor.finish_felix_highlight_error(23, "unrelated"));
+        assert!(editor.finish_felix_highlight_error(24, "server closed"));
+        assert_eq!(editor.last_error.as_deref(), Some("server closed"));
+    }
+
+    #[tokio::test]
+    async fn felix_native_changed_file_picker_opens_nested_untracked_file() {
+        let root = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(root.path())
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success());
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.path().join(".gitignore"), "ignored\n").unwrap();
+        std::fs::write(root.path().join("ignored"), "").unwrap();
+        std::fs::create_dir(root.path().join("dir")).unwrap();
+        std::fs::write(root.path().join("dir/needle.txt"), "found\n").unwrap();
+        std::fs::write(root.path().join("staged"), "").unwrap();
+        git(&["add", ".gitignore", "staged"]);
+        let (mut editor, mut frame, mut runtime) = fixture_editor("current\n");
+        editor.statusline_git_cache.working_directory = root.path().join("dir");
+        for key in " gneedle".chars() {
+            editor
+                .process_editor_event(
+                    Event::Key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)),
+                    &mut frame,
+                    &mut runtime,
+                    EventRenderMode::Immediate,
+                )
+                .await
+                .unwrap();
+        }
+        let (_, job) = editor.felix.changed_files_job.take().unwrap();
+        job.await.unwrap();
+        editor
+            .service_background(&mut frame, &mut runtime)
+            .await
+            .unwrap();
+        assert!(editor.current_dialog.is_some());
+        editor
+            .test_execute_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), "found\n");
+        assert!(editor
+            .current_buffer()
+            .file
+            .as_deref()
+            .unwrap()
+            .ends_with("dir/needle.txt"));
+    }
+
+    #[tokio::test]
+    async fn felix_native_range_format_reports_reference_errors_and_preserves_selections() {
+        let (mut editor, _, _) = fixture_editor("one one\n");
+        chars(&mut editor, "=").await;
+        assert_eq!(
+            editor.last_error.as_deref(),
+            Some("No configured language server supports range formatting")
+        );
+        chars(&mut editor, "%sone").await;
+        editor
+            .test_execute_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+        let before = editor.felix_active_selection().unwrap().clone();
+        chars(&mut editor, "=").await;
+        assert_eq!(
+            editor.last_error.as_deref(),
+            Some("format_selections only supports a single selection for now")
+        );
+        assert_eq!(editor.felix_active_selection(), Some(&before));
+        assert_eq!(editor.current_buffer().contents(), "one one\n");
+    }
+
+    #[tokio::test]
+    async fn felix_native_comments_match_reference_at_every_key() {
+        replay_suite(include_str!("../../scripts/felix/fixtures/comments.json")).await;
+    }
+
+    #[tokio::test]
     async fn macros_match_reference_at_every_key() {
         replay_suite(include_str!("../../scripts/felix/fixtures/macros.json")).await;
+    }
+
+    #[tokio::test]
+    async fn oversized_syntax_documents_keep_selection_and_report_the_error() {
+        let source = format!("(abc)\n{}", "// long line\n".repeat(165_000));
+        let (mut editor, _, _) = named_fixture_editor("large.rs", &source);
+        chars(&mut editor, "l").await;
+        let original = editor.felix.selections.clone();
+        for sequence in ["]f", "mdm"] {
+            chars(&mut editor, sequence).await;
+            assert_eq!(editor.felix.selections, original);
+            assert_eq!(editor.current_buffer().contents(), source);
+            assert!(!editor.felix.session.awaiting_input());
+            assert!(editor
+                .last_error
+                .as_deref()
+                .is_some_and(|m| m.contains("larger than")));
+        }
+    }
+
+    #[tokio::test]
+    async fn structure_matches_reference_at_every_key() {
+        replay_suite(include_str!("../../scripts/felix/fixtures/structure.json")).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_jobs_reject_stale_selections_and_resume_only_their_own_macro() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut editor, mut frame, mut runtime) = fixture_editor("abc\n");
+        editor.statusline_git_cache.working_directory = root.path().into();
+        let command = "while [ ! -e ready ]; do sleep .01; done; printf X";
+        async fn submit(editor: &mut Editor) {
+            editor
+                .test_execute_event(Event::Key(KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                )))
+                .await
+                .unwrap();
+        }
+        async fn finish(editor: &mut Editor, frame: &mut RenderBuffer, runtime: &mut Runtime) {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while editor.felix.shell_job.is_some() {
+                    editor.service_felix_shell(frame, runtime).await.unwrap();
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        chars(&mut editor, "|").await;
+        editor
+            .test_execute_event(Event::Paste(command.into()))
+            .await
+            .unwrap();
+        submit(&mut editor).await;
+        chars(&mut editor, "l").await;
+        std::fs::write(root.path().join("ready"), []).unwrap();
+        finish(&mut editor, &mut frame, &mut runtime).await;
+        assert_eq!(editor.current_buffer().contents(), "abc\n");
+        assert!(editor.last_error.as_deref().unwrap().contains("Discarded"));
+        chars(&mut editor, "|").await;
+        editor
+            .test_execute_event(Event::Paste("printf elsewhere".into()))
+            .await
+            .unwrap();
+        submit(&mut editor).await;
+        chars(&mut editor, "gn").await;
+        finish(&mut editor, &mut frame, &mut runtime).await;
+        assert_eq!(editor.current_buffer().contents(), "other buffer\n");
+        chars(&mut editor, "gp").await;
+        assert_eq!(editor.current_buffer().contents(), "abc\n");
+        editor
+            .felix
+            .registers
+            .write('a', vec!["|printf X<ret>lrY".into()]);
+        chars(&mut editor, "\"aq").await;
+        assert!(editor.felix.shell_job.is_some());
+        finish(&mut editor, &mut frame, &mut runtime).await;
+        assert_eq!(editor.current_buffer().contents(), "aXY\n");
+        editor
+            .felix
+            .registers
+            .write('b', vec!["|sleep 30<ret>rN".into()]);
+        chars(&mut editor, "\"bq").await;
+        editor
+            .test_execute_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            )))
+            .await
+            .unwrap();
+        assert!(editor.felix.shell_job.is_none());
+        assert_eq!(editor.current_buffer().contents(), "aXY\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn closing_the_originating_split_stops_the_shell_process_and_frees_the_job() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut editor, _, _) = fixture_editor("abc\n");
+        editor.statusline_git_cache.working_directory = root.path().into();
+        editor
+            .test_execute_production_action(Action::SplitVertical)
+            .await
+            .unwrap();
+        chars(&mut editor, "|").await;
+        editor
+            .test_execute_event(Event::Paste("echo $$ > child; exec sleep 30".into()))
+            .await
+            .unwrap();
+        editor
+            .test_execute_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+        let deadline = std::time::Duration::from_secs(5);
+        let pid = tokio::time::timeout(deadline, async {
+            loop {
+                if let Ok(contents) = std::fs::read_to_string(root.path().join("child")) {
+                    if let Ok(id) = contents.trim().parse::<i32>() {
+                        break nix::unistd::Pid::from_raw(id);
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        editor
+            .test_execute_production_action(Action::CloseWindow)
+            .await
+            .unwrap();
+        assert!(editor.felix.shell_job.is_none());
+        tokio::time::timeout(deadline, async {
+            while nix::sys::signal::kill(pid, None).is_ok() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("closing the split killed and reaped the child");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_matches_reference_at_every_key() {
+        replay_suite(include_str!("../../scripts/felix/fixtures/shell.json")).await;
+    }
+
+    fn nav_range(editor: &Editor) -> FelixRange {
+        let (doc, view, _, _) = editor.felix_owner().unwrap();
+        editor.felix.selections[&(doc, view)].primary()
+    }
+
+    #[tokio::test]
+    async fn navigation_diagnostics_convert_utf16_and_select_in_motion_order() {
+        let (mut editor, _, _) = fixture_editor("a😀b\nlater\n");
+        let uri = editor.current_uri().unwrap().unwrap();
+        let diagnostic = |line, start, end| {
+            serde_json::from_value(json!({
+            "range":{"start":{"line":line,"character":start},"end":{"line":line,"character":end}},
+            "message":"test diagnostic"
+        })).unwrap()
+        };
+        // Server order can differ from document order.
+        editor
+            .diagnostics
+            .insert(uri, vec![diagnostic(1, 0, 4), diagnostic(0, 3, 4)]);
+        chars(&mut editor, "]d").await;
+        assert_eq!(nav_range(&editor), FelixRange { anchor: 2, head: 3 });
+        chars(&mut editor, "]D").await;
+        assert_eq!(nav_range(&editor), FelixRange { anchor: 4, head: 8 });
+        chars(&mut editor, "[D").await;
+        assert_eq!(nav_range(&editor), FelixRange { anchor: 2, head: 3 });
+    }
+
+    #[tokio::test]
+    async fn navigation_diff_uses_committed_base_and_unsaved_buffer() {
+        let root = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .current_dir(root.path())
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success())
+        };
+        git(&["init", "-q"]);
+        let path = root.path().join("sample.txt");
+        std::fs::write(&path, "top\nfirst\nmiddle\nlast\nend\n").unwrap();
+        git(&["add", "sample.txt"]);
+        git(&[
+            "-c",
+            "user.name=Felix",
+            "-c",
+            "user.email=felix@example.invalid",
+            "commit",
+            "-qm",
+            "base",
+        ]);
+        std::fs::write(&path, "top\nsaved\nmiddle\nlast\nend\n").unwrap();
+        git(&["add", "sample.txt"]);
+        let (mut editor, _, _) =
+            named_fixture_editor(path.to_str().unwrap(), "top\nsaved\nmiddle\nunsaved\nend\n");
+        chars(&mut editor, "]g").await;
+        assert_eq!(
+            nav_range(&editor),
+            FelixRange {
+                anchor: 4,
+                head: 10
+            }
+        );
+        chars(&mut editor, "8]g").await;
+        assert_eq!(
+            nav_range(&editor),
+            FelixRange {
+                anchor: 17,
+                head: 25
+            }
+        );
+        chars(&mut editor, "[g").await;
+        assert_eq!(
+            nav_range(&editor),
+            FelixRange {
+                anchor: 10,
+                head: 4
+            }
+        );
+        chars(&mut editor, ";mig").await;
+        let range = nav_range(&editor);
+        assert_eq!((range.start(), range.end()), (4, 10));
+    }
+
+    #[tokio::test]
+    async fn navigation_gf_resolves_a_quoted_path_relative_to_document() {
+        let root = tempfile::tempdir().unwrap();
+        let main = root.path().join("main.txt");
+        let dest = root.path().join("second.txt");
+        std::fs::write(&main, "\"second.txt\"\n").unwrap();
+        std::fs::write(&dest, "destination\n").unwrap();
+        let (mut editor, _, _) = named_fixture_editor(main.to_str().unwrap(), "\"second.txt\"\n");
+        chars(&mut editor, "gf").await;
+        assert_eq!(
+            editor.current_buffer().contents_snapshot().to_string(),
+            "destination\n"
+        );
+        chars(&mut editor, "ga").await;
+        assert_eq!(
+            editor.current_buffer().contents_snapshot().to_string(),
+            "\"second.txt\"\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn navigation_modified_history_and_alternate_are_view_local() {
+        let (mut editor, _, _) = fixture_editor("text\n");
+        chars(&mut editor, "iX").await;
+        editor
+            .test_execute_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+            .await
+            .unwrap();
+        chars(&mut editor, "gn").await;
+        assert_eq!(editor.current_file_name().as_deref(), Some("other.txt"));
+        chars(&mut editor, "gm").await;
+        assert_eq!(editor.current_file_name().as_deref(), Some("example.txt"));
+        chars(&mut editor, " wv").await;
+        // The new view has never left a document.
+        chars(&mut editor, "ga").await;
+        assert_eq!(editor.current_file_name().as_deref(), Some("example.txt"));
+        chars(&mut editor, "gn").await;
+        chars(&mut editor, " whga").await;
+        // Switching the document in the right split did not replace the left
+        // view's own most recently accessed document.
+        assert_eq!(editor.current_file_name().as_deref(), Some("other.txt"));
+    }
+
+    #[tokio::test]
+    async fn navigation_split_files_and_transpose_preserve_focused_window() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.txt");
+        let filename = "destination.txt";
+        std::fs::write(&source, filename).unwrap();
+        std::fs::write(root.path().join(filename), "target\n").unwrap();
+        for (key, vertical) in [('f', false), ('F', true)] {
+            let (mut editor, _, _) = named_fixture_editor(source.to_str().unwrap(), filename);
+            let window_prefix =
+                Event::Key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+            editor
+                .test_execute_event(window_prefix.clone())
+                .await
+                .unwrap();
+            chars(&mut editor, &key.to_string()).await;
+            assert_eq!(editor.window_manager.windows().len(), 2);
+            assert_eq!(
+                editor.current_buffer().contents_snapshot().to_string(),
+                "target\n"
+            );
+            let id = editor.window_manager.active_stable_window_id();
+            let position = editor.window_manager.active_window().unwrap().position;
+            assert_eq!(position.x > 0, vertical);
+            editor.test_execute_event(window_prefix).await.unwrap();
+            editor
+                .test_execute_event(Event::Key(KeyEvent::new(
+                    KeyCode::Char('t'),
+                    KeyModifiers::CONTROL,
+                )))
+                .await
+                .unwrap();
+            assert_eq!(editor.window_manager.active_stable_window_id(), id);
+            let transposed = editor.window_manager.active_window().unwrap().position;
+            assert_eq!(transposed.x > 0, !vertical);
+            chars(&mut editor, " wt").await;
+            assert_eq!(
+                editor.window_manager.active_window().unwrap().position,
+                position
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn navigation_jump_labels_are_drawn_and_removed_after_cancel() {
+        let (mut editor, mut frame, mut runtime) = fixture_editor("one two three\n");
+        editor.terminal_output_enabled = true;
+        for key in ["g", "w"] {
+            let owner = editor.felix_owner().unwrap();
+            editor
+                .execute_felix(Input::Key(key), owner, &mut frame, &mut runtime)
+                .await
+                .unwrap();
+        }
+        let text_frame = |frame: &RenderBuffer| frame.cells.iter().map(|c| c.c).collect::<String>();
+        assert!(text_frame(&frame).contains("one aao abree"));
+        let owner = editor.felix_owner().unwrap();
+        editor
+            .execute_felix(Input::Key("<esc>"), owner, &mut frame, &mut runtime)
+            .await
+            .unwrap();
+        assert!(text_frame(&frame).contains("one two three"));
+    }
+
+    #[test]
+    fn navigation_routes_lsp_location_links_for_all_destinations() {
+        let (mut editor, _, _) = fixture_editor("abc\n");
+        for method in [
+            "textDocument/definition",
+            "textDocument/declaration",
+            "textDocument/typeDefinition",
+            "textDocument/implementation",
+        ] {
+            let link = json!([{"targetUri":"file:///tmp/felix-lsp.rs","targetSelectionRange":{
+                "start":{"line":4,"character":3},"end":{"line":4,"character":6}}}]);
+            let response = InboundMessage::Message(ResponseMessage {
+                id: 42,
+                result: link,
+                request: Some(crate::lsp::Request::new(method, json!({}))),
+            });
+            editor
+                .felix
+                .definition_owners
+                .insert(42, editor.felix_owner().unwrap());
+            let action = editor.handle_lsp_message(&response, Some(method.into()));
+            assert!(
+                matches!(action,Some(Action::OpenLocation(location,_)) if location.path.ends_with("felix-lsp.rs") && location.line==4 && location.column==3 && location.column_encoding==plugin::LocationColumnEncoding::Utf16)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn navigation_stale_lsp_destinations_are_discarded_and_multiple_hits_open_a_picker() {
+        let (mut editor, _, _) = fixture_editor("abc\n");
+        let method = "textDocument/implementation";
+        let root = tempfile::tempdir().unwrap();
+        let loc = |name: &str| {
+            let path = root.path().join(name);
+            std::fs::write(&path, "😀sample\n").unwrap();
+            json!({"uri":crate::lsp::file_uri(&path).unwrap(),"range":{"start":{"line":0,"character":2},"end":{"line":0,"character":3}}})
+        };
+        let response = InboundMessage::Message(ResponseMessage {
+            id: 24,
+            result: json!([loc("a.rs"), loc("b.rs")]),
+            request: Some(crate::lsp::Request::new(method, json!({}))),
+        });
+        editor
+            .felix
+            .definition_owners
+            .insert(24, editor.felix_owner().unwrap());
+        chars(&mut editor, "gn").await;
+        assert!(editor
+            .handle_lsp_message(&response, Some(method.into()))
+            .is_none());
+        assert!(editor.current_dialog.is_none());
+        editor
+            .felix
+            .definition_owners
+            .insert(24, editor.felix_owner().unwrap());
+        assert!(matches!(
+            editor.handle_lsp_message(&response, Some(method.into())),
+            Some(Action::ShowDialog)
+        ));
+        assert!(editor.current_dialog.is_some());
+        editor
+            .test_execute_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+        assert_eq!(
+            Path::new(&editor.current_file_name().unwrap())
+                .file_name()
+                .unwrap(),
+            "a.rs"
+        );
+        assert_eq!(editor.cursor_text_position(), TextPosition::new(0, 1));
+    }
+
+    #[tokio::test]
+    async fn navigation_matches_helix() {
+        replay_suite(include_str!("../../scripts/felix/fixtures/navigation.json")).await;
     }
 
     async fn replay_suite(capture: &str) {
@@ -2967,6 +3836,12 @@ mod tests {
         assert!(!fixture.is_empty());
         let (mut editor, mut frame, mut runtime) = if name == "register-document-path" {
             named_fixture_editor("~/example.txt", text)
+        } else if name.starts_with("structure-") || name.starts_with("comments-") {
+            let file = fixture[0]["document"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("~/");
+            named_fixture_editor(file, text)
         } else {
             fixture_editor(text)
         };
@@ -2975,6 +3850,12 @@ mod tests {
             let chrome = usize::from(editor.size.0) - editor.active_content_width();
             editor.test_set_size((width + chrome) as u16, editor.size.1);
             assert_eq!(editor.active_content_width(), width);
+        }
+        let shell_root = name
+            .starts_with("shell-")
+            .then(|| tempfile::tempdir().unwrap());
+        if let Some(root) = &shell_root {
+            editor.statusline_git_cache.working_directory = root.path().into();
         }
         for (index, expected) in fixture.iter().enumerate() {
             let token = expected["key"].as_str().unwrap();
@@ -2988,6 +3869,14 @@ mod tests {
                         KeyModifiers::CONTROL
                     };
                     match &token[3..token.len() - 1] {
+                        "up" => KeyCode::Up,
+                        "down" => KeyCode::Down,
+                        "right" => KeyCode::Right,
+                        "left" => KeyCode::Left,
+                        "s-down" => {
+                            modifiers |= KeyModifiers::SHIFT;
+                            KeyCode::Down
+                        }
                         "backspace" => KeyCode::Backspace,
                         "delete" => KeyCode::Delete,
                         _ => KeyCode::Char(token.chars().nth(3).unwrap()),
@@ -3021,7 +3910,12 @@ mod tests {
                 None => Event::Key(KeyEvent::new(code, modifiers)),
             };
             // F12 is bound only in the reference fixture to Helix's unbound static command.
-            if name.starts_with("macro-") {
+            if name.starts_with("comments-")
+                || name.contains("navigation-")
+                || name.starts_with("shell-")
+                || name.starts_with("macro-")
+                || name.starts_with("structure-")
+            {
                 editor
                     .process_editor_event(
                         event.clone(),
@@ -3046,6 +3940,19 @@ mod tests {
                     .unwrap();
             }
             let (doc, view, _, _) = editor.felix_owner().unwrap();
+            if name.starts_with("shell-") && editor.felix.shell_job.is_some() {
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while editor.felix.shell_job.is_some() {
+                        editor
+                            .service_felix_shell(&mut frame, &mut runtime)
+                            .await
+                            .unwrap();
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect("shell fixture completed");
+            }
             let s = &editor.felix.selections[&(doc, view)];
             let mut actual = json!({"key":token,"document":format!("~/{}",std::path::Path::new(&editor.current_file_name().unwrap()).file_name().unwrap().to_string_lossy()),
                 "text":editor.current_buffer().contents(),"ranges":s.ranges().iter().map(|r|[r.anchor,r.head]).collect::<Vec<_>>(),
@@ -3053,6 +3960,9 @@ mod tests {
                 "search":editor.felix.registers.exists('/').then(|| editor.felix.registers.search_history().iter().rev().collect::<Vec<_>>()),
                 "unnamed":editor.felix.registers.stored('"'),
                 "pending":editor.felix.session.pending_keys()});
+            if name.starts_with("comments-") && editor.felix.native_prefix_owner.is_some() {
+                actual["pending"] = json!(["space"]);
+            }
             if let Event::Paste(value) = &event {
                 actual["paste"] = json!(value);
             }
@@ -3072,6 +3982,20 @@ mod tests {
                         index + 1
                     );
                 }
+            }
+            if name.starts_with("shell-") {
+                actual["shell_prompt"] = json!(editor
+                    .felix
+                    .session
+                    .prompt()
+                    .map(|(_, line, cursor)| json!({"line":line,"cursor":cursor})));
+                actual["shell_history"] = json!(editor.felix.registers.stored('|'));
+            }
+            if expected.get("shell_error").is_some() {
+                actual["shell_error"] = json!(editor.last_error);
+            }
+            if expected.get("surround_error").is_some() {
+                actual["surround_error"] = json!(editor.last_error);
             }
             if expected.get("macro_recording").is_some() {
                 actual["macro_recording"] = json!(editor.felix.recorder.register());

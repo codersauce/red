@@ -1,5 +1,6 @@
 # Native document-window actions. Editing commands are resolved by felix-core.
 [normal]
+"=" = "FelixFormatRange"
 "Alt-m" = { PluginCommand = "AgentModel" }
 "Alt-w" = { PluginCommand = "AgentClose" }
 "Alt-y" = "ScrollDown"
@@ -15,6 +16,12 @@ P = "FelixClipboardBefore"
 f = "FilePicker"
 a = "CodeAction"
 e = { PluginCommand = "NeoTree" }
+E = { PluginCommand = "NeoTreeDocumentDirectory" }
+g = "FelixChangedFiles"
+h = "FelixSymbolHighlights"
+c = "FelixToggleComments"
+C = "FelixBlockComments"
+"Alt-c" = "FelixLineComments"
 "=" = "FormatDocument"
 b = { PluginCommand = "BufferPicker" }
 "/" = { PluginCommand = "ProjectSearch" }
@@ -55,6 +62,10 @@ Right = "MoveWindowRight"
 "Ctrl-v" = "SplitVertical"
 "Ctrl-q" = "CloseWindow"
 "Ctrl-o" = "OnlyWindow"
+f = { FelixSplitAtFile = false }
+F = { FelixSplitAtFile = true }
+t = "FelixTransposeWindow"
+"Ctrl-t" = "FelixTransposeWindow"
 H = { FelixSwapWindow = "Left" }
 J = { FelixSwapWindow = "Down" }
 K = { FelixSwapWindow = "Up" }

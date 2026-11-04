@@ -177,6 +177,7 @@ impl Editor {
                     break;
                 }
                 let event = Event::Key(terminal_key(key));
+                let shell_was_running = self.felix.shell_job.is_some();
                 let checkpoint = self.rpc_command_checkpoint();
                 if let Some(action) = self.handle_event_with_runtime(&event, Some(runtime))? {
                     if self
@@ -184,6 +185,12 @@ impl Editor {
                         .await?
                     {
                         self.set_legacy_message(Some("Macro stopped at quit".into()));
+                        break;
+                    }
+                }
+                if !shell_was_running {
+                    if let Some(job) = &mut self.felix.shell_job {
+                        job.tail = Some(std::mem::take(&mut self.felix.playback));
                         break;
                     }
                 }
