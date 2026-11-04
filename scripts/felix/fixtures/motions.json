@@ -1268,6 +1268,462 @@
     {"key": "<a-x>", "mode": "Normal", "text": "a b xxx b\na b xxx b\n", "ranges": [[4, 7], [14, 17]], "primary": 0, "unnamed": null, "search": ["a"], "pending": [], "count": null, "document": "~/example.txt", "last_insert": []},
     {"key": "u", "mode": "Normal", "text": "a b b b b\na b b b b\n", "ranges": [[4, 7], [14, 17]], "primary": 0, "unnamed": null, "search": ["a"], "pending": [], "count": null, "document": "~/example.txt", "last_insert": []}
   ]},
+  {"name": "merge-ranges-normal", "text": "ab cd! ef", "events": [
+    {"key": "%", "mode": "Normal", "text": "ab cd! ef", "ranges": [[0, 9]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "s", "mode": "Normal", "text": "ab cd! ef", "ranges": [[0, 9]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "[", "mode": "Normal", "text": "ab cd! ef", "ranges": [[0, 9]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "a", "mode": "Normal", "text": "ab cd! ef", "ranges": [[0, 9]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "-", "mode": "Normal", "text": "ab cd! ef", "ranges": [[0, 9]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "z", "mode": "Normal", "text": "ab cd! ef", "ranges": [[0, 9]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "]", "mode": "Normal", "text": "ab cd! ef", "ranges": [[0, 1], [1, 2], [3, 4], [4, 5], [7, 8], [8, 9]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "+", "mode": "Normal", "text": "ab cd! ef", "ranges": [[0, 2], [3, 5], [7, 9]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "|", "mode": "Normal", "text": "ab cd! ef", "ranges": [[0, 2], [3, 5], [6, 7], [7, 9]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": " ", "mode": "Normal", "text": "ab cd! ef", "ranges": [[0, 2], [2, 3], [3, 5], [6, 7], [7, 9]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "+", "mode": "Normal", "text": "ab cd! ef", "ranges": [[0, 2], [2, 3], [3, 5], [6, 7], [7, 9]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<enter>", "mode": "Normal", "text": "ab cd! ef", "ranges": [[0, 2], [2, 3], [3, 5], [6, 7], [7, 9]], "primary": 0, "unnamed": null, "search": ["[a-z]+| +"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "2", "mode": "Normal", "text": "ab cd! ef", "ranges": [[0, 2], [2, 3], [3, 5], [6, 7], [7, 9]], "primary": 0, "unnamed": null, "search": ["[a-z]+| +"], "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": ")", "mode": "Normal", "text": "ab cd! ef", "ranges": [[0, 2], [2, 3], [3, 5], [6, 7], [7, 9]], "primary": 2, "unnamed": null, "search": ["[a-z]+| +"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-;>", "mode": "Normal", "text": "ab cd! ef", "ranges": [[2, 0], [3, 2], [5, 3], [7, 6], [9, 7]], "primary": 2, "unnamed": null, "search": ["[a-z]+| +"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "3", "mode": "Normal", "text": "ab cd! ef", "ranges": [[2, 0], [3, 2], [5, 3], [7, 6], [9, 7]], "primary": 2, "unnamed": null, "search": ["[a-z]+| +"], "pending": [], "count": 3, "document": "~/example.txt"},
+    {"key": "<a-_>", "mode": "Normal", "text": "ab cd! ef", "ranges": [[5, 0], [9, 6]], "primary": 0, "unnamed": null, "search": ["[a-z]+| +"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "ab cd! ef", "ranges": [[5, 0], [9, 6]], "primary": 0, "unnamed": ["ab cd", " ef"], "search": ["[a-z]+| +"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "2", "mode": "Normal", "text": "ab cd! ef", "ranges": [[5, 0], [9, 6]], "primary": 0, "unnamed": ["ab cd", " ef"], "search": ["[a-z]+| +"], "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": "<a-->", "mode": "Normal", "text": "ab cd! ef", "ranges": [[9, 0]], "primary": 0, "unnamed": ["ab cd", " ef"], "search": ["[a-z]+| +"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "ab cd! ef", "ranges": [[9, 0]], "primary": 0, "unnamed": ["ab cd! ef"], "search": ["[a-z]+| +"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "r", "mode": "Normal", "text": "ab cd! ef", "ranges": [[9, 0]], "primary": 0, "unnamed": ["ab cd! ef"], "search": ["[a-z]+| +"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "X", "mode": "Normal", "text": "XXXXXXXXX", "ranges": [[9, 0]], "primary": 0, "unnamed": ["ab cd! ef"], "search": ["[a-z]+| +"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "u", "mode": "Normal", "text": "ab cd! ef", "ranges": [[9, 0]], "primary": 0, "unnamed": ["ab cd! ef"], "search": ["[a-z]+| +"], "pending": [], "count": null, "document": "~/example.txt"}
+  ]},
+  {"name": "trim-ranges-normal", "text": " aa ,   , bb , cc ", "events": [
+    {"key": "%", "mode": "Normal", "text": " aa ,   , bb , cc ", "ranges": [[0, 18]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "S", "mode": "Normal", "text": " aa ,   , bb , cc ", "ranges": [[0, 18]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": ",", "mode": "Normal", "text": " aa ,   , bb , cc ", "ranges": [[0, 4], [5, 8], [9, 13], [14, 18]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<enter>", "mode": "Normal", "text": " aa ,   , bb , cc ", "ranges": [[0, 4], [5, 8], [9, 13], [14, 18]], "primary": 0, "unnamed": null, "search": [","], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": ")", "mode": "Normal", "text": " aa ,   , bb , cc ", "ranges": [[0, 4], [5, 8], [9, 13], [14, 18]], "primary": 1, "unnamed": null, "search": [","], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-;>", "mode": "Normal", "text": " aa ,   , bb , cc ", "ranges": [[4, 0], [8, 5], [13, 9], [18, 14]], "primary": 1, "unnamed": null, "search": [","], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "3", "mode": "Normal", "text": " aa ,   , bb , cc ", "ranges": [[4, 0], [8, 5], [13, 9], [18, 14]], "primary": 1, "unnamed": null, "search": [","], "pending": [], "count": 3, "document": "~/example.txt"},
+    {"key": "_", "mode": "Normal", "text": " aa ,   , bb , cc ", "ranges": [[3, 1], [12, 10], [17, 15]], "primary": 2, "unnamed": null, "search": [","], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": " aa ,   , bb , cc ", "ranges": [[3, 1], [12, 10], [17, 15]], "primary": 2, "unnamed": ["aa", "bb", "cc"], "search": [","], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "9", "mode": "Normal", "text": " aa ,   , bb , cc ", "ranges": [[3, 1], [12, 10], [17, 15]], "primary": 2, "unnamed": ["aa", "bb", "cc"], "search": [","], "pending": [], "count": 9, "document": "~/example.txt"},
+    {"key": "(", "mode": "Normal", "text": " aa ,   , bb , cc ", "ranges": [[3, 1], [12, 10], [17, 15]], "primary": 2, "unnamed": ["aa", "bb", "cc"], "search": [","], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "2", "mode": "Normal", "text": " aa ,   , bb , cc ", "ranges": [[3, 1], [12, 10], [17, 15]], "primary": 2, "unnamed": ["aa", "bb", "cc"], "search": [","], "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": ")", "mode": "Normal", "text": " aa ,   , bb , cc ", "ranges": [[3, 1], [12, 10], [17, 15]], "primary": 1, "unnamed": ["aa", "bb", "cc"], "search": [","], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-,>", "mode": "Normal", "text": " aa ,   , bb , cc ", "ranges": [[3, 1], [17, 15]], "primary": 1, "unnamed": ["aa", "bb", "cc"], "search": [","], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": ",", "mode": "Normal", "text": " aa ,   , bb , cc ", "ranges": [[17, 15]], "primary": 0, "unnamed": ["aa", "bb", "cc"], "search": [","], "pending": [], "count": null, "document": "~/example.txt"}
+  ]},
+  {"name": "trim-whitespace-normal", "text": "  ,   ,  ", "events": [
+    {"key": "%", "mode": "Normal", "text": "  ,   ,  ", "ranges": [[0, 9]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "S", "mode": "Normal", "text": "  ,   ,  ", "ranges": [[0, 9]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": ",", "mode": "Normal", "text": "  ,   ,  ", "ranges": [[0, 2], [3, 6], [7, 9]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<enter>", "mode": "Normal", "text": "  ,   ,  ", "ranges": [[0, 2], [3, 6], [7, 9]], "primary": 0, "unnamed": null, "search": [","], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": ")", "mode": "Normal", "text": "  ,   ,  ", "ranges": [[0, 2], [3, 6], [7, 9]], "primary": 1, "unnamed": null, "search": [","], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-;>", "mode": "Normal", "text": "  ,   ,  ", "ranges": [[2, 0], [6, 3], [9, 7]], "primary": 1, "unnamed": null, "search": [","], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "3", "mode": "Normal", "text": "  ,   ,  ", "ranges": [[2, 0], [6, 3], [9, 7]], "primary": 1, "unnamed": null, "search": [","], "pending": [], "count": 3, "document": "~/example.txt"},
+    {"key": "_", "mode": "Normal", "text": "  ,   ,  ", "ranges": [[3, 4]], "primary": 0, "unnamed": null, "search": [","], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "  ,   ,  ", "ranges": [[3, 4]], "primary": 0, "unnamed": [" "], "search": [","], "pending": [], "count": null, "document": "~/example.txt"}
+  ]},
+  {"name": "filter-ranges-normal", "text": "ax bx cx dx", "events": [
+    {"key": "%", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "s", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "[", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "a", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "-", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "z", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "]", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[0, 1], [1, 2], [3, 4], [4, 5], [6, 7], [7, 8], [9, 10], [10, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "+", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[0, 2], [3, 5], [6, 8], [9, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<enter>", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[0, 2], [3, 5], [6, 8], [9, 11]], "primary": 0, "unnamed": null, "search": ["[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "2", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[0, 2], [3, 5], [6, 8], [9, 11]], "primary": 0, "unnamed": null, "search": ["[a-z]+"], "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": ")", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[0, 2], [3, 5], [6, 8], [9, 11]], "primary": 2, "unnamed": null, "search": ["[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-;>", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[2, 0], [5, 3], [8, 6], [11, 9]], "primary": 2, "unnamed": null, "search": ["[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "3", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[2, 0], [5, 3], [8, 6], [11, 9]], "primary": 2, "unnamed": null, "search": ["[a-z]+"], "pending": [], "count": 3, "document": "~/example.txt"},
+    {"key": "K", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[2, 0], [5, 3], [8, 6], [11, 9]], "primary": 2, "unnamed": null, "search": ["[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "[", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[2, 0], [5, 3], [8, 6], [11, 9]], "primary": 2, "unnamed": null, "search": ["[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "a", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[2, 0], [5, 3], [8, 6], [11, 9]], "primary": 2, "unnamed": null, "search": ["[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "c", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[2, 0], [5, 3], [8, 6], [11, 9]], "primary": 2, "unnamed": null, "search": ["[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "]", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[2, 0], [8, 6]], "primary": 0, "unnamed": null, "search": ["[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<enter>", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[2, 0], [8, 6]], "primary": 0, "unnamed": null, "search": ["[ac]", "[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-K>", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[2, 0], [8, 6]], "primary": 0, "unnamed": null, "search": ["[ac]", "[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "a", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[8, 6]], "primary": 0, "unnamed": null, "search": ["[ac]", "[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<enter>", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[8, 6]], "primary": 0, "unnamed": null, "search": ["a", "[ac]", "[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "K", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[8, 6]], "primary": 0, "unnamed": null, "search": ["a", "[ac]", "[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "z", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[8, 6]], "primary": 0, "unnamed": null, "search": ["a", "[ac]", "[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<enter>", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[8, 6]], "primary": 0, "unnamed": null, "search": ["z", "a", "[ac]", "[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-,>", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[8, 6]], "primary": 0, "unnamed": null, "search": ["z", "a", "[ac]", "[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[8, 6]], "primary": 0, "unnamed": ["cx"], "search": ["z", "a", "[ac]", "[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"}
+  ]},
+  {"name": "copy-multiline-normal", "text": "abc\ndef\nghi\njkl\nmno", "events": [
+    {"key": "j", "mode": "Normal", "text": "abc\ndef\nghi\njkl\nmno", "ranges": [[4, 5]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "l", "mode": "Normal", "text": "abc\ndef\nghi\njkl\nmno", "ranges": [[5, 6]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "v", "mode": "Select", "text": "abc\ndef\nghi\njkl\nmno", "ranges": [[5, 6]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "j", "mode": "Select", "text": "abc\ndef\nghi\njkl\nmno", "ranges": [[5, 10]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<esc>", "mode": "Normal", "text": "abc\ndef\nghi\njkl\nmno", "ranges": [[5, 10]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-;>", "mode": "Normal", "text": "abc\ndef\nghi\njkl\nmno", "ranges": [[10, 5]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "3", "mode": "Normal", "text": "abc\ndef\nghi\njkl\nmno", "ranges": [[10, 5]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": 3, "document": "~/example.txt"},
+    {"key": "<a-C>", "mode": "Normal", "text": "abc\ndef\nghi\njkl\nmno", "ranges": [[1, 2], [10, 5]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "abc\ndef\nghi\njkl\nmno", "ranges": [[1, 2], [10, 5]], "primary": 0, "unnamed": ["b", "ef\ngh"], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "2", "mode": "Normal", "text": "abc\ndef\nghi\njkl\nmno", "ranges": [[1, 2], [10, 5]], "primary": 0, "unnamed": ["b", "ef\ngh"], "search": null, "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": "C", "mode": "Normal", "text": "abc\ndef\nghi\njkl\nmno", "ranges": [[1, 2], [5, 10], [18, 13]], "primary": 1, "unnamed": ["b", "ef\ngh"], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "abc\ndef\nghi\njkl\nmno", "ranges": [[1, 2], [5, 10], [18, 13]], "primary": 1, "unnamed": ["b", "ef\ngh", "kl\nmn"], "search": null, "pending": [], "count": null, "document": "~/example.txt"}
+  ]},
+  {"name": "copy-columns-normal", "text": "é界z\n\tQ\nA\n12好x\nabcde\n", "events": [
+    {"key": "l", "mode": "Normal", "text": "é界z\n\tQ\nA\n12好x\nabcde\n", "ranges": [[2, 3]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "l", "mode": "Normal", "text": "é界z\n\tQ\nA\n12好x\nabcde\n", "ranges": [[3, 4]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "3", "mode": "Normal", "text": "é界z\n\tQ\nA\n12好x\nabcde\n", "ranges": [[3, 4]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": 3, "document": "~/example.txt"},
+    {"key": "C", "mode": "Normal", "text": "é界z\n\tQ\nA\n12好x\nabcde\n", "ranges": [[3, 4], [18, 19]], "primary": 1, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "é界z\n\tQ\nA\n12好x\nabcde\n", "ranges": [[3, 4], [18, 19]], "primary": 1, "unnamed": ["z", "d"], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-;>", "mode": "Normal", "text": "é界z\n\tQ\nA\n12好x\nabcde\n", "ranges": [[4, 3], [19, 18]], "primary": 1, "unnamed": ["z", "d"], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "4", "mode": "Normal", "text": "é界z\n\tQ\nA\n12好x\nabcde\n", "ranges": [[4, 3], [19, 18]], "primary": 1, "unnamed": ["z", "d"], "search": null, "pending": [], "count": 4, "document": "~/example.txt"},
+    {"key": "<a-C>", "mode": "Normal", "text": "é界z\n\tQ\nA\n12好x\nabcde\n", "ranges": [[3, 4], [19, 18]], "primary": 0, "unnamed": ["z", "d"], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "é界z\n\tQ\nA\n12好x\nabcde\n", "ranges": [[3, 4], [19, 18]], "primary": 0, "unnamed": ["z", "d"], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": ",", "mode": "Normal", "text": "é界z\n\tQ\nA\n12好x\nabcde\n", "ranges": [[3, 4]], "primary": 0, "unnamed": ["z", "d"], "search": null, "pending": [], "count": null, "document": "~/example.txt"}
+  ]},
+  {"name": "copy-mixed-lines-normal", "text": "a bc\r\nz\n12\r34\nXYZ\npqr", "events": [
+    {"key": "l", "mode": "Normal", "text": "a bc\r\nz\n12\r34\nXYZ\npqr", "ranges": [[1, 2]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "l", "mode": "Normal", "text": "a bc\r\nz\n12\r34\nXYZ\npqr", "ranges": [[2, 3]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "2", "mode": "Normal", "text": "a bc\r\nz\n12\r34\nXYZ\npqr", "ranges": [[2, 3]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": "C", "mode": "Normal", "text": "a bc\r\nz\n12\r34\nXYZ\npqr", "ranges": [[2, 3], [10, 11], [16, 17]], "primary": 2, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "a bc\r\nz\n12\r34\nXYZ\npqr", "ranges": [[2, 3], [10, 11], [16, 17]], "primary": 2, "unnamed": ["b", "\r", "Z"], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-;>", "mode": "Normal", "text": "a bc\r\nz\n12\r34\nXYZ\npqr", "ranges": [[3, 2], [11, 10], [17, 16]], "primary": 2, "unnamed": ["b", "\r", "Z"], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "3", "mode": "Normal", "text": "a bc\r\nz\n12\r34\nXYZ\npqr", "ranges": [[3, 2], [11, 10], [17, 16]], "primary": 2, "unnamed": ["b", "\r", "Z"], "search": null, "pending": [], "count": 3, "document": "~/example.txt"},
+    {"key": "<a-C>", "mode": "Normal", "text": "a bc\r\nz\n12\r34\nXYZ\npqr", "ranges": [[2, 3], [10, 11], [17, 16]], "primary": 0, "unnamed": ["b", "\r", "Z"], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "a bc\r\nz\n12\r34\nXYZ\npqr", "ranges": [[2, 3], [10, 11], [17, 16]], "primary": 0, "unnamed": ["b", "\r", "Z"], "search": null, "pending": [], "count": null, "document": "~/example.txt"}
+  ]},
+  {"name": "copy-across-separator-normal", "text": "a bc\r\nwxyz\n12\r4\nab界z\n", "events": [
+    {"key": "v", "mode": "Select", "text": "a bc\r\nwxyz\n12\r4\nab界z\n", "ranges": [[0, 1]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "3", "mode": "Select", "text": "a bc\r\nwxyz\n12\r4\nab界z\n", "ranges": [[0, 1]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": 3, "document": "~/example.txt"},
+    {"key": "l", "mode": "Select", "text": "a bc\r\nwxyz\n12\r4\nab界z\n", "ranges": [[0, 4]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<esc>", "mode": "Normal", "text": "a bc\r\nwxyz\n12\r4\nab界z\n", "ranges": [[0, 4]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "2", "mode": "Normal", "text": "a bc\r\nwxyz\n12\r4\nab界z\n", "ranges": [[0, 4]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": "C", "mode": "Normal", "text": "a bc\r\nwxyz\n12\r4\nab界z\n", "ranges": [[0, 4], [6, 10], [11, 15]], "primary": 2, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "a bc\r\nwxyz\n12\r4\nab界z\n", "ranges": [[0, 4], [6, 10], [11, 15]], "primary": 2, "unnamed": ["a bc", "wxyz", "12\r4"], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-;>", "mode": "Normal", "text": "a bc\r\nwxyz\n12\r4\nab界z\n", "ranges": [[4, 0], [10, 6], [15, 11]], "primary": 2, "unnamed": ["a bc", "wxyz", "12\r4"], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "2", "mode": "Normal", "text": "a bc\r\nwxyz\n12\r4\nab界z\n", "ranges": [[4, 0], [10, 6], [15, 11]], "primary": 2, "unnamed": ["a bc", "wxyz", "12\r4"], "search": null, "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": "<a-C>", "mode": "Normal", "text": "a bc\r\nwxyz\n12\r4\nab界z\n", "ranges": [[4, 0], [10, 6], [15, 11]], "primary": 0, "unnamed": ["a bc", "wxyz", "12\r4"], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "a bc\r\nwxyz\n12\r4\nab界z\n", "ranges": [[4, 0], [10, 6], [15, 11]], "primary": 0, "unnamed": ["a bc", "wxyz", "12\r4"], "search": null, "pending": [], "count": null, "document": "~/example.txt"}
+  ]},
+  {"name": "copy-at-top-normal", "text": "first\nother\nthird\n", "events": [
+    {"key": "4", "mode": "Normal", "text": "first\nother\nthird\n", "ranges": [[0, 1]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": 4, "document": "~/example.txt"},
+    {"key": "l", "mode": "Normal", "text": "first\nother\nthird\n", "ranges": [[4, 5]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "v", "mode": "Select", "text": "first\nother\nthird\n", "ranges": [[4, 5]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "j", "mode": "Select", "text": "first\nother\nthird\n", "ranges": [[4, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "3", "mode": "Select", "text": "first\nother\nthird\n", "ranges": [[4, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": 3, "document": "~/example.txt"},
+    {"key": "h", "mode": "Select", "text": "first\nother\nthird\n", "ranges": [[4, 8]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<esc>", "mode": "Normal", "text": "first\nother\nthird\n", "ranges": [[4, 8]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-;>", "mode": "Normal", "text": "first\nother\nthird\n", "ranges": [[8, 4]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "2", "mode": "Normal", "text": "first\nother\nthird\n", "ranges": [[8, 4]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": "<a-C>", "mode": "Normal", "text": "first\nother\nthird\n", "ranges": [[1, 8]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "first\nother\nthird\n", "ranges": [[1, 8]], "primary": 0, "unnamed": ["irst\not"], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "2", "mode": "Normal", "text": "first\nother\nthird\n", "ranges": [[1, 8]], "primary": 0, "unnamed": ["irst\not"], "search": null, "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": "C", "mode": "Normal", "text": "first\nother\nthird\n", "ranges": [[1, 8]], "primary": 0, "unnamed": ["irst\not"], "search": null, "pending": [], "count": null, "document": "~/example.txt"}
+  ]},
+  {"name": "copy-at-bottom-normal", "text": "alpha\nbravo", "events": [
+    {"key": "j", "mode": "Normal", "text": "alpha\nbravo", "ranges": [[6, 7]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "l", "mode": "Normal", "text": "alpha\nbravo", "ranges": [[7, 8]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-;>", "mode": "Normal", "text": "alpha\nbravo", "ranges": [[8, 7]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "2", "mode": "Normal", "text": "alpha\nbravo", "ranges": [[8, 7]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": "C", "mode": "Normal", "text": "alpha\nbravo", "ranges": [[8, 7]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "alpha\nbravo", "ranges": [[8, 7]], "primary": 0, "unnamed": ["r"], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-C>", "mode": "Normal", "text": "alpha\nbravo", "ranges": [[1, 2], [8, 7]], "primary": 0, "unnamed": ["r"], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "alpha\nbravo", "ranges": [[1, 2], [8, 7]], "primary": 0, "unnamed": ["l", "r"], "search": null, "pending": [], "count": null, "document": "~/example.txt"}
+  ]},
+  {"name": "merge-mixed-directions-normal", "text": "ab cd\nef gh", "events": [
+    {"key": "%", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "s", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "[", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "a", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "-", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "z", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": " ", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "]", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 1], [1, 2], [2, 3], [3, 4], [4, 5], [6, 7], [7, 8], [8, 9], [9, 10], [10, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<enter>", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 1], [1, 2], [2, 3], [3, 4], [4, 5], [6, 7], [7, 8], [8, 9], [9, 10], [10, 11]], "primary": 0, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-;>", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[1, 0], [2, 1], [3, 2], [4, 3], [5, 4], [7, 6], [8, 7], [9, 8], [10, 9], [11, 10]], "primary": 0, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "C", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[1, 0], [2, 1], [3, 2], [4, 3], [5, 4], [6, 7], [7, 8], [8, 9], [9, 10], [10, 11]], "primary": 5, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "3", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[1, 0], [2, 1], [3, 2], [4, 3], [5, 4], [6, 7], [7, 8], [8, 9], [9, 10], [10, 11]], "primary": 5, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": 3, "document": "~/example.txt"},
+    {"key": ")", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[1, 0], [2, 1], [3, 2], [4, 3], [5, 4], [6, 7], [7, 8], [8, 9], [9, 10], [10, 11]], "primary": 8, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "2", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[1, 0], [2, 1], [3, 2], [4, 3], [5, 4], [6, 7], [7, 8], [8, 9], [9, 10], [10, 11]], "primary": 8, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": "<a-_>", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[5, 0], [6, 11]], "primary": 1, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "2", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[5, 0], [6, 11]], "primary": 1, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": "<a-->", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 11]], "primary": 0, "unnamed": ["ab cd\nef gh"], "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "r", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 11]], "primary": 0, "unnamed": ["ab cd\nef gh"], "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "X", "mode": "Normal", "text": "XXXXXXXXXXX", "ranges": [[0, 11]], "primary": 0, "unnamed": ["ab cd\nef gh"], "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "u", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 11]], "primary": 0, "unnamed": ["ab cd\nef gh"], "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"}
+  ]},
+  {"name": "filter-mixed-directions-normal", "text": "ab cd\nef gh", "events": [
+    {"key": "%", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "s", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "[", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "a", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "-", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "z", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": " ", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "]", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 1], [1, 2], [2, 3], [3, 4], [4, 5], [6, 7], [7, 8], [8, 9], [9, 10], [10, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<enter>", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 1], [1, 2], [2, 3], [3, 4], [4, 5], [6, 7], [7, 8], [8, 9], [9, 10], [10, 11]], "primary": 0, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-;>", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[1, 0], [2, 1], [3, 2], [4, 3], [5, 4], [7, 6], [8, 7], [9, 8], [10, 9], [11, 10]], "primary": 0, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "C", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[1, 0], [2, 1], [3, 2], [4, 3], [5, 4], [6, 7], [7, 8], [8, 9], [9, 10], [10, 11]], "primary": 5, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "2", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[1, 0], [2, 1], [3, 2], [4, 3], [5, 4], [6, 7], [7, 8], [8, 9], [9, 10], [10, 11]], "primary": 5, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": ")", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[1, 0], [2, 1], [3, 2], [4, 3], [5, 4], [6, 7], [7, 8], [8, 9], [9, 10], [10, 11]], "primary": 7, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "3", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[1, 0], [2, 1], [3, 2], [4, 3], [5, 4], [6, 7], [7, 8], [8, 9], [9, 10], [10, 11]], "primary": 7, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": 3, "document": "~/example.txt"},
+    {"key": "_", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[1, 0], [2, 1], [4, 3], [5, 4], [6, 7], [7, 8], [9, 10], [10, 11]], "primary": 7, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "2", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[1, 0], [2, 1], [4, 3], [5, 4], [6, 7], [7, 8], [9, 10], [10, 11]], "primary": 7, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": "K", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[1, 0], [2, 1], [4, 3], [5, 4], [6, 7], [7, 8], [9, 10], [10, 11]], "primary": 7, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "[", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[1, 0], [2, 1], [4, 3], [5, 4], [6, 7], [7, 8], [9, 10], [10, 11]], "primary": 7, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "a", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[1, 0], [2, 1], [4, 3], [5, 4], [6, 7], [7, 8], [9, 10], [10, 11]], "primary": 7, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "e", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[1, 0], [2, 1], [4, 3], [5, 4], [6, 7], [7, 8], [9, 10], [10, 11]], "primary": 7, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "h", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[1, 0], [2, 1], [4, 3], [5, 4], [6, 7], [7, 8], [9, 10], [10, 11]], "primary": 7, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "]", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[1, 0], [6, 7], [10, 11]], "primary": 0, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<enter>", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[1, 0], [6, 7], [10, 11]], "primary": 0, "unnamed": null, "search": ["[aeh]", "[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-K>", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[1, 0], [6, 7], [10, 11]], "primary": 0, "unnamed": null, "search": ["[aeh]", "[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "e", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[1, 0], [10, 11]], "primary": 0, "unnamed": null, "search": ["[aeh]", "[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<enter>", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[1, 0], [10, 11]], "primary": 0, "unnamed": null, "search": ["e", "[aeh]", "[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-;>", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 1], [11, 10]], "primary": 0, "unnamed": null, "search": ["e", "[aeh]", "[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 1], [11, 10]], "primary": 0, "unnamed": ["a", "h"], "search": ["e", "[aeh]", "[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"}
+  ]},
+  {"name": "merge-ranges-select", "text": "ab cd! ef", "events": [
+    {"key": "%", "mode": "Normal", "text": "ab cd! ef", "ranges": [[0, 9]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "s", "mode": "Normal", "text": "ab cd! ef", "ranges": [[0, 9]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "[", "mode": "Normal", "text": "ab cd! ef", "ranges": [[0, 9]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "a", "mode": "Normal", "text": "ab cd! ef", "ranges": [[0, 9]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "-", "mode": "Normal", "text": "ab cd! ef", "ranges": [[0, 9]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "z", "mode": "Normal", "text": "ab cd! ef", "ranges": [[0, 9]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "]", "mode": "Normal", "text": "ab cd! ef", "ranges": [[0, 1], [1, 2], [3, 4], [4, 5], [7, 8], [8, 9]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "+", "mode": "Normal", "text": "ab cd! ef", "ranges": [[0, 2], [3, 5], [7, 9]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "|", "mode": "Normal", "text": "ab cd! ef", "ranges": [[0, 2], [3, 5], [6, 7], [7, 9]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": " ", "mode": "Normal", "text": "ab cd! ef", "ranges": [[0, 2], [2, 3], [3, 5], [6, 7], [7, 9]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "+", "mode": "Normal", "text": "ab cd! ef", "ranges": [[0, 2], [2, 3], [3, 5], [6, 7], [7, 9]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<enter>", "mode": "Normal", "text": "ab cd! ef", "ranges": [[0, 2], [2, 3], [3, 5], [6, 7], [7, 9]], "primary": 0, "unnamed": null, "search": ["[a-z]+| +"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "v", "mode": "Select", "text": "ab cd! ef", "ranges": [[0, 2], [2, 3], [3, 5], [6, 7], [7, 9]], "primary": 0, "unnamed": null, "search": ["[a-z]+| +"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "2", "mode": "Select", "text": "ab cd! ef", "ranges": [[0, 2], [2, 3], [3, 5], [6, 7], [7, 9]], "primary": 0, "unnamed": null, "search": ["[a-z]+| +"], "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": ")", "mode": "Select", "text": "ab cd! ef", "ranges": [[0, 2], [2, 3], [3, 5], [6, 7], [7, 9]], "primary": 2, "unnamed": null, "search": ["[a-z]+| +"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-;>", "mode": "Select", "text": "ab cd! ef", "ranges": [[2, 0], [3, 2], [5, 3], [7, 6], [9, 7]], "primary": 2, "unnamed": null, "search": ["[a-z]+| +"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "3", "mode": "Select", "text": "ab cd! ef", "ranges": [[2, 0], [3, 2], [5, 3], [7, 6], [9, 7]], "primary": 2, "unnamed": null, "search": ["[a-z]+| +"], "pending": [], "count": 3, "document": "~/example.txt"},
+    {"key": "<a-_>", "mode": "Select", "text": "ab cd! ef", "ranges": [[5, 0], [9, 6]], "primary": 0, "unnamed": null, "search": ["[a-z]+| +"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "ab cd! ef", "ranges": [[5, 0], [9, 6]], "primary": 0, "unnamed": ["ab cd", " ef"], "search": ["[a-z]+| +"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "2", "mode": "Normal", "text": "ab cd! ef", "ranges": [[5, 0], [9, 6]], "primary": 0, "unnamed": ["ab cd", " ef"], "search": ["[a-z]+| +"], "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": "<a-->", "mode": "Normal", "text": "ab cd! ef", "ranges": [[9, 0]], "primary": 0, "unnamed": ["ab cd", " ef"], "search": ["[a-z]+| +"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "ab cd! ef", "ranges": [[9, 0]], "primary": 0, "unnamed": ["ab cd! ef"], "search": ["[a-z]+| +"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "r", "mode": "Normal", "text": "ab cd! ef", "ranges": [[9, 0]], "primary": 0, "unnamed": ["ab cd! ef"], "search": ["[a-z]+| +"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "X", "mode": "Normal", "text": "XXXXXXXXX", "ranges": [[9, 0]], "primary": 0, "unnamed": ["ab cd! ef"], "search": ["[a-z]+| +"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "u", "mode": "Normal", "text": "ab cd! ef", "ranges": [[9, 0]], "primary": 0, "unnamed": ["ab cd! ef"], "search": ["[a-z]+| +"], "pending": [], "count": null, "document": "~/example.txt"}
+  ]},
+  {"name": "trim-ranges-select", "text": " aa ,   , bb , cc ", "events": [
+    {"key": "%", "mode": "Normal", "text": " aa ,   , bb , cc ", "ranges": [[0, 18]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "S", "mode": "Normal", "text": " aa ,   , bb , cc ", "ranges": [[0, 18]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": ",", "mode": "Normal", "text": " aa ,   , bb , cc ", "ranges": [[0, 4], [5, 8], [9, 13], [14, 18]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<enter>", "mode": "Normal", "text": " aa ,   , bb , cc ", "ranges": [[0, 4], [5, 8], [9, 13], [14, 18]], "primary": 0, "unnamed": null, "search": [","], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "v", "mode": "Select", "text": " aa ,   , bb , cc ", "ranges": [[0, 4], [5, 8], [9, 13], [14, 18]], "primary": 0, "unnamed": null, "search": [","], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": ")", "mode": "Select", "text": " aa ,   , bb , cc ", "ranges": [[0, 4], [5, 8], [9, 13], [14, 18]], "primary": 1, "unnamed": null, "search": [","], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-;>", "mode": "Select", "text": " aa ,   , bb , cc ", "ranges": [[4, 0], [8, 5], [13, 9], [18, 14]], "primary": 1, "unnamed": null, "search": [","], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "3", "mode": "Select", "text": " aa ,   , bb , cc ", "ranges": [[4, 0], [8, 5], [13, 9], [18, 14]], "primary": 1, "unnamed": null, "search": [","], "pending": [], "count": 3, "document": "~/example.txt"},
+    {"key": "_", "mode": "Select", "text": " aa ,   , bb , cc ", "ranges": [[3, 1], [12, 10], [17, 15]], "primary": 2, "unnamed": null, "search": [","], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": " aa ,   , bb , cc ", "ranges": [[3, 1], [12, 10], [17, 15]], "primary": 2, "unnamed": ["aa", "bb", "cc"], "search": [","], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "9", "mode": "Normal", "text": " aa ,   , bb , cc ", "ranges": [[3, 1], [12, 10], [17, 15]], "primary": 2, "unnamed": ["aa", "bb", "cc"], "search": [","], "pending": [], "count": 9, "document": "~/example.txt"},
+    {"key": "(", "mode": "Normal", "text": " aa ,   , bb , cc ", "ranges": [[3, 1], [12, 10], [17, 15]], "primary": 2, "unnamed": ["aa", "bb", "cc"], "search": [","], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "2", "mode": "Normal", "text": " aa ,   , bb , cc ", "ranges": [[3, 1], [12, 10], [17, 15]], "primary": 2, "unnamed": ["aa", "bb", "cc"], "search": [","], "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": ")", "mode": "Normal", "text": " aa ,   , bb , cc ", "ranges": [[3, 1], [12, 10], [17, 15]], "primary": 1, "unnamed": ["aa", "bb", "cc"], "search": [","], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-,>", "mode": "Normal", "text": " aa ,   , bb , cc ", "ranges": [[3, 1], [17, 15]], "primary": 1, "unnamed": ["aa", "bb", "cc"], "search": [","], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": ",", "mode": "Normal", "text": " aa ,   , bb , cc ", "ranges": [[17, 15]], "primary": 0, "unnamed": ["aa", "bb", "cc"], "search": [","], "pending": [], "count": null, "document": "~/example.txt"}
+  ]},
+  {"name": "trim-whitespace-select", "text": "  ,   ,  ", "events": [
+    {"key": "%", "mode": "Normal", "text": "  ,   ,  ", "ranges": [[0, 9]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "S", "mode": "Normal", "text": "  ,   ,  ", "ranges": [[0, 9]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": ",", "mode": "Normal", "text": "  ,   ,  ", "ranges": [[0, 2], [3, 6], [7, 9]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<enter>", "mode": "Normal", "text": "  ,   ,  ", "ranges": [[0, 2], [3, 6], [7, 9]], "primary": 0, "unnamed": null, "search": [","], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "v", "mode": "Select", "text": "  ,   ,  ", "ranges": [[0, 2], [3, 6], [7, 9]], "primary": 0, "unnamed": null, "search": [","], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": ")", "mode": "Select", "text": "  ,   ,  ", "ranges": [[0, 2], [3, 6], [7, 9]], "primary": 1, "unnamed": null, "search": [","], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-;>", "mode": "Select", "text": "  ,   ,  ", "ranges": [[2, 0], [6, 3], [9, 7]], "primary": 1, "unnamed": null, "search": [","], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "3", "mode": "Select", "text": "  ,   ,  ", "ranges": [[2, 0], [6, 3], [9, 7]], "primary": 1, "unnamed": null, "search": [","], "pending": [], "count": 3, "document": "~/example.txt"},
+    {"key": "_", "mode": "Select", "text": "  ,   ,  ", "ranges": [[3, 4]], "primary": 0, "unnamed": null, "search": [","], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "  ,   ,  ", "ranges": [[3, 4]], "primary": 0, "unnamed": [" "], "search": [","], "pending": [], "count": null, "document": "~/example.txt"}
+  ]},
+  {"name": "filter-ranges-select", "text": "ax bx cx dx", "events": [
+    {"key": "%", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "s", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "[", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "a", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "-", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "z", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "]", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[0, 1], [1, 2], [3, 4], [4, 5], [6, 7], [7, 8], [9, 10], [10, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "+", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[0, 2], [3, 5], [6, 8], [9, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<enter>", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[0, 2], [3, 5], [6, 8], [9, 11]], "primary": 0, "unnamed": null, "search": ["[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "v", "mode": "Select", "text": "ax bx cx dx", "ranges": [[0, 2], [3, 5], [6, 8], [9, 11]], "primary": 0, "unnamed": null, "search": ["[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "2", "mode": "Select", "text": "ax bx cx dx", "ranges": [[0, 2], [3, 5], [6, 8], [9, 11]], "primary": 0, "unnamed": null, "search": ["[a-z]+"], "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": ")", "mode": "Select", "text": "ax bx cx dx", "ranges": [[0, 2], [3, 5], [6, 8], [9, 11]], "primary": 2, "unnamed": null, "search": ["[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-;>", "mode": "Select", "text": "ax bx cx dx", "ranges": [[2, 0], [5, 3], [8, 6], [11, 9]], "primary": 2, "unnamed": null, "search": ["[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "3", "mode": "Select", "text": "ax bx cx dx", "ranges": [[2, 0], [5, 3], [8, 6], [11, 9]], "primary": 2, "unnamed": null, "search": ["[a-z]+"], "pending": [], "count": 3, "document": "~/example.txt"},
+    {"key": "K", "mode": "Select", "text": "ax bx cx dx", "ranges": [[2, 0], [5, 3], [8, 6], [11, 9]], "primary": 2, "unnamed": null, "search": ["[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "[", "mode": "Select", "text": "ax bx cx dx", "ranges": [[2, 0], [5, 3], [8, 6], [11, 9]], "primary": 2, "unnamed": null, "search": ["[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "a", "mode": "Select", "text": "ax bx cx dx", "ranges": [[2, 0], [5, 3], [8, 6], [11, 9]], "primary": 2, "unnamed": null, "search": ["[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "c", "mode": "Select", "text": "ax bx cx dx", "ranges": [[2, 0], [5, 3], [8, 6], [11, 9]], "primary": 2, "unnamed": null, "search": ["[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "]", "mode": "Select", "text": "ax bx cx dx", "ranges": [[2, 0], [8, 6]], "primary": 0, "unnamed": null, "search": ["[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<enter>", "mode": "Select", "text": "ax bx cx dx", "ranges": [[2, 0], [8, 6]], "primary": 0, "unnamed": null, "search": ["[ac]", "[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-K>", "mode": "Select", "text": "ax bx cx dx", "ranges": [[2, 0], [8, 6]], "primary": 0, "unnamed": null, "search": ["[ac]", "[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "a", "mode": "Select", "text": "ax bx cx dx", "ranges": [[8, 6]], "primary": 0, "unnamed": null, "search": ["[ac]", "[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<enter>", "mode": "Select", "text": "ax bx cx dx", "ranges": [[8, 6]], "primary": 0, "unnamed": null, "search": ["a", "[ac]", "[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "K", "mode": "Select", "text": "ax bx cx dx", "ranges": [[8, 6]], "primary": 0, "unnamed": null, "search": ["a", "[ac]", "[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "z", "mode": "Select", "text": "ax bx cx dx", "ranges": [[8, 6]], "primary": 0, "unnamed": null, "search": ["a", "[ac]", "[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<enter>", "mode": "Select", "text": "ax bx cx dx", "ranges": [[8, 6]], "primary": 0, "unnamed": null, "search": ["z", "a", "[ac]", "[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-,>", "mode": "Select", "text": "ax bx cx dx", "ranges": [[8, 6]], "primary": 0, "unnamed": null, "search": ["z", "a", "[ac]", "[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "ax bx cx dx", "ranges": [[8, 6]], "primary": 0, "unnamed": ["cx"], "search": ["z", "a", "[ac]", "[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"}
+  ]},
+  {"name": "copy-multiline-select", "text": "abc\ndef\nghi\njkl\nmno", "events": [
+    {"key": "j", "mode": "Normal", "text": "abc\ndef\nghi\njkl\nmno", "ranges": [[4, 5]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "l", "mode": "Normal", "text": "abc\ndef\nghi\njkl\nmno", "ranges": [[5, 6]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "v", "mode": "Select", "text": "abc\ndef\nghi\njkl\nmno", "ranges": [[5, 6]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "j", "mode": "Select", "text": "abc\ndef\nghi\njkl\nmno", "ranges": [[5, 10]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<esc>", "mode": "Normal", "text": "abc\ndef\nghi\njkl\nmno", "ranges": [[5, 10]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "v", "mode": "Select", "text": "abc\ndef\nghi\njkl\nmno", "ranges": [[5, 10]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-;>", "mode": "Select", "text": "abc\ndef\nghi\njkl\nmno", "ranges": [[10, 5]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "3", "mode": "Select", "text": "abc\ndef\nghi\njkl\nmno", "ranges": [[10, 5]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": 3, "document": "~/example.txt"},
+    {"key": "<a-C>", "mode": "Select", "text": "abc\ndef\nghi\njkl\nmno", "ranges": [[1, 2], [10, 5]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "abc\ndef\nghi\njkl\nmno", "ranges": [[1, 2], [10, 5]], "primary": 0, "unnamed": ["b", "ef\ngh"], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "2", "mode": "Normal", "text": "abc\ndef\nghi\njkl\nmno", "ranges": [[1, 2], [10, 5]], "primary": 0, "unnamed": ["b", "ef\ngh"], "search": null, "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": "C", "mode": "Normal", "text": "abc\ndef\nghi\njkl\nmno", "ranges": [[1, 2], [5, 10], [18, 13]], "primary": 1, "unnamed": ["b", "ef\ngh"], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "abc\ndef\nghi\njkl\nmno", "ranges": [[1, 2], [5, 10], [18, 13]], "primary": 1, "unnamed": ["b", "ef\ngh", "kl\nmn"], "search": null, "pending": [], "count": null, "document": "~/example.txt"}
+  ]},
+  {"name": "copy-columns-select", "text": "é界z\n\tQ\nA\n12好x\nabcde\n", "events": [
+    {"key": "l", "mode": "Normal", "text": "é界z\n\tQ\nA\n12好x\nabcde\n", "ranges": [[2, 3]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "l", "mode": "Normal", "text": "é界z\n\tQ\nA\n12好x\nabcde\n", "ranges": [[3, 4]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "v", "mode": "Select", "text": "é界z\n\tQ\nA\n12好x\nabcde\n", "ranges": [[3, 4]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "3", "mode": "Select", "text": "é界z\n\tQ\nA\n12好x\nabcde\n", "ranges": [[3, 4]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": 3, "document": "~/example.txt"},
+    {"key": "C", "mode": "Select", "text": "é界z\n\tQ\nA\n12好x\nabcde\n", "ranges": [[3, 4], [18, 19]], "primary": 1, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "é界z\n\tQ\nA\n12好x\nabcde\n", "ranges": [[3, 4], [18, 19]], "primary": 1, "unnamed": ["z", "d"], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-;>", "mode": "Normal", "text": "é界z\n\tQ\nA\n12好x\nabcde\n", "ranges": [[4, 3], [19, 18]], "primary": 1, "unnamed": ["z", "d"], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "4", "mode": "Normal", "text": "é界z\n\tQ\nA\n12好x\nabcde\n", "ranges": [[4, 3], [19, 18]], "primary": 1, "unnamed": ["z", "d"], "search": null, "pending": [], "count": 4, "document": "~/example.txt"},
+    {"key": "<a-C>", "mode": "Normal", "text": "é界z\n\tQ\nA\n12好x\nabcde\n", "ranges": [[3, 4], [19, 18]], "primary": 0, "unnamed": ["z", "d"], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "é界z\n\tQ\nA\n12好x\nabcde\n", "ranges": [[3, 4], [19, 18]], "primary": 0, "unnamed": ["z", "d"], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": ",", "mode": "Normal", "text": "é界z\n\tQ\nA\n12好x\nabcde\n", "ranges": [[3, 4]], "primary": 0, "unnamed": ["z", "d"], "search": null, "pending": [], "count": null, "document": "~/example.txt"}
+  ]},
+  {"name": "copy-mixed-lines-select", "text": "a bc\r\nz\n12\r34\nXYZ\npqr", "events": [
+    {"key": "l", "mode": "Normal", "text": "a bc\r\nz\n12\r34\nXYZ\npqr", "ranges": [[1, 2]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "l", "mode": "Normal", "text": "a bc\r\nz\n12\r34\nXYZ\npqr", "ranges": [[2, 3]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "v", "mode": "Select", "text": "a bc\r\nz\n12\r34\nXYZ\npqr", "ranges": [[2, 3]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "2", "mode": "Select", "text": "a bc\r\nz\n12\r34\nXYZ\npqr", "ranges": [[2, 3]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": "C", "mode": "Select", "text": "a bc\r\nz\n12\r34\nXYZ\npqr", "ranges": [[2, 3], [10, 11], [16, 17]], "primary": 2, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "a bc\r\nz\n12\r34\nXYZ\npqr", "ranges": [[2, 3], [10, 11], [16, 17]], "primary": 2, "unnamed": ["b", "\r", "Z"], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-;>", "mode": "Normal", "text": "a bc\r\nz\n12\r34\nXYZ\npqr", "ranges": [[3, 2], [11, 10], [17, 16]], "primary": 2, "unnamed": ["b", "\r", "Z"], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "3", "mode": "Normal", "text": "a bc\r\nz\n12\r34\nXYZ\npqr", "ranges": [[3, 2], [11, 10], [17, 16]], "primary": 2, "unnamed": ["b", "\r", "Z"], "search": null, "pending": [], "count": 3, "document": "~/example.txt"},
+    {"key": "<a-C>", "mode": "Normal", "text": "a bc\r\nz\n12\r34\nXYZ\npqr", "ranges": [[2, 3], [10, 11], [17, 16]], "primary": 0, "unnamed": ["b", "\r", "Z"], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "a bc\r\nz\n12\r34\nXYZ\npqr", "ranges": [[2, 3], [10, 11], [17, 16]], "primary": 0, "unnamed": ["b", "\r", "Z"], "search": null, "pending": [], "count": null, "document": "~/example.txt"}
+  ]},
+  {"name": "copy-across-separator-select", "text": "a bc\r\nwxyz\n12\r4\nab界z\n", "events": [
+    {"key": "v", "mode": "Select", "text": "a bc\r\nwxyz\n12\r4\nab界z\n", "ranges": [[0, 1]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "3", "mode": "Select", "text": "a bc\r\nwxyz\n12\r4\nab界z\n", "ranges": [[0, 1]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": 3, "document": "~/example.txt"},
+    {"key": "l", "mode": "Select", "text": "a bc\r\nwxyz\n12\r4\nab界z\n", "ranges": [[0, 4]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<esc>", "mode": "Normal", "text": "a bc\r\nwxyz\n12\r4\nab界z\n", "ranges": [[0, 4]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "v", "mode": "Select", "text": "a bc\r\nwxyz\n12\r4\nab界z\n", "ranges": [[0, 4]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "2", "mode": "Select", "text": "a bc\r\nwxyz\n12\r4\nab界z\n", "ranges": [[0, 4]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": "C", "mode": "Select", "text": "a bc\r\nwxyz\n12\r4\nab界z\n", "ranges": [[0, 4], [6, 10], [11, 15]], "primary": 2, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "a bc\r\nwxyz\n12\r4\nab界z\n", "ranges": [[0, 4], [6, 10], [11, 15]], "primary": 2, "unnamed": ["a bc", "wxyz", "12\r4"], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-;>", "mode": "Normal", "text": "a bc\r\nwxyz\n12\r4\nab界z\n", "ranges": [[4, 0], [10, 6], [15, 11]], "primary": 2, "unnamed": ["a bc", "wxyz", "12\r4"], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "2", "mode": "Normal", "text": "a bc\r\nwxyz\n12\r4\nab界z\n", "ranges": [[4, 0], [10, 6], [15, 11]], "primary": 2, "unnamed": ["a bc", "wxyz", "12\r4"], "search": null, "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": "<a-C>", "mode": "Normal", "text": "a bc\r\nwxyz\n12\r4\nab界z\n", "ranges": [[4, 0], [10, 6], [15, 11]], "primary": 0, "unnamed": ["a bc", "wxyz", "12\r4"], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "a bc\r\nwxyz\n12\r4\nab界z\n", "ranges": [[4, 0], [10, 6], [15, 11]], "primary": 0, "unnamed": ["a bc", "wxyz", "12\r4"], "search": null, "pending": [], "count": null, "document": "~/example.txt"}
+  ]},
+  {"name": "copy-at-top-select", "text": "first\nother\nthird\n", "events": [
+    {"key": "4", "mode": "Normal", "text": "first\nother\nthird\n", "ranges": [[0, 1]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": 4, "document": "~/example.txt"},
+    {"key": "l", "mode": "Normal", "text": "first\nother\nthird\n", "ranges": [[4, 5]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "v", "mode": "Select", "text": "first\nother\nthird\n", "ranges": [[4, 5]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "j", "mode": "Select", "text": "first\nother\nthird\n", "ranges": [[4, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "3", "mode": "Select", "text": "first\nother\nthird\n", "ranges": [[4, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": 3, "document": "~/example.txt"},
+    {"key": "h", "mode": "Select", "text": "first\nother\nthird\n", "ranges": [[4, 8]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<esc>", "mode": "Normal", "text": "first\nother\nthird\n", "ranges": [[4, 8]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "v", "mode": "Select", "text": "first\nother\nthird\n", "ranges": [[4, 8]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-;>", "mode": "Select", "text": "first\nother\nthird\n", "ranges": [[8, 4]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "2", "mode": "Select", "text": "first\nother\nthird\n", "ranges": [[8, 4]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": "<a-C>", "mode": "Select", "text": "first\nother\nthird\n", "ranges": [[1, 8]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "first\nother\nthird\n", "ranges": [[1, 8]], "primary": 0, "unnamed": ["irst\not"], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "2", "mode": "Normal", "text": "first\nother\nthird\n", "ranges": [[1, 8]], "primary": 0, "unnamed": ["irst\not"], "search": null, "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": "C", "mode": "Normal", "text": "first\nother\nthird\n", "ranges": [[1, 8]], "primary": 0, "unnamed": ["irst\not"], "search": null, "pending": [], "count": null, "document": "~/example.txt"}
+  ]},
+  {"name": "copy-at-bottom-select", "text": "alpha\nbravo", "events": [
+    {"key": "j", "mode": "Normal", "text": "alpha\nbravo", "ranges": [[6, 7]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "l", "mode": "Normal", "text": "alpha\nbravo", "ranges": [[7, 8]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "v", "mode": "Select", "text": "alpha\nbravo", "ranges": [[7, 8]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-;>", "mode": "Select", "text": "alpha\nbravo", "ranges": [[8, 7]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "2", "mode": "Select", "text": "alpha\nbravo", "ranges": [[8, 7]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": "C", "mode": "Select", "text": "alpha\nbravo", "ranges": [[8, 7]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "alpha\nbravo", "ranges": [[8, 7]], "primary": 0, "unnamed": ["r"], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-C>", "mode": "Normal", "text": "alpha\nbravo", "ranges": [[1, 2], [8, 7]], "primary": 0, "unnamed": ["r"], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "alpha\nbravo", "ranges": [[1, 2], [8, 7]], "primary": 0, "unnamed": ["l", "r"], "search": null, "pending": [], "count": null, "document": "~/example.txt"}
+  ]},
+  {"name": "merge-mixed-directions-select", "text": "ab cd\nef gh", "events": [
+    {"key": "%", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "s", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "[", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "a", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "-", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "z", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": " ", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "]", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 1], [1, 2], [2, 3], [3, 4], [4, 5], [6, 7], [7, 8], [8, 9], [9, 10], [10, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<enter>", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 1], [1, 2], [2, 3], [3, 4], [4, 5], [6, 7], [7, 8], [8, 9], [9, 10], [10, 11]], "primary": 0, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "v", "mode": "Select", "text": "ab cd\nef gh", "ranges": [[0, 1], [1, 2], [2, 3], [3, 4], [4, 5], [6, 7], [7, 8], [8, 9], [9, 10], [10, 11]], "primary": 0, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-;>", "mode": "Select", "text": "ab cd\nef gh", "ranges": [[1, 0], [2, 1], [3, 2], [4, 3], [5, 4], [7, 6], [8, 7], [9, 8], [10, 9], [11, 10]], "primary": 0, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "C", "mode": "Select", "text": "ab cd\nef gh", "ranges": [[1, 0], [2, 1], [3, 2], [4, 3], [5, 4], [6, 7], [7, 8], [8, 9], [9, 10], [10, 11]], "primary": 5, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "3", "mode": "Select", "text": "ab cd\nef gh", "ranges": [[1, 0], [2, 1], [3, 2], [4, 3], [5, 4], [6, 7], [7, 8], [8, 9], [9, 10], [10, 11]], "primary": 5, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": 3, "document": "~/example.txt"},
+    {"key": ")", "mode": "Select", "text": "ab cd\nef gh", "ranges": [[1, 0], [2, 1], [3, 2], [4, 3], [5, 4], [6, 7], [7, 8], [8, 9], [9, 10], [10, 11]], "primary": 8, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "2", "mode": "Select", "text": "ab cd\nef gh", "ranges": [[1, 0], [2, 1], [3, 2], [4, 3], [5, 4], [6, 7], [7, 8], [8, 9], [9, 10], [10, 11]], "primary": 8, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": "<a-_>", "mode": "Select", "text": "ab cd\nef gh", "ranges": [[5, 0], [6, 11]], "primary": 1, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "2", "mode": "Select", "text": "ab cd\nef gh", "ranges": [[5, 0], [6, 11]], "primary": 1, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": "<a-->", "mode": "Select", "text": "ab cd\nef gh", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 11]], "primary": 0, "unnamed": ["ab cd\nef gh"], "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "r", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 11]], "primary": 0, "unnamed": ["ab cd\nef gh"], "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "X", "mode": "Normal", "text": "XXXXXXXXXXX", "ranges": [[0, 11]], "primary": 0, "unnamed": ["ab cd\nef gh"], "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "u", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 11]], "primary": 0, "unnamed": ["ab cd\nef gh"], "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"}
+  ]},
+  {"name": "filter-mixed-directions-select", "text": "ab cd\nef gh", "events": [
+    {"key": "%", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "s", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "[", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "a", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "-", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "z", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": " ", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "]", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 1], [1, 2], [2, 3], [3, 4], [4, 5], [6, 7], [7, 8], [8, 9], [9, 10], [10, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<enter>", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 1], [1, 2], [2, 3], [3, 4], [4, 5], [6, 7], [7, 8], [8, 9], [9, 10], [10, 11]], "primary": 0, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "v", "mode": "Select", "text": "ab cd\nef gh", "ranges": [[0, 1], [1, 2], [2, 3], [3, 4], [4, 5], [6, 7], [7, 8], [8, 9], [9, 10], [10, 11]], "primary": 0, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-;>", "mode": "Select", "text": "ab cd\nef gh", "ranges": [[1, 0], [2, 1], [3, 2], [4, 3], [5, 4], [7, 6], [8, 7], [9, 8], [10, 9], [11, 10]], "primary": 0, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "C", "mode": "Select", "text": "ab cd\nef gh", "ranges": [[1, 0], [2, 1], [3, 2], [4, 3], [5, 4], [6, 7], [7, 8], [8, 9], [9, 10], [10, 11]], "primary": 5, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "2", "mode": "Select", "text": "ab cd\nef gh", "ranges": [[1, 0], [2, 1], [3, 2], [4, 3], [5, 4], [6, 7], [7, 8], [8, 9], [9, 10], [10, 11]], "primary": 5, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": ")", "mode": "Select", "text": "ab cd\nef gh", "ranges": [[1, 0], [2, 1], [3, 2], [4, 3], [5, 4], [6, 7], [7, 8], [8, 9], [9, 10], [10, 11]], "primary": 7, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "3", "mode": "Select", "text": "ab cd\nef gh", "ranges": [[1, 0], [2, 1], [3, 2], [4, 3], [5, 4], [6, 7], [7, 8], [8, 9], [9, 10], [10, 11]], "primary": 7, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": 3, "document": "~/example.txt"},
+    {"key": "_", "mode": "Select", "text": "ab cd\nef gh", "ranges": [[1, 0], [2, 1], [4, 3], [5, 4], [6, 7], [7, 8], [9, 10], [10, 11]], "primary": 7, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "2", "mode": "Select", "text": "ab cd\nef gh", "ranges": [[1, 0], [2, 1], [4, 3], [5, 4], [6, 7], [7, 8], [9, 10], [10, 11]], "primary": 7, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": "K", "mode": "Select", "text": "ab cd\nef gh", "ranges": [[1, 0], [2, 1], [4, 3], [5, 4], [6, 7], [7, 8], [9, 10], [10, 11]], "primary": 7, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "[", "mode": "Select", "text": "ab cd\nef gh", "ranges": [[1, 0], [2, 1], [4, 3], [5, 4], [6, 7], [7, 8], [9, 10], [10, 11]], "primary": 7, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "a", "mode": "Select", "text": "ab cd\nef gh", "ranges": [[1, 0], [2, 1], [4, 3], [5, 4], [6, 7], [7, 8], [9, 10], [10, 11]], "primary": 7, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "e", "mode": "Select", "text": "ab cd\nef gh", "ranges": [[1, 0], [2, 1], [4, 3], [5, 4], [6, 7], [7, 8], [9, 10], [10, 11]], "primary": 7, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "h", "mode": "Select", "text": "ab cd\nef gh", "ranges": [[1, 0], [2, 1], [4, 3], [5, 4], [6, 7], [7, 8], [9, 10], [10, 11]], "primary": 7, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "]", "mode": "Select", "text": "ab cd\nef gh", "ranges": [[1, 0], [6, 7], [10, 11]], "primary": 0, "unnamed": null, "search": ["[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<enter>", "mode": "Select", "text": "ab cd\nef gh", "ranges": [[1, 0], [6, 7], [10, 11]], "primary": 0, "unnamed": null, "search": ["[aeh]", "[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-K>", "mode": "Select", "text": "ab cd\nef gh", "ranges": [[1, 0], [6, 7], [10, 11]], "primary": 0, "unnamed": null, "search": ["[aeh]", "[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "e", "mode": "Select", "text": "ab cd\nef gh", "ranges": [[1, 0], [10, 11]], "primary": 0, "unnamed": null, "search": ["[aeh]", "[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<enter>", "mode": "Select", "text": "ab cd\nef gh", "ranges": [[1, 0], [10, 11]], "primary": 0, "unnamed": null, "search": ["e", "[aeh]", "[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-;>", "mode": "Select", "text": "ab cd\nef gh", "ranges": [[0, 1], [11, 10]], "primary": 0, "unnamed": null, "search": ["e", "[aeh]", "[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "ab cd\nef gh", "ranges": [[0, 1], [11, 10]], "primary": 0, "unnamed": ["a", "h"], "search": ["e", "[aeh]", "[a-z ]"], "pending": [], "count": null, "document": "~/example.txt"}
+  ]},
+  {"name": "word-from-reversed-crlf", "text": "a\r\n", "events": [
+    {"key": "f", "mode": "Normal", "text": "a\r\n", "ranges": [[0, 1]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<enter>", "mode": "Normal", "text": "a\r\n", "ranges": [[0, 3]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": ";", "mode": "Normal", "text": "a\r\n", "ranges": [[1, 3]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-;>", "mode": "Normal", "text": "a\r\n", "ranges": [[3, 1]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "E", "mode": "Normal", "text": "a\r\n", "ranges": [[3, 3]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "v", "mode": "Select", "text": "a\r\n", "ranges": [[1, 3]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "w", "mode": "Select", "text": "a\r\n", "ranges": [[1, 3]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "b", "mode": "Select", "text": "a\r\n", "ranges": [[3, 0]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<esc>", "mode": "Normal", "text": "a\r\n", "ranges": [[3, 0]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"}
+  ]},
+  {"name": "copy-eof", "text": "ab\ncd\n", "events": [
+    {"key": "g", "mode": "Normal", "text": "ab\ncd\n", "ranges": [[0, 1]], "primary": 0, "unnamed": null, "search": null, "pending": ["g"], "count": null, "document": "~/example.txt"},
+    {"key": "e", "mode": "Normal", "text": "ab\ncd\n", "ranges": [[3, 4]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "2", "mode": "Normal", "text": "ab\ncd\n", "ranges": [[3, 4]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": "<a-C>", "mode": "Normal", "text": "ab\ncd\n", "ranges": [[0, 1], [3, 4]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "ab\ncd\n", "ranges": [[0, 1], [3, 4]], "primary": 0, "unnamed": ["a", "c"], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-;>", "mode": "Normal", "text": "ab\ncd\n", "ranges": [[1, 0], [4, 3]], "primary": 0, "unnamed": ["a", "c"], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "2", "mode": "Normal", "text": "ab\ncd\n", "ranges": [[1, 0], [4, 3]], "primary": 0, "unnamed": ["a", "c"], "search": null, "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": "C", "mode": "Normal", "text": "ab\ncd\n", "ranges": [[1, 0], [3, 4], [6, 6]], "primary": 2, "unnamed": ["a", "c"], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "ab\ncd\n", "ranges": [[1, 0], [3, 4], [6, 6]], "primary": 2, "unnamed": ["a", "c", ""], "search": null, "pending": [], "count": null, "document": "~/example.txt"}
+  ]},
   {"name": "typed-selection", "text": "abcd\n", "events": [
     {"key": "e", "mode": "Normal", "text": "abcd\n", "ranges": [[0, 4]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
     {"key": "l", "mode": "Normal", "text": "abcd\n", "ranges": [[4, 5]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},

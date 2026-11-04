@@ -85,6 +85,11 @@ pub(crate) fn word(
         } else {
             span.head.checked_sub(1).and_then(|i| text.get_char(i))
         };
+        // A reversed range on the final line ending starts a forward scan
+        // at EOF. The newline still resets the anchor when no character follows.
+        if previous == Some('\n') {
+            span.anchor = span.head;
+        }
         let mut at_start = true;
         let mut skipping_lines = true;
         while let Some(ch) = if backward { chars.prev() } else { chars.next() } {
@@ -97,9 +102,6 @@ pub(crate) fn word(
                 span.anchor = span.head;
                 previous = Some(ch);
                 continue;
-            }
-            if skipping_lines && previous == Some('\n') {
-                span.anchor = span.head;
             }
             skipping_lines = false;
             let hit = previous.is_none_or(|prev| {
@@ -158,9 +160,14 @@ fn logical_start(text: RopeSlice<'_>, pos: usize) -> usize {
 }
 
 fn move_lines(text: RopeSlice<'_>, start: usize, down: bool, count: usize) -> usize {
+    shift_lines(text, start, down, count).0
+}
+
+// Return how many logical lines were actually crossed before reaching the edge.
+fn shift_lines(text: RopeSlice<'_>, start: usize, down: bool, count: usize) -> (usize, usize) {
     let mut pos = start;
+    let mut left = count;
     if down {
-        let mut left = count;
         let mut end = start;
         for line in text.lines_at(text.char_to_line(start)) {
             if left == 0 {
@@ -179,9 +186,10 @@ fn move_lines(text: RopeSlice<'_>, start: usize, down: bool, count: usize) -> us
                 break;
             }
             pos = logical_start(text, pos - 1);
+            left -= 1;
         }
     }
-    pos
+    (pos, count - left)
 }
 
 fn logical_end(text: RopeSlice<'_>, start: usize) -> usize {
@@ -515,6 +523,49 @@ pub fn cell_width(grapheme: &str, column: usize, tab_width: usize) -> usize {
     }
 }
 
+fn column_at(text: RopeSlice<'_>, start: usize, pos: usize, tab_width: usize) -> usize {
+    let mut col = 0;
+    let mut at = start;
+    while at < pos {
+        let next = boundary(text, at, true);
+        if next > pos {
+            break;
+        }
+        col += width_at(text, at, next, col, tab_width);
+        at = next;
+    }
+    col
+}
+
+fn width_at(text: RopeSlice<'_>, start: usize, end: usize, col: usize, tab_width: usize) -> usize {
+    cell_width(
+        std::borrow::Cow::from(text.slice(start..end)).as_ref(),
+        col,
+        tab_width,
+    )
+}
+
+fn position_at_column(
+    text: RopeSlice<'_>,
+    start: usize,
+    goal: usize,
+    tab_width: usize,
+) -> (usize, usize) {
+    let mut pos = start;
+    let mut col = 0;
+    let end = logical_end(text, start);
+    while pos < end {
+        let next = boundary(text, pos, true);
+        let width = width_at(text, pos, next, col, tab_width);
+        if col + width > goal {
+            break;
+        }
+        col += width;
+        pos = next;
+    }
+    (pos, col)
+}
+
 pub(crate) fn vertical(
     text: RopeSlice<'_>,
     r: Range,
@@ -526,37 +577,12 @@ pub(crate) fn vertical(
 ) -> (Range, usize) {
     let cursor = r.cursor(text);
     let start = logical_start(text, cursor);
-    let width = |a, b, x| {
-        cell_width(
-            std::borrow::Cow::<str>::from(text.slice(a..b)).as_ref(),
-            x,
-            tab_width,
-        )
-    };
-    let goal = goal.unwrap_or_else(|| {
-        let mut col = 0;
-        let mut i = start;
-        while i < cursor {
-            let next = boundary(text, i, true);
-            col += width(i, next, col);
-            i = next;
-        }
-        col
-    });
-    let mut pos = move_lines(text, start, down, count);
+    let goal = goal.unwrap_or_else(|| column_at(text, start, cursor, tab_width));
+    let pos = move_lines(text, start, down, count);
     if extend && pos == text.len_chars() {
         return (r, goal);
     }
-    let end = logical_end(text, pos);
-    let mut col = 0;
-    while pos < end {
-        let next = boundary(text, pos, true);
-        col += width(pos, next, col);
-        if col > goal {
-            break;
-        }
-        pos = next;
-    }
+    let (pos, _) = position_at_column(text, pos, goal, tab_width);
     (r.move_to(text, pos, extend), goal)
 }
 
@@ -636,30 +662,44 @@ pub(crate) fn copies(
         } else {
             r.anchor.saturating_sub(1)
         };
-        let rows = text.char_to_line(head).abs_diff(text.char_to_line(anchor)) + 1;
-        let max = if down {
-            text.len_lines() - 1 - text.char_to_line(head.max(anchor))
-        } else {
-            text.char_to_line(head.max(anchor))
-        };
+        let mut anchor_line = logical_start(text, anchor);
+        let mut head_line = logical_start(text, head);
+        let anchor_col = column_at(text, anchor_line, anchor, tab_width);
+        let head_col = column_at(text, head_line, head, tab_width);
+        let height = 1 + text
+            .slice(anchor_line.min(head_line)..anchor_line.max(head_line))
+            .chars()
+            .filter(|&ch| ch == '\n')
+            .count();
         let mut added = 0;
-        for step in (rows..=max).step_by(rows) {
-            let project = |pos| {
-                let base = Range::at(text, pos);
-                let (next, goal) = vertical(text, base, down, step, tab_width, None, false);
-                let (_, actual) = vertical(text, next, down, 0, tab_width, None, false);
-                (goal == actual).then(|| next.cursor(text))
-            };
-            if let (Some(a), Some(h)) = (project(anchor), project(head)) {
-                let copied = Range { anchor: a, head: a }.move_to(text, h, true);
+        while added < count {
+            let anchor_step;
+            let head_step;
+            (anchor_line, anchor_step) = shift_lines(text, anchor_line, down, height);
+            (head_line, head_step) = shift_lines(text, head_line, down, height);
+            // Helix clamps each endpoint separately at the top, but stops
+            // before either endpoint would cross the bottom.
+            if down && (anchor_step < height || head_step < height) {
+                break;
+            }
+            let (anchor, actual_anchor_col) =
+                position_at_column(text, anchor_line, anchor_col, tab_width);
+            let (head, actual_head_col) = position_at_column(text, head_line, head_col, tab_width);
+            if actual_anchor_col == anchor_col && actual_head_col == head_col {
                 if i == selections.primary_index() {
                     primary = out.len();
                 }
-                out.push(copied);
+                out.push(
+                    Range {
+                        anchor,
+                        head: anchor,
+                    }
+                    .move_to(text, head, true),
+                );
                 added += 1;
-                if added >= count {
-                    break;
-                }
+            }
+            if !down && anchor_line == 0 && head_line == 0 {
+                break;
             }
         }
     }

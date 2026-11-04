@@ -43,6 +43,10 @@ The pending-input cases compare Normal and Select mode after every key. They cov
 
 A terminal trace also cancels a counted Space command, sends bracketed paste while the leader is pending, and checks the next edit in both panes after a counted window prefix.
 
+The selection fixtures compare counts, range direction, and which selection stays primary after merging, trimming, filtering, or copying. Copies cover short lines, tabs and wide characters, selections spanning more than one line, and mixed LF and CRLF with a standalone carriage return or Unicode separator.
+
+A terminal trace checks the messages shown when a regex or removal would leave no selections, then edits the preserved selection.
+
 The whole-line selection fixtures cover counts, reversed selections, and files that mix CRLF and LF with a standalone carriage return or Unicode separator inside a line.
 
 The text-object fixtures exercise inner and around selections for words, paragraphs, quotes, and nested delimiters. They include backward selections, Unicode delimiters, unmatched selections in a multi-cursor edit, counted searches, and CRLF paragraph separators.

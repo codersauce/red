@@ -38,6 +38,45 @@ def pending_input_cases():
         list("%sa") + ["<enter>"] + list("fb2") + ["<a-.>", "2", "r", "<a-x>", "u"])
 
 
+def selection_cases():
+    enter = ["<enter>"]
+    for mode, toggle in (("normal", []), ("select", ["v"])):
+        # Keep the primary in the middle. The first two runs touch, the last is separate.
+        runs = list("%s[a-z]+| +") + enter + toggle + list("2)") + ["<a-;>"]
+        yield f"merge-ranges-{mode}", "ab cd! ef", (
+            runs + ["3", "<a-_>", "y", "2", "<a-->", "y", "r", "X", "u"])
+        yield f"trim-ranges-{mode}", " aa ,   , bb , cc ", (
+            list("%S,") + enter + toggle + [")", "<a-;>", "3", "_", "y"]
+            + list("9(2)") + ["<a-,>", ","])
+        yield f"trim-whitespace-{mode}", "  ,   ,  ", (
+            list("%S,") + enter + toggle + [")", "<a-;>", "3", "_", "y"])
+        yield f"filter-ranges-{mode}", "ax bx cx dx", (
+            list("%s[a-z]+") + enter + toggle + list("2)") + ["<a-;>"] + list("3K[ac]") + enter
+            + ["<a-K>", "a"] + enter + list("Kz") + enter + ["<a-,>", "y"])
+        yield f"copy-multiline-{mode}", "abc\ndef\nghi\njkl\nmno", (
+            list("jl") + ["v", "j", "<esc>"] + toggle + ["<a-;>", "3", "<a-C>", "y", "2", "C", "y"])
+        yield f"copy-columns-{mode}", "e\u0301界z\n\tQ\nA\n12好x\nabcde\n", (
+            list("ll") + toggle + ["3", "C", "y", "<a-;>", "4", "<a-C>", "y", ","])
+        yield f"copy-mixed-lines-{mode}", "a\u2028bc\r\nz\n12\r34\nXYZ\npqr", (
+            list("ll") + toggle + ["2", "C", "y", "<a-;>", "3", "<a-C>", "y"])
+        yield f"copy-across-separator-{mode}", "a\u2028bc\r\nwxyz\n12\r4\nab界z\n", (
+            list("v3l") + ["<esc>"] + toggle + ["2", "C", "y", "<a-;>", "2", "<a-C>", "y"])
+        yield f"copy-at-top-{mode}", "first\nother\nthird\n", (
+            list("4lvj3h") + ["<esc>"] + toggle + ["<a-;>", "2", "<a-C>", "y", "2", "C"])
+        yield f"copy-at-bottom-{mode}", "alpha\nbravo", (
+            list("jl") + toggle + ["<a-;>", "2", "C", "y", "<a-C>", "y"])
+        # Copying reversed one-character selections onto the next row produces
+        # forward copies. Exercise both directions in the same selection set.
+        mixed = list("%s[a-z ]") + enter + toggle + ["<a-;>", "C"]
+        yield f"merge-mixed-directions-{mode}", "ab cd\nef gh", (
+            mixed + ["3", ")", "2", "<a-_>", "2", "<a-->", "y", "r", "X", "u"])
+        yield f"filter-mixed-directions-{mode}", "ab cd\nef gh", (
+            mixed + ["2", ")", "3", "_", "2", "K", "[", "a", "e", "h", "]"] + enter
+            + ["<a-K>", "e"] + enter + ["<a-;>", "y"])
+    yield "word-from-reversed-crlf", "a\r\n", ["f", "<enter>", ";", "<a-;>", "E", "v", "w", "b", "<esc>"]
+    yield "copy-eof", "ab\ncd\n", list("ge") + ["2", "<a-C>", "y", "<a-;>", "2", "C", "y"]
+
+
 def scenarios(seed, steps):
     text = "éclair e\u0301!  👩‍💻\r\n\tlast line\r\n"
     yield "word-boundaries", text, list("wwb2EW3BveB") + ["<esc>"] + list("gggsglge")
@@ -101,6 +140,7 @@ def scenarios(seed, steps):
         keys += list("g2gm2i(ggf2r3") + ["<esc>"]
         yield f"cancel-arguments-{mode}", "abc 123 abc\nline two\n", keys
     yield from pending_input_cases()
+    yield from selection_cases()
     yield "typed-selection", "abcd\n", list("eliX") + ["<esc>"] + list("uU")
     yield "unicode-vertical-goal", "ab界cd\n\tx\nabcdefg\n👩‍💻x\n", (
         list("3ljjjkkkvjj") + ["<esc>"] + list("ggllgjgjgk"))

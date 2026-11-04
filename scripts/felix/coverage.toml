@@ -13,13 +13,22 @@ remaining = ["Command-by-command count coverage and asynchronous focus changes w
 
 [[area]]
 name = "Movement and navigation"
-cases = ["word-boundaries", "character-arguments", "vertical-goal", "unicode-vertical-goal", "logical-separators", "mixed-ending-counted-motion", "wrapped-motion", "wrapped-unicode-motion", "wrapped-zero-width", "zero-width-goal", "wrapped-zero-edge", "wrapped-edges", "wrapped-mixed-goals", "page-movement", "page-multiple", "page-edges", "page-through-eof", "page-wrapped-continuations", "selection-jumplist", "jump-follows-edit", "motion-seed-{seed}"]
+cases = ["word-boundaries", "word-from-reversed-crlf", "character-arguments", "vertical-goal", "unicode-vertical-goal", "logical-separators", "mixed-ending-counted-motion", "wrapped-motion", "wrapped-unicode-motion", "wrapped-zero-width", "zero-width-goal", "wrapped-zero-edge", "wrapped-edges", "wrapped-mixed-goals", "page-movement", "page-multiple", "page-edges", "page-through-eof", "page-wrapped-continuations", "selection-jumplist", "jump-follows-edit", "motion-seed-{seed}"]
 remaining = ["Motion across inline virtual text and projected Markdown", "Other logical and visual line motions at non-LF separators", "All aliases and repeated motions"]
 
 [[area]]
 name = "Selections"
-cases = ["line-selections", "mixed-ending-line-selection", "mixed-ending-reverse-selection", "keep-and-rotate", "regex-select-split-keep", "paragraph-and-copies"]
-remaining = ["Full count and direction matrix for merging, trimming, copying and filtering"]
+cases = ["line-selections", "mixed-ending-line-selection", "mixed-ending-reverse-selection", "keep-and-rotate", "regex-select-split-keep", "paragraph-and-copies",
+         "merge-ranges-normal", "trim-ranges-normal", "trim-whitespace-normal",
+         "filter-ranges-normal", "copy-multiline-normal", "copy-columns-normal",
+         "copy-mixed-lines-normal", "copy-across-separator-normal", "copy-at-top-normal",
+         "copy-at-bottom-normal", "merge-ranges-select", "trim-ranges-select",
+         "trim-whitespace-select", "filter-ranges-select", "copy-multiline-select",
+         "copy-columns-select", "copy-mixed-lines-select", "copy-across-separator-select",
+         "copy-at-top-select", "copy-at-bottom-select", "copy-eof",
+         "merge-mixed-directions-normal", "merge-mixed-directions-select",
+         "filter-mixed-directions-normal", "filter-mixed-directions-select"]
+remaining = []
 
 [[area]]
 name = "Search"

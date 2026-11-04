@@ -733,6 +733,15 @@ impl Session {
                             p.viewport_start =
                                 Some(context.search_viewport(text, found.primary().cursor(text)));
                         }
+                        if preview.is_none() {
+                            p.message = match kind {
+                                Query::Select => Some("nothing selected".into()),
+                                Query::Keep | Query::Remove => {
+                                    Some("no selections remaining".into())
+                                }
+                                _ => None,
+                            };
+                        }
                         p.set(preview.unwrap_or_else(|| original.clone()));
                         if submit {
                             p.save_jump = Some(original.clone());
@@ -1156,6 +1165,7 @@ impl Session {
                 p.ranges.remove(p.primary);
                 p.primary = p.primary.min(p.ranges.len() - 1);
             }
+            "<a-,>" => p.message = Some("no selections remaining".into()),
             "y" | "d" | "c" | "<a-c>" | "<a-d>" => {
                 if !key.starts_with("<a-") {
                     p.register = Some(

@@ -113,7 +113,7 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
 
     checkpoints = []
 
-    def observe(label, line, mode, sels="1/2 sels", name=None, copies=1, menu=None, cursor=None):
+    def observe(label, line, mode, sels="1/2 sels", name=None, copies=1, menu=None, cursor=None, message=None):
         name = name or fixture.name
         # Reading the tmux screen sends no input to the editor.
         deadline = time.monotonic() + (30 if label == "open" else 5)
@@ -130,6 +130,8 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
             else:
                 matches = (expected_line in rows and status[:2] == [mode, f"~/{name}"]
                            and status[-3:-1] == sels.split())
+            if message is not None:
+                matches &= any(message in row for row in rows)
             if cursor is not None and not red:
                 matches &= bool(status) and status[-1] == cursor and not rows[-1].startswith("select:")
             if copies > 1:
@@ -430,6 +432,19 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
                 tmux("send-keys", key)
                 observe_page(first)
             return checkpoints
+        if scenario == "selection-errors":
+            observe("open", "foo foo", "NOR", "1 sel")
+            for label, keys, message in [
+                ("remove the sole selection", ["M-,"], "no selections remaining"),
+                ("select with no match", ["s", "z", "Enter"], "nothing selected"),
+                ("keep with no match", ["K", "z", "Enter"], "no selections remaining"),
+                ("remove every match", ["M-K", "f", "Enter"], "no selections remaining"),
+            ]:
+                tmux("send-keys", *keys)
+                observe(label, "foo foo", "NOR", "1 sel", message=message)
+            tmux("send-keys", "r", "X")
+            observe("edit the preserved selection", "Xoo foo", "NOR", "1 sel")
+            return checkpoints
         if scenario == "prefix-count":
             observe("open", "foo foo", "NOR", "1 sel")
             tmux("send-keys", "2", "Space", "3", "Home", "l", "r", "X")
@@ -556,11 +571,12 @@ def main():
             prefixes = run_trace(bundle, root / "release-prefix", scenario="prefix-count")
             red_prefixes = (run_trace(bundle, root / "red-prefix", args.candidate.resolve(strict=True),
                                       red=True, scenario="prefix-count") if args.candidate else None)
-            split_traces = {}
-            for scenario, directory in (("split-search", "split"), ("wrapped-split-search", "wrap")):
+            additional_traces = {}
+            for scenario, directory in (("split-search", "split"), ("wrapped-split-search", "wrap"),
+                                        ("selection-errors", "sel")):
                 key = scenario.replace("-", "_")
-                split_traces[key] = run_trace(bundle, root / f"release-{directory}", scenario=scenario)
-                split_traces[f"red_{key}"] = (run_trace(bundle, root / f"red-{directory}",
+                additional_traces[key] = run_trace(bundle, root / f"release-{directory}", scenario=scenario)
+                additional_traces[f"red_{key}"] = (run_trace(bundle, root / f"red-{directory}",
                                                        args.candidate.resolve(strict=True), red=True,
                                                        scenario=scenario) if args.candidate else None)
             records = None
@@ -585,7 +601,7 @@ def main():
                       "completion": completion, "red_completion": red_completion,
                       "prompt": prompts, "red_prompt": red_prompts,
                       "prefix_count": prefixes, "red_prefix_count": red_prefixes,
-                      "horizontal": horizontal, "red_horizontal": red_horizontal, **split_traces}, indent=2))
+                      "horizontal": horizontal, "red_horizontal": red_horizontal, **additional_traces}, indent=2))
 
 
 if __name__ == "__main__":
