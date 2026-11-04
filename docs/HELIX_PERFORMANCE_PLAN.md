@@ -1,5 +1,7 @@
 # Helix performance plan
 
+[Workstation results and reproduction](HELIX_PERFORMANCE_RESULTS.md)
+
 Prepared against `81083077a3387d38dd856f2c3ad950500d84b6bb` on `fcoury/felix-core`.
 
 The reported problem is slow ordinary typing and cursor movement. Improving those interactions with one selection is the first priority. Performance remains a Milestone 1 acceptance requirement, ahead of broad compatibility work.

@@ -191,13 +191,18 @@ def workload(args):
                     col += 7
                     row += 1
                 start = time.monotonic_ns()
-                for key in keys:
+                for index, key in enumerate(keys):
+                    if index and args.burst_ms:
+                        deadline = start + round(index * args.burst_ms * 1_000_000)
+                        remaining = (deadline - time.monotonic_ns()) / 1e9
+                        if remaining > 0:
+                            time.sleep(remaining)
                     driver.send(bytes([key]))
                     last_send = time.monotonic_ns()
-                    if args.burst_ms:
-                        time.sleep(args.burst_ms / 1000)
                 shown = driver.wait_position((row, col), start)
-                burst = dict(inputs=len(keys), elapsed_us=(shown - start) // 1000,
+                burst = dict(inputs=len(keys), interval_ms=args.burst_ms,
+                             enqueue_us=(last_send - start) // 1000,
+                             elapsed_us=(shown - start) // 1000,
                              drain_us=max(0, (shown - last_send) // 1000))
             # The edit marker verifies the document cursor independently of the statusline.
             if args.scenario == "select":
