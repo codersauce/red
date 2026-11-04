@@ -20,6 +20,10 @@ enum Pending {
     #[default]
     None,
     Goto,
+    SelectRegister,
+    InsertRegister {
+        visible: bool,
+    },
     Replace,
     Match,
     Object {
@@ -146,6 +150,7 @@ fn visual_target(
 pub struct Context<'a> {
     /// Search register entries, oldest first.
     pub search_history: &'a [String],
+    /// Fragments requested by Session::register_to_read for this input.
     pub register: &'a [String],
     pub tab_width: usize,
     pub indent: &'a str,
@@ -245,6 +250,7 @@ impl Context<'_> {
 pub struct Session {
     pub mode: Mode,
     pending: Pending,
+    selected_register: Option<char>,
     count: Option<usize>,
     // Helix carries the preferred wrap row and screen column across both kinds of vertical motion.
     goals: Vec<(usize, usize)>,
@@ -289,6 +295,7 @@ pub struct Plan {
     pub edits: Vec<Edit>,
     pub history: History,
     pub register: Option<Vec<String>>,
+    pub register_name: char,
     pub search: Option<String>,
     pub host: Option<HostAction>,
     pub save_jump: Option<Selections>,
@@ -603,6 +610,7 @@ impl Session {
             edits: Vec::new(),
             history: History::None,
             register: None,
+            register_name: self.selected_register.unwrap_or('"'),
             search: None,
             host: None,
             save_jump: None,
@@ -685,6 +693,68 @@ impl Session {
         self.count
     }
 
+    pub fn selected_register(&self) -> Option<char> {
+        self.selected_register
+    }
+
+    pub fn clear_selected_register(&mut self) {
+        self.selected_register = None;
+    }
+
+    pub fn register_prompt(&self) -> Option<&'static str> {
+        match self.pending {
+            Pending::SelectRegister => Some("Select register"),
+            Pending::InsertRegister { visible: true } => Some("Insert register"),
+            _ => None,
+        }
+    }
+
+    pub fn awaiting_register_argument(&self) -> bool {
+        matches!(
+            self.pending,
+            Pending::InsertRegister { .. } | Pending::SelectRegister
+        )
+    }
+
+    /// Helix replays Insert keybindings directly. A register name is a separate
+    /// physical-key callback and is absent from the recorded insert sequence.
+    pub fn replay_key(
+        &self,
+        text: RopeSlice<'_>,
+        selections: &Selections,
+        key: &str,
+        context: &Context<'_>,
+    ) -> Plan {
+        let callback = matches!(self.pending, Pending::InsertRegister { .. });
+        if !callback && self.selected_register.is_none() {
+            return self.plan(text, selections, key, context);
+        }
+        // Dot bypasses the normal count/register prefix dispatch. The pending
+        // register belongs to the next physical command, including after dot.
+        let mut direct = self.clone();
+        direct.selected_register = None;
+        if callback {
+            direct.pending = Pending::None;
+        }
+        let mut plan = direct.plan(text, selections, key, context);
+        plan.next.selected_register = self.selected_register;
+        if callback {
+            plan.next.pending = Pending::InsertRegister { visible: false };
+        }
+        plan
+    }
+
+    /// Ask the host for values only when the key consumes a register.
+    pub fn register_to_read(&self, key: &str) -> Option<char> {
+        match (&self.pending, self.mode) {
+            (Pending::InsertRegister { .. }, _) => argument_character(key),
+            (Pending::None, Mode::Normal | Mode::Select) if matches!(key, "p" | "P" | "R") => {
+                Some(self.selected_register.unwrap_or('"'))
+            }
+            _ => None,
+        }
+    }
+
     /// The active prompt label, text and UTF-8 byte offset of its caret.
     pub fn prompt(&self) -> Option<(&'static str, &str, usize)> {
         match &self.pending {
@@ -709,6 +779,7 @@ impl Session {
     /// its pre-prompt selection and viewport just as Escape would.
     pub fn leave_document_input(&mut self) -> Option<(Selections, usize)> {
         self.count = None;
+        self.selected_register = None;
         match std::mem::take(&mut self.pending) {
             Pending::Regex {
                 original,
@@ -722,6 +793,7 @@ impl Session {
     pub fn cancel_pending(&mut self) {
         self.pending = Pending::None;
         self.count = None;
+        self.selected_register = None;
     }
 
     /// Text keys are literal characters. Special keys use names such as
@@ -752,7 +824,21 @@ impl Session {
         {
             return p;
         }
+        if !matches!(self.pending, Pending::None) || !matches!(key, "g" | "m" | ".") {
+            p.next.selected_register = None;
+        }
         match &self.pending {
+            Pending::SelectRegister | Pending::InsertRegister { .. } => {
+                p.next.pending = Pending::None;
+                if let Some(name) = argument_character(key) {
+                    if matches!(self.pending, Pending::InsertRegister { .. }) {
+                        p.paste(text, selections, register, Paste::Cursor, 1);
+                    } else {
+                        p.next.selected_register = Some(name);
+                    }
+                }
+                return p;
+            }
             Pending::Regex {
                 original,
                 input,
@@ -955,7 +1041,11 @@ impl Session {
             Pending::None => {}
         }
         if self.mode == Mode::Insert {
-            p.insert_key(text, selections, key, context);
+            if key == "<c-r>" {
+                p.next.pending = Pending::InsertRegister { visible: true };
+            } else {
+                p.insert_key(text, selections, key, context);
+            }
             return p;
         }
         if key != "g" && key != "m" {
@@ -971,6 +1061,7 @@ impl Session {
                 })
             }
             "." => p.host = Some(HostAction::RepeatInsert(count)),
+            "\"" => p.next.pending = Pending::SelectRegister,
             "g" => p.next.pending = Pending::Goto,
             "m" => p.next.pending = Pending::Match,
             "/" | "?" | "s" | "S" | "K" | "<a-K>" => {
@@ -1259,7 +1350,17 @@ impl Session {
             }
             "<a-,>" => p.message = Some("no selections remaining".into()),
             "y" | "d" | "c" | "<a-c>" | "<a-d>" => {
-                if !key.starts_with("<a-") {
+                if key == "y" {
+                    p.next.mode = Mode::Normal;
+                }
+                if !key.starts_with("<a-") && p.register_name != '_' {
+                    if matches!(p.register_name, '#' | '.' | '%') {
+                        p.message = Some(format!(
+                            "Register {} does not support writing",
+                            p.register_name
+                        ));
+                        return p;
+                    }
                     p.register = Some(
                         selections
                             .ranges
@@ -1267,9 +1368,6 @@ impl Session {
                             .map(|r| text.slice(r.start()..r.end()).to_string())
                             .collect(),
                     );
-                }
-                if key == "y" {
-                    p.next.mode = Mode::Normal;
                 }
                 if key != "y" {
                     let change = key == "c" || key == "<a-c>";

@@ -576,6 +576,21 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
             tmux("send-keys", "l", "r", "Q")
             observe("move once in the new split", "fYYZQ foo", "NOR", "1 sel", copies=2)
             return checkpoints
+        if scenario == "registers":
+            observe("open", "foo foo", "NOR", "1 sel")
+            tmux("send-keys", "-l", '"')
+            observe("select register prompt", "foo foo", "NOR", "1 sel", message="Select register")
+            tmux("send-keys", "-l", "aygn")
+            observe("switch after named yank", "other buffer", "NOR", "1 sel", "other.txt")
+            tmux("send-keys", "i", "C-r")
+            observe("insert register prompt", "other buffer", "INS", "1 sel", "other.txt", message="Insert register")
+            tmux("send-keys", "-l", "a")
+            observe("insert from the first document", "fother buffer", "INS", "1 sel", "other.txt")
+            tmux("send-keys", "Escape")
+            observe("finish insert", "fother buffer", "NOR", "1 sel", "other.txt")
+            tmux("send-keys", "u")
+            observe("undo register insertion", "other buffer", "NOR", "1 sel", "other.txt")
+            return checkpoints
         if scenario == "repeat":
             observe("open", "foo foo", "NOR", "1 sel")
             tmux("send-keys", "i", "X", "Escape")
@@ -691,7 +706,7 @@ def main():
             for scenario, directory in (("split-search", "split"), ("wrapped-split-search", "wrap"),
                                         ("selection-errors", "sel"), ("clipboard", "clip"),
                                         ("completion-repeat", "cr"), ("snippet-stops", "st"), ("rust-edit", "rs"),
-                                        ("split-completion", "sc")):
+                                        ("split-completion", "sc"), ("registers", "reg")):
                 key = scenario.replace("-", "_")
                 additional_traces[key] = run_trace(bundle, root / f"release-{directory}", scenario=scenario)
                 additional_traces[f"red_{key}"] = (run_trace(bundle, root / f"red-{directory}",

@@ -246,10 +246,12 @@ mod jumps;
 mod motion;
 pub use jumps::Jumps;
 pub use motion::cell_width;
+mod registers;
 mod repeat;
 mod search;
 pub use command::open_line_site;
 pub use command::{Context, Edit, History, HostAction, Mode, Paste, Plan, Session, VisualLines};
+pub use registers::Registers;
 pub use repeat::{CompletionChange, InsertEvent, LastInsert, ReplayStep};
 
 impl Selections {

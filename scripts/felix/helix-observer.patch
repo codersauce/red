@@ -1,5 +1,5 @@
 diff --git a/helix-term/src/application.rs b/helix-term/src/application.rs
-index cf09aac..af64942 100644
+index cf09aac..c4a6f63 100644
 --- a/helix-term/src/application.rs
 +++ b/helix-term/src/application.rs
 @@ -642,7 +642,11 @@ pub async fn handle_terminal_events(&mut self, event: std::io::Result<CrosstermE
@@ -15,7 +15,7 @@ index cf09aac..af64942 100644
              CrosstermEvent::Resize(width, height) => {
                  self.terminal
                      .resize(Rect::new(0, 0, width, height))
-@@ -663,6 +667,41 @@ pub async fn handle_terminal_events(&mut self, event: std::io::Result<CrosstermE
+@@ -663,6 +667,48 @@ pub async fn handle_terminal_events(&mut self, event: std::io::Result<CrosstermE
              event => self.compositor.handle_event(&event.into(), &mut cx),
          };
  
@@ -39,10 +39,17 @@ index cf09aac..af64942 100644
 +                ui::editor::InsertEvent::CompletionApply { trigger_offset, changes } =>
 +                    json!({"completion_at": trigger_offset, "changes": format!("{changes:?}")}),
 +            }).collect::<Vec<_>>();
++            let observed_slots = std::env::var("FELIX_REFERENCE_REGISTERS").ok().map(|names| {
++                names.chars().map(|ch| (ch.to_string(), json!(read_register(ch))))
++                    .collect::<serde_json::Map<String, serde_json::Value>>()
++            });
 +            let record = json!({
 +                "event": event, "paste": paste, "mode": format!("{:?}", self.editor.mode),
 +                "text": doc.text().to_string(), "primary": selections.primary_index(),
 +                "ranges": selections.iter().map(|r| [r.anchor, r.head]).collect::<Vec<_>>(),
++                "selected_register": self.editor.selected_register, "registers": observed_slots,
++                "register_prompt": self.editor.autoinfo.as_ref().map(|info| info.title.as_ref())
++                    .filter(|title| matches!(*title, "Select register" | "Insert register")),
 +                "unnamed": read_register('"'), "search": read_register('/'),
 +                "prompt": prompt, "pending": ui.keymaps.pending().iter().map(ToString::to_string).collect::<Vec<_>>(),
 +                "count": self.editor.count, "last_insert": format!("{:?}", ui.last_insert),

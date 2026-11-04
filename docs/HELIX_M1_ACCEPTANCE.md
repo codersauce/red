@@ -4,6 +4,8 @@ The candidate covers the agreed document-window commands against Helix 25.07.1, 
 
 **Accepted November 4, 2026 at `c45a52f4790dadadcce303b4049650dd2eea8ab6`.** The Linux run passed with the committed lockfile. Its deterministic seed reproduced the checked-in 4,044 observations byte for byte. The extended seed, 41882086443, passed 4,675 observations in both Felix and Red. The downloaded receipt matched the candidate, reference revision and Cargo.lock hash. [Linux conformance run](https://github.com/codersauce/red/actions/runs/41882086443) · [Evidence artifact](https://github.com/codersauce/red/actions/runs/41882086443/artifacts/13351605165)
 
+The [push-triggered run](https://github.com/codersauce/red/actions/runs/41882148510) also passed on the same commit. Its extended seed covered 4,692 inputs. Both Linux captures reproduce the workstation deterministic fixture.
+
 | Gate | What to verify on the candidate |
 | --- | --- |
 | Coverage | The [inventory](../scripts/felix/coverage.toml) names 137 reference cases. The deterministic seed is 250701 with 4,044 key-by-key observations. The checker verifies the starting mode and count for each listed binding, including aliases delivered as distinct terminal events. The [native bindings](../src/editor/felix_bindings.toml) and [binding decisions](HELIX_IMPLEMENTATION_PLAN.md) define Red-owned actions. |

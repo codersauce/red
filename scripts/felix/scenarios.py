@@ -13,6 +13,37 @@ import time
 COMMIT = tomllib.loads(Path(__file__).with_name("coverage.toml").read_text())["reference"]
 
 
+REGISTER_SLOTS = "aAb7"
+
+
+def register_cases():
+    # Each case runs in a clean editor. Inspect all slots at every input to
+    # catch accidental writes to the unnamed register or the wrong case.
+    text = "a bb ccc\nsecond line\n"
+    yield "register-lifetime", text, ['"', 'a', 'y', 'l', '"', 'A', 'y', '"', 'a', '2', 'p',
+        '"', 'a', 'g', 'h', 'p', '"', '7', 'y', '"', '<esc>', '"', 'b', 'h', 'y']
+    yield "register-before-repeat", text, ['"', 'a', 'y', 'i', 'X', '<esc>', '"', 'a', '.', 'p', 'u']
+    yield "register-selection", text, ['%', 's', '[', 'a', 'b', ']', '+', '<enter>', '"', 'a', 'y',
+        ',', '"', 'a', 'p', 'u', '"', 'a', 'P', 'u', 'v', '"', 'a', 'R', 'u']
+    yield "register-overwrite", text, ['"', 'a', 'y', 'w', '"', 'A', 'y', 'w', '"', 'a', 'y',
+        '"', 'A', 'p', '"', 'a', 'P', '"', 'b', 'R', '"', 'a', 'd', '"', 'a', 'c', '<esc>', 'u']
+    yield "register-insert", text, ['x', '"', 'a', 'y', ';', 'i', 'X', '<c-r>', 'a', 'Y',
+        '<esc>', 'u', 'u', 'U', 'U', 'l', '.', 'u']
+    yield "register-insert-cancel", text, ['i', '<c-r>', '<esc>', 'X', '<c-r>', 'b', 'Z', '<esc>', 'u']
+    yield "register-insert-multiple", text, ['%', 's', '[', 'a', 'b', ']', '+', '<enter>', '"', 'a',
+        'y', 'i', '<c-r>', 'a', '<esc>', 'u', 'U']
+    yield "register-empty-and-count", text, ['2', '"', 'a', 'y', '"', 'A', 'p', 'v', '"', 'b', 'p',
+        '"', 'a', '<esc>', '"', '<left>', 'l', 'i', '<c-r>', '<left>', '<esc>']
+    yield "register-builtins", text, ['%', 's', '[', 'a', 'b', ']', '+', '<enter>', 'i',
+        '<c-r>', '#', '<esc>', 'u', 'v', '"', '.', 'P', 'u', '"', '_', 'y', '"', '_', 'd', 'u',
+        '"', '#', 'd', '"', '%', 'c', '"', '.', 'y', '"', '/', 'p', 'u']
+    yield "register-document-path", text, ['i', '<c-r>', '%', '<esc>', 'u']
+    yield "register-search-history", text, ['/', 'c', '<enter>', '/', 'd', '<enter>', '"', '/', 'p',
+        'u', '"', '/', 'y', 'i', '<c-r>', '/', '<esc>']
+    yield "register-read-only", text, ['v', 'l', '"', '#', 'y', 'v', '"', '.', 'c', '"', '%', 'd',
+        '"', '_', 'c', 'X', '<esc>', 'u']
+
+
 def pending_input_cases():
     for mode, start in (("normal", []), ("select", ["v"])):
         yield f"modified-arguments-{mode}", "aa b c x c w (aa bb) x 2 🦊 2\n", (
@@ -314,6 +345,8 @@ def capture(observer, runtime, root, name, text, keys):
     env = {"PATH": os.environ["PATH"], "HOME": str(root), "SHELL": "/bin/sh",
            "LANG": "en_US.UTF-8", "HELIX_RUNTIME": str(runtime),
            "FELIX_REFERENCE_TRACE": str(trace), "XDG_CONFIG_HOME": str(root/"config")}
+    if name.startswith("register-"):
+        env["FELIX_REFERENCE_REGISTERS"] = REGISTER_SLOTS
     def tmux(*args, check=True):
         return subprocess.run(["tmux", "-f", "/dev/null", "-S", str(root/"t.sock"), *args],
                               cwd=workdir, env=env, capture_output=True, text=True, check=check).stdout
@@ -379,11 +412,20 @@ def capture(observer, runtime, root, name, text, keys):
                 raise ValueError(f"{name}: missing shift modifier in {raw_event}")
             events.append({"key": key, **{k: record[k] for k in
                 ("mode", "text", "ranges", "primary", "unnamed", "search", "pending", "count", "document")}})
+            if name.startswith("register-"):
+                events[-1].update({k: record[k] for k in ("registers", "selected_register", "register_prompt")})
+                label = record["register_prompt"]
+                if label:
+                    deadline = time.monotonic() + 5
+                    while label not in tmux("capture-pane", "-pt", "h"):
+                        if time.monotonic() >= deadline:
+                            raise ValueError(f"{name}: register prompt {label!r} was not painted")
+                        time.sleep(.01)
             if name.startswith("prompt-"):
                 events[-1]["prompt"] = record["prompt"]
             if paste is not None:
                 events[-1]["paste"] = paste
-            if name.startswith("repeat-"):
+            if name.startswith(("repeat-", "register-")):
                 recipe = record["insert_recipe"]
                 commands = {"normal_mode": "", "insert_mode": "i", "append_mode": "a", "change_selection": "c",
                             "insert_at_line_start": "I", "insert_at_line_end": "A", "open_below": "o", "open_above": "O"}
@@ -420,11 +462,13 @@ def main():
     parser.add_argument("--runtime", required=True, type=Path)
     parser.add_argument("--seed", type=int, default=250701)
     parser.add_argument("--steps", type=int, default=48)
+    parser.add_argument("--suite", choices=("core", "registers"), default="core")
     args = parser.parse_args()
+    cases = register_cases() if args.suite == "registers" else scenarios(args.seed, args.steps)
     with tempfile.TemporaryDirectory(prefix="fx-") as tmp:
         result = [capture(args.observer.resolve(strict=True), args.runtime.resolve(strict=True),
                           Path(tmp)/str(i), *scenario)
-                  for i, scenario in enumerate(scenarios(args.seed, args.steps))]
+                  for i, scenario in enumerate(cases)]
     dump_suite(COMMIT, args.seed, result)
 
 

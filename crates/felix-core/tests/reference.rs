@@ -52,14 +52,24 @@ fn reference_sequences() {
         || include_str!("../../../scripts/felix/fixtures/motions.json").to_owned(),
         |path| std::fs::read_to_string(path).expect("live reference"),
     );
-    let suite: Value = serde_json::from_str(&source).unwrap();
+    replay_suite(&source);
+}
+
+#[test]
+fn reference_registers() {
+    replay_suite(include_str!(
+        "../../../scripts/felix/fixtures/registers.json"
+    ));
+}
+
+fn replay_suite(source: &str) {
+    let suite: Value = serde_json::from_str(source).unwrap();
     for case in suite["cases"].as_array().unwrap() {
         let mut text = Rope::from_str(case["text"].as_str().unwrap());
         let indent = felix_core::detect_indent(text.slice(..)).unwrap_or_else(|| "    ".into());
         let mut sel = Selections::single(text.slice(..), Range::at(text.slice(..), 0));
         let mut session = Session::default();
-        let mut search = Vec::new();
-        let mut register = Vec::new();
+        let mut registers = felix_core::Registers::default();
         let mut jumps = felix_core::Jumps::default();
         let mut viewport_start = 0;
         let mut before: Option<(Rope, Selections)> = None;
@@ -86,26 +96,31 @@ fn reference_sequences() {
                 };
                 let mut plan = match (input, event["paste"].as_str()) {
                     (_, Some(value)) => session.bracketed_paste(text.slice(..), &sel, value),
-                    (InsertEvent::Key(token), None) => session.plan(
-                        text.slice(..),
-                        &sel,
-                        token,
-                        &felix_core::Context {
-                            search_history: &search,
-                            register: &register,
+                    (InsertEvent::Key(token), None) => {
+                        let values = session.register_to_read(token).map(|name| {
+                            registers.read(name, text.slice(..), &sel, "~/example.txt")
+                        });
+                        let context = felix_core::Context {
+                            search_history: &registers.search,
+                            register: values.as_deref().unwrap_or_default(),
                             visual_lines: wrap_width.map(|_| &layout as &_),
                             viewport_start,
                             indent: &indent,
                             ..Default::default()
-                        },
-                    ),
+                        };
+                        if step.is_some() {
+                            session.replay_key(text.slice(..), &sel, token, &context)
+                        } else {
+                            session.plan(text.slice(..), &sel, token, &context)
+                        }
+                    }
                     (InsertEvent::Completion(change), None) => {
                         session.replay_completion(text.slice(..), &sel, change)
                     }
                 };
                 if let Some(step) = step {
                     plan.history = step.history(plan.history);
-                } else if event.get("paste").is_none() {
+                } else if event.get("paste").is_none() && !session.awaiting_register_argument() {
                     last_insert.record(key, session.mode, plan.next.mode);
                 }
                 viewport_start = plan
@@ -137,10 +152,10 @@ fn reference_sequences() {
                 sel = plan.selections(text.slice(..));
                 session = plan.next;
                 if let Some(value) = plan.search {
-                    search.push(value);
+                    registers.search.push(value);
                 }
                 if let Some(value) = plan.register {
-                    register = value;
+                    registers.write(plan.register_name, value);
                 }
                 if matches!(
                     plan.history,
@@ -185,11 +200,26 @@ fn reference_sequences() {
                     i + 1
                 );
             }
-            let actual = json!({"text":text.to_string(),"mode":format!("{:?}",session.mode),
+            let mut actual = json!({"text":text.to_string(),"mode":format!("{:?}",session.mode),
                 "ranges": sel.ranges().iter().map(|r|[r.anchor,r.head]).collect::<Vec<_>>(),
                 "primary":sel.primary_index(),"pending":session.pending_keys(),"count":session.count(),
-                "search":(!search.is_empty()).then(||search.iter().rev().collect::<Vec<_>>()),
-                "unnamed":(!register.is_empty()).then_some(&register)});
+                "search":(!registers.search.is_empty()).then(||registers.search.iter().rev().collect::<Vec<_>>()),
+                "unnamed":registers.stored('"')});
+            if let Some(slots) = event["registers"].as_object() {
+                actual["selected_register"] = json!(session.selected_register());
+                actual["register_prompt"] = json!(session.register_prompt());
+                actual["registers"] = Value::Object(
+                    slots
+                        .keys()
+                        .map(|slot| {
+                            (
+                                slot.clone(),
+                                json!(registers.stored(slot.chars().next().unwrap())),
+                            )
+                        })
+                        .collect(),
+                );
+            }
             if let Some(expected) = event.get("prompt") {
                 let prompt = session.prompt().map(|(_, line, cursor)| {
                     let (candidates, selected) = session.prompt_completions().unwrap();

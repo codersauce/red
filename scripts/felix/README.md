@@ -101,3 +101,9 @@ python3 scripts/felix/input_bench.py --binary target/debug/red --model helix \
 ```
 
 The paced burst reports time through the last expected frame and time from the last write until that frame. Motion reverses direction and ends on a distinct row and column. The document marker verifies the destination. On macOS, add `--sample FILE` to a longer diagnostic run to collect a separate process sample. Compare gating runs with instrumentation disabled.
+
+## M2 register comparisons
+
+The register corpus runs separately from the accepted M1 motions fixture. Generate it with the same pinned observer and release runtime, using `scripts/felix/scenarios.py --suite registers --observer <hx> --runtime <runtime>`. Compare the output with `scripts/felix/fixtures/registers.json`. Run `cargo test -p felix-core --test reference reference_registers` and `cargo test --features helix --lib registers_match_reference_at_every_key` to exercise the standalone engine and Red chooser. The paired terminal runner also yanks into a named register, switches documents, inserts it with Ctrl-r and undoes the insertion in both editors.
+
+The 12 cases compare 232 per-key observations, including slot contents, the selected register, prompt visibility, Insert replay, text and directed selections. Red also tests failure of a system clipboard write before committing a deletion and reads externally changed clipboard contents. The primary-selection clipboard (`*`) needs its own frontend transport. Named search commands and register-copy commands are further M2 coverage.

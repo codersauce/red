@@ -39,7 +39,12 @@ fn first_prompt_row(line: &str, width: usize) -> String {
 
 impl Editor {
     pub(in crate::editor) fn felix_prompt(&self) -> Option<(&'static str, &str, usize)> {
-        let prompt = self.felix.session.prompt()?;
+        let prompt = self.felix.session.prompt().or_else(|| {
+            self.felix
+                .session
+                .register_prompt()
+                .map(|title| (title, "", 0))
+        })?;
         (!self.has_term()
             && self.current_dialog.is_none()
             && !self.panel_manager.has_focused_panel())
@@ -64,7 +69,28 @@ impl Editor {
         let start = prefix.len();
         let style = &self.theme.style;
         buffer.set_text(0, row, &prefix, style);
-        if let Some(suggestion) = self.felix.search.last().filter(|_| line.is_empty()) {
+        if self.felix.session.register_prompt().is_some() {
+            let mut col = start + 1;
+            for (name, first) in self.felix.registers.previews() {
+                if col >= width {
+                    break;
+                }
+                let item = truncate_display_width(
+                    &format!("{name} {}", first.lines().next().unwrap_or("")),
+                    (width - col).min(20),
+                );
+                buffer.set_text(col, row, &item, style);
+                col += display_width(&item) + 2;
+            }
+            return true;
+        }
+        if let Some(suggestion) = self
+            .felix
+            .registers
+            .search
+            .last()
+            .filter(|_| line.is_empty())
+        {
             let muted = self
                 .theme
                 .get_style("comment")
