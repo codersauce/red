@@ -1835,7 +1835,13 @@ mod tests {
                 actual["last_insert"] = json!(editor.felix.last_insert.keys());
             }
             if expected.get("viewport").is_some() {
-                actual["viewport"] = json!({"height":editor.vheight(),"anchor":editor.current_buffer().contents_snapshot().line_to_char(editor.vtop)});
+                let window = editor.active_window_with_editor_view().unwrap();
+                let layout = editor.layout_for_window(&window);
+                let first = layout.rows.first().unwrap();
+                let text = editor.current_buffer().contents_snapshot();
+                let anchor = text.line_to_char(first.line)
+                    + text.line(first.line).byte_to_char(first.start_byte);
+                actual["viewport"] = json!({"height":editor.vheight(),"anchor":anchor});
             }
             if expected.get("count").is_some() {
                 actual["count"] = json!(editor.felix.session.count());

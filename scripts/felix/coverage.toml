@@ -10,8 +10,8 @@ remaining = ["Complete mode/count/argument/cancellation matrix"]
 
 [[area]]
 name = "Movement and navigation"
-cases = ["word-boundaries", "character-arguments", "vertical-goal", "wrapped-motion", "page-movement", "page-multiple", "page-edges", "page-through-eof", "selection-jumplist", "jump-follows-edit", "motion-seed-{seed}"]
-remaining = ["Wrapping with tabs, wide glyphs and inline decorations", "Paging over wrapped continuations", "All aliases and repeated motions"]
+cases = ["word-boundaries", "character-arguments", "vertical-goal", "wrapped-motion", "page-movement", "page-multiple", "page-edges", "page-through-eof", "page-wrapped-continuations", "selection-jumplist", "jump-follows-edit", "motion-seed-{seed}"]
+remaining = ["Wrapping with tabs, wide glyphs and inline decorations", "All aliases and repeated motions"]
 
 [[area]]
 name = "Selections"
@@ -20,8 +20,8 @@ remaining = ["Full count and direction matrix for merging, trimming, copying and
 
 [[area]]
 name = "Search"
-cases = ["search-and-navigate", "cancel-invalid-search", "empty-and-keep", "search-jump-history", "search-identical-selections", "search-viewport", "prompt-history", "prompt-completions", "prompt-edit", "prompt-words-and-paste"]
-remaining = ["Search viewport across wrapped and split views"]
+cases = ["search-and-navigate", "cancel-invalid-search", "empty-and-keep", "search-jump-history", "search-identical-selections", "search-viewport", "search-wrapped-viewport", "prompt-history", "prompt-completions", "prompt-edit", "prompt-words-and-paste"]
+remaining = ["Search viewport with inline decorations"]
 
 [[area]]
 name = "Text objects"

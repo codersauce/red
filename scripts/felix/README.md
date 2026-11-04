@@ -1,6 +1,6 @@
 # Felix reference smoke test
 
-Run the official Helix 25.07.1 editor through a two-buffer editing workflow. The runner verifies the release archive against its pinned SHA-256 digest, extracts its bundled runtime into a temporary directory, and launches Helix in an isolated 80 × 24 tmux session with fresh user and project configuration.
+Run the official Helix 25.07.1 editor through a two-buffer editing workflow. The runner verifies the release archive against its pinned SHA-256 digest, extracts its bundled runtime into a temporary directory, and launches Helix in an isolated tmux session with fresh user and project configuration.
 
 On Apple Silicon, with Python 3.12+, tmux, and the GitHub CLI installed, run these commands from the Red repository root.
 
@@ -30,6 +30,8 @@ python3 scripts/felix/reference_smoke.py ~/.cache/red-felix/reference/helix-25.0
 The runner compares the observer with tracing disabled and enabled against the release's visible frames, checks all 17 reference events against the fixture, and exercises Red at the same 11 terminal checkpoints. Separate traces compare five paging frames and eight repeat checkpoints, including undo after a counted repeat in another document opened in a split.
 
 The search-prompt trace checks the bottom row and terminal caret in both editors while recalling a previous query, moving inside it, inserting a wide character, deleting it, and cancelling. It also checks the search-history menu, Tab and Shift-Tab wraparound, and the visible query and caret after narrowing and widening the terminal. The per-key fixtures also compare the prompt text and its UTF-8 cursor offset against the observer after every key, including bracketed paste and history traversal in a selection prompt.
+
+Two split-view traces search the same document independently in each pane. One uses 100 numbered lines. The other uses a single line that wraps across 100 display rows. Both check every visible row in each pane during preview, after accepting a search, and after canceling with Escape or Ctrl-C. The per-key wrapped paging and search fixtures also check the character offset at the top of the viewport, which can fall partway through a line.
 
 The completion trace exercises 45 checkpoints with two active selections. Up, Tab, and Ctrl-P cycle through candidates. The language server still sees the original document during preview. Ctrl-C discards the preview and keeps any filter text typed at both cursors. Typing or pressing Escape with a candidate selected accepts the preview before processing the key. One candidate requires deferred resolution.
 

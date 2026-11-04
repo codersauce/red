@@ -23,6 +23,9 @@ def scenarios(seed, steps):
     yield "search-and-navigate", "foo xFOO foo\n", list("/foo") + enter + list("nnNvN") + ["<esc>"] + list("?x") + enter
     yield "cancel-invalid-search", "foo 😀 bar foo\n", list("/foo") + enter + list("?ba") + ["<esc>"] + list("/[") + enter + ["<esc>", "n"]
     yield "search-viewport", "home\n" + "a\n" * 40 + "target\n" + "a\n" * 25, list("/ta") + ["<esc>"] + list("/ta[") + ["<esc>"] + list("/ta") + enter + list("?ho") + ["<c-c>"]
+    yield "search-wrapped-viewport", "abcd" * 150 + "goal" + "efgh" * 100 + "end\n", (
+        list("/goal") + ["<esc>"] + list("/goal") + enter + list("/end") + ["<c-c>"]
+        + list("?abcd[") + ["<esc>"])
     yield "empty-and-keep", "ab abc abc\n", list("%sab") + enter + list("Kx") + enter + ["<a-K>", "a", "<enter>", "<esc>"]
     yield "search-jump-history", "a1 ab a2 ab a3\n", list("/ab") + enter + ["<c-o>", "<tab>", "/", "<enter>"] + list("?a") + ["<backspace>", "<c-c>"]
     yield "prompt-history", "red green blue red\n", (list("/green") + enter + list("/blue") + enter
@@ -67,6 +70,8 @@ def scenarios(seed, steps):
     yield "paragraph-and-copies", "abc\ndef\n\nnext\n", list("lC") + ["<a-C>", ","] + list("mipmap")
     yield "page-movement", "abc\n" * 90, ["l", "<pagedown>", "2", "<c-f>", "<c-b>", "<c-d>", "v", "<c-u>", "<esc>", "<pageup>"]
     yield "wrapped-motion", "abcdefghijklmnopqrstuvwxyz" * 3 + "\nabc\n" + "ABCDEF" * 12 + "\n", list("4ljjkkvj") + ["<esc>"] + list("gjgkk")
+    yield "page-wrapped-continuations", "abcd" * 290 + "\nxy\n" + "EFGH" * 170 + "\n", (
+        ["l", "<c-f>", "<c-d>", "v", "<c-u>", "<esc>", "2", "<pagedown>", "<pageup>", "<c-b>"])
     yield "page-through-eof", "abc\n" * 40, ["<c-f>", "<c-f>", "<c-f>", "<c-b>", "<c-b>"]
     yield "page-edges", "a\nbc\ndef", ["<c-f>", "<c-f>", "<c-u>", "<pageup>", "i", "<pagedown>", "<pageup>", "<esc>"]
     yield "page-multiple", "abcdef\n" * 75, ["l", "C", "<c-d>", "<c-f>", "<c-u>", "<pageup>"]
@@ -94,7 +99,7 @@ def capture(observer, runtime, root, name, text, keys):
     path = root / "example.txt"
     path.write_bytes(text.encode())
     trace = root / "trace.jsonl"
-    wrap_width = 20 if name == "wrapped-motion" else None
+    wrap_width = 20 if name in ("wrapped-motion", "search-wrapped-viewport", "page-wrapped-continuations") else None
     if wrap_width:
         config = root / "config" / "helix"
         config.mkdir(parents=True)
@@ -175,7 +180,7 @@ def capture(observer, runtime, root, name, text, keys):
                     token = item["key"]
                     keys.append(token if len(token) == 1 else "<" + token.lower() + ">")
                 events[-1]["last_insert"] = keys
-            if name.startswith("page-") or name == "search-viewport":
+            if name.startswith("page-") or name in ("search-viewport", "search-wrapped-viewport"):
                 events[-1]["viewport"] = record["viewport"]
         case = {"name": name, "text": text, "events": events}
         if wrap_width:

@@ -34,7 +34,16 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
     workdir = root / "work"
     workdir.mkdir()
     fixture = root / ("example.rs" if scenario == "completion" else "example.txt")
-    fixture.write_text("".join(f"ROW-{number:03}\n" for number in range(1, 41)) if scenario == "paging" else "foo foo\n")
+    split_search = scenario in ("split-search", "wrapped-split-search")
+    wrapped = scenario == "wrapped-split-search"
+    if wrapped:
+        # Each tag starts one 36-cell display row on the same logical line.
+        fixture.write_text("".join(f"ROW-{n:03}" + "x" * 29 for n in range(1, 101)) + "\n")
+    elif split_search or scenario == "paging":
+        row_count = 100 if split_search else 40
+        fixture.write_text("".join(f"ROW-{n:03}\n" for n in range(1, row_count + 1)))
+    else:
+        fixture.write_text("foo foo\n")
     other = root / "other.txt"
     other.write_text("other buffer\n")
     env = {
@@ -61,12 +70,21 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
             '[[language]]\nname = "rust"\nlanguage-servers = ["felix-test"]\n[language-server.felix-test]\n' + command
         )
         (config / "config.toml").write_text('[editor]\nauto-completion = false\n')
+    if wrapped and not red:
+        config = root / "config/helix"
+        config.mkdir(parents=True)
+        (config / "config.toml").write_text(
+            '[editor]\ngutters = []\ntext-width = 36\n[editor.soft-wrap]\nenable = true\n'
+            'wrap-at-text-width = true\nwrap-indicator = ""\nmax-wrap = 0\nmax-indent-retain = 0\n'
+        )
     if red:
         config = root / "config/red"
         config.mkdir(parents=True)
         # Compare equal document heights. Red's optional breadcrumb plugin
         # can reserve a screen row asynchronously after the document opens.
-        window_config = 'disabled_plugins = ["barbecue"]\n' if scenario in ("paging", "repeat") else ""
+        window_config = 'disabled_plugins = ["barbecue"]\n' if split_search or scenario in ("paging", "repeat") else ""
+        if wrapped:
+            window_config += "wrap = true\n"
         (config / "config.toml").write_text(
             window_config + 'editing_model = "helix"\ndisable_ai = true\nsplash = false\n'
             'show_whats_new = false\nfetch_release_notes = false\n[lsp]\n'
@@ -142,8 +160,57 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
             time.sleep(0.02)
 
     try:
-        tmux("new-session", "-d", "-x", "80", "-y", "24", "-s", "oracle",
+        tmux("new-session", "-d", "-x", "81" if wrapped else "80", "-y", "24", "-s", "oracle",
              str(executable or bundle / "hx"), str(fixture), str(other))
+        if split_search:
+            def check_views(label, left, right, prompt=""):
+                deadline = time.monotonic() + 5
+                expected = [list(range(top, min(top + 22, 101))) for top in (left, right)]
+                while True:
+                    rows = tmux("capture-pane", "-p", "-t", "oracle:0.0").stdout.splitlines()
+                    panes = [[], []]
+                    for row in rows[:-2]:
+                        for match in re.finditer(r"ROW-(\d{3})", row):
+                            side = int(match.start() >= 40)
+                            panes[side].append(int(match[1]))
+                    prompt_matches = rows and (rows[-1] == "search:" + prompt if prompt
+                                               else not rows[-1].startswith("search:"))
+                    if panes == expected and prompt_matches:
+                        checkpoints.append({"step": label, "visible": panes, "prompt": prompt})
+                        return
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(f"{label}: expected {expected} and prompt {prompt!r}, saw\n" + "\n".join(rows))
+                    time.sleep(.02)
+            if wrapped:
+                # Helix wraps at 36 before splitting too. Red initially uses
+                # the full terminal width, so both tags can share its first row.
+                deadline = time.monotonic() + 30
+                while "ROW-001" not in tmux("capture-pane", "-p").stdout:
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("wrapped document did not open")
+                    time.sleep(0.02)
+            else:
+                observe("open", "ROW-001", "NOR", "1 sel")
+            tmux("send-keys", "C-w", "v", "C-w", "h")
+            check_views("open two views", 1, 1)
+            tmux("send-keys", "-l", "/ROW-060")
+            check_views("preview in left view", 50, 1, "ROW-060")
+            tmux("send-keys", "Escape")
+            check_views("cancel left preview", 1, 1)
+            tmux("send-keys", "-l", "/ROW-060")
+            tmux("send-keys", "Enter")
+            check_views("accept left search", 50, 1)
+            tmux("send-keys", "C-w", "l")
+            tmux("send-keys", "-l", "/ROW-090")
+            check_views("preview in right view", 50, 80, "ROW-090")
+            tmux("send-keys", "Enter")
+            check_views("accept right search", 50, 80)
+            tmux("send-keys", "C-w", "h")
+            tmux("send-keys", "-l", "?ROW-012")
+            check_views("reverse search on return", 7, 80, "ROW-012")
+            tmux("send-keys", "C-c")
+            check_views("restore both viewports", 50, 80)
+            return checkpoints
         if scenario == "prompt":
             observe("open", "foo foo", "NOR", "1 sel")
             def check_prompt(label, value, column, menu_rows=()):
@@ -412,6 +479,13 @@ def main():
             prompts = run_trace(bundle, root / "release-prompt", scenario="prompt")
             red_prompts = (run_trace(bundle, root / "red-prompt", args.candidate.resolve(strict=True),
                                      red=True, scenario="prompt") if args.candidate else None)
+            split_traces = {}
+            for scenario, directory in (("split-search", "split"), ("wrapped-split-search", "wrap")):
+                key = scenario.replace("-", "_")
+                split_traces[key] = run_trace(bundle, root / f"release-{directory}", scenario=scenario)
+                split_traces[f"red_{key}"] = (run_trace(bundle, root / f"red-{directory}",
+                                                       args.candidate.resolve(strict=True), red=True,
+                                                       scenario=scenario) if args.candidate else None)
             records = None
             if args.observer:
                 observer = args.observer.resolve(strict=True)
@@ -432,7 +506,8 @@ def main():
                       "target": target, "checkpoints": checkpoints, "events": records, "red_checkpoints": red_frames,
                       "paging": pages, "red_paging": red_pages, "repeat": repeats, "red_repeat": red_repeats,
                       "completion": completion, "red_completion": red_completion,
-                      "prompt": prompts, "red_prompt": red_prompts}, indent=2))
+                      "prompt": prompts, "red_prompt": red_prompts,
+                      **split_traces}, indent=2))
 
 
 if __name__ == "__main__":
