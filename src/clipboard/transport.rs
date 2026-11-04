@@ -6,7 +6,7 @@ use anyhow::{bail, ensure};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 
-use super::{ClipboardProvider, CopyOutcome, NativeClipboardProvider};
+use super::{ClipboardProvider, CopyOutcome, NativeClipboardProvider, PrimarySelection};
 use crate::config::ClipboardConfig;
 
 const MAX_OSC52_BYTES: usize = 256 * 1024;
@@ -157,6 +157,27 @@ impl SessionClipboard {
             self.config.max_bytes)
     }
 
+    fn send_osc52(
+        &self,
+        selection: &str,
+        text: &str,
+        output: &mut dyn Write,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            (1..=MAX_OSC52_BYTES).contains(&self.config.max_bytes),
+            "clipboard.max_bytes must be between 1 and 262144"
+        );
+        ensure!(
+            text.len() <= self.config.max_bytes,
+            "copy exceeds clipboard.max_bytes ({} bytes)",
+            self.config.max_bytes
+        );
+        output
+            .write_all(format!("\x1b]52;{selection};{}\x07", STANDARD.encode(text)).as_bytes())?;
+        output.flush()?;
+        Ok(())
+    }
+
     pub fn report(outcome: anyhow::Result<CopyOutcome>) -> String {
         match outcome {
             Ok(CopyOutcome::Written) => "copied to clipboard".into(),
@@ -168,6 +189,55 @@ impl SessionClipboard {
 }
 
 impl ClipboardProvider for SessionClipboard {
+    fn primary_selection(&self) -> PrimarySelection {
+        match self.backend {
+            ClipboardBackend::Osc52 => PrimarySelection::WriteOnly,
+            ClipboardBackend::Native => match self
+                .native
+                .as_ref()
+                .map(|native| native.primary_selection())
+            {
+                Some(PrimarySelection::ReadWrite) if !self.config.sync_on_paste => {
+                    PrimarySelection::WriteOnly
+                }
+                mode => mode.unwrap_or_default(),
+            },
+            _ => PrimarySelection::Unavailable,
+        }
+    }
+
+    fn read_primary(&mut self) -> futures::future::BoxFuture<'_, anyhow::Result<Option<String>>> {
+        match self.primary_selection() {
+            PrimarySelection::ReadWrite => self
+                .native
+                .as_mut()
+                .expect("native primary clipboard")
+                .read_primary(),
+            PrimarySelection::WriteOnly => Box::pin(async { Ok(None) }),
+            PrimarySelection::Unavailable => {
+                Box::pin(async { bail!("Primary selection clipboard is unavailable") })
+            }
+        }
+    }
+
+    fn copy_primary(
+        &mut self,
+        text: &str,
+        output: &mut dyn Write,
+    ) -> futures::future::BoxFuture<'static, anyhow::Result<()>> {
+        if let Some(native) = &mut self.native {
+            return native.copy_primary(text, output);
+        }
+        let result = if self.backend == ClipboardBackend::Osc52 {
+            self.send_osc52("p", text, output)
+        } else {
+            Err(anyhow::anyhow!(
+                "Primary selection clipboard is unavailable"
+            ))
+        };
+        Box::pin(std::future::ready(result))
+    }
+
     fn is_available(&self) -> bool {
         self.backend != ClipboardBackend::None
     }
@@ -201,17 +271,7 @@ impl ClipboardProvider for SessionClipboard {
                 Ok(CopyOutcome::Written)
             }
             ClipboardBackend::Osc52 => {
-                ensure!(
-                    (1..=MAX_OSC52_BYTES).contains(&self.config.max_bytes),
-                    "clipboard.max_bytes must be between 1 and 262144"
-                );
-                ensure!(
-                    text.len() <= self.config.max_bytes,
-                    "copy exceeds clipboard.max_bytes ({} bytes)",
-                    self.config.max_bytes
-                );
-                output.write_all(format!("\x1b]52;c;{}\x07", STANDARD.encode(text)).as_bytes())?;
-                output.flush()?;
+                self.send_osc52("c", text, output)?;
                 Ok(CopyOutcome::Sent)
             }
             ClipboardBackend::None | ClipboardBackend::Auto => bail!("{}", self.reason),
@@ -251,6 +311,28 @@ mod tests {
             assert_eq!(output.last(), Some(&7));
             assert_eq!(clipboard.get_text().unwrap(), None);
         }
+    }
+
+    #[tokio::test]
+    async fn osc52_primary_selection_uses_a_separate_bounded_target() {
+        let mut provider = SessionClipboard::with_environment(
+            &ClipboardConfig {
+                backend: ClipboardBackend::Osc52,
+                max_bytes: 5,
+                ..ClipboardConfig::default()
+            },
+            Environment {
+                terminal: true,
+                ..Default::default()
+            },
+        );
+        let mut output = Vec::new();
+        assert_eq!(provider.primary_selection(), PrimarySelection::WriteOnly);
+        assert_eq!(provider.read_primary().await.unwrap(), None);
+        provider.copy("b", &mut output).unwrap();
+        provider.copy_primary("a", &mut output).await.unwrap();
+        assert!(provider.copy_primary("123456", &mut output).await.is_err());
+        assert_eq!(output, b"\x1b]52;c;Yg==\x07\x1b]52;p;YQ==\x07");
     }
 
     #[test]

@@ -139,8 +139,30 @@ pub(crate) fn entries(
     keys: &Keys,
     plugin_commands: &[RegisteredPluginCommand],
 ) -> Vec<CommandPaletteEntry> {
+    entries_for_model(keys, plugin_commands, Default::default())
+}
+
+pub(crate) fn entries_for_model(
+    keys: &Keys,
+    plugin_commands: &[RegisteredPluginCommand],
+    model: crate::config::EditingModel,
+) -> Vec<CommandPaletteEntry> {
+    let model_command = match model {
+        #[cfg(feature = "helix")]
+        crate::config::EditingModel::Helix => Some(builtin(
+            "copy_between_registers",
+            "Copy between registers",
+            "Helix",
+            "Copy all fragments from one register to another",
+            None,
+            &["copy_between_registers"],
+            Action::FelixCopyBetweenRegisters,
+        )),
+        _ => None,
+    };
     let mut entries = builtin_commands()
         .into_iter()
+        .chain(model_command)
         .map(|command| {
             let shortcuts = shortcuts_for_action(keys, &command.action);
             CommandPaletteEntry {

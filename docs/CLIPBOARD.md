@@ -56,11 +56,30 @@ render snapshots. Input copies are delivered with their response; asynchronous
 plugin copies are delivered on the next heartbeat. Only the final pending copy
 is retained, and disconnect discards it so reconnect cannot replay old copies.
 
-Native clipboard reads are requested only during paste actions, never on input
-polling or reconnect. Detach IPC bounds clipboard text to 1 MiB and chunks writes
+The owner requests clipboard text when an editing command needs it. Polling and
+reconnecting do not read the clipboard. Detach IPC bounds clipboard text to 1 MiB and chunks writes
 to fit frame limits, preserving the existing plugin write limit. OSC 52 retains
 its smaller terminal-specific limit. IPC protocol version 4 requires restarting
 older detached owners before attaching the updated frontend.
+
+## Helix registers
+
+In a Helix document window, `"+` selects the system clipboard and `"*` selects
+the primary selection for the next command. For example, `"*y` yanks to the
+primary selection and `"*p` pastes from it. In Insert mode, press `Ctrl-r` and
+then `*` or `+` to insert from that register.
+
+On Linux, the native backend reads and writes the primary selection when the
+display provides it. The regression suite exercises X11 on a private display.
+The native macOS and Windows backends report that the primary selection is
+unavailable. The OSC 52 backend sends primary writes to the terminal's `p`
+target and system writes to `c`. A write-only terminal can paste fragments Red
+previously sent to that target. Terminal delivery depends on the emulator.
+
+Updated detached clients advertise clipboard capabilities with each input. For
+either clipboard register, the owner waits for the frontend to finish the write
+before applying a delete or change. Disconnecting clears both sets of saved
+fragments. Older clients retain their original system-clipboard delivery path.
 
 ## Diagnose and verify
 

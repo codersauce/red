@@ -44,6 +44,23 @@ def register_cases():
         '"', '_', 'c', 'X', '<esc>', 'u']
 
 
+def register_followup_cases():
+    text = "red blue red green blue red\n"
+    yield "register-search-names", text, ['/', 'g', '<enter>', '"', 'a', '/', 'r', '<enter>',
+        'n', 'N', '"', '/', 'n', 'n', '"', 'a', '?', 'b', '<enter>', '"', 'a', '/', '<up>',
+        '<esc>', '"', 'a', '/', '<enter>', '"', 'a', '/', '[', '<enter>', 'n']
+    # Identical whole words make the selected-pattern alternation deterministic in Helix.
+    yield "register-selection-queries", text, ['%', '"', 'a', 's', 'r', 'e', 'd', '<enter>', '"', 'b', '*',
+        'n', '"', 'a', 'N', '%', '"', 'A', 'S', ' ', '<enter>', '"', '7', 'K', 'e', '<enter>',
+        '"', '7', '<a-K>', 'd', '<enter>', '"', 'a', 'p']
+    yield "register-search-special", text, ['v', '"', 'a', '/', 'r', '<enter>', '"', '#', '*',
+        '"', '.', '/', 'b', '<enter>', '"', '_', '<a-*>', 'n', '"', 'a', 'n', '<esc>']
+    yield "register-copy-values", text, ['%', 's', '[', 'r', 'b', ']', '<enter>', '"', 'a', 'y',
+        '<f12>', 'a', 'b', '<f12>', 'b', 'b', '<f12>', '7', '<f12>', '<esc>', '<f12>', 'a', '<esc>',
+        '<f12>', 'a', '#', '<f12>', '#', 'A', '<f12>', '_', '7', '<f12>', '7', 'b', '"', 'A', 'p',
+        '<f12>', '_', '/', '<f12>', '/', 'a']
+
+
 def pending_input_cases():
     for mode, start in (("normal", []), ("select", ["v"])):
         yield f"modified-arguments-{mode}", "aa b c x c w (aa bb) x 2 🦊 2\n", (
@@ -335,6 +352,10 @@ def capture(observer, runtime, root, name, text, keys):
     path.write_bytes(text.encode())
     trace = root / "trace.jsonl"
     wrap_width = 20 if name.startswith("wrapped-") or name in ("search-wrapped-viewport", "page-wrapped-continuations") else None
+    if name.startswith("register-copy"):
+        config = root / "config" / "helix"
+        config.mkdir(parents=True)
+        (config / "config.toml").write_text('[keys.normal]\nF12 = "copy_between_registers"\n')
     if wrap_width:
         config = root / "config" / "helix"
         config.mkdir(parents=True)
@@ -362,6 +383,7 @@ def capture(observer, runtime, root, name, text, keys):
         for index, key in enumerate(keys):
             named = {"<backspace>": "BSpace", "<pageup>": "PageUp", "<pagedown>": "PageDown", "<esc>": "Escape", "<enter>": "Enter", "<tab>": "Tab", "<backtab>": "BTab", "<a-;>": "M-;", "<a-,>": "M-,"}
             named.update(ARROW_AND_EDIT_KEYS)
+            named["<f12>"] = "F12"
             paste = key["paste"] if isinstance(key, dict) else None
             if paste is not None:
                 key = "<paste>"
@@ -398,6 +420,7 @@ def capture(observer, runtime, root, name, text, keys):
             record = json.loads(line)
             raw_event = record["event"]
             special = {"<backspace>": "Backspace", "<pageup>": "PageUp", "<pagedown>": "PageDown", "<esc>": "Esc", "<enter>": "Enter", "<tab>": "Tab", "<backtab>": "BackTab", "<a-;>": "Char(';')", "<a-,>": "Char(',')"}
+            special["<f12>"] = "F(12)"
             special.update(ARROW_AND_EDIT_KEYS)
             special.update({"<a-delete>": "Delete", "<a-backspace>": "Backspace", "<s-backspace>": "Backspace"})
             ch = key[3:-1] if key.startswith(("<a-", "<c-")) else key
@@ -414,6 +437,8 @@ def capture(observer, runtime, root, name, text, keys):
                 ("mode", "text", "ranges", "primary", "unnamed", "search", "pending", "count", "document")}})
             if name.startswith("register-"):
                 events[-1].update({k: record[k] for k in ("registers", "selected_register", "register_prompt")})
+                if name.startswith(("register-search-", "register-selection-queries", "register-copy-values")):
+                    events[-1]["last_search_register"] = record["last_search_register"]
                 label = record["register_prompt"]
                 if label:
                     deadline = time.monotonic() + 5
@@ -421,7 +446,7 @@ def capture(observer, runtime, root, name, text, keys):
                         if time.monotonic() >= deadline:
                             raise ValueError(f"{name}: register prompt {label!r} was not painted")
                         time.sleep(.01)
-            if name.startswith("prompt-"):
+            if name.startswith(("prompt-", "register-search-", "register-selection-queries")):
                 events[-1]["prompt"] = record["prompt"]
             if paste is not None:
                 events[-1]["paste"] = paste
@@ -464,7 +489,7 @@ def main():
     parser.add_argument("--steps", type=int, default=48)
     parser.add_argument("--suite", choices=("core", "registers"), default="core")
     args = parser.parse_args()
-    cases = register_cases() if args.suite == "registers" else scenarios(args.seed, args.steps)
+    cases = [*register_cases(), *register_followup_cases()] if args.suite == "registers" else scenarios(args.seed, args.steps)
     with tempfile.TemporaryDirectory(prefix="fx-") as tmp:
         result = [capture(args.observer.resolve(strict=True), args.runtime.resolve(strict=True),
                           Path(tmp)/str(i), *scenario)

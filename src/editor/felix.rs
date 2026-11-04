@@ -91,7 +91,8 @@ pub(super) struct FelixHost {
     // jumps once against the committed text, using edits in application order.
     pending_rebase: Option<Vec<AppliedTextEdit>>,
     registers: felix_core::Registers,
-    clipboard: Vec<String>,
+    pub(super) clipboard: Vec<String>,
+    pub(super) primary_clipboard: Vec<String>,
     before: Option<Selections>,
     history: HashMap<(BufferId, String), (Selections, Selections)>,
 }
@@ -580,35 +581,81 @@ impl Editor {
         }
     }
 
-    fn write_felix_clipboard(&mut self, values: Vec<String>) -> Result<(), String> {
+    async fn write_felix_clipboard(
+        &mut self,
+        name: char,
+        values: Vec<String>,
+    ) -> Result<(), String> {
         if !self.config.clipboard.enabled {
             return Err("Clipboard is disabled".into());
         }
+        if name == '*' {
+            self.clipboard
+                .copy_primary(&values.join(CLIPBOARD_SEPARATOR), &mut self.stdout)
+                .await
+                .map_err(|err| format!("Primary clipboard write failed: {err}"))?;
+            self.felix.primary_clipboard = values;
+            return Ok(());
+        }
         self.clipboard
-            .copy(&values.join(CLIPBOARD_SEPARATOR), &mut self.stdout)
+            .copy_system_for_edit(&values.join(CLIPBOARD_SEPARATOR), &mut self.stdout)
+            .await
             .map_err(|err| format!("Clipboard write failed: {err}"))?;
         self.felix.clipboard = values;
         Ok(())
     }
 
-    async fn read_felix_clipboard(&mut self) -> Result<Option<Vec<String>>, String> {
+    async fn read_felix_clipboard(&mut self, name: char) -> Result<Option<Vec<String>>, String> {
         if !self.config.clipboard.enabled {
             return Err("Clipboard is disabled".into());
         }
-        let value = self
-            .clipboard
-            .read_text()
-            .await
-            .map_err(|err| format!("Clipboard read failed: {err}"))?;
-        let saved = &self.felix.clipboard;
+        let (value, saved, write_only) = if name == '*' {
+            let write_only =
+                self.clipboard.primary_selection() == crate::clipboard::PrimarySelection::WriteOnly;
+            (
+                self.clipboard.read_primary().await,
+                &self.felix.primary_clipboard,
+                write_only,
+            )
+        } else {
+            (
+                self.clipboard.read_text().await,
+                &self.felix.clipboard,
+                self.clipboard.uses_saved_yank(),
+            )
+        };
+        let value = value.map_err(|err| format!("Clipboard read failed: {err}"))?;
         Ok(match value {
             Some(external) if saved.is_empty() || saved.join(CLIPBOARD_SEPARATOR) != external => {
                 Some(vec![external])
             }
             Some(_) => Some(saved.clone()),
-            None if self.clipboard.uses_saved_yank() && !saved.is_empty() => Some(saved.clone()),
+            None if write_only && !saved.is_empty() => Some(saved.clone()),
             None => None,
         })
+    }
+
+    async fn push_felix_clipboard_query(
+        &mut self,
+        name: char,
+        query: String,
+    ) -> Result<(), String> {
+        // A search must never prepend its history to text another application copied.
+        let current = self.read_felix_clipboard(name).await?.unwrap_or_default();
+        let saved = if name == '*' {
+            &self.felix.primary_clipboard
+        } else {
+            &self.felix.clipboard
+        };
+        if current.join(CLIPBOARD_SEPARATOR) != saved.join(CLIPBOARD_SEPARATOR) {
+            return Err(format!(
+                "Failed to push to register {name}: clipboard does not match register contents"
+            ));
+        }
+        let values = std::iter::once(query)
+            .chain(saved.iter().cloned())
+            .collect();
+        self.write_felix_clipboard(name, values).await
     }
 
     pub(super) async fn execute_felix_clipboard(
@@ -881,7 +928,7 @@ impl Editor {
         text: ropey::RopeSlice<'_>,
         initial: &Selections,
         key: &str,
-        register: &[String],
+        register: Option<&[String]>,
         replay: bool,
         language: &FelixLanguageEdit,
     ) -> felix_core::Plan {
@@ -923,7 +970,7 @@ impl Editor {
             ) || self.felix.session.prompt().is_some())
                 && self.active_has_markdown_tables();
         let context = felix_core::Context {
-            search_history: &self.felix.registers.search,
+            search_history: self.felix.registers.search_history(),
             register,
             tab_width,
             indent: &self.felix.indent[&self.current_buffer().id()],
@@ -1010,55 +1057,43 @@ impl Editor {
             })
             .and_then(|key| self.felix.session.register_to_read(key));
         let values = match named_read {
-            Some('+') => match self.read_felix_clipboard().await {
-                Ok(values) => values.map(std::borrow::Cow::Owned),
+            Some(name @ ('+' | '*')) => match self.read_felix_clipboard(name).await {
+                Ok(values) => Some(std::borrow::Cow::Owned(values.unwrap_or_default())),
                 Err(error) => {
                     self.felix.session.cancel_pending();
                     self.set_legacy_message(Some(error));
                     return self.render(frame);
                 }
             },
-            Some('*') => {
-                self.felix.session.cancel_pending();
-                self.set_legacy_message(Some("Primary selection clipboard is unavailable".into()));
-                return self.render(frame);
-            }
             Some(name) => {
                 let document = if name == '%' {
                     felix_document_register_name(self.current_buffer().path())
                 } else {
                     String::new()
                 };
-                Some(self.felix.registers.read(name, text, &initial, &document))
+                self.felix
+                    .registers
+                    .exists(name)
+                    .then(|| self.felix.registers.read(name, text, &initial, &document))
             }
             None => None,
         };
         let plan_span = perf::PerfSpan::start("felix:plan");
         let mut plan = match input {
-            Input::Key(key) => self.plan_felix_key(
-                text,
-                &initial,
-                key,
-                values.as_deref().unwrap_or_default(),
-                false,
-                &language,
-            ),
+            Input::Key(key) => {
+                self.plan_felix_key(text, &initial, key, values.as_deref(), false, &language)
+            }
             Input::Replay(step) => match step.event {
-                felix_core::InsertEvent::Key(key) => self.plan_felix_key(
-                    text,
-                    &initial,
-                    key,
-                    values.as_deref().unwrap_or_default(),
-                    true,
-                    &language,
-                ),
+                felix_core::InsertEvent::Key(key) => {
+                    self.plan_felix_key(text, &initial, key, values.as_deref(), true, &language)
+                }
                 felix_core::InsertEvent::Completion(change) => {
                     self.felix.session.replay_completion(text, &initial, change)
                 }
             },
             Input::Bracketed(value) => self.felix.session.bracketed_paste(text, &initial, value),
             Input::ClipboardYank { primary } => {
-                let mut plan = self.plan_felix_key(text, &initial, "y", &[], false, &language);
+                let mut plan = self.plan_felix_key(text, &initial, "y", None, false, &language);
                 let values = if primary {
                     vec![text
                         .slice(initial.primary().start()..initial.primary().end())
@@ -1067,14 +1102,14 @@ impl Editor {
                     plan.register.take().unwrap_or_default()
                 };
                 plan.register = None;
-                if let Err(error) = self.write_felix_clipboard(values) {
+                if let Err(error) = self.write_felix_clipboard('+', values).await {
                     self.set_legacy_message(Some(error));
                     return self.render(frame);
                 }
                 plan
             }
             Input::ClipboardPaste(_) | Input::ClipboardReplace => {
-                let values = match self.read_felix_clipboard().await {
+                let values = match self.read_felix_clipboard('+').await {
                     Ok(Some(values)) => values,
                     Ok(None) => return Ok(()),
                     Err(error) => {
@@ -1085,7 +1120,7 @@ impl Editor {
                 if let Input::ClipboardPaste(placement) = input {
                     self.felix.session.paste(text, &initial, &values, placement)
                 } else {
-                    self.plan_felix_key(text, &initial, "R", &values, false, &language)
+                    self.plan_felix_key(text, &initial, "R", Some(&values), false, &language)
                 }
             }
         };
@@ -1094,15 +1129,29 @@ impl Editor {
             .register
             .take_if(|_| matches!(plan.register_name, '+' | '*'))
         {
-            let result = if plan.register_name == '+' {
-                self.write_felix_clipboard(values)
-            } else {
-                Err("Primary selection clipboard is unavailable".into())
-            };
+            let result = self.write_felix_clipboard(plan.register_name, values).await;
             if let Err(error) = result {
                 self.felix.session.cancel_pending();
                 self.set_legacy_message(Some(error));
                 return self.render(frame);
+            }
+        }
+        if let Some(query) = plan
+            .search
+            .take_if(|_| matches!(plan.search_name, '+' | '*'))
+        {
+            if let Err(error) = self
+                .push_felix_clipboard_query(plan.search_name, query)
+                .await
+            {
+                if !self.felix.session.awaiting_input() {
+                    // Search from the selection changes the last register only after a successful push.
+                    self.felix.session.cancel_pending();
+                    self.set_legacy_message(Some(error));
+                    return self.render(frame);
+                }
+                // Submitting a regex still runs the query when history could not be saved.
+                plan.message.get_or_insert(error);
             }
         }
         drop(plan_span);
@@ -1181,7 +1230,9 @@ impl Editor {
             self.felix.before = Some(initial.clone());
         }
         if let Some(query) = &plan.search {
-            self.felix.registers.search.push(query.clone());
+            self.felix
+                .registers
+                .push_query(plan.search_name, query.clone());
         }
         if let Some(values) = plan.register.take() {
             self.felix.registers.write(plan.register_name, values);
@@ -2390,6 +2441,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn command_palette_copies_registers_without_a_default_binding() {
+        let (mut editor, _, _) = fixture_editor("abc\n");
+        let key = |ch| Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        for ch in "\"ay ?".chars() {
+            editor.test_execute_event(key(ch)).await.unwrap();
+        }
+        assert!(editor.current_dialog.is_some());
+        editor
+            .test_execute_event(Event::Paste("copy_between_registers".into()))
+            .await
+            .unwrap();
+        editor
+            .test_execute_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+        assert_eq!(
+            editor.felix.session.register_prompt(),
+            Some("Copy from register")
+        );
+        editor.test_execute_event(key('a')).await.unwrap();
+        assert_eq!(
+            editor.felix.session.register_prompt(),
+            Some("Copy into register")
+        );
+        editor.test_execute_event(key('b')).await.unwrap();
+        assert_eq!(editor.felix.registers.stored('b').unwrap(), &["a"]);
+        assert_eq!(editor.felix.session.register_prompt(), None);
+    }
+
+    #[tokio::test]
+    async fn clipboard_search_history_preserves_external_changes_and_the_last_search_slot() {
+        use crate::clipboard::{ClipboardProvider, MemoryClipboardProvider};
+        let (mut editor, _, _) = fixture_editor("abc\n");
+        let mut peer = MemoryClipboardProvider::with_text("system");
+        editor.test_set_clipboard(Box::new(peer.clone()));
+        editor.config.clipboard.enabled = true;
+        let key = |ch| Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        for ch in "\"*y\"*/b".chars() {
+            editor.test_execute_event(key(ch)).await.unwrap();
+        }
+        editor
+            .test_execute_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+        let saved = ["b", "a"].join(CLIPBOARD_SEPARATOR);
+        assert_eq!(
+            peer.read_primary().await.unwrap().as_deref(),
+            Some(saved.as_str())
+        );
+        for ch in "\"a*".chars() {
+            editor.test_execute_event(key(ch)).await.unwrap();
+        }
+        assert_eq!(editor.felix.session.last_search_register(), 'a');
+        let external = format!("{saved}EXTERNAL");
+        peer.copy_primary(&external, &mut std::io::sink())
+            .await
+            .unwrap();
+        for ch in "\"**".chars() {
+            editor.test_execute_event(key(ch)).await.unwrap();
+        }
+        assert_eq!(
+            peer.read_primary().await.unwrap().as_deref(),
+            Some(external.as_str())
+        );
+        assert_eq!(editor.felix.session.last_search_register(), 'a');
+        assert_eq!(peer.get_text().unwrap().as_deref(), Some("system"));
+    }
+
+    #[tokio::test]
     async fn named_registers_survive_a_document_switch_and_use_the_live_system_clipboard() {
         let (mut editor, _, _) = fixture_editor("abc\n");
         let provider = crate::clipboard::MemoryClipboardProvider::default();
@@ -2456,9 +2582,9 @@ mod tests {
         ] {
             clipboard.begin_input(None);
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-            clipboard.set_reader(tx);
+            clipboard.set_reader(tx, None);
             let reply =
-                tokio::spawn(async move { rx.recv().await.unwrap().send(response).unwrap() });
+                tokio::spawn(async move { rx.recv().await.unwrap().reply.send(response).unwrap() });
             for ch in [' ', 'p'] {
                 editor.test_execute_event(key(ch)).await.unwrap();
             }
@@ -2560,7 +2686,12 @@ mod tests {
     #[tokio::test]
     async fn search_completion_pages_keep_the_selected_candidate_visible() {
         let (mut editor, mut frame, mut runtime) = fixture_editor("doc\n");
-        editor.felix.registers.search = (0..23).map(|i| format!("item{i:02}")).collect();
+        for i in 0..23 {
+            editor
+                .felix
+                .registers
+                .push_query('/', format!("item{i:02}"));
+        }
         for key in ["/", "<backtab>"] {
             let owner = editor.felix_owner().unwrap();
             editor
@@ -2798,6 +2929,7 @@ mod tests {
             let token = expected["key"].as_str().unwrap();
             let mut modifiers = KeyModifiers::NONE;
             let code = match token {
+                "<f12>" => KeyCode::F(12),
                 token if token.starts_with("<a-") || token.starts_with("<c-") => {
                     modifiers = if token.starts_with("<a-") {
                         KeyModifiers::ALT
@@ -2834,10 +2966,15 @@ mod tests {
                 Some(value) => Event::Paste(value.as_str().unwrap().to_owned()),
                 None => Event::Key(KeyEvent::new(code, modifiers)),
             };
-            let action = editor
-                .handle_event_with_runtime(&event, Some(&runtime))
-                .unwrap()
-                .expect("document key");
+            // F12 is bound only in the reference fixture to Helix's unbound static command.
+            let action = if token == "<f12>" {
+                KeyAction::Single(Action::FelixCopyBetweenRegisters)
+            } else {
+                editor
+                    .handle_event_with_runtime(&event, Some(&runtime))
+                    .unwrap()
+                    .expect("document key")
+            };
             editor
                 .handle_key_action(&event, &action, &mut frame, &mut runtime)
                 .await
@@ -2847,7 +2984,7 @@ mod tests {
             let mut actual = json!({"key":token,"document":format!("~/{}",std::path::Path::new(&editor.current_file_name().unwrap()).file_name().unwrap().to_string_lossy()),
                 "text":editor.current_buffer().contents(),"ranges":s.ranges().iter().map(|r|[r.anchor,r.head]).collect::<Vec<_>>(),
                 "primary":s.primary_index(),"mode":format!("{:?}",editor.felix.session.mode),
-                "search":(!editor.felix.registers.search.is_empty()).then(|| editor.felix.registers.search.iter().rev().collect::<Vec<_>>()),
+                "search":editor.felix.registers.exists('/').then(|| editor.felix.registers.search_history().iter().rev().collect::<Vec<_>>()),
                 "unnamed":editor.felix.registers.stored('"'),
                 "pending":editor.felix.session.pending_keys()});
             if let Event::Paste(value) = &event {
@@ -2869,6 +3006,9 @@ mod tests {
                         index + 1
                     );
                 }
+            }
+            if expected.get("last_search_register").is_some() {
+                actual["last_search_register"] = json!(editor.felix.session.last_search_register());
             }
             if let Some(slots) = expected["registers"].as_object() {
                 actual["selected_register"] = json!(editor.felix.session.selected_register());

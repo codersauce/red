@@ -313,7 +313,9 @@ The first register change has four testable parts, in this order:
 | Insertion | Use Insert `Ctrl-r` with populated and empty slots, multiline text and multiple cursors. Check Escape during the prompt, repeat, and the undo boundary. Compare the displayed prompt and final terminal frame. |
 | Host-backed registers | Exercise the black hole, selection numbers, selected text, document path, search history, and both clipboard providers. Compare read-only write errors and provider failure against the pinned reference. Retain Red's agreed handling of externally edited clipboard contents. |
 
-Extend the observer to capture selected register identity and the contents of the slots exercised by each case. Keep M1's pinned corpus replayable and add the new fixtures under M2.
+The first register slice, `52aa8438`, passed Linux with the committed lockfile. Its artifact contains 232 register inputs, 4,044 fixed M1 inputs and 4,676 extended inputs. [Linux conformance run](https://github.com/codersauce/red/actions/runs/41887329947)
+
+The second register slice adds named search histories, copying between registers, and the primary-selection clipboard. The dedicated corpus now compares 366 inputs across 16 cases. The next group is macro recording with `Q` and replay with `q`, starting with named registers, counts, and recursive playback. [Register comparison instructions](../scripts/felix/README.md#m2-register-comparisons)
 
 Include the already reserved M2 bindings and actions in that inventory: current-document-directory NeoTree, changed-file navigation, symbol-reference selections, comment toggles, and syntax navigation/selections. Each group extends the same manifest, live differential suite, production integration, and visible-behavior checks. Independent groups may proceed concurrently once their prerequisites exist. M2 remains scoped to document windows; release scheduling does not delay it.
 

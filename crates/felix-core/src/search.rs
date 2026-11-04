@@ -127,13 +127,14 @@ pub(crate) struct Prompt {
     pub line: String,
     pub cursor: usize,
     history_index: Option<usize>,
+    named_history: Option<std::sync::Arc<[String]>>,
     history_candidates: std::sync::Arc<[String]>,
     matches: std::ops::Range<usize>,
     pub selected: Option<usize>,
 }
 
 impl Prompt {
-    pub fn new(kind: Query, history: &[String]) -> Self {
+    pub fn new(kind: Query, history: std::borrow::Cow<'_, [String]>) -> Self {
         let mut prompt = Self::default();
         if matches!(kind, Query::Forward | Query::Backward) {
             let mut entries: Vec<_> = history.iter().rev().take(200).cloned().collect();
@@ -142,7 +143,14 @@ impl Prompt {
             prompt.matches = 0..entries.len();
             prompt.history_candidates = entries.into();
         }
+        if let std::borrow::Cow::Owned(entries) = history {
+            prompt.named_history = Some(entries.into());
+        }
         prompt
+    }
+
+    pub fn history<'a>(&'a self, default: &'a [String]) -> &'a [String] {
+        self.named_history.as_deref().unwrap_or(default)
     }
 
     pub fn candidates(&self) -> &[String] {
@@ -292,7 +300,7 @@ mod tests {
     fn completion_uses_the_last_two_hundred_searches_before_deduplicating() {
         let mut history: Vec<_> = (0..201).rev().map(|i| format!("q{i:03}")).collect();
         history.push("q008".into());
-        let mut prompt = Prompt::new(Query::Forward, &history);
+        let mut prompt = Prompt::new(Query::Forward, history.as_slice().into());
         assert_eq!(prompt.candidates().len(), 199);
         assert_eq!(prompt.candidates().first().unwrap(), "q000");
         assert_eq!(prompt.candidates().last().unwrap(), "q198");
@@ -300,6 +308,10 @@ mod tests {
         assert_eq!(prompt.candidates().len(), 9);
         prompt.cycle(true);
         assert_eq!(prompt.line, "q198");
-        assert!(Prompt::new(Query::Select, &history).candidates().is_empty());
+        assert!(
+            Prompt::new(Query::Select, history.as_slice().into())
+                .candidates()
+                .is_empty()
+        );
     }
 }

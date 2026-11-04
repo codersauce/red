@@ -86,9 +86,8 @@ impl Editor {
         }
         if let Some(suggestion) = self
             .felix
-            .registers
-            .search
-            .last()
+            .session
+            .prompt_history_hint(self.felix.registers.search_history())
             .filter(|_| line.is_empty())
         {
             let muted = self

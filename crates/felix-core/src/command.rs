@@ -21,6 +21,11 @@ enum Pending {
     None,
     Goto,
     SelectRegister,
+    CopyFrom,
+    CopyInto {
+        source: char,
+        values: std::sync::Arc<[String]>,
+    },
     InsertRegister {
         visible: bool,
     },
@@ -35,6 +40,7 @@ enum Pending {
         count: usize,
     },
     Regex {
+        register: char,
         kind: Query,
         input: Prompt,
         original: Selections,
@@ -151,7 +157,8 @@ pub struct Context<'a> {
     /// Search register entries, oldest first.
     pub search_history: &'a [String],
     /// Fragments requested by Session::register_to_read for this input.
-    pub register: &'a [String],
+    /// A populated slot may contain zero fragments.
+    pub register: Option<&'a [String]>,
     pub tab_width: usize,
     pub indent: &'a str,
     /// Language indentation in display columns, sorted by original break position.
@@ -167,7 +174,7 @@ impl Default for Context<'_> {
     fn default() -> Self {
         Self {
             search_history: &[],
-            register: &[],
+            register: None,
             tab_width: 4,
             indent: "    ",
             newline_indents: &[],
@@ -251,6 +258,7 @@ pub struct Session {
     pub mode: Mode,
     pending: Pending,
     selected_register: Option<char>,
+    last_search_register: Option<char>,
     count: Option<usize>,
     // Helix carries the preferred wrap row and screen column across both kinds of vertical motion.
     goals: Vec<(usize, usize)>,
@@ -297,6 +305,7 @@ pub struct Plan {
     pub register: Option<Vec<String>>,
     pub register_name: char,
     pub search: Option<String>,
+    pub search_name: char,
     pub host: Option<HostAction>,
     pub save_jump: Option<Selections>,
     /// New top display row, as a document character offset.
@@ -336,6 +345,17 @@ fn register_text(value: &str, newline: &str, count: usize) -> Result<String, &'s
 }
 
 impl Plan {
+    fn push_query(&mut self, query: String) {
+        if matches!(self.search_name, '#' | '.' | '%') {
+            self.message = Some(format!(
+                "Register {} does not support pushing",
+                self.search_name
+            ));
+        } else {
+            self.search = Some(query);
+        }
+    }
+
     fn paste(
         &mut self,
         text: RopeSlice<'_>,
@@ -612,6 +632,7 @@ impl Session {
             register: None,
             register_name: self.selected_register.unwrap_or('"'),
             search: None,
+            search_name: self.selected_register.unwrap_or('/'),
             host: None,
             save_jump: None,
             viewport_start: None,
@@ -703,6 +724,8 @@ impl Session {
 
     pub fn register_prompt(&self) -> Option<&'static str> {
         match self.pending {
+            Pending::CopyFrom => Some("Copy from register"),
+            Pending::CopyInto { .. } => Some("Copy into register"),
             Pending::SelectRegister => Some("Select register"),
             Pending::InsertRegister { visible: true } => Some("Insert register"),
             _ => None,
@@ -744,10 +767,31 @@ impl Session {
         plan
     }
 
+    pub fn last_search_register(&self) -> char {
+        self.last_search_register.unwrap_or('/')
+    }
+
+    pub fn prompt_history_hint<'a>(&'a self, history: &'a [String]) -> Option<&'a str> {
+        match &self.pending {
+            Pending::Regex { input, .. } => input.history(history).last().map(String::as_str),
+            _ => None,
+        }
+    }
+
     /// Ask the host for values only when the key consumes a register.
     pub fn register_to_read(&self, key: &str) -> Option<char> {
         match (&self.pending, self.mode) {
-            (Pending::InsertRegister { .. }, _) => argument_character(key),
+            (Pending::CopyFrom | Pending::InsertRegister { .. }, _) => argument_character(key),
+            (Pending::None, Mode::Normal | Mode::Select) if matches!(key, "n" | "N") => Some(
+                self.selected_register
+                    .unwrap_or(self.last_search_register()),
+            )
+            .filter(|name| *name != '/'),
+            (Pending::None, Mode::Normal | Mode::Select)
+                if matches!(key, "/" | "?" | "s" | "S" | "K" | "<a-K>") =>
+            {
+                self.selected_register.filter(|name| *name != '/')
+            }
             (Pending::None, Mode::Normal | Mode::Select) if matches!(key, "p" | "P" | "R") => {
                 Some(self.selected_register.unwrap_or('"'))
             }
@@ -806,8 +850,8 @@ impl Session {
         context: &Context<'_>,
     ) -> Plan {
         let mut p = self.unchanged(selections);
-        let search = context.search_history.last().map(String::as_str);
-        let register = context.register;
+
+        let register = context.register.unwrap_or_default();
         let count = self.count.unwrap_or(1);
         let extend = self.mode == Mode::Select;
         if !matches!(key, "j" | "k" | "<down>" | "<up>" | "<c-d>" | "<c-u>" | "g")
@@ -828,6 +872,37 @@ impl Session {
             p.next.selected_register = None;
         }
         match &self.pending {
+            Pending::CopyFrom => {
+                p.next.pending = Pending::None;
+                if let Some(source) = argument_character(key) {
+                    if let Some(values) = context.register {
+                        p.next.pending = Pending::CopyInto {
+                            source,
+                            values: values.into(),
+                        };
+                    } else {
+                        p.message = Some(format!("register {source} is empty"));
+                    }
+                }
+                return p;
+            }
+            Pending::CopyInto { source, values } => {
+                p.next.pending = Pending::None;
+                if let Some(dest) = argument_character(key) {
+                    if matches!(dest, '#' | '.' | '%') {
+                        p.message = Some(format!("Register {dest} does not support writing"));
+                    } else {
+                        let count = values.len();
+                        let plural = if count == 1 { "" } else { "s" };
+                        p.message = Some(format!(
+                            "yanked {count} value{plural} from register {source} to {dest}"
+                        ));
+                        p.register_name = dest;
+                        p.register = Some(values.to_vec());
+                    }
+                }
+                return p;
+            }
             Pending::SelectRegister | Pending::InsertRegister { .. } => {
                 p.next.pending = Pending::None;
                 if let Some(name) = argument_character(key) {
@@ -840,11 +915,15 @@ impl Session {
                 return p;
             }
             Pending::Regex {
+                register: history_name,
                 original,
                 input,
                 kind,
                 viewport_start,
             } => {
+                let history = input.history(context.search_history);
+                let search = history.last().map(String::as_str);
+                p.search_name = *history_name;
                 let mut prompt = input.clone();
                 let submit = key == "<enter>";
                 match key {
@@ -866,14 +945,14 @@ impl Session {
                         if prompt.line.is_empty() {
                             prompt.line = search.unwrap_or_default().to_owned();
                         } else if search != Some(prompt.line.as_str()) {
-                            p.search = Some(prompt.line.clone());
+                            p.push_query(prompt.line.clone());
                         }
                     }
                     "<up>" | "<c-p>" | "<down>" | "<c-n>" => {
                         p.set(original.clone());
                         p.viewport_start = Some(*viewport_start);
-                        prompt.recall(context.search_history, matches!(key, "<up>" | "<c-p>"));
-                        if context.search_history.is_empty() {
+                        prompt.recall(history, matches!(key, "<up>" | "<c-p>"));
+                        if history.is_empty() {
                             return p;
                         }
                     }
@@ -897,6 +976,9 @@ impl Session {
                 let query = &prompt.line;
                 if !query.is_empty() {
                     if let Some(regex) = Query::compile(query) {
+                        if submit && matches!(kind, Query::Forward | Query::Backward) {
+                            p.next.last_search_register = Some(*history_name);
+                        }
                         let preview = kind.apply(text, original, &regex, extend);
                         if let Some(ref found) = preview
                             && matches!(kind, Query::Forward | Query::Backward)
@@ -927,6 +1009,7 @@ impl Session {
                 }
                 if !submit {
                     p.next.pending = Pending::Regex {
+                        register: *history_name,
                         kind: *kind,
                         original: original.clone(),
                         viewport_start: *viewport_start,
@@ -1061,6 +1144,7 @@ impl Session {
                 })
             }
             "." => p.host = Some(HostAction::RepeatInsert(count)),
+            "<copy-between-registers>" => p.next.pending = Pending::CopyFrom,
             "\"" => p.next.pending = Pending::SelectRegister,
             "g" => p.next.pending = Pending::Goto,
             "m" => p.next.pending = Pending::Match,
@@ -1073,11 +1157,17 @@ impl Session {
                     "<a-K>" => Query::Remove,
                     _ => Query::Select,
                 };
+                let history = if p.search_name == '/' {
+                    std::borrow::Cow::Borrowed(context.search_history)
+                } else {
+                    std::borrow::Cow::Owned(register.iter().rev().cloned().collect())
+                };
                 p.next.pending = Pending::Regex {
+                    register: p.search_name,
                     kind,
                     original: selections.clone(),
                     viewport_start: context.viewport_start,
-                    input: Prompt::new(kind, context.search_history),
+                    input: Prompt::new(kind, history),
                 };
             }
             "r" => p.next.pending = Pending::Replace,
@@ -1178,7 +1268,15 @@ impl Session {
                 } else {
                     Query::Backward
                 };
-                if let Some(regex) = search.and_then(Query::compile) {
+                let name = self
+                    .selected_register
+                    .unwrap_or(self.last_search_register());
+                let query = if name == '/' {
+                    context.search_history.last()
+                } else {
+                    register.first()
+                };
+                if let Some(regex) = query.and_then(|query| Query::compile(query)) {
                     let mut state = selections.clone();
                     for _ in 0..count {
                         let Some(next) = kind.apply(text, &state, &regex, extend) else {
@@ -1229,7 +1327,10 @@ impl Session {
                         alternatives.push(pattern);
                     }
                 }
-                p.search = Some(alternatives.join("|"));
+                p.push_query(alternatives.join("|"));
+                if p.search.is_some() {
+                    p.next.last_search_register = Some(p.search_name);
+                }
             }
             "_" => {
                 let mut trimmed = Vec::new();

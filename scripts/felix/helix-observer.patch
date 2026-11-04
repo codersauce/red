@@ -1,5 +1,5 @@
 diff --git a/helix-term/src/application.rs b/helix-term/src/application.rs
-index cf09aac..c4a6f63 100644
+index cf09aac..d3f6152 100644
 --- a/helix-term/src/application.rs
 +++ b/helix-term/src/application.rs
 @@ -642,7 +642,11 @@ pub async fn handle_terminal_events(&mut self, event: std::io::Result<CrosstermE
@@ -47,9 +47,9 @@ index cf09aac..c4a6f63 100644
 +                "event": event, "paste": paste, "mode": format!("{:?}", self.editor.mode),
 +                "text": doc.text().to_string(), "primary": selections.primary_index(),
 +                "ranges": selections.iter().map(|r| [r.anchor, r.head]).collect::<Vec<_>>(),
-+                "selected_register": self.editor.selected_register, "registers": observed_slots,
++                "last_search_register": self.editor.registers.last_search_register, "selected_register": self.editor.selected_register, "registers": observed_slots,
 +                "register_prompt": self.editor.autoinfo.as_ref().map(|info| info.title.as_ref())
-+                    .filter(|title| matches!(*title, "Select register" | "Insert register")),
++                    .filter(|title| matches!(*title, "Select register" | "Insert register" | "Copy from register" | "Copy into register")),
 +                "unnamed": read_register('"'), "search": read_register('/'),
 +                "prompt": prompt, "pending": ui.keymaps.pending().iter().map(ToString::to_string).collect::<Vec<_>>(),
 +                "count": self.editor.count, "last_insert": format!("{:?}", ui.last_insert),

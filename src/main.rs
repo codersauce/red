@@ -967,7 +967,9 @@ async fn send_detached_input(
     output: &mut impl std::io::Write,
     input: DetachedInput,
 ) -> anyhow::Result<red::headless::RenderDelta> {
-    let delta = client.input_with_provider(input, clipboard).await?;
+    let delta = client
+        .input_with_provider_and_output(input, clipboard, output)
+        .await?;
     deliver_detached_clipboard(client, clipboard, output, delta).await
 }
 

@@ -109,7 +109,15 @@ jobs:
           cargo clippy --locked --all-targets --all-features -- -D warnings
           cargo test --locked -p felix-core
           cargo test --locked -p red --features helix --lib --test completion --test mouse_selection_detached --test lsp_save -- --test-threads=1
+          cargo test --locked -p red --features helix --test detach helix_primary_clipboard
           cargo test --locked -p red --features helix --test rpc_connection
+      - name: Exercise native primary and system clipboards on an isolated X display
+        run: |
+          if ! command -v Xvfb || ! command -v xauth; then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends -y xvfb xauth
+          fi
+          xvfb-run -a cargo test --locked -p red --features helix --lib native_primary_selection_is_independent_of_system_clipboard -- --ignored
       - name: Replay the extended seed against the same revision
         if: github.event_name != 'pull_request'
         env:

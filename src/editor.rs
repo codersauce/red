@@ -2675,6 +2675,8 @@ pub enum Action {
     #[cfg(feature = "helix")]
     FelixSwapWindow(crate::window::Direction),
     #[cfg(feature = "helix")]
+    FelixCopyBetweenRegisters,
+    #[cfg(feature = "helix")]
     FelixClipboardYank,
     #[cfg(feature = "helix")]
     FelixClipboardYankPrimary,
@@ -4343,9 +4345,10 @@ impl DetachedEditorCore {
     pub(crate) async fn input_with_clipboard_reader(
         &mut self,
         event: crate::headless::InputEvent,
-        reader: tokio::sync::mpsc::UnboundedSender<crate::clipboard::ClipboardReadRequest>,
+        reader: tokio::sync::mpsc::UnboundedSender<crate::clipboard::ClipboardRequest>,
+        capabilities: Option<crate::clipboard::ClipboardCapabilities>,
     ) -> anyhow::Result<crate::headless::RenderDelta> {
-        self.client_clipboard.set_reader(reader);
+        self.client_clipboard.set_reader(reader, capabilities);
         self.input_with_clipboard(event, None).await
     }
 
@@ -4558,6 +4561,11 @@ impl DetachedEditorCore {
 
     pub fn client_disconnected(&mut self) {
         self.client_clipboard.set_attached(false);
+        #[cfg(feature = "helix")]
+        {
+            self.editor.felix.clipboard.clear();
+            self.editor.felix.primary_clipboard.clear();
+        }
         self.editor.mouse_selection.gesture = None;
         self.editor.mouse_selection.last_click = None;
         self.editor.notification_client_attached = false;
@@ -22459,6 +22467,19 @@ impl Editor {
                 return Ok(Some((true, false)));
             }
             #[cfg(feature = "helix")]
+            Action::FelixCopyBetweenRegisters => {
+                if let Some(owner) = self.felix_owner() {
+                    self.execute_felix(
+                        felix::Input::Key("<copy-between-registers>"),
+                        owner,
+                        buffer,
+                        runtime,
+                    )
+                    .await?;
+                }
+                return Ok(Some((true, false)));
+            }
+            #[cfg(feature = "helix")]
             Action::FelixClipboardBefore
             | Action::FelixClipboardAfter
             | Action::FelixClipboardYank
@@ -25247,7 +25268,11 @@ impl Editor {
                     } else {
                         keys
                     };
-                    let entries = command_palette::entries(keys, &commands);
+                    let entries = command_palette::entries_for_model(
+                        keys,
+                        &commands,
+                        self.config.editing_model,
+                    );
                     let actions = entries
                         .iter()
                         .map(|entry| (entry.id.clone(), entry.action.clone()))

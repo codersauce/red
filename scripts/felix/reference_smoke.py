@@ -538,6 +538,10 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
             tmux("send-keys", "%", "s", "[a-z]+", "Enter")
             observe("select both words", "a bb", "NOR")
             for keys, line in [
+                (['"', '*', 'y', 'r', 'x'], "x xx"),
+                (['"', '+', 'y', '"', '*', 'R'], "a bb"),
+                (['"', '+', 'R'], "x xx"),
+                (['"', '*', 'R'], "a bb"),
                 (["Space", "y", "Space", "p"], "aa bbbb"),
                 (["u"], "a bb"),
                 (["Space", "P"], "aa bbbb"),

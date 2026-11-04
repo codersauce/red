@@ -172,8 +172,11 @@ pub enum ClientMessage {
         sequence: u64,
         /// Normalized input payload.
         event: InputEvent,
+        /// Older clients omit this field and receive legacy system clipboard effects.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        clipboard: Option<crate::clipboard::ClipboardCapabilities>,
     },
-    /// Reply to a clipboard read requested by the currently executing paste action.
+    /// Result of an input-scoped clipboard request. Successful writes return no text.
     ClipboardReadResult {
         result: Result<Option<String>, String>,
     },
@@ -260,6 +263,13 @@ pub enum ServerMessage {
     },
     /// Read only in response to an explicit paste action; no polling or reconnect reads.
     ClipboardRead,
+    /// These requests are sent only during an input that advertised a primary selection.
+    PrimaryRead,
+    /// Base64 keeps even 1 MiB of control characters within the bounded JSON frame.
+    RegisterWrite {
+        target: crate::clipboard::ClipboardTarget,
+        base64: String,
+    },
     /// Transient input effect, sent before its Render response and never included in snapshots.
     ClipboardWrite { text: String, final_chunk: bool },
     /// Render response correlated with an input sequence.
@@ -894,10 +904,20 @@ async fn serve_editor_connection(
             return Ok(false);
         };
         match message {
-            ClientMessage::Input { sequence, event } => {
+            ClientMessage::Input {
+                sequence,
+                event,
+                clipboard,
+            } => {
                 let mut core = core.lock().await;
-                let delta =
-                    input_with_client_clipboard(&mut core, event, &mut reader, &mut writer).await?;
+                let delta = input_with_client_clipboard(
+                    &mut core,
+                    event,
+                    clipboard,
+                    &mut reader,
+                    &mut writer,
+                )
+                .await?;
                 let clipboard_write = core.take_clipboard_write();
                 client_revision = delta.revision;
                 let stopped = core.stopped();
@@ -1073,25 +1093,35 @@ pub async fn stop_session(directory: &Path, name: &str) -> anyhow::Result<()> {
 async fn input_with_client_clipboard(
     core: &mut crate::editor::DetachedEditorCore,
     event: InputEvent,
+    capabilities: Option<crate::clipboard::ClipboardCapabilities>,
     reader: &mut (impl AsyncBufRead + Unpin),
     writer: &mut (impl AsyncWrite + Unpin),
 ) -> anyhow::Result<RenderDelta> {
     let (requests, mut reads) = tokio::sync::mpsc::unbounded_channel();
-    let input = core.input_with_clipboard_reader(event, requests);
+    let input = core.input_with_clipboard_reader(event, requests, capabilities);
     tokio::pin!(input);
     loop {
         tokio::select! {
             result = &mut input => return result,
-            Some(reply) = reads.recv() => {
-                write_frame(writer, &ServerMessage::ClipboardRead).await?;
-                let response = read_frame_with_timeout(reader, Duration::from_secs(3), "clipboard client read timed out").await?;
-                let Some(ClientMessage::ClipboardReadResult { result }) = response else { anyhow::bail!("expected clipboard read response"); };
+            Some(request) = reads.recv() => {
+                use crate::clipboard::ClipboardOperation;
+                let message = match request.operation {
+                    ClipboardOperation::ReadSystem => ServerMessage::ClipboardRead,
+                    ClipboardOperation::ReadPrimary => ServerMessage::PrimaryRead,
+                    ClipboardOperation::Write(target, text) => {
+                        use base64::Engine;
+                        ServerMessage::RegisterWrite { target, base64: base64::engine::general_purpose::STANDARD.encode(text) }
+                    }
+                };
+                write_frame(writer, &message).await?;
+                let response = read_frame_with_timeout(reader, Duration::from_secs(3), "clipboard client response timed out").await?;
+                let Some(ClientMessage::ClipboardReadResult { result }) = response else { anyhow::bail!("expected clipboard response"); };
                 match &result {
                     Ok(Some(text)) => anyhow::ensure!(text.len() <= crate::clipboard::MAX_CLIPBOARD_BYTES, "clipboard read exceeds 1 MiB"),
                     Err(message) => anyhow::ensure!(message.len() <= 4096, "clipboard read error too large"),
                     _ => {}
                 }
-                let _ = reply.send(result);
+                let _ = request.reply.send(result);
             }
         }
     }
@@ -1364,7 +1394,9 @@ where
         let mut provider = crate::clipboard::MemoryClipboardProvider::from(Arc::new(
             std::sync::Mutex::new(clipboard),
         ));
-        self.input_with_provider(event, &mut provider).await
+        let sequence = self.send_input(event, None).await?;
+        self.expect_render(sequence, None, &mut provider, &mut std::io::sink())
+            .await
     }
 
     /// Service clipboard requests only while the owner is executing this input.
@@ -1373,16 +1405,50 @@ where
         event: InputEvent,
         clipboard: &mut dyn crate::clipboard::ClipboardProvider,
     ) -> anyhow::Result<RenderDelta> {
+        self.input_with_provider_and_output(event, clipboard, &mut std::io::stdout())
+            .await
+    }
+
+    pub async fn input_with_provider_and_output(
+        &mut self,
+        event: InputEvent,
+        clipboard: &mut dyn crate::clipboard::ClipboardProvider,
+        output: &mut impl std::io::Write,
+    ) -> anyhow::Result<RenderDelta> {
+        let capabilities = Some(crate::clipboard::ClipboardCapabilities {
+            primary: clipboard.primary_selection(),
+            system_write_only: clipboard.uses_saved_yank(),
+        });
+        let sequence = self.send_input(event, capabilities).await?;
+        self.expect_render(sequence, capabilities, clipboard, output)
+            .await
+    }
+
+    async fn send_input(
+        &mut self,
+        event: InputEvent,
+        capabilities: Option<crate::clipboard::ClipboardCapabilities>,
+    ) -> anyhow::Result<u64> {
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.saturating_add(1);
-        write_frame(&mut self.writer, &ClientMessage::Input { sequence, event }).await?;
-        self.expect_render(sequence, clipboard).await
+        write_frame(
+            &mut self.writer,
+            &ClientMessage::Input {
+                sequence,
+                event,
+                clipboard: capabilities,
+            },
+        )
+        .await?;
+        Ok(sequence)
     }
 
     async fn expect_render(
         &mut self,
         sequence: u64,
+        capabilities: Option<crate::clipboard::ClipboardCapabilities>,
         clipboard: &mut dyn crate::clipboard::ClipboardProvider,
+        output: &mut impl std::io::Write,
     ) -> anyhow::Result<RenderDelta> {
         let mut pending_copy = String::new();
         let mut copy_in_progress = false;
@@ -1395,6 +1461,45 @@ where
             )
             .await?
             {
+                Some(ServerMessage::PrimaryRead) => {
+                    anyhow::ensure!(
+                        capabilities.is_some_and(
+                            |c| c.primary == crate::clipboard::PrimarySelection::ReadWrite
+                        ),
+                        "primary clipboard read was not advertised"
+                    );
+                    write_frame(
+                        &mut self.writer,
+                        &clipboard_read_result(clipboard.read_primary().await),
+                    )
+                    .await?;
+                }
+                Some(ServerMessage::RegisterWrite { target, base64 }) => {
+                    use base64::Engine;
+                    anyhow::ensure!(
+                        capabilities
+                            .is_some_and(|c| target == crate::clipboard::ClipboardTarget::System
+                                || c.primary != crate::clipboard::PrimarySelection::Unavailable),
+                        "clipboard write was not advertised"
+                    );
+                    let text = String::from_utf8(
+                        base64::engine::general_purpose::STANDARD.decode(base64)?,
+                    )?;
+                    anyhow::ensure!(
+                        text.len() <= crate::clipboard::MAX_CLIPBOARD_BYTES,
+                        "clipboard write exceeds 1 MiB"
+                    );
+                    let delivery = match target {
+                        crate::clipboard::ClipboardTarget::Primary => {
+                            clipboard.copy_primary(&text, output).await
+                        }
+                        crate::clipboard::ClipboardTarget::System => {
+                            clipboard.copy(&text, output).map(|_| ())
+                        }
+                    }
+                    .map(|_| None);
+                    write_frame(&mut self.writer, &clipboard_read_result(delivery)).await?;
+                }
                 Some(ServerMessage::ClipboardRead) => {
                     let message = clipboard_read_result(clipboard.read_text().await);
                     write_frame(&mut self.writer, &message).await?;
@@ -1479,8 +1584,13 @@ where
     }
 
     async fn expect_control_render(&mut self) -> anyhow::Result<RenderDelta> {
-        self.expect_render(0, &mut crate::clipboard::DisabledClipboardProvider)
-            .await
+        self.expect_render(
+            0,
+            None,
+            &mut crate::clipboard::DisabledClipboardProvider,
+            &mut std::io::sink(),
+        )
+        .await
     }
 }
 
@@ -1720,6 +1830,20 @@ mod tests {
     }
 
     #[test]
+    fn legacy_input_omits_register_clipboard_capabilities() {
+        let legacy = serde_json::json!({"type":"input", "sequence":7, "event":{"kind":"paste", "text":"abc"}});
+        let event: ClientMessage = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(matches!(
+            event,
+            ClientMessage::Input {
+                clipboard: None,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(event).unwrap(), legacy);
+    }
+
+    #[test]
     fn escaped_clipboard_reads_report_a_bounded_error_without_disconnect() {
         let plain =
             clipboard_read_result(Ok(Some("x".repeat(crate::clipboard::MAX_CLIPBOARD_BYTES))));
@@ -1877,6 +2001,7 @@ mod tests {
                 let Some(ClientMessage::Input {
                     sequence,
                     event: InputEvent::PasteChunk { final_chunk, .. },
+                    ..
                 }) = read_frame(&mut reader).await.unwrap()
                 else {
                     panic!("expected paste chunk");

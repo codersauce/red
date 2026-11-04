@@ -162,6 +162,156 @@ async fn clipboard_delivery_is_transient_and_paste_uses_the_current_client() {
     server.unwrap();
 }
 
+#[cfg(feature = "helix")]
+#[tokio::test(flavor = "current_thread")]
+async fn helix_primary_clipboard_uses_the_attached_client_and_requires_delivery() {
+    use red::clipboard::{ClipboardProvider, MemoryClipboardProvider, PrimarySelection};
+    struct Terminal {
+        deny_copy: bool,
+    }
+    impl ClipboardProvider for Terminal {
+        fn primary_selection(&self) -> PrimarySelection {
+            PrimarySelection::WriteOnly
+        }
+        fn uses_saved_yank(&self) -> bool {
+            true
+        }
+        fn get_text(&mut self) -> anyhow::Result<Option<String>> {
+            panic!("a write-only client must not be asked to read")
+        }
+        fn set_text(&mut self, _: &str) -> anyhow::Result<()> {
+            anyhow::ensure!(!self.deny_copy, "terminal denied copy");
+            Ok(())
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let config = Config::from_user_toml_with_overrides("editing_model = 'helix'", &[]).unwrap();
+    let editor = Editor::test_with_size(
+        Box::new(LspManager::new(config.lsp.clone())),
+        80,
+        24,
+        config,
+        Theme::default(),
+        vec![Buffer::new(None, "abc\n".into())],
+    )
+    .unwrap();
+    let core = DetachedEditorCore::new(editor).await.unwrap();
+    let session = bind_session(directory.path(), "primary").unwrap();
+    let key = |character| InputEvent::Key {
+        code: KeyCode::Character(character),
+        modifiers: vec![],
+        key_kind: red::headless::KeyKind::Press,
+    };
+    let client = async {
+        let mut first = connect_session(directory.path(), "primary", None, (80, 24))
+            .await
+            .unwrap();
+        let mut provider = MemoryClipboardProvider::with_text("system");
+        for ch in "\"*y".chars() {
+            first
+                .input_with_provider(key(ch), &mut provider)
+                .await
+                .unwrap();
+        }
+        assert_eq!(provider.read_primary().await.unwrap().as_deref(), Some("a"));
+        assert_eq!(provider.get_text().unwrap().as_deref(), Some("system"));
+        assert!(first.take_clipboard_write().is_none());
+
+        let mut terminal = Terminal { deny_copy: false };
+        for ch in "\"+y\"+".chars() {
+            first
+                .input_with_provider(key(ch), &mut terminal)
+                .await
+                .unwrap();
+        }
+        let pasted = first
+            .input_with_provider(key('P'), &mut terminal)
+            .await
+            .unwrap();
+        assert!(pasted.lines.iter().any(|line| line.text.contains("aabc")));
+        first.input(key('u')).await.unwrap();
+        let mut denied = Terminal { deny_copy: true };
+        for ch in "\"+".chars() {
+            first
+                .input_with_provider(key(ch), &mut denied)
+                .await
+                .unwrap();
+        }
+        let failed = first
+            .input_with_provider(key('d'), &mut denied)
+            .await
+            .unwrap();
+        assert!(failed
+            .lines
+            .iter()
+            .any(|line| line.text.contains("terminal denied copy")));
+        for ch in "\"*".chars() {
+            first
+                .input_with_provider(key(ch), &mut denied)
+                .await
+                .unwrap();
+        }
+        let failed = first
+            .input_with_provider(key('d'), &mut denied)
+            .await
+            .unwrap();
+        assert!(failed
+            .lines
+            .iter()
+            .any(|line| line.text.contains("Primary clipboard write failed")));
+        first.detach().await.unwrap();
+        drop(first);
+
+        let mut second = connect_session(directory.path(), "primary", None, (80, 24))
+            .await
+            .unwrap();
+        assert!(second
+            .initial_render
+            .lines
+            .iter()
+            .any(|line| line.text.contains("abc")));
+        // The compatibility input method has no primary provider.
+        for ch in "\"*".chars() {
+            second.input(key(ch)).await.unwrap();
+        }
+        let failed = second.input(key('d')).await.unwrap();
+        assert!(failed
+            .lines
+            .iter()
+            .any(|line| line.text.contains("Primary clipboard write failed")));
+        // The new attachment cannot reuse the first terminal's write-only cache.
+        for ch in "\"+P".chars() {
+            second
+                .input_with_provider(key(ch), &mut terminal)
+                .await
+                .unwrap();
+        }
+        let mut external = MemoryClipboardProvider::default();
+        external
+            .copy_primary("aXYZ", &mut std::io::sink())
+            .await
+            .unwrap();
+        for ch in "\"*".chars() {
+            second
+                .input_with_provider(key(ch), &mut external)
+                .await
+                .unwrap();
+        }
+        let pasted = second
+            .input_with_provider(key('P'), &mut external)
+            .await
+            .unwrap();
+        assert!(pasted
+            .lines
+            .iter()
+            .any(|line| line.text.contains("aXYZabc")));
+        second.stop().await.unwrap();
+    };
+    let (server, ()) = tokio::join!(serve_editor_session(&session, core), client);
+    server.unwrap();
+}
+
 async fn wait_for_pid(path: &Path) -> i32 {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {

@@ -44,8 +44,9 @@ mixed across a running session.
 
 Clipboard delivery belongs to the current terminal attachment. Yanks are sent as
 one-time effects, separately from render frames, and never replay on reconnect.
-Native clipboard reads are requested only by paste actions;
-OSC 52 and tmux use Red's internal register for `p`. Use your terminal's paste shortcut
+Clipboard reads occur when an edit needs them. In Helix mode, clients can also
+acknowledge system and primary register writes before the owner edits the document.
+OSC 52 and tmux reuse saved yanks for `p`. Use your terminal's paste shortcut
 to insert client-side clipboard text over SSH. See [Clipboard](CLIPBOARD.md).
 
 Detach and crash recovery solve different failures. A client or SSH disconnect leaves

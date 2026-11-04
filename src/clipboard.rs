@@ -21,8 +21,60 @@ pub enum CopyOutcome {
     Deferred,
 }
 
+/// Whether this frontend can read a primary selection or only send it to its terminal.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrimarySelection {
+    #[default]
+    Unavailable,
+    ReadWrite,
+    WriteOnly,
+}
+
+/// An input carrying these capabilities can acknowledge writes before an edit commits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ClipboardCapabilities {
+    pub primary: PrimarySelection,
+    pub system_write_only: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipboardTarget {
+    System,
+    Primary,
+}
+
 /// Fallible text clipboard operations required by the editor.
 pub trait ClipboardProvider: Send {
+    fn primary_selection(&self) -> PrimarySelection {
+        PrimarySelection::Unavailable
+    }
+
+    fn read_primary(&mut self) -> futures::future::BoxFuture<'_, anyhow::Result<Option<String>>> {
+        Box::pin(async { anyhow::bail!("Primary selection clipboard is unavailable") })
+    }
+
+    /// Synchronous providers write before returning. A detached provider waits for
+    /// the frontend's acknowledgment before the editor applies a destructive edit.
+    fn copy_primary(
+        &mut self,
+        _text: &str,
+        _output: &mut dyn std::io::Write,
+    ) -> futures::future::BoxFuture<'static, anyhow::Result<()>> {
+        Box::pin(async { anyhow::bail!("Primary selection clipboard is unavailable") })
+    }
+
+    /// Copy to the system clipboard before applying an edit. Older attached clients
+    /// deliver system writes with the next render, as in the original IPC protocol.
+    fn copy_system_for_edit(
+        &mut self,
+        text: &str,
+        output: &mut dyn std::io::Write,
+    ) -> futures::future::BoxFuture<'static, anyhow::Result<()>> {
+        Box::pin(std::future::ready(self.copy(text, output).map(|_| ())))
+    }
+
     /// Reports whether a copy route is configured, not whether delivery was acknowledged.
     fn is_available(&self) -> bool {
         true
@@ -67,15 +119,31 @@ struct ClientClipboardState {
     text: Option<String>,
     write: Option<String>,
     accepting: bool,
-    reader: Option<tokio::sync::mpsc::UnboundedSender<ClipboardReadRequest>>,
+    reader: Option<tokio::sync::mpsc::UnboundedSender<ClipboardRequest>>,
+    capabilities: Option<ClipboardCapabilities>,
 }
 
-pub(crate) type ClipboardReadRequest = tokio::sync::oneshot::Sender<Result<Option<String>, String>>;
+pub(crate) enum ClipboardOperation {
+    ReadSystem,
+    ReadPrimary,
+    Write(ClipboardTarget, String),
+}
+
+pub(crate) struct ClipboardRequest {
+    pub operation: ClipboardOperation,
+    pub reply: tokio::sync::oneshot::Sender<Result<Option<String>, String>>,
+}
 
 impl ClientClipboard {
     #[cfg(unix)]
-    pub fn set_reader(&self, reader: tokio::sync::mpsc::UnboundedSender<ClipboardReadRequest>) {
-        self.state.lock().unwrap().reader = Some(reader);
+    pub fn set_reader(
+        &self,
+        reader: tokio::sync::mpsc::UnboundedSender<ClipboardRequest>,
+        capabilities: Option<ClipboardCapabilities>,
+    ) {
+        let mut state = self.state.lock().unwrap();
+        state.reader = Some(reader);
+        state.capabilities = capabilities;
     }
     pub fn begin_input(&self, text: Option<String>) {
         let mut state = self.state.lock().unwrap();
@@ -87,6 +155,7 @@ impl ClientClipboard {
         let mut state = self.state.lock().unwrap();
         state.text = None;
         state.reader = None;
+        state.capabilities = None;
     }
 
     pub fn set_attached(&self, attached: bool) {
@@ -96,7 +165,39 @@ impl ClientClipboard {
             state.write = None;
             state.text = None;
             state.reader = None;
+            state.capabilities = None;
         }
+    }
+
+    fn request(
+        &self,
+        operation: ClipboardOperation,
+    ) -> futures::future::BoxFuture<'static, anyhow::Result<Option<String>>> {
+        let reader = self.state.lock().unwrap().reader.clone();
+        Box::pin(async move {
+            let reader = reader.context("clipboard operation requires an attached client")?;
+            let (reply, receiver) = tokio::sync::oneshot::channel();
+            reader
+                .send(ClipboardRequest { operation, reply })
+                .map_err(|_| anyhow::anyhow!("clipboard client disconnected"))?;
+            tokio::time::timeout(std::time::Duration::from_secs(3), receiver)
+                .await
+                .context("clipboard client timed out")?
+                .context("clipboard client disconnected")?
+                .map_err(anyhow::Error::msg)
+        })
+    }
+
+    fn request_write(
+        &self,
+        target: ClipboardTarget,
+        text: &str,
+    ) -> futures::future::BoxFuture<'static, anyhow::Result<()>> {
+        if text.len() > MAX_CLIPBOARD_BYTES {
+            return Box::pin(async { anyhow::bail!("clipboard write exceeds 1 MiB") });
+        }
+        let delivery = self.request(ClipboardOperation::Write(target, text.to_owned()));
+        Box::pin(async move { delivery.await.map(|_| ()) })
     }
 
     pub fn take_write(&self) -> Option<String> {
@@ -113,22 +214,72 @@ impl ClipboardProvider for ClientClipboard {
         let state = self.state.lock().unwrap();
         // A macro may yank and paste in one input; that new register takes precedence
         // until its write is delivered at the end of the input transaction.
-        if state.text.is_some() || state.reader.is_none() {
+        if state.text.is_some()
+            || state.reader.is_none()
+            || state.capabilities.is_some_and(|c| c.system_write_only)
+        {
             let text = state.text.clone();
             return Box::pin(async move { Ok(text) });
         }
-        let reader = state.reader.clone().unwrap();
         drop(state);
+        self.request(ClipboardOperation::ReadSystem)
+    }
+
+    fn primary_selection(&self) -> PrimarySelection {
+        self.state
+            .lock()
+            .unwrap()
+            .capabilities
+            .unwrap_or_default()
+            .primary
+    }
+
+    fn read_primary(&mut self) -> futures::future::BoxFuture<'_, anyhow::Result<Option<String>>> {
+        match self.primary_selection() {
+            PrimarySelection::Unavailable => {
+                Box::pin(async { anyhow::bail!("Primary selection clipboard is unavailable") })
+            }
+            PrimarySelection::WriteOnly => Box::pin(async { Ok(None) }),
+            PrimarySelection::ReadWrite => self.request(ClipboardOperation::ReadPrimary),
+        }
+    }
+
+    fn copy_primary(
+        &mut self,
+        text: &str,
+        _: &mut dyn std::io::Write,
+    ) -> futures::future::BoxFuture<'static, anyhow::Result<()>> {
+        if self.primary_selection() == PrimarySelection::Unavailable {
+            return Box::pin(async { anyhow::bail!("primary selection clipboard is unavailable") });
+        }
+        self.request_write(ClipboardTarget::Primary, text)
+    }
+
+    fn uses_saved_yank(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .capabilities
+            .is_some_and(|c| c.system_write_only)
+    }
+
+    fn copy_system_for_edit(
+        &mut self,
+        text: &str,
+        output: &mut dyn std::io::Write,
+    ) -> futures::future::BoxFuture<'static, anyhow::Result<()>> {
+        if self.state.lock().unwrap().capabilities.is_none() {
+            return Box::pin(std::future::ready(self.copy(text, output).map(|_| ())));
+        }
+        let delivery = self.request_write(ClipboardTarget::System, text);
+        let state = self.state.clone();
         Box::pin(async move {
-            let (reply, receiver) = tokio::sync::oneshot::channel();
-            reader
-                .send(reply)
-                .map_err(|_| anyhow::anyhow!("clipboard client disconnected"))?;
-            tokio::time::timeout(std::time::Duration::from_secs(3), receiver)
-                .await
-                .context("clipboard client read timed out")?
-                .context("clipboard client disconnected")?
-                .map_err(anyhow::Error::msg)
+            delivery.await?;
+            // A confirmed write supersedes older deferred writes from this input.
+            let mut state = state.lock().unwrap();
+            state.write = None;
+            state.text = None;
+            Ok(())
         })
     }
 
@@ -176,6 +327,43 @@ impl NativeClipboardProvider {
 }
 
 impl ClipboardProvider for NativeClipboardProvider {
+    #[cfg(target_os = "linux")]
+    fn primary_selection(&self) -> PrimarySelection {
+        PrimarySelection::ReadWrite
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_primary(&mut self) -> futures::future::BoxFuture<'_, anyhow::Result<Option<String>>> {
+        use arboard::{GetExtLinux, LinuxClipboardKind};
+        let value = match self
+            .clipboard
+            .get()
+            .clipboard(LinuxClipboardKind::Primary)
+            .text()
+        {
+            Ok(text) => Ok(Some(text)),
+            Err(arboard::Error::ContentNotAvailable) => Ok(None),
+            Err(error) => Err(error).context("failed to read primary selection"),
+        };
+        Box::pin(std::future::ready(value))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn copy_primary(
+        &mut self,
+        text: &str,
+        _: &mut dyn std::io::Write,
+    ) -> futures::future::BoxFuture<'static, anyhow::Result<()>> {
+        use arboard::{LinuxClipboardKind, SetExtLinux};
+        let result = self
+            .clipboard
+            .set()
+            .clipboard(LinuxClipboardKind::Primary)
+            .text(text)
+            .context("failed to write primary selection");
+        Box::pin(std::future::ready(result))
+    }
+
     fn get_text(&mut self) -> anyhow::Result<Option<String>> {
         match self.clipboard.get_text() {
             Ok(text) => Ok(Some(text)),
@@ -220,6 +408,7 @@ impl ClipboardProvider for DisabledClipboardProvider {
 #[derive(Debug, Clone, Default)]
 /// Deterministic shared-memory clipboard used by tests and embedded callers.
 pub struct MemoryClipboardProvider {
+    primary: Arc<Mutex<Option<String>>>,
     text: Arc<Mutex<Option<String>>>,
 }
 
@@ -244,6 +433,21 @@ impl MemoryClipboardProvider {
 }
 
 impl ClipboardProvider for MemoryClipboardProvider {
+    fn primary_selection(&self) -> PrimarySelection {
+        PrimarySelection::ReadWrite
+    }
+    fn read_primary(&mut self) -> futures::future::BoxFuture<'_, anyhow::Result<Option<String>>> {
+        Box::pin(std::future::ready(Ok(self.primary.lock().unwrap().clone())))
+    }
+    fn copy_primary(
+        &mut self,
+        text: &str,
+        _: &mut dyn std::io::Write,
+    ) -> futures::future::BoxFuture<'static, anyhow::Result<()>> {
+        *self.primary.lock().unwrap() = Some(text.to_owned());
+        Box::pin(std::future::ready(Ok(())))
+    }
+
     fn get_text(&mut self) -> anyhow::Result<Option<String>> {
         Ok(self.text.lock().ok().and_then(|text| text.clone()))
     }
@@ -256,13 +460,74 @@ impl ClipboardProvider for MemoryClipboardProvider {
 
 impl From<Arc<Mutex<Option<String>>>> for MemoryClipboardProvider {
     fn from(text: Arc<Mutex<Option<String>>>) -> Self {
-        Self { text }
+        Self {
+            text,
+            ..Default::default()
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn confirmed_system_write_supersedes_an_earlier_deferred_copy_only_on_success() {
+        let mut owner = ClientClipboard::default();
+        owner.set_attached(true);
+        let (tx, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        owner.set_reader(tx, Some(ClipboardCapabilities::default()));
+        for accepted in [false, true] {
+            owner.set_text("deferred").unwrap();
+            let delivery = owner.copy_system_for_edit("new", &mut std::io::sink());
+            let client = async {
+                let request = requests.recv().await.unwrap();
+                assert!(
+                    matches!(request.operation, ClipboardOperation::Write(ClipboardTarget::System, text) if text == "new")
+                );
+                request
+                    .reply
+                    .send(if accepted {
+                        Ok(None)
+                    } else {
+                        Err("denied".into())
+                    })
+                    .unwrap();
+            };
+            let (result, ()) = tokio::join!(delivery, client);
+            assert_eq!(result.is_ok(), accepted);
+            assert_eq!(
+                owner.take_write().as_deref(),
+                (!accepted).then_some("deferred")
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "run with xvfb-run on an isolated display"]
+    async fn native_primary_selection_is_independent_of_system_clipboard() {
+        let mut owner = NativeClipboardProvider::new().unwrap();
+        let mut peer = NativeClipboardProvider::new().unwrap();
+        owner.set_text("system").unwrap();
+        owner
+            .copy_primary("primary 👻", &mut std::io::sink())
+            .await
+            .unwrap();
+        assert_eq!(
+            peer.read_primary().await.unwrap().as_deref(),
+            Some("primary 👻")
+        );
+        peer.copy_primary("external", &mut std::io::sink())
+            .await
+            .unwrap();
+        assert_eq!(
+            owner.read_primary().await.unwrap().as_deref(),
+            Some("external")
+        );
+        assert_eq!(owner.get_text().unwrap().as_deref(), Some("system"));
+    }
 
     #[test]
     fn detached_background_copies_require_an_attachment_and_never_replay() {

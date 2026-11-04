@@ -97,12 +97,20 @@ fn replay_suite(source: &str) {
                 let mut plan = match (input, event["paste"].as_str()) {
                     (_, Some(value)) => session.bracketed_paste(text.slice(..), &sel, value),
                     (InsertEvent::Key(token), None) => {
-                        let values = session.register_to_read(token).map(|name| {
-                            registers.read(name, text.slice(..), &sel, "~/example.txt")
-                        });
+                        let token = if token == "<f12>" {
+                            "<copy-between-registers>"
+                        } else {
+                            token
+                        };
+                        let values = session
+                            .register_to_read(token)
+                            .filter(|name| registers.exists(*name))
+                            .map(|name| {
+                                registers.read(name, text.slice(..), &sel, "~/example.txt")
+                            });
                         let context = felix_core::Context {
-                            search_history: &registers.search,
-                            register: values.as_deref().unwrap_or_default(),
+                            search_history: registers.search_history(),
+                            register: values.as_deref(),
                             visual_lines: wrap_width.map(|_| &layout as &_),
                             viewport_start,
                             indent: &indent,
@@ -152,7 +160,7 @@ fn replay_suite(source: &str) {
                 sel = plan.selections(text.slice(..));
                 session = plan.next;
                 if let Some(value) = plan.search {
-                    registers.search.push(value);
+                    registers.push_query(plan.search_name, value);
                 }
                 if let Some(value) = plan.register {
                     registers.write(plan.register_name, value);
@@ -203,8 +211,11 @@ fn replay_suite(source: &str) {
             let mut actual = json!({"text":text.to_string(),"mode":format!("{:?}",session.mode),
                 "ranges": sel.ranges().iter().map(|r|[r.anchor,r.head]).collect::<Vec<_>>(),
                 "primary":sel.primary_index(),"pending":session.pending_keys(),"count":session.count(),
-                "search":(!registers.search.is_empty()).then(||registers.search.iter().rev().collect::<Vec<_>>()),
+                "search":registers.exists('/').then(||registers.search_history().iter().rev().collect::<Vec<_>>()),
                 "unnamed":registers.stored('"')});
+            if event.get("last_search_register").is_some() {
+                actual["last_search_register"] = json!(session.last_search_register());
+            }
             if let Some(slots) = event["registers"].as_object() {
                 actual["selected_register"] = json!(session.selected_register());
                 actual["register_prompt"] = json!(session.register_prompt());
