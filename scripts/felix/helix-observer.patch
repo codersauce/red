@@ -1,0 +1,47 @@
+diff --git a/helix-term/src/application.rs b/helix-term/src/application.rs
+index cf09aac..e7ebe45 100644
+--- a/helix-term/src/application.rs
++++ b/helix-term/src/application.rs
+@@ -642,7 +642,11 @@ pub async fn handle_terminal_events(&mut self, event: std::io::Result<CrosstermE
+             scroll: None,
+         };
+         // Handle key events
+-        let should_redraw = match event.unwrap() {
++        let event = event.unwrap();
++        let capture = std::env::var_os("FELIX_REFERENCE_TRACE").filter(|_| {
++            matches!(&event, CrosstermEvent::Key(key) if key.kind != crossterm::event::KeyEventKind::Release)
++        }).map(|path| (path, format!("{event:?}")));
++        let should_redraw = match event {
+             CrosstermEvent::Resize(width, height) => {
+                 self.terminal
+                     .resize(Rect::new(0, 0, width, height))
+@@ -663,6 +667,29 @@ pub async fn handle_terminal_events(&mut self, event: std::io::Result<CrosstermE
+             event => self.compositor.handle_event(&event.into(), &mut cx),
+         };
+ 
++        if let Some((path, event)) = capture.filter(|_| !self.editor.should_close()) {
++            use std::io::Write;
++            let mut output = std::fs::OpenOptions::new().append(true).create(true)
++                .open(path).expect("open reference trace");
++            let view = self.editor.tree.get(self.editor.tree.focus);
++            let doc = self.editor.document(view.doc).unwrap();
++            let selections = doc.selection(view.id);
++            let read_register = |name| self.editor.registers.read(name, &self.editor)
++                .map(|values| values.map(|v| v.into_owned()).collect::<Vec<_>>());
++            let ui = self.compositor.find::<ui::EditorView>().unwrap();
++            let record = json!({
++                "event": event, "mode": format!("{:?}", self.editor.mode),
++                "text": doc.text().to_string(), "primary": selections.primary_index(),
++                "ranges": selections.iter().map(|r| [r.anchor, r.head]).collect::<Vec<_>>(),
++                "unnamed": read_register('"'), "search": read_register('/'),
++                "pending": ui.keymaps.pending().iter().map(ToString::to_string).collect::<Vec<_>>(),
++                "count": self.editor.count, "last_insert": format!("{:?}", ui.last_insert),
++                "revision": doc.version(), "document": doc.display_name(),
++                "history_revision": self.editor.document_mut(view.doc).unwrap().get_current_revision()
++            });
++            writeln!(output, "{record}").expect("write reference trace");
++        }
++
+         if should_redraw && !self.editor.should_close() {
+             self.render().await;
+         }

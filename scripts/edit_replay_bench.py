@@ -25,8 +25,9 @@ import time
 import tomllib
 
 ROOT = Path(__file__).resolve().parent.parent
-EVENT = re.compile(r"\[PERF\] event (?:Key\(|Paste\().*?: (\d+)us$")
-TIMING = re.compile(r"\[PERF\] ([\w:+-]+)(?: (.*?))?: (\d+)us$")
+END = r"\[PERF\] (?:end id=\d+ t=\d+us )?"
+EVENT = re.compile(END + r"event (?:Key\(|Paste\().*?: (\d+)us$")
+TIMING = re.compile(END + r"([\w:+-]+)(?: (.*?))?: (\d+)us$")
 SCENARIOS = ("dot", "macro", "delete", "block", "paste", "substitute", "indent", "undo")
 
 
@@ -124,7 +125,7 @@ def run(args, scenario):
             return wait_for(completed, repr(data[:40]))
 
         try:
-            wait_for(lambda: "[PERF] startup:interactive:" in contents(), "startup")
+            wait_for(lambda: re.search(END + r"startup:interactive: \d+us", contents()), "startup")
             if args.lsp != "off":
                 synced(source)
             if args.split:

@@ -1,0 +1,387 @@
+[
+  {
+    "key": "%",
+    "text": "foo foo\n",
+    "mode": "Normal",
+    "ranges": [
+      [
+        0,
+        8
+      ]
+    ],
+    "primary": 0,
+    "search": null,
+    "unnamed": null,
+    "pending": [],
+    "document": "~/example.txt"
+  },
+  {
+    "key": "s",
+    "text": "foo foo\n",
+    "mode": "Normal",
+    "ranges": [
+      [
+        0,
+        8
+      ]
+    ],
+    "primary": 0,
+    "search": null,
+    "unnamed": null,
+    "pending": [],
+    "document": "~/example.txt"
+  },
+  {
+    "key": "f",
+    "text": "foo foo\n",
+    "mode": "Normal",
+    "ranges": [
+      [
+        0,
+        1
+      ],
+      [
+        4,
+        5
+      ]
+    ],
+    "primary": 0,
+    "search": null,
+    "unnamed": null,
+    "pending": [],
+    "document": "~/example.txt"
+  },
+  {
+    "key": "o",
+    "text": "foo foo\n",
+    "mode": "Normal",
+    "ranges": [
+      [
+        0,
+        2
+      ],
+      [
+        4,
+        6
+      ]
+    ],
+    "primary": 0,
+    "search": null,
+    "unnamed": null,
+    "pending": [],
+    "document": "~/example.txt"
+  },
+  {
+    "key": "o",
+    "text": "foo foo\n",
+    "mode": "Normal",
+    "ranges": [
+      [
+        0,
+        3
+      ],
+      [
+        4,
+        7
+      ]
+    ],
+    "primary": 0,
+    "search": null,
+    "unnamed": null,
+    "pending": [],
+    "document": "~/example.txt"
+  },
+  {
+    "key": "<enter>",
+    "text": "foo foo\n",
+    "mode": "Normal",
+    "ranges": [
+      [
+        0,
+        3
+      ],
+      [
+        4,
+        7
+      ]
+    ],
+    "primary": 0,
+    "search": [
+      "foo"
+    ],
+    "unnamed": null,
+    "pending": [],
+    "document": "~/example.txt"
+  },
+  {
+    "key": "c",
+    "text": " \n",
+    "mode": "Insert",
+    "ranges": [
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        2
+      ]
+    ],
+    "primary": 0,
+    "search": [
+      "foo"
+    ],
+    "unnamed": [
+      "foo",
+      "foo"
+    ],
+    "pending": [],
+    "document": "~/example.txt"
+  },
+  {
+    "key": "b",
+    "text": "b b\n",
+    "mode": "Insert",
+    "ranges": [
+      [
+        1,
+        2
+      ],
+      [
+        3,
+        4
+      ]
+    ],
+    "primary": 0,
+    "search": [
+      "foo"
+    ],
+    "unnamed": [
+      "foo",
+      "foo"
+    ],
+    "pending": [],
+    "document": "~/example.txt"
+  },
+  {
+    "key": "a",
+    "text": "ba ba\n",
+    "mode": "Insert",
+    "ranges": [
+      [
+        2,
+        3
+      ],
+      [
+        5,
+        6
+      ]
+    ],
+    "primary": 0,
+    "search": [
+      "foo"
+    ],
+    "unnamed": [
+      "foo",
+      "foo"
+    ],
+    "pending": [],
+    "document": "~/example.txt"
+  },
+  {
+    "key": "r",
+    "text": "bar bar\n",
+    "mode": "Insert",
+    "ranges": [
+      [
+        3,
+        4
+      ],
+      [
+        7,
+        8
+      ]
+    ],
+    "primary": 0,
+    "search": [
+      "foo"
+    ],
+    "unnamed": [
+      "foo",
+      "foo"
+    ],
+    "pending": [],
+    "document": "~/example.txt"
+  },
+  {
+    "key": "<esc>",
+    "text": "bar bar\n",
+    "mode": "Normal",
+    "ranges": [
+      [
+        3,
+        4
+      ],
+      [
+        7,
+        8
+      ]
+    ],
+    "primary": 0,
+    "search": [
+      "foo"
+    ],
+    "unnamed": [
+      "foo",
+      "foo"
+    ],
+    "pending": [],
+    "document": "~/example.txt"
+  },
+  {
+    "key": "g",
+    "text": "bar bar\n",
+    "mode": "Normal",
+    "ranges": [
+      [
+        3,
+        4
+      ],
+      [
+        7,
+        8
+      ]
+    ],
+    "primary": 0,
+    "search": [
+      "foo"
+    ],
+    "unnamed": [
+      "foo",
+      "foo"
+    ],
+    "pending": [
+      "g"
+    ],
+    "document": "~/example.txt"
+  },
+  {
+    "key": "n",
+    "text": "other buffer\n",
+    "mode": "Normal",
+    "ranges": [
+      [
+        0,
+        1
+      ]
+    ],
+    "primary": 0,
+    "search": [
+      "foo"
+    ],
+    "unnamed": [
+      "foo",
+      "foo"
+    ],
+    "pending": [],
+    "document": "~/other.txt"
+  },
+  {
+    "key": "g",
+    "text": "other buffer\n",
+    "mode": "Normal",
+    "ranges": [
+      [
+        0,
+        1
+      ]
+    ],
+    "primary": 0,
+    "search": [
+      "foo"
+    ],
+    "unnamed": [
+      "foo",
+      "foo"
+    ],
+    "pending": [
+      "g"
+    ],
+    "document": "~/other.txt"
+  },
+  {
+    "key": "p",
+    "text": "bar bar\n",
+    "mode": "Normal",
+    "ranges": [
+      [
+        3,
+        4
+      ],
+      [
+        7,
+        8
+      ]
+    ],
+    "primary": 0,
+    "search": [
+      "foo"
+    ],
+    "unnamed": [
+      "foo",
+      "foo"
+    ],
+    "pending": [],
+    "document": "~/example.txt"
+  },
+  {
+    "key": "u",
+    "text": "foo foo\n",
+    "mode": "Normal",
+    "ranges": [
+      [
+        0,
+        3
+      ],
+      [
+        4,
+        7
+      ]
+    ],
+    "primary": 0,
+    "search": [
+      "foo"
+    ],
+    "unnamed": [
+      "foo",
+      "foo"
+    ],
+    "pending": [],
+    "document": "~/example.txt"
+  },
+  {
+    "key": "U",
+    "text": "bar bar\n",
+    "mode": "Normal",
+    "ranges": [
+      [
+        3,
+        4
+      ],
+      [
+        7,
+        8
+      ]
+    ],
+    "primary": 0,
+    "search": [
+      "foo"
+    ],
+    "unnamed": [
+      "foo",
+      "foo"
+    ],
+    "pending": [],
+    "document": "~/example.txt"
+  }
+]
