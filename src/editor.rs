@@ -8786,19 +8786,17 @@ impl Editor {
             .any(|segment| segment.line == line_index && segment.contains_cursor_col(display_col))
     }
 
-    fn cursor_has_display_row_margin(&self, line_index: usize, display_col: usize) -> bool {
-        let Some(window) = self.active_window_with_editor_view() else {
-            return false;
-        };
+    fn cursor_row_and_margin(
+        &self,
+        line_index: usize,
+        display_col: usize,
+    ) -> Option<(usize, std::ops::RangeInclusive<usize>)> {
+        let window = self.active_window_with_editor_view()?;
         let layout = self.layout_for_window(&window);
-        let Some(bounds) = self.viewport_cursor_row_bounds(&layout) else {
-            return false;
-        };
-        layout.rows.iter().any(|segment| {
-            segment.line == line_index
-                && segment.contains_cursor_col(display_col)
-                && bounds.contains(&segment.row)
-        })
+        let segment = layout.rows.iter().find(|segment| {
+            segment.line == line_index && segment.contains_cursor_col(display_col)
+        })?;
+        Some((segment.row, self.viewport_cursor_row_bounds(&layout)?))
     }
 
     /// Best-effort scrolloff bounds in physical rows, excluding virtual comments.
@@ -9203,13 +9201,18 @@ impl Editor {
                 )
             })
             .unwrap_or(self.cx);
-        if self.cursor_has_display_row_margin(line_index, display_col) {
-            self.cy = line_index.saturating_sub(self.vtop);
-            return;
-        }
-
         let target_is_below =
-            line_index > self.vtop || (line_index == self.vtop && display_col >= self.skipcol);
+            if let Some((row, margin)) = self.cursor_row_and_margin(line_index, display_col) {
+                if margin.contains(&row) {
+                    self.cy = line_index.saturating_sub(self.vtop);
+                    return;
+                }
+                // A visible cursor in the top margin needs an earlier viewport,
+                // even when its source line is below vtop.
+                row > *margin.end()
+            } else {
+                line_index > self.vtop || (line_index == self.vtop && display_col >= self.skipcol)
+            };
         for _ in 0..height {
             let scrolled = if target_is_below {
                 self.scroll_wrapped_viewport_down_one_screen_line()
@@ -9220,7 +9223,10 @@ impl Editor {
                 break;
             }
             self.cy = line_index.saturating_sub(self.vtop);
-            if self.cursor_has_display_row_margin(line_index, display_col) {
+            if self
+                .cursor_row_and_margin(line_index, display_col)
+                .is_some_and(|(row, margin)| margin.contains(&row))
+            {
                 return;
             }
         }
