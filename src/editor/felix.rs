@@ -397,16 +397,7 @@ impl Editor {
                 &self.felix.unnamed,
                 indentation.tab_width,
             ),
-            Input::Bracketed(value) => self.felix.session.paste(
-                text,
-                &initial,
-                &[value.to_owned()],
-                if self.felix.session.mode == felix_core::Mode::Normal {
-                    felix_core::Paste::Before
-                } else {
-                    felix_core::Paste::Cursor
-                },
-            ),
+            Input::Bracketed(value) => self.felix.session.bracketed_paste(text, &initial, value),
             Input::ClipboardYank { primary } => {
                 let mut plan = self.plan_felix_key(
                     text,
@@ -480,7 +471,13 @@ impl Editor {
             Input::Replay(step) => plan.history = step.history(plan.history),
             _ => {}
         }
-        if matches!(plan.history, History::Begin | History::Atomic) {
+        if plan.history == History::InsertPaste {
+            self.commit_felix_transaction(id.0, &initial);
+        }
+        if matches!(
+            plan.history,
+            History::Begin | History::Atomic | History::InsertPaste
+        ) {
             self.begin_transaction("Helix edit");
             self.felix.before = None;
         }
@@ -526,21 +523,11 @@ impl Editor {
         }
         if matches!(
             plan.history,
-            History::Atomic | History::Commit | History::Checkpoint
+            History::Atomic | History::Commit | History::Checkpoint | History::InsertPaste
         ) {
-            let before = self.felix.before.take();
-            if self.commit_transaction(self.cursor_snapshot()) {
-                if let (Some(before), Some(tx)) = (
-                    before,
-                    self.current_buffer().undo_history.latest_transaction(),
-                ) {
-                    self.felix
-                        .history
-                        .insert((id.0, tx.id.clone()), (before, selections.clone()));
-                }
-            }
+            self.commit_felix_transaction(id.0, &selections);
         }
-        if plan.history == History::Checkpoint {
+        if matches!(plan.history, History::Checkpoint | History::InsertPaste) {
             self.begin_transaction("Helix edit");
         }
         if let Some(request) = plan.host {
@@ -648,6 +635,21 @@ impl Editor {
 }
 
 impl Editor {
+    fn commit_felix_transaction(&mut self, doc: BufferId, selections: &Selections) {
+        let before = self.felix.before.take();
+        if !self.commit_transaction(self.cursor_snapshot()) {
+            return;
+        }
+        if let (Some(before), Some(tx)) = (
+            before,
+            self.current_buffer().undo_history.latest_transaction(),
+        ) {
+            self.felix
+                .history
+                .insert((doc, tx.id.clone()), (before, selections.clone()));
+        }
+    }
+
     pub(super) fn felix_status(&self) -> Option<String> {
         let (doc, view, _, _) = self.felix_owner()?;
         let (primary, total) = self
@@ -939,6 +941,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clipboard_provider_failures_leave_the_document_and_registers_intact() {
+        struct Unavailable;
+        impl crate::clipboard::ClipboardProvider for Unavailable {
+            fn get_text(&mut self) -> anyhow::Result<Option<String>> {
+                anyhow::bail!("test read failure")
+            }
+            fn set_text(&mut self, _: &str) -> anyhow::Result<()> {
+                anyhow::bail!("test write failure")
+            }
+        }
+        let (mut editor, mut frame, mut runtime) = fixture_editor("aa bb\n");
+        editor.test_set_clipboard(Box::new(Unavailable));
+        editor.config.clipboard.enabled = true;
+        for key in ["e", "y", "w", "v", "l"] {
+            let owner = editor.felix_owner().unwrap();
+            editor
+                .execute_felix(Input::Key(key), owner, &mut frame, &mut runtime)
+                .await
+                .unwrap();
+        }
+        let owner = editor.felix_owner().unwrap();
+        let original = editor.felix_active_selection().unwrap().clone();
+        let unnamed = editor.felix.unnamed.clone();
+        let history = editor.current_buffer().undo_history.current_index();
+        editor.felix.clipboard = vec!["prior".into()];
+        for input in [
+            Input::ClipboardYank { primary: false },
+            Input::ClipboardPaste(felix_core::Paste::After),
+            Input::ClipboardReplace,
+        ] {
+            editor
+                .execute_felix(input, owner, &mut frame, &mut runtime)
+                .await
+                .unwrap();
+            assert_eq!(editor.felix_owner(), Some(owner));
+            assert_eq!(editor.felix_active_selection(), Some(&original));
+            assert_eq!(editor.felix.session.mode, felix_core::Mode::Select);
+            assert_eq!(editor.felix.unnamed, unnamed);
+            assert_eq!(editor.felix.clipboard, ["prior"]);
+            assert_eq!(editor.current_buffer().contents(), "aa bb\n");
+            assert_eq!(
+                editor.current_buffer().undo_history.current_index(),
+                history
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn clipboard_replace_repeats_external_text_with_document_line_endings() {
+        let (mut editor, mut frame, mut runtime) = fixture_editor("aa bb\r\n");
+        editor.test_set_clipboard(Box::new(
+            crate::clipboard::MemoryClipboardProvider::with_text("x\ry\nz\r\n"),
+        ));
+        editor.config.clipboard.enabled = true;
+        for key in ["%", "s", "[", "a", "b", "]", "+", "<enter>", "2"] {
+            let owner = editor.felix_owner().unwrap();
+            editor
+                .execute_felix(Input::Key(key), owner, &mut frame, &mut runtime)
+                .await
+                .unwrap();
+        }
+        let owner = editor.felix_owner().unwrap();
+        editor
+            .execute_felix(Input::ClipboardReplace, owner, &mut frame, &mut runtime)
+            .await
+            .unwrap();
+        let replacement = "x\r\ny\r\nz\r\n".repeat(2);
+        assert_eq!(
+            editor.current_buffer().contents(),
+            format!("{replacement} {replacement}\r\n")
+        );
+        let owner = editor.felix_owner().unwrap();
+        editor
+            .execute_felix(Input::Key("u"), owner, &mut frame, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), "aa bb\r\n");
+        assert_eq!(editor.felix_active_selection().unwrap().ranges().len(), 2);
+    }
+
+    #[tokio::test]
     async fn explicit_clipboard_preserves_fragments_and_bracketed_paste_edits_all_ranges() {
         let (mut editor, mut frame, mut runtime) = fixture_editor("a bb\n");
         let provider = crate::clipboard::MemoryClipboardProvider::with_text("system");
@@ -1102,7 +1185,10 @@ mod tests {
                 "<tab>" => KeyCode::Tab,
                 _ => KeyCode::Char(token.chars().next().unwrap()),
             };
-            let event = Event::Key(KeyEvent::new(code, modifiers));
+            let event = match expected.get("paste") {
+                Some(value) => Event::Paste(value.as_str().unwrap().to_owned()),
+                None => Event::Key(KeyEvent::new(code, modifiers)),
+            };
             let action = editor
                 .handle_event_with_runtime(&event, Some(&runtime))
                 .unwrap()
@@ -1119,6 +1205,9 @@ mod tests {
                 "search":(!editor.felix.search.is_empty()).then(|| editor.felix.search.iter().rev().collect::<Vec<_>>()),
                 "unnamed":(!editor.felix.unnamed.is_empty()).then_some(&editor.felix.unnamed),
                 "pending":editor.felix.session.pending_keys()});
+            if let Event::Paste(value) = &event {
+                actual["paste"] = json!(value);
+            }
             if expected.get("last_insert").is_some() {
                 actual["last_insert"] = json!(editor.felix.last_insert.keys());
             }

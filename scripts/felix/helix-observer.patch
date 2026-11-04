@@ -1,5 +1,5 @@
 diff --git a/helix-term/src/application.rs b/helix-term/src/application.rs
-index cf09aac..b646264 100644
+index cf09aac..21fe3db 100644
 --- a/helix-term/src/application.rs
 +++ b/helix-term/src/application.rs
 @@ -642,7 +642,11 @@ pub async fn handle_terminal_events(&mut self, event: std::io::Result<CrosstermE
@@ -9,8 +9,8 @@ index cf09aac..b646264 100644
 -        let should_redraw = match event.unwrap() {
 +        let event = event.unwrap();
 +        let capture = std::env::var_os("FELIX_REFERENCE_TRACE").filter(|_| {
-+            matches!(&event, CrosstermEvent::Key(key) if key.kind != crossterm::event::KeyEventKind::Release)
-+        }).map(|path| (path, format!("{event:?}")));
++            matches!(&event, CrosstermEvent::Key(key) if key.kind != crossterm::event::KeyEventKind::Release) || matches!(&event, CrosstermEvent::Paste(_))
++        }).map(|path| (path, format!("{event:?}"), match &event { CrosstermEvent::Paste(value) => Some(value.clone()), _ => None }));
 +        let should_redraw = match event {
              CrosstermEvent::Resize(width, height) => {
                  self.terminal
@@ -19,7 +19,7 @@ index cf09aac..b646264 100644
              event => self.compositor.handle_event(&event.into(), &mut cx),
          };
  
-+        if let Some((path, event)) = capture.filter(|_| !self.editor.should_close()) {
++        if let Some((path, event, paste)) = capture.filter(|_| !self.editor.should_close()) {
 +            use std::io::Write;
 +            let mut output = std::fs::OpenOptions::new().append(true).create(true)
 +                .open(path).expect("open reference trace");
@@ -37,7 +37,7 @@ index cf09aac..b646264 100644
 +                    json!({"completion_at": trigger_offset, "changes": format!("{changes:?}")}),
 +            }).collect::<Vec<_>>();
 +            let record = json!({
-+                "event": event, "mode": format!("{:?}", self.editor.mode),
++                "event": event, "paste": paste, "mode": format!("{:?}", self.editor.mode),
 +                "text": doc.text().to_string(), "primary": selections.primary_index(),
 +                "ranges": selections.iter().map(|r| [r.anchor, r.head]).collect::<Vec<_>>(),
 +                "unnamed": read_register('"'), "search": read_register('/'),

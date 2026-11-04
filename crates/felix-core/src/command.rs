@@ -133,6 +133,8 @@ pub enum History {
     Begin,
     Commit,
     Checkpoint,
+    /// Commit surrounding typing separately on both sides of a paste.
+    InsertPaste,
     Atomic,
 }
 
@@ -166,6 +168,28 @@ pub enum Paste {
     Cursor,
 }
 
+/// Pasting and replacing use the destination document's line endings.
+fn register_text(value: &str, newline: &str, count: usize) -> Result<String, &'static str> {
+    static ENDINGS: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\r\n|\r|\n").unwrap());
+    let normalized = ENDINGS.replace_all(value, newline);
+    if count == 1 || normalized.is_empty() {
+        return Ok(normalized.into_owned());
+    }
+    let bytes = normalized
+        .len()
+        .checked_mul(count)
+        .ok_or("Register text is too large")?;
+    let mut result = String::new();
+    result
+        .try_reserve_exact(bytes)
+        .map_err(|_| "Insufficient memory for register text")?;
+    for _ in 0..count {
+        result.push_str(&normalized);
+    }
+    Ok(result)
+}
+
 impl Plan {
     fn paste(
         &mut self,
@@ -176,6 +200,9 @@ impl Plan {
         count: usize,
     ) {
         if values.is_empty() {
+            if self.next.mode == Mode::Select {
+                self.next.mode = Mode::Normal;
+            }
             return;
         }
         let linewise = values.iter().any(|v| v.ends_with('\n'));
@@ -183,9 +210,7 @@ impl Plan {
         let mut added = 0;
         let mut ranges = Vec::with_capacity(selections.ranges().len());
         for (i, r) in selections.ranges().iter().enumerate() {
-            let value = values[i.min(values.len() - 1)]
-                .replace("\r\n", "\n")
-                .replace('\n', newline);
+            let value = &values[i.min(values.len() - 1)];
             let pos = match (placement, linewise) {
                 (Paste::Before, true) => text.line_to_char(text.char_to_line(r.start())),
                 (Paste::After, true) => text.line_to_char(
@@ -200,26 +225,14 @@ impl Plan {
                 (Paste::After, false) => r.end(),
                 (Paste::Cursor, _) => r.cursor(text),
             };
-            let Some(bytes) = value
-                .len()
-                .checked_mul(count)
-                .filter(|&n| n <= isize::MAX as usize)
-            else {
-                self.edits.clear();
-                self.message = Some("Paste exceeds maximum document size".into());
-                return;
-            };
-            let mut insert = String::new();
-            if insert.try_reserve_exact(bytes).is_err() {
-                self.edits.clear();
-                self.message = Some("Insufficient memory for paste".into());
-                return;
-            }
-            if !value.is_empty() {
-                for _ in 0..count {
-                    insert.push_str(&value);
+            let insert = match register_text(value, newline, count) {
+                Ok(insert) => insert,
+                Err(reason) => {
+                    self.edits.clear();
+                    self.message = Some(reason.into());
+                    return;
                 }
-            }
+            };
             let width = insert.chars().count();
             let from = pos + added;
             let mapped = if self.next.mode == Mode::Normal {
@@ -236,9 +249,42 @@ impl Plan {
             added += width;
         }
         self.ranges = ranges;
-        if self.next.mode != Mode::Insert {
+        if self.next.mode == Mode::Insert {
+            self.history = History::InsertPaste;
+        } else {
             self.history = History::Atomic;
             self.next.mode = Mode::Normal;
+        }
+    }
+
+    fn replace_from_register(
+        &mut self,
+        text: RopeSlice<'_>,
+        selections: &Selections,
+        values: &[String],
+        count: usize,
+    ) {
+        self.next.mode = Mode::Normal;
+        if values.is_empty() {
+            return;
+        }
+        let newline = document_newline(text);
+        let mut index = 0;
+        let replacements: Result<Vec<_>, _> = selections
+            .ranges()
+            .iter()
+            .map(|range| {
+                if range.start() == range.end() {
+                    return Ok(String::new());
+                }
+                let fragment = &values[index];
+                index = (index + 1).min(values.len() - 1);
+                register_text(fragment, newline, count)
+            })
+            .collect();
+        match replacements {
+            Ok(values) => self.replace_selections(selections, values),
+            Err(reason) => self.message = Some(reason.into()),
         }
     }
 
@@ -253,10 +299,22 @@ impl Plan {
         selection: &Selections,
         mut transform: impl FnMut(usize, RopeSlice<'_>) -> String,
     ) {
+        let replacements = selection
+            .ranges()
+            .iter()
+            .enumerate()
+            .map(|(i, r)| transform(i, text.slice(r.start()..r.end())));
+        self.replace_selections(selection, replacements);
+    }
+
+    fn replace_selections(
+        &mut self,
+        selection: &Selections,
+        replacements: impl IntoIterator<Item = String>,
+    ) {
         let mut removed = 0;
         let mut added = 0;
-        for (i, r) in selection.ranges().iter().enumerate() {
-            let insert = transform(i, text.slice(r.start()..r.end()));
+        for (i, (r, insert)) in selection.ranges().iter().zip(replacements).enumerate() {
             let start = r.start() - removed + added;
             let width = insert.chars().count();
             self.ranges[i] = r.with_bounds(start, start + width);
@@ -435,6 +493,20 @@ impl Session {
             ranges: selections.ranges.clone(),
             primary: selections.primary,
         }
+    }
+
+    pub fn bracketed_paste(
+        &self,
+        text: RopeSlice<'_>,
+        selections: &Selections,
+        value: &str,
+    ) -> Plan {
+        let placement = if self.mode == Mode::Normal {
+            Paste::Before
+        } else {
+            Paste::Cursor
+        };
+        self.paste(text, selections, &[value.to_owned()], placement)
     }
 
     pub fn paste(
@@ -702,13 +774,7 @@ impl Session {
                     }));
                 }
             }
-            "R" if !register.is_empty() => p.replace_fragments(text, selections, |i, slice| {
-                if slice.len_chars() == 0 {
-                    String::new()
-                } else {
-                    register[i.min(register.len() - 1)].clone()
-                }
-            }),
+            "R" => p.replace_from_register(text, selections, register, count),
             "~" | "`" | "<a-`>" => p.replace_fragments(text, selections, |_, slice| {
                 let mut out = String::new();
                 for c in slice.chars() {

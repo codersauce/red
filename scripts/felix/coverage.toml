@@ -30,8 +30,8 @@ remaining = ["Delimiters, nesting, counts and failure on unmatched objects"]
 
 [[area]]
 name = "Editing and clipboard"
-cases = ["yank-paste-replace", "whole-line-change", "indent-join"]
-remaining = ["Clipboard failure and counts", "Language-specific indentation and joins"]
+cases = ["yank-paste-replace", "counted-register-edits", "bracketed-paste-modes", "reverse-register-edits", "empty-register", "whole-line-change", "indent-join"]
+remaining = ["Clipboard transport interoperability", "Language-specific indentation and joins"]
 
 [[area]]
 name = "Insert behavior"
@@ -40,5 +40,5 @@ remaining = ["Snippet and completion precedence with multiple selections", "Lang
 
 [[area]]
 name = "Undo and repeat"
-cases = ["append-and-undo", "repeat-count", "repeat-change", "repeat-checkpoint"]
-remaining = ["Repeat recipes containing pasted text, snippets or completion edits"]
+cases = ["append-and-undo", "repeat-count", "repeat-bracketed-paste", "repeat-change", "repeat-checkpoint"]
+remaining = ["Repeat recipes containing snippets or completion edits"]

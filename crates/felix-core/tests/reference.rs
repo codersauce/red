@@ -19,7 +19,7 @@ fn reference_sequences() {
         let mut register = Vec::new();
         let mut jumps = felix_core::Jumps::default();
         let mut viewport_start = 0;
-        let mut before = None;
+        let mut before: Option<(Rope, Selections)> = None;
         let mut last_insert = felix_core::LastInsert::default();
         let mut undo = Vec::new();
         let mut redo = Vec::new();
@@ -58,22 +58,26 @@ fn reference_sequences() {
                         .map_or(text.len_chars(), |next| next - 1);
                     ((rows[destination] + goal).min(end), goal)
                 };
-                let mut plan = session.plan(
-                    text.slice(..),
-                    &sel,
-                    token,
-                    &felix_core::Context {
-                        search: search.last().map(String::as_str),
-                        register: &register,
-                        visual_motion: wrap_width.map(|_| &visual_motion as &_),
-                        viewport_start,
-                        indent: &indent,
-                        ..Default::default()
-                    },
-                );
+                let mut plan = if let Some(value) = event["paste"].as_str() {
+                    session.bracketed_paste(text.slice(..), &sel, value)
+                } else {
+                    session.plan(
+                        text.slice(..),
+                        &sel,
+                        token,
+                        &felix_core::Context {
+                            search: search.last().map(String::as_str),
+                            register: &register,
+                            visual_motion: wrap_width.map(|_| &visual_motion as &_),
+                            viewport_start,
+                            indent: &indent,
+                            ..Default::default()
+                        },
+                    )
+                };
                 if let Some(step) = step {
                     plan.history = step.history(plan.history);
-                } else {
+                } else if event.get("paste").is_none() {
                     last_insert.record(token, session.mode, plan.next.mode);
                 }
                 viewport_start = plan
@@ -82,6 +86,13 @@ fn reference_sequences() {
                     .min(text.len_chars());
                 if let Some(saved) = &plan.save_jump {
                     jumps.save((), saved);
+                }
+                if plan.history == History::InsertPaste
+                    && let Some(original) = before.take()
+                    && text != original.0
+                {
+                    undo.push(original);
+                    redo.clear();
                 }
                 if !plan.edits.is_empty() && before.is_none() {
                     before = Some((text.clone(), sel.clone()));
@@ -105,7 +116,7 @@ fn reference_sequences() {
                 }
                 if matches!(
                     plan.history,
-                    History::Commit | History::Atomic | History::Checkpoint
+                    History::Commit | History::Atomic | History::Checkpoint | History::InsertPaste
                 ) && let Some(original) = before.take()
                     && text != original.0
                 {

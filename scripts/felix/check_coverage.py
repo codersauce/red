@@ -23,6 +23,8 @@ def validate(inventory, suite):
             missing = required - event.keys()
             if missing:
                 raise ValueError(f"{case['name']} input {index}: missing fields {sorted(missing)}")
+            if event["key"] == "<paste>" and not isinstance(event.get("paste"), str):
+                raise ValueError(f"{case['name']} input {index}: missing paste text")
             if case["name"].startswith("repeat-") and not isinstance(event.get("last_insert"), list):
                 raise ValueError(f"{case['name']} input {index}: missing insert recipe")
             if case["name"].startswith("page-") or case["name"] == "search-viewport":

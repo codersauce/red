@@ -29,10 +29,15 @@ def scenarios(seed, steps):
     yield "quoted-objects", '(one (two)) "foo" bar\n', list('5lmi(2ma(gg13lmi"ma"ggmm')
     yield "regex-select-split-keep", "red blue red\n", list("%S ") + enter + list("Kred") + enter + list(")") + [",", "<a-;>"]
     yield "yank-paste-replace", "one two\n", list("eywpP;Rl") + ["<a-;>"] + list("rX")
+    yield "counted-register-edits", "a bb ccc\r\nend\r\n", list("%s[a-z]+") + enter + list("y,2R3pPuU")
+    yield "empty-register", "ab\n", list("vlRvplvP")
+    yield "reverse-register-edits", "abc def\n", list("wywe") + ["<a-;>", "2", "R", "u", "U"]
     yield "character-arguments", "abc db e!\n", list("fb") + ["<a-.>"] + list("TbFr") + ["<esc>"] + list("ggvre") + ["<esc>"]
     yield "line-selections", "a\r\nbc\r\ndef", list("x2x") + ["<a-s>", ")", "<a-->", "<a-;>", "X", "<a-x>"]
     yield "typed-selection", "abcd\n", list("eliX") + ["<esc>"] + list("uU")
     yield "vertical-goal", "abcdef\nxy\nuvwxyz\n", list("4ljjkkvjj") + ["<esc>"]
+    yield "repeat-bracketed-paste", "ab cd\n", ["i", "X", {"paste":"é😀"}, "Y", "<esc>", ".", "u", "u", "u", "u", "U"]
+    yield "bracketed-paste-modes", "one two\r\n", ["2", {"paste":"x\ny"}, "u", "v", "l", {"paste":"Z"}, "u"]
     yield "repeat-count", "ab cd ef\n", list("ia") + ["<esc>"] + list("w.2.uU")
     yield "repeat-change", "foo foo baz\n", list("%sfoo") + enter + list("cZ") + ["<esc>", ",", "w", ".", "u", "U"]
     yield "repeat-checkpoint", "abc def\n", ["A", "x", "<c-s>", "y", "<esc>", "2", ".", "u", "u", "u", "U", "U"]
@@ -91,7 +96,12 @@ def capture(observer, runtime, root, name, text, keys):
         trace_offset = 0
         for index, key in enumerate(keys):
             named = {"<backspace>": "BSpace", "<pageup>": "PageUp", "<pagedown>": "PageDown", "<esc>": "Escape", "<enter>": "Enter", "<tab>": "Tab", "<a-;>": "M-;", "<a-,>": "M-,"}
-            if key.startswith("<a-"):
+            paste = key["paste"] if isinstance(key, dict) else None
+            if paste is not None:
+                key = "<paste>"
+                raw = b"\x1b[200~" + paste.encode() + b"\x1b[201~"
+                tmux("send-keys", "-t", "h", "-H", *(format(byte, "02x") for byte in raw))
+            elif key.startswith("<a-"):
                 raw = b"\x1b" + key[3:-1].encode()
                 tmux("send-keys","-t","h","-H",*[format(byte,"02x") for byte in raw])
             elif key.startswith("<c-"):
@@ -119,10 +129,15 @@ def capture(observer, runtime, root, name, text, keys):
             special = {"<backspace>": "Backspace", "<pageup>": "PageUp", "<pagedown>": "PageDown", "<esc>": "Esc", "<enter>": "Enter", "<tab>": "Tab", "<a-;>": "Char(';')", "<a-,>": "Char(',')"}
             ch = key[3:-1] if key.startswith(("<a-", "<c-")) else key
             code = special.get(key, f"Char('{ch}')")
-            if f"code: {code}," not in raw_event or ("ALT" in raw_event) != key.startswith("<a-") or ("CONTROL" in raw_event) != key.startswith("<c-"):
+            if paste is not None:
+                if record["paste"] != paste:
+                    raise ValueError(f"{name}: input {index+1} expected paste {paste!r}, observed {raw_event}")
+            elif f"code: {code}," not in raw_event or ("ALT" in raw_event) != key.startswith("<a-") or ("CONTROL" in raw_event) != key.startswith("<c-"):
                 raise ValueError(f"{name}: input {index+1} expected {key}, observed {raw_event}")
             events.append({"key": key, **{k: record[k] for k in
                 ("mode", "text", "ranges", "primary", "unnamed", "search", "pending", "count", "document")}})
+            if paste is not None:
+                events[-1]["paste"] = paste
             if name.startswith("repeat-"):
                 recipe = record["insert_recipe"]
                 commands = {"normal_mode": "", "insert_mode": "i", "append_mode": "a", "change_selection": "c",

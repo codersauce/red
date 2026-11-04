@@ -207,6 +207,47 @@
     {"key": "r", "mode": "Normal", "text": "one ononeonetwo\n", "ranges": [[10, 9]], "primary": 0, "unnamed": ["one"], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
     {"key": "X", "mode": "Normal", "text": "one ononeXnetwo\n", "ranges": [[10, 9]], "primary": 0, "unnamed": ["one"], "search": null, "pending": [], "count": null, "document": "~/example.txt"}
   ]},
+  {"name": "counted-register-edits", "text": "a bb ccc\r\nend\r\n", "events": [
+    {"key": "%", "mode": "Normal", "text": "a bb ccc\r\nend\r\n", "ranges": [[0, 15]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "s", "mode": "Normal", "text": "a bb ccc\r\nend\r\n", "ranges": [[0, 15]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "[", "mode": "Normal", "text": "a bb ccc\r\nend\r\n", "ranges": [[0, 15]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "a", "mode": "Normal", "text": "a bb ccc\r\nend\r\n", "ranges": [[0, 15]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "-", "mode": "Normal", "text": "a bb ccc\r\nend\r\n", "ranges": [[0, 15]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "z", "mode": "Normal", "text": "a bb ccc\r\nend\r\n", "ranges": [[0, 15]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "]", "mode": "Normal", "text": "a bb ccc\r\nend\r\n", "ranges": [[0, 1], [2, 3], [3, 4], [5, 6], [6, 7], [7, 8], [10, 11], [11, 12], [12, 13]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "+", "mode": "Normal", "text": "a bb ccc\r\nend\r\n", "ranges": [[0, 1], [2, 4], [5, 8], [10, 13]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<enter>", "mode": "Normal", "text": "a bb ccc\r\nend\r\n", "ranges": [[0, 1], [2, 4], [5, 8], [10, 13]], "primary": 0, "unnamed": null, "search": ["[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "a bb ccc\r\nend\r\n", "ranges": [[0, 1], [2, 4], [5, 8], [10, 13]], "primary": 0, "unnamed": ["a", "bb", "ccc", "end"], "search": ["[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": ",", "mode": "Normal", "text": "a bb ccc\r\nend\r\n", "ranges": [[0, 1]], "primary": 0, "unnamed": ["a", "bb", "ccc", "end"], "search": ["[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "2", "mode": "Normal", "text": "a bb ccc\r\nend\r\n", "ranges": [[0, 1]], "primary": 0, "unnamed": ["a", "bb", "ccc", "end"], "search": ["[a-z]+"], "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": "R", "mode": "Normal", "text": "aa bb ccc\r\nend\r\n", "ranges": [[0, 2]], "primary": 0, "unnamed": ["a", "bb", "ccc", "end"], "search": ["[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "3", "mode": "Normal", "text": "aa bb ccc\r\nend\r\n", "ranges": [[0, 2]], "primary": 0, "unnamed": ["a", "bb", "ccc", "end"], "search": ["[a-z]+"], "pending": [], "count": 3, "document": "~/example.txt"},
+    {"key": "p", "mode": "Normal", "text": "aaaaa bb ccc\r\nend\r\n", "ranges": [[2, 5]], "primary": 0, "unnamed": ["a", "bb", "ccc", "end"], "search": ["[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "P", "mode": "Normal", "text": "aaaaaa bb ccc\r\nend\r\n", "ranges": [[2, 3]], "primary": 0, "unnamed": ["a", "bb", "ccc", "end"], "search": ["[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "u", "mode": "Normal", "text": "aaaaa bb ccc\r\nend\r\n", "ranges": [[2, 5]], "primary": 0, "unnamed": ["a", "bb", "ccc", "end"], "search": ["[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "U", "mode": "Normal", "text": "aaaaaa bb ccc\r\nend\r\n", "ranges": [[2, 3]], "primary": 0, "unnamed": ["a", "bb", "ccc", "end"], "search": ["[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"}
+  ]},
+  {"name": "empty-register", "text": "ab\n", "events": [
+    {"key": "v", "mode": "Select", "text": "ab\n", "ranges": [[0, 1]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "l", "mode": "Select", "text": "ab\n", "ranges": [[0, 2]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "R", "mode": "Normal", "text": "ab\n", "ranges": [[0, 2]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "v", "mode": "Select", "text": "ab\n", "ranges": [[0, 2]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "p", "mode": "Normal", "text": "ab\n", "ranges": [[0, 2]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "l", "mode": "Normal", "text": "ab\n", "ranges": [[2, 3]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "v", "mode": "Select", "text": "ab\n", "ranges": [[2, 3]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "P", "mode": "Normal", "text": "ab\n", "ranges": [[2, 3]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"}
+  ]},
+  {"name": "reverse-register-edits", "text": "abc def\n", "events": [
+    {"key": "w", "mode": "Normal", "text": "abc def\n", "ranges": [[0, 4]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "y", "mode": "Normal", "text": "abc def\n", "ranges": [[0, 4]], "primary": 0, "unnamed": ["abc "], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "w", "mode": "Normal", "text": "abc def\n", "ranges": [[4, 7]], "primary": 0, "unnamed": ["abc "], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "e", "mode": "Normal", "text": "abc def\n", "ranges": [[8, 8]], "primary": 0, "unnamed": ["abc "], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<a-;>", "mode": "Normal", "text": "abc def\n", "ranges": [[8, 8]], "primary": 0, "unnamed": ["abc "], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "2", "mode": "Normal", "text": "abc def\n", "ranges": [[8, 8]], "primary": 0, "unnamed": ["abc "], "search": null, "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": "R", "mode": "Normal", "text": "abc def\n", "ranges": [[8, 8]], "primary": 0, "unnamed": ["abc "], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "u", "mode": "Normal", "text": "abc def\n", "ranges": [[8, 8]], "primary": 0, "unnamed": ["abc "], "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "U", "mode": "Normal", "text": "abc def\n", "ranges": [[8, 8]], "primary": 0, "unnamed": ["abc "], "search": null, "pending": [], "count": null, "document": "~/example.txt"}
+  ]},
   {"name": "character-arguments", "text": "abc db e!\n", "events": [
     {"key": "f", "mode": "Normal", "text": "abc db e!\n", "ranges": [[0, 1]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
     {"key": "b", "mode": "Normal", "text": "abc db e!\n", "ranges": [[0, 2]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
@@ -254,6 +295,28 @@
     {"key": "j", "mode": "Select", "text": "abcdef\nxy\nuvwxyz\n", "ranges": [[4, 10]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
     {"key": "j", "mode": "Select", "text": "abcdef\nxy\nuvwxyz\n", "ranges": [[4, 15]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
     {"key": "<esc>", "mode": "Normal", "text": "abcdef\nxy\nuvwxyz\n", "ranges": [[4, 15]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"}
+  ]},
+  {"name": "repeat-bracketed-paste", "text": "ab cd\n", "events": [
+    {"key": "i", "mode": "Insert", "text": "ab cd\n", "ranges": [[1, 0]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["i"]},
+    {"key": "X", "mode": "Insert", "text": "Xab cd\n", "ranges": [[2, 1]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["i", "X"]},
+    {"key": "<paste>", "mode": "Insert", "text": "Xé😀ab cd\n", "ranges": [[4, 3]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "paste": "é😀", "last_insert": ["i", "X"]},
+    {"key": "Y", "mode": "Insert", "text": "Xé😀Yab cd\n", "ranges": [[5, 4]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["i", "X", "Y"]},
+    {"key": "<esc>", "mode": "Normal", "text": "Xé😀Yab cd\n", "ranges": [[5, 4]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["i", "X", "Y", "<esc>"]},
+    {"key": ".", "mode": "Normal", "text": "Xé😀YXYab cd\n", "ranges": [[7, 6]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["i", "X", "Y", "<esc>"]},
+    {"key": "u", "mode": "Normal", "text": "Xé😀Yab cd\n", "ranges": [[5, 4]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["i", "X", "Y", "<esc>"]},
+    {"key": "u", "mode": "Normal", "text": "Xé😀ab cd\n", "ranges": [[4, 3]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["i", "X", "Y", "<esc>"]},
+    {"key": "u", "mode": "Normal", "text": "Xab cd\n", "ranges": [[2, 1]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["i", "X", "Y", "<esc>"]},
+    {"key": "u", "mode": "Normal", "text": "ab cd\n", "ranges": [[1, 0]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["i", "X", "Y", "<esc>"]},
+    {"key": "U", "mode": "Normal", "text": "Xab cd\n", "ranges": [[2, 1]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["i", "X", "Y", "<esc>"]}
+  ]},
+  {"name": "bracketed-paste-modes", "text": "one two\r\n", "events": [
+    {"key": "2", "mode": "Normal", "text": "one two\r\n", "ranges": [[0, 1]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": "<paste>", "mode": "Normal", "text": "x\r\nyx\r\nyone two\r\n", "ranges": [[0, 8]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "paste": "x\ny"},
+    {"key": "u", "mode": "Normal", "text": "one two\r\n", "ranges": [[0, 1]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "v", "mode": "Select", "text": "one two\r\n", "ranges": [[0, 1]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "l", "mode": "Select", "text": "one two\r\n", "ranges": [[0, 2]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<paste>", "mode": "Normal", "text": "oZne two\r\n", "ranges": [[0, 3]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "paste": "Z"},
+    {"key": "u", "mode": "Normal", "text": "one two\r\n", "ranges": [[0, 2]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"}
   ]},
   {"name": "repeat-count", "text": "ab cd ef\n", "events": [
     {"key": "i", "mode": "Insert", "text": "ab cd ef\n", "ranges": [[1, 0]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["i"]},
