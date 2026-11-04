@@ -120,6 +120,11 @@ impl Editor {
         let active = self.signature_help.is_active();
         let typed = match action {
             Action::InsertCharAtCursorPos(ch) => Some(*ch),
+            #[cfg(feature = "helix")]
+            Action::FelixInput { key, .. } if before.mode == Mode::Insert => {
+                let mut chars = key.chars();
+                chars.next().filter(|_| chars.next().is_none())
+            }
             _ => None,
         };
         let trigger = typed.filter(|ch| {
@@ -456,6 +461,23 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn real_transport_tracks_arguments_nested_calls_and_document_changes() {
+        signature_help_over_transport(crate::config::EditingModel::Vim).await;
+    }
+
+    #[cfg(all(unix, feature = "helix"))]
+    #[tokio::test]
+    async fn helix_insert_keys_trigger_and_dismiss_signature_help_over_transport() {
+        signature_help_over_transport(crate::config::EditingModel::Helix).await;
+    }
+
+    #[cfg(unix)]
+    async fn signature_help_over_transport(model: crate::config::EditingModel) {
+        async fn press(editor: &mut Editor, code: KeyCode) {
+            editor
+                .test_execute_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+                .await
+                .unwrap();
+        }
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("example.sigtest");
         let script = root.path().join("server.py");
@@ -467,7 +489,8 @@ mod tests {
         )
         .unwrap();
         let file = path.to_string_lossy().into_owned();
-        let mut config = Config::default();
+        let mut config = Config::from_user_toml_with_overrides("", &[]).unwrap();
+        config.editing_model = model;
         config.completion.auto_trigger = false;
         config.signature_help.debounce_ms = 0;
         config.lsp.servers = HashMap::from([("signature-test".to_owned(), serde_json::from_value(json!({
@@ -483,8 +506,8 @@ mod tests {
         )
         .unwrap();
         editor.test_disable_terminal_output();
-        editor.mode = Mode::Insert;
-        editor.cx = 5;
+        press(&mut editor, KeyCode::Char('A')).await;
+        assert!(editor.is_insert());
         editor.ensure_current_buffer_lsp_opened().await.unwrap();
         pump_until(&mut editor, |editor| {
             editor.lsp.server_capabilities_for_file(&file).is_some()
@@ -492,10 +515,7 @@ mod tests {
         .await;
         async fn type_and_request(editor: &mut Editor, text: &str) {
             for ch in text.chars() {
-                editor
-                    .test_execute_production_action(Action::InsertCharAtCursorPos(ch))
-                    .await
-                    .unwrap();
+                press(editor, KeyCode::Char(ch)).await;
             }
             editor.service_signature_help().await.unwrap();
             pump_until(editor, |editor| editor.signature_help.pending.is_none()).await;
@@ -564,14 +584,10 @@ mod tests {
         })
         .await;
         assert!(editor.signature_help.is_visible());
-        editor
-            .test_execute_production_action(Action::EnterMode(Mode::Normal))
-            .await
-            .unwrap();
+        press(&mut editor, KeyCode::Esc).await;
         assert!(!editor.signature_help.is_active());
 
-        editor.mode = Mode::Insert;
-        editor.cx = grapheme_len(&editor.current_buffer().contents());
+        press(&mut editor, KeyCode::Char('A')).await;
         editor.config.signature_help.auto_trigger = true;
         editor
             .test_execute_production_action(Action::ApplyCompletion {

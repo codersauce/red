@@ -63,6 +63,60 @@ def counted_command_cases():
         list("3li") + ["<a-delete>", "<a-backspace>", "<esc>", "u"]
         + list("3li") + ["<a-d>", "<c-w>", "<esc>", "u"])
 
+def counted_composition_cases():
+    text = "ab X ab X!\r\n  ab X!\nlast ab X\n"
+    for mode, toggle in (("normal", []), ("select", ["v"])):
+        keys = []
+        for key in ("i", "a", "I", "A", "o", "O", "c", "<a-c>"):
+            keys += ["<esc>"] + list("ggw") + toggle + ["2", key, "q", "<esc>", "u"]
+        yield f"counted-insert-{mode}", text, keys
+
+        # Start with three selections so that rotation, deletion, merging, and
+        # counts which the reference ignores can all have observable effects.
+        keys = []
+        for command in ([";"], ["<a-;>"], ["<a-:>"], ["%"], [","], ["<a-,>"],
+                        ["("], [")"], ["_"], ["<a-_>"], ["<a-->"], ["<a-s>"],
+                        ["*"], ["<a-*>"], ["y"], ["m","i","w"], ["m","a","("], ["m","m"],
+                        ["x"], ["X"], ["<a-x>"], ["v"], ["<c-s>"], ["<esc>"]):
+            keys += ["<esc>"] + list("%sab") + ["<enter>"] + toggle + ["2"] + command
+        yield f"counted-selection-{mode}", text, keys
+
+        keys = list("/ab") + ["<enter>"] + toggle + ["2","n","2","N","<esc>"]
+        keys += list("gg2w") + ["<c-s>"] + list("ge") + ["<c-s>"] + list("gg")
+        keys += toggle + ["2","<c-o>","2","<tab>","<esc>"]
+        keys += toggle + ["2", "<c-o>", "2", "<c-i>"]
+        for key in ("/", "?", "s", "S", "K", "<a-K>"):
+            keys += ["<esc>"] + list("gg%") + toggle + ["2", key, "a", "b", "<enter>"]
+        yield f"counted-search-jumps-{mode}", text, keys
+
+        history = list("iQ") + ["<esc>"] + list("wix") + ["<esc>"] + toggle + list("2u")
+        history += ["<esc>"] + toggle + list("2U") + ["<esc>"] + toggle + list("2.")
+        yield f"counted-history-{mode}", text, history
+
+        # Each source row contains separators Helix renders inside the row.
+        # Include both directions, an active selection and a retained visual goal.
+        mixed = "ab\vcd\fef\u0085gh\u2028ij\u2029kl\rmn\r\n\t界Qqqqqqqqqqqqqqqqqqqqqq\nlast\n"
+        keys = list("3l") + toggle + ["<end>", "<left>", "<home>", "<right>"]
+        keys += list("4l2gjgkgj") + ["<down>", "<up>"] + list("2j2kghgsglgegg")
+        keys += ["<esc>"] + list("2li") + ["<end>", "<left>", "<down>", "<up>", "<home>", "<esc>"]
+        yield f"wrapped-mixed-separators-{mode}", mixed, keys
+
+        keys = list("gg") + toggle
+        for command in ("fX", "tX", "Fa", "Ta"):
+            keys += list(command) + ["<a-.>", "2", "<a-.>"]
+        yield f"repeated-find-aliases-{mode}", text, keys
+
+
+def insert_alias_cases():
+    corpus = "ab 世界 cd\r\n  xyz\n"
+    for key in ("<backspace>", "<s-backspace>", "<c-h>", "<delete>", "<c-d>",
+                "<c-u>", "<c-k>", "<enter>", "<c-j>", "<backtab>", "<tab>"):
+        name = key[1:-1]
+        # Start on whitespace for smart Tab and inside a word for deletions.
+        setup = list("jI") if key in ("<backtab>", "<tab>") else list("4li")
+        yield f"insert-alias-{name}", corpus, setup + [key, "Q", "<esc>", "u", "U"]
+
+
 def selection_cases():
     enter = ["<enter>"]
     for mode, toggle in (("normal", []), ("select", ["v"])):
@@ -165,6 +219,8 @@ def scenarios(seed, steps):
         keys += list("g2gm2i(ggf2r3") + ["<esc>"]
         yield f"cancel-arguments-{mode}", "abc 123 abc\nline two\n", keys
     yield from counted_command_cases()
+    yield from counted_composition_cases()
+    yield from insert_alias_cases()
     yield from pending_input_cases()
     yield from selection_cases()
     yield "typed-selection", "abcd\n", list("eliX") + ["<esc>"] + list("uU")
@@ -232,6 +288,11 @@ ARROW_AND_EDIT_KEYS = {f"<{name}>": name.title()
                        for name in ("left", "right", "up", "down", "home", "end", "delete")}
 
 
+# Legacy terminal encodings collapse Ctrl-I into Tab and Shift-Backspace into
+# Backspace. Deliver distinct CSI-u keys and check the observer decoded them.
+CSI_U = {"<c-i>": "105;5", "<c-h>": "104;5", "<c-j>": "106;5", "<s-backspace>": "127;2"}
+
+
 def capture(observer, runtime, root, name, text, keys):
     # Helix abbreviates paths inside its working directory before folding HOME.
     # Keep documents in HOME and launch from its child so snapshots always use ~/.
@@ -273,6 +334,9 @@ def capture(observer, runtime, root, name, text, keys):
                 key = "<paste>"
                 raw = b"\x1b[200~" + paste.encode() + b"\x1b[201~"
                 tmux("send-keys", "-t", "h", "-H", *(format(byte, "02x") for byte in raw))
+            elif key in CSI_U:
+                raw = ("\x1b[" + CSI_U[key] + "u").encode()
+                tmux("send-keys", "-t", "h", "-H", *(format(byte, "02x") for byte in raw))
             elif key in ("<a-delete>", "<a-backspace>"):
                 tmux("send-keys", "-t", "h", "M-DC" if key == "<a-delete>" else "M-BSpace")
             elif key.startswith("<a-"):
@@ -302,7 +366,7 @@ def capture(observer, runtime, root, name, text, keys):
             raw_event = record["event"]
             special = {"<backspace>": "Backspace", "<pageup>": "PageUp", "<pagedown>": "PageDown", "<esc>": "Esc", "<enter>": "Enter", "<tab>": "Tab", "<backtab>": "BackTab", "<a-;>": "Char(';')", "<a-,>": "Char(',')"}
             special.update(ARROW_AND_EDIT_KEYS)
-            special.update({"<a-delete>": "Delete", "<a-backspace>": "Backspace"})
+            special.update({"<a-delete>": "Delete", "<a-backspace>": "Backspace", "<s-backspace>": "Backspace"})
             ch = key[3:-1] if key.startswith(("<a-", "<c-")) else key
             code = special.get(key, f"Char('{ch}')")
             if paste is not None:
@@ -311,6 +375,8 @@ def capture(observer, runtime, root, name, text, keys):
             elif (f"code: {code}," not in raw_event and
                   not (len(ch) == 1 and f"code: Char('\\u{{{ord(ch):x}}}')," in raw_event)) or ("ALT" in raw_event) != key.startswith("<a-") or ("CONTROL" in raw_event) != key.startswith("<c-"):
                 raise ValueError(f"{name}: input {index+1} expected {key}, observed {raw_event}")
+            if key == "<s-backspace>" and "SHIFT" not in raw_event:
+                raise ValueError(f"{name}: missing shift modifier in {raw_event}")
             events.append({"key": key, **{k: record[k] for k in
                 ("mode", "text", "ranges", "primary", "unnamed", "search", "pending", "count", "document")}})
             if name.startswith("prompt-"):

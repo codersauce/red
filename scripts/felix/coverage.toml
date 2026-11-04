@@ -3,19 +3,40 @@ schema = 1
 reference = "a05c151bb6e8e9c65ec390b0ae2afe7a5efd619b"
 fields = ["key", "document", "text", "mode", "ranges", "primary", "pending", "count", "search", "unnamed"]
 
+# Space-separated tokens describe one complete command. The validator looks for
+# a real count in the reference state before the first token in each mode.
+[bindings]
+counted_normal_select = [
+  "h", "l", "j", "k", "<left>", "<right>", "<down>", "<up>", "w", "W", "b", "B", "e", "E",
+  "<home>", "<end>", "G", "g g", "g e", "g h", "g l", "g s", "g |", "g j", "g k",
+  "f X", "F X", "t X", "T X", "<a-.>", "<pageup>", "<pagedown>", "<c-f>", "<c-b>", "<c-u>", "<c-d>",
+  "%", "x", "X", "<a-x>", ";", "<a-;>", "<a-:>", "C", "<a-C>", "(", ")", ",", "<a-,>",
+  "s", "S", "K", "<a-K>", "<a-s>", "<a-_>", "<a-->", "_", "/", "?", "n", "N", "*", "<a-*>",
+  "m i w", "m a (", "m m", "i", "I", "a", "A", "o", "O", "d", "<a-d>", "c", "<a-c>",
+  "r X", "R", "y", "p", "P", ">", "<", "J", "<a-J>", "~", "`", "<a-`>", ".", "u", "U",
+  "v", "<esc>", "<c-s>", "<c-o>", "<c-i>", "<tab>"
+]
+insert = ["<left>", "<right>", "<up>", "<down>", "<home>", "<end>", "<pageup>", "<pagedown>", "<enter>",
+          "<c-j>", "<tab>", "<backtab>", "<backspace>", "<s-backspace>", "<c-h>", "<delete>", "<c-d>",
+          "<c-w>", "<a-backspace>", "<a-d>", "<a-delete>", "<c-u>", "<c-k>", "<c-s>", "<esc>", "<paste>"]
+
 [[area]]
 name = "Modes and pending input"
 cases = ["typed-selection", "reverse-at-eof", "empty-rope", "cancel-arguments-normal", "cancel-arguments-select",
          "modified-arguments-normal", "modified-arguments-select", "line-ending-arguments-normal", "line-ending-arguments-select",
          "count-recovery-normal", "count-recovery-select", "repeat-argument-normal", "repeat-argument-select",
          "paste-pending-normal", "paste-pending-select", "repeat-multiple-finds", "counted-command-motion-normal", "counted-command-motion-select",
-         "counted-command-edit-normal", "counted-command-edit-select"]
-remaining = ["Counted command inventory audit"]
+         "counted-command-edit-normal", "counted-command-edit-select", "counted-insert-normal", "counted-insert-select",
+         "counted-selection-normal", "counted-selection-select", "counted-search-jumps-normal", "counted-search-jumps-select"]
+terminal = ["prefix-count"]
+remaining = []
 
 [[area]]
 name = "Movement and navigation"
-cases = ["word-boundaries", "word-from-reversed-crlf", "character-arguments", "vertical-goal", "unicode-vertical-goal", "logical-separators", "mixed-ending-counted-motion", "wrapped-motion", "wrapped-unicode-motion", "wrapped-zero-width", "zero-width-goal", "wrapped-zero-edge", "wrapped-edges", "wrapped-mixed-goals", "page-movement", "page-multiple", "page-edges", "page-through-eof", "page-wrapped-continuations", "selection-jumplist", "jump-follows-edit", "motion-seed-{seed}"]
-remaining = ["Motion across inline virtual text and projected Markdown", "Other logical and visual line motions at non-LF separators", "All aliases and repeated motions"]
+cases = ["wrapped-mixed-separators-normal", "wrapped-mixed-separators-select", "repeated-find-aliases-normal", "repeated-find-aliases-select",
+         "word-boundaries", "word-from-reversed-crlf", "character-arguments", "vertical-goal", "unicode-vertical-goal", "logical-separators", "mixed-ending-counted-motion", "wrapped-motion", "wrapped-unicode-motion", "wrapped-zero-width", "zero-width-goal", "wrapped-zero-edge", "wrapped-edges", "wrapped-mixed-goals", "page-movement", "page-multiple", "page-edges", "page-through-eof", "page-wrapped-continuations", "selection-jumplist", "jump-follows-edit", "motion-seed-{seed}"]
+terminal = ["paging", "horizontal", "checkpoints"]
+remaining = []
 
 [[area]]
 name = "Selections"
@@ -29,12 +50,14 @@ cases = ["line-selections", "mixed-ending-line-selection", "mixed-ending-reverse
          "copy-at-top-select", "copy-at-bottom-select", "copy-eof",
          "merge-mixed-directions-normal", "merge-mixed-directions-select",
          "filter-mixed-directions-normal", "filter-mixed-directions-select"]
+terminal = ["selection-errors"]
 remaining = []
 
 [[area]]
 name = "Search"
 cases = ["search-and-navigate", "cancel-invalid-search", "empty-and-keep", "search-jump-history", "search-identical-selections", "search-viewport", "search-wrapped-viewport", "prompt-history", "prompt-completions", "prompt-edit", "prompt-words-and-paste"]
-remaining = ["Search viewport with inline decorations"]
+terminal = ["prompt", "split-search", "wrapped-split-search"]
+remaining = []
 
 [[area]]
 name = "Text objects"
@@ -49,12 +72,14 @@ remaining = []
 
 [[area]]
 name = "Insert behavior"
-cases = ["open-line", "auto-pairs", "insert-controls", "newline-pairs", "newline-whitespace", "mixed-insert-aliases", "insert-word-delete-aliases"]
+cases = ["open-line", "auto-pairs", "insert-controls", "newline-pairs", "newline-whitespace", "mixed-insert-aliases", "insert-word-delete-aliases",
+         "insert-alias-backspace", "insert-alias-s-backspace", "insert-alias-c-h", "insert-alias-delete", "insert-alias-c-d",
+         "insert-alias-c-u", "insert-alias-c-k", "insert-alias-enter", "insert-alias-c-j", "insert-alias-backtab", "insert-alias-tab"]
 terminal = ["snippet-stops", "completion", "rust-edit", "split-completion"]
-remaining = ["Completion preview layout in decorated views"]
+remaining = []
 
 [[area]]
 name = "Undo and repeat"
-cases = ["append-and-undo", "repeat-count", "repeat-bracketed-paste", "repeat-change", "repeat-checkpoint"]
+cases = ["append-and-undo", "repeat-count", "repeat-bracketed-paste", "repeat-change", "repeat-checkpoint", "counted-history-normal", "counted-history-select"]
 terminal = ["repeat", "completion", "completion-repeat"]
 remaining = []

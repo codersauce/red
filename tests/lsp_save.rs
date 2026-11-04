@@ -125,3 +125,50 @@ async fn did_save_contains_the_final_formatted_text() {
     assert_eq!(saves[0].text, "value\n");
     assert_eq!(saves[0].disk_text.as_deref(), Some("value\n"));
 }
+
+#[cfg(feature = "helix")]
+#[tokio::test]
+async fn helix_write_obeys_reds_configured_whitespace_policy_after_a_multi_edit() {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    for trim in [true, false] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("example.txt");
+        std::fs::write(&path, "foo foo  \n").unwrap();
+        let mut config =
+            Config::from_user_toml_with_overrides("editing_model = 'helix'", &[]).unwrap();
+        config.formatting.on_save = true;
+        config.formatting.trim_trailing_whitespace = trim;
+        config.lsp.enabled = false;
+        let lsp = Box::new(red::lsp::LspManager::new(config.lsp.clone()));
+        let mut editor = Editor::test_with_size(
+            lsp,
+            80,
+            24,
+            config,
+            Theme::default(),
+            vec![Buffer::new(
+                Some(path.to_string_lossy().into_owned()),
+                "foo foo  \n".into(),
+            )],
+        )
+        .unwrap();
+        editor.test_disable_terminal_output();
+        for code in "%sfoo".chars().map(KeyCode::Char).chain([
+            KeyCode::Enter,
+            KeyCode::Char('c'),
+            KeyCode::Char('X'),
+            KeyCode::Esc,
+            KeyCode::Char(':'),
+            KeyCode::Char('w'),
+            KeyCode::Enter,
+        ]) {
+            editor
+                .test_execute_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+                .await
+                .unwrap();
+        }
+        let expected = if trim { "X X\n" } else { "X X  \n" };
+        assert_eq!(editor.test_buffer_contents(), expected);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), expected);
+    }
+}

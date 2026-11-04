@@ -84,7 +84,8 @@ impl Editor {
                         .current_dialog
                         .as_ref()
                         .is_some_and(|dialog| !dialog.allows_event_passthrough())
-                    || gesture.started && !self.is_visual()
+                    // A Felix drag extends the document selection in its current mode.
+                    || gesture.started && self.config.editing_model == crate::config::EditingModel::Vim && !self.is_visual()
             })
         {
             self.mouse_selection.gesture = None;

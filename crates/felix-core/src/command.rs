@@ -83,9 +83,64 @@ impl ArgumentMotion {
     }
 }
 
-/// Map a character offset to a destination on another display row, retaining
-/// the preferred screen column across consecutive vertical movements.
-pub type VisualMotion<'a> = dyn Fn(usize, isize, Option<usize>) -> (usize, usize) + 'a;
+/// Screen geometry for a logical line, whose offsets exclude the line terminator.
+/// A row index is relative to that line. Implementations clamp rows and columns
+/// beyond its last cursor stop.
+pub trait VisualLines {
+    fn position(&self, line: std::ops::Range<usize>, offset: usize) -> (usize, usize);
+    fn offset(&self, line: std::ops::Range<usize>, row: usize, column: usize) -> usize;
+}
+
+fn visual_target(
+    text: RopeSlice<'_>,
+    layout: &dyn VisualLines,
+    cursor: usize,
+    delta: isize,
+    goal: Option<(usize, usize)>,
+    logical: bool,
+) -> (usize, (usize, usize)) {
+    let mut start = crate::motion::logical_start(text, cursor);
+    let mut end = crate::motion::logical_end(text, start);
+    let (current_row, current_col) = layout.position(start..end, cursor);
+    let (old_row, col) = goal.unwrap_or((current_row, current_col));
+    if logical {
+        start = crate::motion::shift_lines(text, start, delta > 0, delta.unsigned_abs()).0;
+        end = crate::motion::logical_end(text, start);
+        let row = old_row.max(current_row);
+        let dest = if row > layout.position(start..end, end).0 {
+            end
+        } else {
+            layout.offset(start..end, row, col)
+        };
+        return (dest, (row, col));
+    }
+    let mut row = current_row;
+    let mut left = delta.unsigned_abs();
+    if delta > 0 {
+        loop {
+            let last = layout.position(start..end, end).0;
+            let within = left.min(last.saturating_sub(row));
+            row += within;
+            left -= within;
+            if left == 0 || end == text.len_chars() {
+                break;
+            }
+            start = crate::boundary(text, end, true);
+            end = crate::motion::logical_end(text, start);
+            row = 0;
+            left -= 1;
+        }
+    } else {
+        while left > row && start > 0 {
+            left -= row + 1;
+            end = crate::boundary(text, start, false);
+            start = crate::motion::logical_start(text, end);
+            row = layout.position(start..end, end).0;
+        }
+        row = row.saturating_sub(left);
+    }
+    (layout.offset(start..end, row, col), (0, col))
+}
 
 /// Document settings and register contents supplied by the current host.
 pub struct Context<'a> {
@@ -100,7 +155,7 @@ pub struct Context<'a> {
     pub page_height: usize,
     pub viewport_start: usize,
     pub scrolloff: usize,
-    pub visual_motion: Option<&'a VisualMotion<'a>>,
+    pub visual_lines: Option<&'a dyn VisualLines>,
 }
 
 impl Default for Context<'_> {
@@ -115,7 +170,7 @@ impl Default for Context<'_> {
             page_height: 22,
             viewport_start: 0,
             scrolloff: 5,
-            visual_motion: None,
+            visual_lines: None,
         }
     }
 }
@@ -149,8 +204,8 @@ impl Context<'_> {
     }
 
     fn row_start(&self, text: RopeSlice<'_>, pos: usize, delta: isize) -> usize {
-        if let Some(resolve) = self.visual_motion {
-            return resolve(pos, delta, Some(0)).0;
+        if let Some(layout) = self.visual_lines {
+            return visual_target(text, layout, pos, delta, Some((0, 0)), false).0;
         }
         let start = crate::motion::logical_start(text, pos);
         let (target, crossed) =
@@ -191,9 +246,8 @@ pub struct Session {
     pub mode: Mode,
     pending: Pending,
     count: Option<usize>,
-    // A logical source column and a screen column differ on a wrapped line.
-    goals: Vec<usize>,
-    visual_goals: Vec<usize>,
+    // Helix carries the preferred wrap row and screen column across both kinds of vertical motion.
+    goals: Vec<(usize, usize)>,
     restore_append: bool,
     last_motion: Option<ArgumentMotion>,
 }
@@ -418,61 +472,41 @@ impl Plan {
         &mut self,
         text: RopeSlice<'_>,
         selections: &Selections,
-        down: bool,
-        count: usize,
-        tab_width: usize,
-        extend: bool,
+        delta: isize,
+        ctx: &Context<'_>,
+        logical: bool,
     ) {
-        let mut goals = Vec::new();
-        for (i, &r) in selections.ranges().iter().enumerate() {
-            let (range, goal) = crate::motion::vertical(
-                text,
-                r,
-                down,
-                count,
-                tab_width,
-                self.next.goals.get(i).copied(),
-                extend,
-            );
-            self.ranges[i] = range;
+        let extend = self.next.mode == Mode::Select;
+        let mut goals = Vec::with_capacity(self.ranges.len());
+        for (i, &range) in selections.ranges().iter().enumerate() {
+            let old = self.next.goals.get(i).copied();
+            let (moved, goal) = if let Some(layout) = ctx.visual_lines {
+                let (dest, goal) =
+                    visual_target(text, layout, range.cursor(text), delta, old, logical);
+                if extend
+                    && dest == text.len_chars()
+                    && crate::motion::logical_start(text, dest) == dest
+                {
+                    (range, old.unwrap_or(goal))
+                } else {
+                    (range.move_to(text, dest, extend), goal)
+                }
+            } else {
+                let (range, col) = crate::motion::vertical(
+                    text,
+                    range,
+                    delta >= 0,
+                    delta.unsigned_abs(),
+                    ctx.tab_width,
+                    old.map(|(_, col)| col),
+                    extend,
+                );
+                (range, (0, col))
+            };
+            self.ranges[i] = moved;
             goals.push(goal);
         }
         self.next.goals = goals;
-    }
-
-    fn visual_vertical(
-        &mut self,
-        text: RopeSlice<'_>,
-        selections: &Selections,
-        delta: isize,
-        ctx: &Context<'_>,
-    ) {
-        let extend = self.next.mode == Mode::Select;
-        let Some(resolve) = ctx.visual_motion else {
-            self.vertical(
-                text,
-                selections,
-                delta >= 0,
-                delta.unsigned_abs(),
-                ctx.tab_width,
-                extend,
-            );
-            return;
-        };
-        let mut goals = Vec::with_capacity(self.ranges.len());
-        for (index, &range) in selections.ranges().iter().enumerate() {
-            let (pos, goal) = resolve(
-                range.cursor(text),
-                delta,
-                self.next.visual_goals.get(index).copied(),
-            );
-            if !extend || text.line(text.char_to_line(pos)).len_chars() != 0 {
-                self.ranges[index] = range.move_to(text, pos, extend);
-            }
-            goals.push(goal);
-        }
-        self.next.visual_goals = goals;
-        self.next.goals.clear();
     }
 
     fn page(&mut self, text: RopeSlice<'_>, selections: &Selections, key: &str, ctx: &Context<'_>) {
@@ -483,7 +517,7 @@ impl Plan {
         let delta = if down { distance } else { -distance };
         let top = ctx.row_start(text, ctx.viewport_start, delta);
         if half {
-            self.visual_vertical(text, selections, delta, ctx);
+            self.vertical(text, selections, delta, ctx, false);
         } else {
             let margin = ctx.scrolloff.min((height - 1) / 2);
             let edge = if down { margin } else { height - 1 - margin };
@@ -708,7 +742,6 @@ impl Session {
             && !key.bytes().all(|ch| ch.is_ascii_digit())
         {
             p.next.goals.clear();
-            p.next.visual_goals.clear();
         }
         // Prefix maps still accept counts. Prompts and commands waiting for
         // a character (such as f and r) consume a digit as their argument.
@@ -906,10 +939,13 @@ impl Session {
                     "j" | "k" => p.vertical(
                         text,
                         selections,
-                        key == "j",
-                        count,
-                        context.tab_width,
-                        extend,
+                        if key == "j" {
+                            count.min(isize::MAX as usize) as isize
+                        } else {
+                            -(count.min(isize::MAX as usize) as isize)
+                        },
+                        context,
+                        true,
                     ),
                     "r" => p.host = Some(HostAction::References),
                     _ => {}
@@ -1188,7 +1224,7 @@ impl Session {
                 } else {
                     -distance
                 };
-                p.visual_vertical(text, selections, delta, context);
+                p.vertical(text, selections, delta, context, false);
             }
             "<pageup>" | "<pagedown>" | "<c-f>" | "<c-b>" | "<c-u>" | "<c-d>" => {
                 p.page(text, selections, key, context);

@@ -16,6 +16,7 @@ from collections import defaultdict
 import fcntl
 import json
 import os
+import re
 from pathlib import Path
 import pty
 import struct
@@ -119,8 +120,11 @@ def run(args):
         )
         os.close(slave)
         drained = [0]
+        await_signature = threading.Event()
+        painted_signature = threading.Event()
 
         def drain():
+            tail = b""
             while True:
                 try:
                     data = os.read(master, 1 << 20)
@@ -129,6 +133,11 @@ def run(args):
                 if not data:
                     return
                 drained[0] += len(data)
+                if await_signature.is_set() and not painted_signature.is_set():
+                    tail = (tail + data)[-65536:]
+                    visible = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", tail)
+                    if b"fn outer(" in visible and b"y: f32" in visible:
+                        painted_signature.set()
 
         threading.Thread(target=drain, daemon=True).start()
 
@@ -168,6 +177,7 @@ def run(args):
                 process.kill()
                 process.wait(timeout=5)
                 raise SystemExit("signature benchmark server did not initialize")
+            await_signature.set()
             os.write(master, b"ggiouter(")
             deadline = time.monotonic() + args.startup_timeout
             while time.monotonic() < deadline:
@@ -180,8 +190,11 @@ def run(args):
             else:
                 process.kill()
                 process.wait(timeout=5)
-                raise SystemExit("signature benchmark did not display parameter help")
-            time.sleep(0.2)
+                raise SystemExit("signature benchmark did not request parameter help")
+            if not painted_signature.wait(timeout=args.startup_timeout):
+                process.kill()
+                process.wait(timeout=5)
+                raise SystemExit("signature benchmark received no painted parameter label")
         if args.scenario == "typing" and args.typing_context != "source":
             if args.typing_context == "heading":
                 position = b"0f 8l"

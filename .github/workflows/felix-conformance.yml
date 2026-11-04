@@ -25,6 +25,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install ripgrep
+        uses: ./.github/actions/install-ripgrep
+      - name: Ensure tmux is available for terminal comparisons
+        run: |
+          if ! command -v tmux; then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends -y tmux
+          fi
       - name: Check benchmark trace parsing
         run: python3 -m unittest discover -s scripts -p test_perf_trace.py
       - name: Check out pinned Helix
@@ -80,6 +88,10 @@ jobs:
               --line "$line" --rows 94 --cols 152 --events 12 --warmup 4 --perf-mode trace \
               --config-override markdown_images=kitty --verify-image-reuse > "evidence/image-$scenario.json"
           done
+      - name: Verify typed Helix signature-help triggers in the terminal
+        run: |
+          python3 scripts/interaction_bench.py signature --binary target/debug/red \
+            --root "$PWD" --config-override editing_model=helix --cycles 4 > evidence/signature-help.txt
       - name: Verify multi-selection edits reach the language server
         run: |
           python3 scripts/edit_replay_bench.py --binary target/debug/red --scenario felix-change \
@@ -90,20 +102,29 @@ jobs:
         run: |
           tar -xJf "$ARCHIVE" helix-25.07.1-x86_64-linux/runtime
           python3 scripts/felix/scenarios.py --observer reference/target/debug/hx --runtime helix-25.07.1-x86_64-linux/runtime --steps 48 --seed 250701 > "$FELIX_SCENARIOS"
-          python3 scripts/felix/check_coverage.py "$FELIX_SCENARIOS" >> "$GITHUB_STEP_SUMMARY"
+          python3 scripts/felix/check_coverage.py "$FELIX_SCENARIOS" --terminal evidence/terminal.json >> "$GITHUB_STEP_SUMMARY"
           cmp scripts/felix/fixtures/motions.json "$FELIX_SCENARIOS"
           cargo clippy --locked --all-targets --all-features -- -D warnings
           cargo test --locked -p felix-core
-          cargo test --locked -p red --features helix --lib --test completion -- --test-threads=1
+          cargo test --locked -p red --features helix --lib --test completion --test mouse_selection_detached --test lsp_save -- --test-threads=1
+          cargo test --locked -p red --features helix --test rpc_connection
       - name: Replay the extended seed against the same revision
         if: github.event_name != 'pull_request'
         env:
           FELIX_SCENARIOS: ${{ github.workspace }}/evidence/extended.json
         run: |
           python3 scripts/felix/scenarios.py --observer reference/target/debug/hx --runtime helix-25.07.1-x86_64-linux/runtime --steps 512 --seed "$GITHUB_RUN_ID" > "$FELIX_SCENARIOS"
-          python3 scripts/felix/check_coverage.py "$FELIX_SCENARIOS" >> "$GITHUB_STEP_SUMMARY"
+          python3 scripts/felix/check_coverage.py "$FELIX_SCENARIOS" --terminal evidence/terminal.json >> "$GITHUB_STEP_SUMMARY"
           cargo test --locked -p felix-core --test reference
           cargo test --locked -p red --features helix --lib editor::felix::tests::motions_match_reference_at_every_key
+      - name: Record candidate and reference identities
+        run: |
+          git rev-parse HEAD > evidence/candidate-commit.txt
+          git -C reference rev-parse HEAD > evidence/reference-commit.txt
+          sha256sum Cargo.lock "$ARCHIVE" reference/target/debug/hx target/debug/red \
+            scripts/felix/helix-observer.patch scripts/felix/coverage.toml \
+            scripts/felix/fixtures/motions.json scripts/felix/*baseline.json \
+            default_config.toml src/editor/felix_bindings.toml > evidence/sha256.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:

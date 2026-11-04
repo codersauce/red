@@ -156,7 +156,7 @@ pub(super) struct TableLayout {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct TableLayoutOptions {
+pub(super) struct TableLayoutOptions {
     width: usize,
     tab_width: usize,
     wrap: bool,
@@ -172,6 +172,19 @@ pub(super) struct CachedTables {
 }
 
 impl super::Editor {
+    pub(super) fn table_layout_options(
+        &self,
+        window: &crate::window::Window,
+    ) -> TableLayoutOptions {
+        TableLayoutOptions {
+            width: self.window_content_width(window),
+            tab_width: self.tab_width_for_buffer_index(window.buffer_index),
+            wrap: window.wrap,
+            ascii: self.config.window_borders_ascii,
+            model: self.config.editing_model,
+        }
+    }
+
     pub(super) fn markdown_tables_enabled(&self, window: &crate::window::Window) -> bool {
         window
             .markdown_tables
@@ -213,13 +226,7 @@ impl super::Editor {
             }
             cached.revision = buffer.revision();
         }
-        let key = TableLayoutOptions {
-            width: self.window_content_width(window),
-            tab_width: self.tab_width_for_buffer_index(window.buffer_index),
-            wrap: window.wrap,
-            ascii: self.config.window_borders_ascii,
-            model: self.config.editing_model,
-        };
+        let key = self.table_layout_options(window);
         if cached.layouts.len() >= 4 && !cached.layouts.contains_key(&key) {
             cached.layouts.clear();
         }
@@ -270,30 +277,21 @@ impl super::Editor {
 
     /// A search landing in concealed syntax must still show what matched.
     fn markdown_hidden_search_match(&self, window: &crate::window::Window, line: usize) -> bool {
-        if self.search_highlights_suppressed || self.search_term.is_empty() {
-            return false;
-        }
+        #[cfg(feature = "helix")]
+        let selected = self.felix_active_selection().is_some();
+        #[cfg(not(feature = "helix"))]
+        let selected = false;
         let Some(buffer) = self.buffer_manager.get(window.buffer_index) else {
             return false;
         };
-        let Some(cache) = self.search_match_cache.as_ref().filter(|cache| {
-            cache.buffer_id == buffer.id()
+        let vim_matches = self.search_match_cache.as_ref().filter(|cache| {
+            !self.search_highlights_suppressed
+                && !self.search_term.is_empty()
+                && cache.buffer_id == buffer.id()
                 && cache.revision == buffer.revision()
                 && cache.pattern == self.search_term
-        }) else {
-            return false;
-        };
-        let Some(text) = buffer.get(line) else {
-            return false;
-        };
-        let prefix = text.graphemes(true).take(window.cx).collect::<String>();
-        if cache
-            .matches
-            .binary_search_by_key(&(line, prefix.chars().count()), |matched| {
-                (matched.start_y, matched.start_x)
-            })
-            .is_err()
-        {
+        });
+        if !selected && vim_matches.is_none() {
             return false;
         }
         let Some(layout) = self.markdown_table_layout(window) else {
@@ -302,6 +300,22 @@ impl super::Editor {
         let Some(table_line) = layout.lines.get(&line) else {
             return false;
         };
+        let Some(text) = buffer.get(line) else {
+            return false;
+        };
+        let prefix = text.graphemes(true).take(window.cx).collect::<String>();
+        if !selected
+            && !vim_matches.is_some_and(|cache| {
+                cache
+                    .matches
+                    .binary_search_by_key(&(line, prefix.chars().count()), |matched| {
+                        (matched.start_y, matched.start_x)
+                    })
+                    .is_ok()
+            })
+        {
+            return false;
+        }
         let column = self.config.editing_model.source_width(
             &prefix,
             self.tab_width_for_buffer_index(window.buffer_index),
@@ -645,7 +659,7 @@ impl MarkdownTables {
         result
     }
 
-    fn layout(&self, options: TableLayoutOptions) -> TableLayout {
+    pub(super) fn layout(&self, options: TableLayoutOptions) -> TableLayout {
         let TableLayoutOptions {
             width,
             tab_width,

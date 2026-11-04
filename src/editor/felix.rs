@@ -90,6 +90,8 @@ pub(super) struct FilterSavepoint {
 pub(super) struct CompletionPreview {
     owner: Owner,
     pub(super) text: ropey::Rope,
+    pub(super) tables: Option<markdown_tables::MarkdownTables>,
+    pub(super) concealments: Option<display_layout::LineConcealments>,
     original: ropey::Rope,
     replacements: Vec<std::ops::Range<usize>>,
     replacement_len: usize,
@@ -126,6 +128,80 @@ fn felix_display_col(
         line,
         crate::config::EditingModel::Helix.source_width(&prefix, tab_width),
     )
+}
+
+/// Most logical lines occupy one Red buffer line. Ropey also indexes standalone
+/// CR and Unicode separators, which Helix displays inside the logical line.
+struct FelixVisualLines<'a> {
+    editor: &'a Editor,
+    text: ropey::RopeSlice<'a>,
+    width: usize,
+    tab_width: usize,
+}
+
+impl FelixVisualLines<'_> {
+    fn segments(&self, line: std::ops::Range<usize>) -> Vec<display_layout::LineSegment> {
+        let index = self.text.char_to_line(line.start);
+        if self.text.char_to_line(line.end) == index {
+            return self.editor.navigable_line_segments(index, self.width);
+        }
+        let contents = std::borrow::Cow::<str>::from(self.text.slice(line));
+        let options = self
+            .editor
+            .break_indent_options_for_buffer_index(self.editor.buffer_manager.active_index());
+        if self.editor.wrap {
+            display_layout::wrap_line_segments(&contents, index, self.width, 0, options)
+        } else {
+            display_layout::nowrap_line_segment(&contents, index, usize::MAX, 0, options)
+        }
+    }
+}
+
+impl felix_core::VisualLines for FelixVisualLines<'_> {
+    fn position(&self, line: std::ops::Range<usize>, offset: usize) -> (usize, usize) {
+        let prefix =
+            std::borrow::Cow::<str>::from(self.text.slice(line.start..offset.min(line.end)));
+        let col = self
+            .editor
+            .config
+            .editing_model
+            .source_width(&prefix, self.tab_width);
+        let segments = self.segments(line);
+        let row = segments
+            .iter()
+            .position(|s| s.contains_cursor_col(col))
+            .unwrap_or(segments.len() - 1);
+        (
+            row,
+            segments[row].screen_col_for_display_col(col, self.width),
+        )
+    }
+
+    fn offset(&self, line: std::ops::Range<usize>, row: usize, column: usize) -> usize {
+        let segments = self.segments(line.clone());
+        let segment = &segments[row.min(segments.len() - 1)];
+        let mapped = segment.display_col_for_screen_col(column);
+        let col = if segment.projection.is_some() {
+            mapped
+        } else if segment.last_segment {
+            mapped.min(segment.end_col)
+        } else if segment.has_hidden_columns() {
+            mapped.min(segment.last_visible_source_col())
+        } else {
+            mapped.min(segment.end_col.saturating_sub(1))
+        };
+        let source = std::borrow::Cow::<str>::from(self.text.slice(line.clone()));
+        let grapheme =
+            self.editor
+                .config
+                .editing_model
+                .source_grapheme(&source, col, self.tab_width);
+        let byte = source
+            .grapheme_indices(true)
+            .nth(grapheme)
+            .map_or(source.len(), |(byte, _)| byte);
+        line.start + self.text.slice(line).byte_to_char(byte)
+    }
 }
 
 impl Editor {
@@ -381,7 +457,32 @@ impl Editor {
             text.remove(range.clone());
             text.insert(at, value);
         }
+        let windows = self.window_manager.windows();
+        let same_document = |window: &&crate::window::Window| {
+            self.buffer_manager[window.buffer_index].id() == buffer.id()
+        };
+        let tables = windows
+            .iter()
+            .copied()
+            .filter(same_document)
+            .any(|w| self.markdown_tables_enabled(w));
+        let conceal = windows
+            .iter()
+            .copied()
+            .filter(same_document)
+            .any(|w| self.markdown_conceal_enabled(w));
+        let markdown = ((tables || conceal)
+            && text.len_bytes() <= markdown_tables::MAX_TABLE_DOCUMENT_BYTES)
+            .then(|| text.to_string());
         Some(CompletionPreview {
+            tables: markdown
+                .as_deref()
+                .filter(|_| tables)
+                .map(markdown_tables::MarkdownTables::parse),
+            concealments: markdown
+                .as_deref()
+                .filter(|_| conceal)
+                .map(markdown_conceal::conceal_markdown),
             owner: self.felix_owner()?,
             text,
             original,
@@ -596,6 +697,7 @@ impl Editor {
                 };
                 format!("<{prefix}-{code:?}>").to_lowercase()
             }
+            KeyCode::Backspace if key.modifiers == KeyModifiers::SHIFT => "<s-backspace>".into(),
             KeyCode::Backspace => "<backspace>".into(),
             KeyCode::Left => "<left>".into(),
             KeyCode::Right => "<right>".into(),
@@ -741,23 +843,11 @@ impl Editor {
             );
             text.line_to_char(line) + self.grapheme_to_char_on_line(grapheme, line)
         };
-        let visual_motion = |offset, delta, goal| {
-            let (line, col) = felix_display_col(text, offset, tab_width);
-            self.screen_line_target(
-                line,
-                col,
-                delta,
-                self.active_content_width().max(1),
-                goal,
-                true,
-            )
-            .map(|target| {
-                (
-                    display_offset(target.line, target.display_col),
-                    target.screen_col,
-                )
-            })
-            .unwrap_or((offset, goal.unwrap_or(col)))
+        let layout = FelixVisualLines {
+            editor: self,
+            text,
+            width: self.active_content_width().max(1),
+            tab_width,
         };
         let visual_rows = self.wrap
             || (matches!(
@@ -785,7 +875,7 @@ impl Editor {
             page_height: self.vheight(),
             viewport_start: display_offset(viewport_line, self.skipcol),
             scrolloff: self.config.scrolloff.unwrap_or(5),
-            visual_motion: visual_rows.then_some(&visual_motion),
+            visual_lines: visual_rows.then_some(&layout),
         };
         self.felix.session.plan(text, initial, key, &context)
     }
@@ -1713,6 +1803,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multiline_completion_shifts_the_projected_table_in_both_splits() {
+        let source = "f\n\n| Fruit | Value |\n| --- | --- |\n| **pear** | 7 |\n";
+        let (mut editor, mut frame, mut runtime) = named_fixture_editor("food.md", source);
+        editor
+            .execute(&Action::SplitVertical, &mut frame, &mut runtime)
+            .await
+            .unwrap();
+        let press = |code| Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+        editor
+            .test_execute_event(press(KeyCode::Char('A')))
+            .await
+            .unwrap();
+        let item = serde_json::from_value(json!({
+            "label": "fruit", "textEdit": {"range": {"start": {"line": 0, "character": 0},
+                "end": {"line": 0, "character": 1}}, "newText": "one\ntwo"}
+        }))
+        .unwrap();
+        assert!(editor.show_completion_items(vec![item], editor.completion_snapshot()));
+        editor
+            .test_execute_event(press(KeyCode::Tab))
+            .await
+            .unwrap();
+        editor.render(&mut frame).unwrap();
+        let active = editor.active_window_with_editor_view().unwrap();
+        for window in editor.window_manager.windows() {
+            let layout = editor.felix_preview_layout(window).unwrap().0;
+            let shifted = layout
+                .rows
+                .iter()
+                .find(|row| row.line == 5 && row.projection.is_some())
+                .unwrap();
+            let y = editor.window_to_terminal_y(window, shifted.row);
+            let x = window.position.x + editor.gutter_width_for_window(window) + 1;
+            let painted: String = frame.cells
+                [y * frame.width + x..y * frame.width + x + editor.window_content_width(window)]
+                .iter()
+                .map(|cell| cell.c)
+                .collect();
+            assert!(painted.contains("│ pear"), "{painted}");
+        }
+        assert_eq!(editor.current_buffer().contents(), source);
+        editor
+            .test_execute_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            )))
+            .await
+            .unwrap();
+        assert!(editor.felix_preview(&active).is_none());
+        assert_eq!(editor.current_buffer().contents(), source);
+    }
+
+    #[tokio::test]
+    async fn incremental_search_reveals_a_hidden_target_and_restores_the_decorated_view_on_cancel()
+    {
+        let source = format!(
+            "top\n{}| A | B |\n| --- | --- |\n| [label](https://needle.test) | b |\n",
+            "filler\n".repeat(31)
+        );
+        let (mut editor, mut frame, mut runtime) = named_fixture_editor("link.md", &source);
+        let press = |code| Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+        for ch in "31gg".chars() {
+            editor
+                .test_execute_event(press(KeyCode::Char(ch)))
+                .await
+                .unwrap();
+        }
+        editor
+            .execute(&Action::AddSampleInlineComment, &mut frame, &mut runtime)
+            .await
+            .unwrap();
+        for ch in "gg".chars() {
+            editor
+                .test_execute_event(press(KeyCode::Char(ch)))
+                .await
+                .unwrap();
+        }
+        for ending in [KeyCode::Esc, KeyCode::Enter] {
+            for ch in "/needle".chars() {
+                editor
+                    .test_execute_event(press(KeyCode::Char(ch)))
+                    .await
+                    .unwrap();
+            }
+            editor.render(&mut frame).unwrap();
+            let window = editor.active_window_with_editor_view().unwrap();
+            let layout = editor.layout_for_window(&window);
+            assert!(layout.inline_comments.iter().any(|c| c.line == 30));
+            let row = layout
+                .rows
+                .iter()
+                .find(|r| r.line == 34 && r.projection.is_none())
+                .unwrap();
+            let y = editor.window_to_terminal_y(&window, row.row);
+            let row_text: String = frame.cells[y * frame.width..(y + 1) * frame.width]
+                .iter()
+                .map(|cell| cell.c)
+                .collect();
+            assert!(row_text.contains("https://needle.test"), "{row_text}");
+            editor.test_execute_event(press(ending)).await.unwrap();
+            if ending == KeyCode::Esc {
+                assert_eq!((editor.vtop, editor.cursor_text_position().line), (0, 0));
+            } else {
+                let sel = editor.felix_active_selection().unwrap().primary();
+                assert_eq!(
+                    editor
+                        .current_buffer()
+                        .contents_snapshot()
+                        .slice(sel.start()..sel.end()),
+                    "needle"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn search_and_move_through_projected_table_with_inline_comment() {
         let source =
             "before\n| A | Name |\n| --- | --- |\n| 界 | target |\n| x | second |\nafter\n";
@@ -2481,6 +2687,10 @@ mod tests {
                         "delete" => KeyCode::Delete,
                         _ => KeyCode::Char(token.chars().nth(3).unwrap()),
                     }
+                }
+                "<s-backspace>" => {
+                    modifiers = KeyModifiers::SHIFT;
+                    KeyCode::Backspace
                 }
                 "<backspace>" => KeyCode::Backspace,
                 "<up>" => KeyCode::Up,

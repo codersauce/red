@@ -2,7 +2,7 @@ use super::*;
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use red::{
     buffer::Buffer,
-    config::{Config, KeyAction},
+    config::{Config, EditingModel, KeyAction},
     editor::{Action, DetachedEditorCore, Editor},
     headless::{InputEvent, KeyCode, KeyKind},
     theme::Theme,
@@ -16,21 +16,22 @@ struct Harness {
 
 impl Harness {
     async fn new(mapping: KeyAction) -> Result<Self> {
-        Self::build(mapping, false, default_buffers()).await
+        Self::build(mapping, false, default_buffers(), EditingModel::Vim).await
     }
 
     async fn with_delayed_initialization(mapping: KeyAction) -> Result<Self> {
-        Self::build(mapping, true, default_buffers()).await
+        Self::build(mapping, true, default_buffers(), EditingModel::Vim).await
     }
 
     async fn with_buffers(mapping: KeyAction, buffers: Vec<Buffer>) -> Result<Self> {
-        Self::build(mapping, false, buffers).await
+        Self::build(mapping, false, buffers, EditingModel::Vim).await
     }
 
     async fn build(
         mapping: KeyAction,
         delay_initialization: bool,
         buffers: Vec<Buffer>,
+        model: EditingModel,
     ) -> Result<Self> {
         let package = tempfile::tempdir()?;
         let slow = package.path().join("slow");
@@ -55,6 +56,7 @@ impl Harness {
             fs::write(slow.join("delay-initialize"), [])?;
         }
         let mut config = Config::from_user_toml_with_overrides("disable_ai = true", &[])?;
+        config.editing_model = model;
         config.plugins.clear();
         config.lsp.enabled = false;
         config.plugins.insert(
@@ -190,6 +192,10 @@ fn write_package(root: &Path, commands: &[&str]) -> Result<()> {
 }
 
 pub(super) async fn run() -> Result<()> {
+    #[cfg(feature = "helix")]
+    helix_selections_follow_rpc_document_apply()
+        .await
+        .context("Felix RPC document edit")?;
     lazy_initialization_keeps_input_responsive()
         .await
         .context("responsive lazy initialization")?;
@@ -226,9 +232,13 @@ pub(super) async fn run() -> Result<()> {
     host_native_pickers_select_cancel_and_reload_cleanly()
         .await
         .context("host-native RPC pickers")?;
-    rpc_panel_actions_are_owner_routed()
+    rpc_panel_actions_are_owner_routed(EditingModel::Vim)
         .await
         .context("RPC panel actions")?;
+    #[cfg(feature = "helix")]
+    rpc_panel_actions_are_owner_routed(EditingModel::Helix)
+        .await
+        .context("Helix panel focus handoff")?;
     explicit_path_edit_preserves_the_active_view_and_insert()
         .await
         .context("off-screen document edit")?;
@@ -241,8 +251,14 @@ pub(super) async fn run() -> Result<()> {
     Ok(())
 }
 
-async fn rpc_panel_actions_are_owner_routed() -> Result<()> {
-    let mut h = Harness::new(KeyAction::Single(Action::PluginCommand("RpcPanel".into()))).await?;
+async fn rpc_panel_actions_are_owner_routed(model: EditingModel) -> Result<()> {
+    let mut h = Harness::build(
+        KeyAction::Single(Action::PluginCommand("RpcPanel".into())),
+        false,
+        default_buffers(),
+        model,
+    )
+    .await?;
     let slow = h.package.path().join("slow");
 
     h.command("RpcPanel").await?;
@@ -478,6 +494,42 @@ async fn responsive_commands_and_undo() -> Result<()> {
     assert!(h.screen().contains('X'));
     h.text("u").await?;
     assert!(h.screen().contains("userhello"));
+    Ok(())
+}
+
+#[cfg(feature = "helix")]
+async fn helix_selections_follow_rpc_document_apply() -> Result<()> {
+    let mut h = Harness::build(
+        KeyAction::Single(Action::PluginCommand("RpcEdit".into())),
+        false,
+        default_buffers(),
+        EditingModel::Helix,
+    )
+    .await?;
+    h.text("%s[eo]").await?;
+    h.key(KeyCode::Enter).await?;
+    h.command("RpcEdit").await?;
+    h.until(|h| h.marker("started", 1).exists()).await?;
+    h.release(1)?;
+    h.until(|h| h.document_screen().contains("plugin-hello"))
+        .await?;
+    h.text("cZ").await?;
+    h.key(KeyCode::Escape).await?;
+    assert!(
+        h.document_screen().contains("plugin-hZllZ"),
+        "{}",
+        h.screen()
+    );
+    h.text("u").await?;
+    assert!(h.document_screen().contains("plugin-hello"));
+    h.command("RpcLegacy").await?;
+    h.until(|h| h.marker("started", 2).exists()).await?;
+    h.text("gn").await?;
+    h.release(2)?;
+    h.until(|h| h.screen().contains("current document changed"))
+        .await?;
+    assert!(h.document_screen().contains("other"));
+    assert!(!h.document_screen().contains("plugin-"));
     Ok(())
 }
 

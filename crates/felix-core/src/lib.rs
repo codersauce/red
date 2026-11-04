@@ -249,7 +249,7 @@ pub use motion::cell_width;
 mod repeat;
 mod search;
 pub use command::open_line_site;
-pub use command::{Context, Edit, History, HostAction, Mode, Paste, Plan, Session};
+pub use command::{Context, Edit, History, HostAction, Mode, Paste, Plan, Session, VisualLines};
 pub use repeat::{CompletionChange, InsertEvent, LastInsert, ReplayStep};
 
 impl Selections {

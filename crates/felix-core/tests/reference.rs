@@ -3,6 +3,49 @@ use felix_core::{History, HostAction, InsertEvent, Range, Selections, Session};
 use ropey::Rope;
 use serde_json::{Value, json};
 
+struct FixtureLines<'a> {
+    text: ropey::RopeSlice<'a>,
+    width: usize,
+}
+
+impl FixtureLines<'_> {
+    fn rows(&self, line: std::ops::Range<usize>) -> Vec<Vec<(usize, usize)>> {
+        use unicode_segmentation::UnicodeSegmentation;
+        let source = std::borrow::Cow::<str>::from(self.text.slice(line.clone()));
+        let mut rows = vec![Vec::new()];
+        let mut col = 0;
+        let mut offset = line.start;
+        for grapheme in source.graphemes(true) {
+            let mut cells = felix_core::cell_width(grapheme, col, 4);
+            if col > 0 && col + cells > self.width {
+                rows.push(Vec::new());
+                col = 0;
+                cells = felix_core::cell_width(grapheme, col, 4);
+            }
+            rows.last_mut().unwrap().push((offset, col));
+            col += cells;
+            offset += grapheme.chars().count();
+        }
+        rows.last_mut().unwrap().push((line.end, col));
+        rows
+    }
+}
+
+impl felix_core::VisualLines for FixtureLines<'_> {
+    fn position(&self, line: std::ops::Range<usize>, pos: usize) -> (usize, usize) {
+        let rows = self.rows(line);
+        let row = rows.partition_point(|r| r[0].0 <= pos) - 1;
+        let cell = rows[row].partition_point(|&(offset, _)| offset <= pos) - 1;
+        (row, rows[row][cell].1)
+    }
+
+    fn offset(&self, line: std::ops::Range<usize>, row: usize, col: usize) -> usize {
+        let rows = self.rows(line);
+        let target = &rows[row.min(rows.len() - 1)];
+        target[target.partition_point(|&(_, column)| column <= col) - 1].0
+    }
+}
+
 #[test]
 fn reference_sequences() {
     let source = std::env::var_os("FELIX_SCENARIOS").map_or_else(
@@ -37,44 +80,9 @@ fn reference_sequences() {
                 // Plain unindented fixture layout, with no retained indent, word
                 // wrapping, or annotations. Red independently uses its real rows.
                 let wrap_width = case["wrap_width"].as_u64().map(|w| w as usize);
-                let mut rows: Vec<Vec<(usize, usize)>> = Vec::new();
-                if let Some(width) = wrap_width {
-                    use unicode_segmentation::UnicodeSegmentation;
-                    assert!(width > 0);
-                    for line in 0..text.len_lines() {
-                        let mut offset = text.line_to_char(line);
-                        let source = std::borrow::Cow::<str>::from(text.line(line));
-                        let mut row = Vec::new();
-                        let mut col = 0;
-                        for grapheme in source
-                            .graphemes(true)
-                            .chain((line + 1 == text.len_lines()).then_some(""))
-                        {
-                            let mut cells = felix_core::cell_width(grapheme, col, 4);
-                            // A line terminator or the EOF caret belongs to the last
-                            // visual row even when its text fills every cell.
-                            if !matches!(grapheme, "" | "\n" | "\r\n")
-                                && col > 0
-                                && col + cells > width
-                            {
-                                rows.push(std::mem::take(&mut row));
-                                col = 0;
-                                cells = felix_core::cell_width(grapheme, col, 4);
-                            }
-                            row.push((offset, col));
-                            col += cells;
-                            offset += grapheme.chars().count();
-                        }
-                        rows.push(row);
-                    }
-                }
-                let visual_motion = |pos: usize, delta: isize, goal: Option<usize>| {
-                    let row = rows.partition_point(|r| r[0].0 <= pos) - 1;
-                    let cursor = rows[row].partition_point(|&(offset, _)| offset <= pos) - 1;
-                    let goal = goal.unwrap_or(rows[row][cursor].1);
-                    let dest = &rows[row.saturating_add_signed(delta).min(rows.len() - 1)];
-                    let cell = dest.partition_point(|&(_, col)| col <= goal) - 1;
-                    (dest[cell].0, goal)
+                let layout = FixtureLines {
+                    text: text.slice(..),
+                    width: wrap_width.unwrap_or(1),
                 };
                 let mut plan = match (input, event["paste"].as_str()) {
                     (_, Some(value)) => session.bracketed_paste(text.slice(..), &sel, value),
@@ -85,7 +93,7 @@ fn reference_sequences() {
                         &felix_core::Context {
                             search_history: &search,
                             register: &register,
-                            visual_motion: wrap_width.map(|_| &visual_motion as &_),
+                            visual_lines: wrap_width.map(|_| &layout as &_),
                             viewport_start,
                             indent: &indent,
                             ..Default::default()

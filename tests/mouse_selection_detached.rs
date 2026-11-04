@@ -142,3 +142,53 @@ async fn disconnect_cancels_captured_autoscroll_without_discarding_the_selection
     .unwrap();
     assert_eq!(core.snapshot(None).cursor, before_disconnect.cursor);
 }
+
+#[cfg(feature = "helix")]
+#[tokio::test]
+async fn helix_drag_autoscroll_extends_the_edit_and_stops_on_release() {
+    let mut config =
+        Config::from_user_toml_with_overrides("editing_model = 'helix'\nscrolloff = 0", &[])
+            .unwrap();
+    config.plugins.clear();
+    let content = (0..40).map(|row| format!("row-{row:02}\n")).collect();
+    let harness =
+        common::EditorHarness::with_config_and_size(Buffer::new(None, content), config, 40, 10);
+    let mut core = DetachedEditorCore::new(harness.editor).await.unwrap();
+    let mouse = |kind, row| InputEvent::Mouse {
+        event: MouseEvent {
+            kind,
+            column: 7,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    };
+    core.input(mouse(MouseEventKind::Down(MouseButton::Left), 1))
+        .await
+        .unwrap();
+    core.input(mouse(MouseEventKind::Drag(MouseButton::Left), 9))
+        .await
+        .unwrap();
+    let first = core.snapshot(None).lines[0].text.clone();
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    core.tick().await.unwrap();
+    assert_ne!(core.snapshot(None).lines[0].text, first);
+    core.input(mouse(MouseEventKind::Up(MouseButton::Left), 9))
+        .await
+        .unwrap();
+    let released = core.snapshot(None);
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    core.tick().await.unwrap();
+    assert_eq!(core.snapshot(None).lines[0], released.lines[0]);
+    for ch in ['c', 'Z'] {
+        core.input(InputEvent::Key {
+            code: KeyCode::Character(ch),
+            modifiers: vec![],
+            key_kind: KeyKind::Press,
+        })
+        .await
+        .unwrap();
+    }
+    let edited = core.snapshot(None);
+    assert!(edited.lines.iter().any(|line| line.text.contains('Z')));
+    assert!(!edited.lines.iter().any(|line| line.text.contains("row-05")));
+}

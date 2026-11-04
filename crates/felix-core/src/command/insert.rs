@@ -313,11 +313,15 @@ impl Plan {
                     Range::at(text, dest)
                 }))
             }
-            "<up>" | "<down>" => {
-                self.visual_vertical(text, selections, if key == "<down>" { 1 } else { -1 }, ctx)
-            }
-            "<backspace>" | "<c-h>" | "<delete>" | "<c-d>" | "<c-w>" | "<a-d>"
-            | "<a-backspace>" | "<a-delete>" | "<c-u>" | "<c-k>" => {
+            "<up>" | "<down>" => self.vertical(
+                text,
+                selections,
+                if key == "<down>" { 1 } else { -1 },
+                ctx,
+                false,
+            ),
+            "<backspace>" | "<s-backspace>" | "<c-h>" | "<delete>" | "<c-d>" | "<c-w>"
+            | "<a-d>" | "<a-backspace>" | "<a-delete>" | "<c-u>" | "<c-k>" => {
                 let forward =
                     matches!(key, "<delete>" | "<c-d>" | "<a-d>" | "<a-delete>" | "<c-k>");
                 let mut append_eol = false;

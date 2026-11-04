@@ -2348,21 +2348,22 @@ impl Editor {
     }
 
     #[cfg(feature = "helix")]
-    fn felix_preview_layout(
+    pub(super) fn felix_preview_layout(
         &self,
         window: &crate::window::Window,
-    ) -> Option<(DisplayLayout, Vec<String>)> {
+    ) -> Option<(DisplayLayout, Vec<String>, usize)> {
         let preview = self.felix_preview(window)?;
         let height = self.window_content_height(window);
         let count = preview.text.len_lines();
-        let lines: Vec<_> = (window.vtop..count.min(window.vtop.saturating_add(height)))
+        let vtop = preview.projected_line(window.vtop)?;
+        let lines: Vec<_> = (vtop..count.min(vtop.saturating_add(height)))
             .map(|line| preview.text.line(line).to_string())
             .collect();
         let config = super::LayoutConfig {
             content_width: self.window_content_width(window),
             height,
             wrap: window.wrap,
-            vtop: window.vtop,
+            vtop,
             vleft: window.vleft,
             skipcol: window.skipcol,
             break_indent: self.break_indent_options_for_buffer_index(window.buffer_index),
@@ -2375,9 +2376,30 @@ impl Editor {
             .iter()
             .filter_map(|(line, message)| Some((preview.projected_line(*line)?, message.as_str())))
             .collect::<Vec<_>>();
-        let layout = super::display_layout::layout_lines(&lines, count, config)
-            .with_inline_comments(&comments, config.content_width, config.height);
-        Some((layout, lines))
+        let tables = preview
+            .tables
+            .as_ref()
+            .filter(|_| self.markdown_tables_enabled(window))
+            .map(|tables| tables.layout(self.table_layout_options(window)));
+        // A completion may insert newlines before another table or place several
+        // carets inside one. Compute the reveal range in the preview document.
+        let reveal = preview.text.char_to_line(*preview.carets.first()?)
+            ..preview.text.char_to_line(*preview.carets.last()?) + 1;
+        let layout = super::display_layout::layout_lines_with_tables(
+            &lines,
+            count,
+            config,
+            tables.as_ref(),
+            window.active.then_some(&reveal),
+            preview
+                .concealments
+                .as_ref()
+                .filter(|_| self.markdown_conceal_enabled(window)),
+            window.active.then_some(&reveal),
+            None,
+        )
+        .with_inline_comments(&comments, config.content_width, config.height);
+        Some((layout, lines, vtop))
     }
 
     #[cfg(feature = "helix")]
@@ -2414,7 +2436,7 @@ impl Editor {
         frame: &mut RenderBuffer,
         window: &crate::window::Window,
     ) -> anyhow::Result<()> {
-        let Some((layout, lines)) = self.felix_preview_layout(window) else {
+        let Some((layout, lines, vtop)) = self.felix_preview_layout(window) else {
             return Ok(());
         };
         let width = self.window_content_width(window);
@@ -2429,10 +2451,15 @@ impl Editor {
         };
         let mut styles = StyleCursor::new(&spans);
         for segment in &layout.rows {
-            let line = &lines[segment.line - window.vtop];
+            if self.render_projected_segment_in_window(frame, window, segment) {
+                continue;
+            }
+            let line = &lines[segment.line - vtop];
             // Preserve decorations on source rows outside the preview.
             if source_layout.row(segment.row).is_some_and(|source| {
                 source.line == segment.line
+                    && source.projection.is_none()
+                    && source.column_changes == segment.column_changes
                     && source.start_byte == segment.start_byte
                     && source.end_byte == segment.end_byte
             }) && self.buffer_manager[window.buffer_index]
@@ -4746,7 +4773,7 @@ impl Editor {
             if let Some(window) = self.window_manager.active_window() {
                 #[cfg(feature = "helix")]
                 if let Some(preview) = self.felix_preview(window) {
-                    let (layout, _) = self.felix_preview_layout(window)?;
+                    let (layout, _, _) = self.felix_preview_layout(window)?;
                     return self.felix_preview_caret(
                         window,
                         &layout,

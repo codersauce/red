@@ -24105,7 +24105,17 @@ impl Editor {
             )
             .await?
         {
-            Some((true, quit)) => return Ok(quit),
+            Some((true, quit)) => {
+                #[cfg(feature = "helix")]
+                if matches!(
+                    action,
+                    Action::FelixInput { .. } | Action::FelixPaste { .. }
+                ) && self.observe_signature_help_action(action, signature_snapshot)
+                {
+                    self.render(buffer)?;
+                }
+                return Ok(quit);
+            }
             Some((false, _)) => {}
             None => match action {
                 Action::Command(cmd) => {

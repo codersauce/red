@@ -100,7 +100,7 @@ The raw evidence archive is `target/felix-perf/evidence.tar.gz`. The local run d
 
 The numeric Red command used during fixture setup revealed a separate bug. After `:1000`, the next Felix edit could return to the previous selection. The fix makes host jumps update the active document selection. Both a native jump and a position with a nonzero Unicode column have a regression test. Timed runs use the same counted `G` setup on both revisions.
 
-The separate signature-help fixture finds that an automatic LSP signature request is missing on a typed trigger in Helix mode on both the baseline and the candidate. Vim opens it in the control run. The ordinary-input comparison uses LSP disabled in both models. The controlled language-server and completion replays exercise their own paths.
+The original performance comparison exposed a missing automatic signature request on a typed Helix trigger. The M1 acceptance candidate fixes the early return from Felix key dispatch. The real-server regression exercises both Vim and Helix, and the PTY signature workload verifies that the terminal actually displays the parameter help. The ordinary-input comparison uses LSP disabled in both models. The controlled language-server and completion replays exercise their own paths.
 
 ## Follow-up with the README images present
 

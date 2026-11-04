@@ -282,9 +282,13 @@ Shared-workflow performance baselines are captured in stage 1 before implementat
 
 The observer remains an early feasibility risk until stage 1 proves it. If required state cannot be captured reliably, resolve the instrumentation or revise the approach before expanding implementation; do not substitute fabricated fields, destructive probes, or a weaker comparison contract. Later Red observer work must satisfy the same non-mutation checks when stage 3 introduces the candidate path.
 
-### Remaining M1 work before the next push
+### Milestone 1 acceptance candidate
 
-The reported ordinary typing and cursor-movement slowdown takes priority in the performance work. The [Helix performance plan](HELIX_PERFORMANCE_PLAN.md) defines the input-to-frame and scaling gates. The [workstation acceptance report](HELIX_PERFORMANCE_RESULTS.md) records the passing local comparisons and the remaining signature-help compatibility finding.
+Use the [candidate acceptance record](HELIX_M1_ACCEPTANCE.md) to verify the eight gates against the revision being handed off. The workstation and Linux comparisons use the same pinned Helix release.
+
+### Implementation and validation sequence
+
+The reported ordinary typing and cursor-movement slowdown takes priority in the performance work. The [Helix performance plan](HELIX_PERFORMANCE_PLAN.md) defines the input-to-frame and scaling gates. The [workstation acceptance report](HELIX_PERFORMANCE_RESULTS.md) records the passing local comparisons and the original signature-help compatibility finding. The candidate includes a terminal reproduction and a language-server regression for that trigger.
 
 Starting from `e91d6017`, keep the remaining changes on the local Felix branch in small, tested commits. The next planned push is the M1 acceptance candidate. Use the following order for the remaining work.
 
@@ -299,6 +303,17 @@ During this stint, provide progress updates as work lands. Request an earlier ha
 ### Immediate broad-compatibility follow-up
 
 Prepare the M2 inventory while closing M1, but begin its implementation only after the M1 gate passes. The first M2 group is explicit named registers and register insertion, followed by macros using the already-tested command/replay and host protocol. Continue with syntax selections/objects and closest-pair/surround editing; shell filters and output insertion; then the remaining navigation, history, view, and native-host command families.
+
+The first register change has four testable parts, in this order:
+
+| Part | Reference and Red checks |
+| --- | --- |
+| Selection and lifetime | Record the pending `"` prompt, the chosen register, cancellation, a count and the next command in Normal and Select modes. Check when a motion consumes the choice and what happens across a document switch. |
+| Storage | Yank two different fragments into `a`, write separately to `A`, then overwrite `a`. Check both slots and the unnamed register after each key. Paste into fewer and more selections, then undo. |
+| Insertion | Use Insert `Ctrl-r` with populated and empty slots, multiline text and multiple cursors. Check Escape during the prompt, repeat, and the undo boundary. Compare the displayed prompt and final terminal frame. |
+| Host-backed registers | Exercise the black hole, selection numbers, selected text, document path, search history, and both clipboard providers. Compare read-only write errors and provider failure against the pinned reference. Retain Red's agreed handling of externally edited clipboard contents. |
+
+Extend the observer to capture selected register identity and the contents of the slots exercised by each case. Keep M1's pinned corpus replayable and add the new fixtures under M2.
 
 Include the already reserved M2 bindings and actions in that inventory: current-document-directory NeoTree, changed-file navigation, symbol-reference selections, comment toggles, and syntax navigation/selections. Each group extends the same manifest, live differential suite, production integration, and visible-behavior checks. Independent groups may proceed concurrently once their prerequisites exist. M2 remains scoped to document windows; release scheduling does not delay it.
 
