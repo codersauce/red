@@ -1,0 +1,62 @@
+{
+  "metric": "Compare the median of five candidate event times to the maximum of the five baseline observations. Each replay verifies the saved document.",
+  "profile": "dev, debug=0, incremental=false",
+  "os": "macOS-26.7.2-arm64-arm-64bit",
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "vim_baseline": {
+    "commit": "c42adfff6894a589331571ec1e34663f628b82bc",
+    "lock_sha256": "c57e85517c017498015658816d4c55222e76d2017592591162a0bfef2e813c74",
+    "undo": [
+      3.813,
+      3.856,
+      3.74,
+      4.026,
+      5.281
+    ],
+    "paste": [
+      5.62,
+      5.635,
+      5.809,
+      6.614,
+      7.401
+    ]
+  },
+  "felix_scaling": {
+    "commit": "88aa6fbe8ce6a002a22c2f9b0f0ed78b64804aac",
+    "local_lock_sha256": "ab13d6ab68f469f98aeca0377ab9b81b4187a61feff92c5e80f4f7e320ad1a67",
+    "binary_sha256": "b8f34c8770e78e67e197239bb6a92a31d68a540b90804b6aff2eda28b652c78b",
+    "lines": 2000,
+    "runs": {
+      "2": {
+        "source_sha256": "87cf654986acb7fb717d66d8a768a58a37478c0f29bbccd68bfbc42ea1dbffd1",
+        "event_ms": [
+          4.331,
+          4.486,
+          4.278,
+          4.218,
+          4.037
+        ]
+      },
+      "16": {
+        "source_sha256": "db2d0b906f5f59eafe61d234478f704e0dbdd01c0aa39091bcc493a152cc04c4",
+        "event_ms": [
+          7.051,
+          6.907,
+          6.434,
+          6.786,
+          6.782
+        ]
+      },
+      "128": {
+        "source_sha256": "bc9e91ec1f3a9487b748a7478f1897d451ea094c7d45154c6453427e9e773860",
+        "event_ms": [
+          18.488,
+          18.489,
+          18.001,
+          18.789,
+          17.96
+        ]
+      }
+    }
+  }
+}
