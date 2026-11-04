@@ -127,12 +127,67 @@ pub(crate) struct Prompt {
     pub line: String,
     pub cursor: usize,
     history_index: Option<usize>,
+    history_candidates: std::sync::Arc<[String]>,
+    matches: std::ops::Range<usize>,
+    pub selected: Option<usize>,
 }
 
 impl Prompt {
+    pub fn new(kind: Query, history: &[String]) -> Self {
+        let mut prompt = Self::default();
+        if matches!(kind, Query::Forward | Query::Backward) {
+            let mut entries: Vec<_> = history.iter().rev().take(200).cloned().collect();
+            entries.sort_unstable();
+            entries.dedup();
+            prompt.matches = 0..entries.len();
+            prompt.history_candidates = entries.into();
+        }
+        prompt
+    }
+
+    pub fn candidates(&self) -> &[String] {
+        &self.history_candidates[self.matches.clone()]
+    }
+
+    fn refilter(&mut self) {
+        let entries = &self.history_candidates;
+        let start = entries.partition_point(|entry| entry < &self.line);
+        let count = entries[start..].partition_point(|entry| entry.starts_with(&self.line));
+        self.matches = start..start + count;
+        self.selected = None;
+    }
+
+    pub fn cycle(&mut self, backward: bool) {
+        let count = self.matches.len();
+        if count == 0 {
+            return;
+        }
+        let index = if backward {
+            (self.selected.unwrap_or(0) + count - 1) % count
+        } else {
+            self.selected.map_or(0, |i| (i + 1) % count)
+        };
+        self.selected = Some(index);
+        self.line
+            .clone_from(&self.history_candidates[self.matches.start + index]);
+        self.cursor = self.line.len();
+        if !backward && count == 1 && self.line.ends_with(std::path::MAIN_SEPARATOR) {
+            self.refilter();
+        }
+    }
+
+    pub fn keep_directory_completion(&mut self) -> bool {
+        if self.selected.is_some() && self.line.ends_with(std::path::MAIN_SEPARATOR) {
+            self.refilter();
+            return true;
+        }
+        false
+    }
+
     pub fn paste(&mut self, value: &str) {
         self.line.insert_str(self.cursor, value);
         self.cursor += value.len();
+        self.refilter();
     }
 
     fn grapheme(&self, forward: bool) -> usize {
@@ -182,11 +237,16 @@ impl Prompt {
         self.line.clone_from(&history[index]);
         self.cursor = self.line.len();
         self.history_index = Some(index);
+        self.refilter();
     }
 
     /// Returns whether the editor should refresh the live regex selection.
     pub fn edit(&mut self, key: &str) -> bool {
         let (target, delete) = match key {
+            "<c-q>" => {
+                self.selected = None;
+                return false;
+            }
             "<left>" | "<c-b>" => (self.grapheme(false), false),
             "<right>" | "<c-f>" => (self.grapheme(true), false),
             "<backspace>" | "<c-h>" => (self.grapheme(false), true),
@@ -206,6 +266,7 @@ impl Prompt {
                 {
                     self.line.insert(self.cursor, ch);
                     self.cursor = self.grapheme(true);
+                    self.refilter();
                     return true;
                 }
                 return false;
@@ -215,9 +276,30 @@ impl Prompt {
             self.line
                 .replace_range(target.min(self.cursor)..target.max(self.cursor), "");
             self.cursor = target.min(self.cursor);
+            self.refilter();
         } else {
             self.cursor = target;
         }
         delete
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completion_uses_the_last_two_hundred_searches_before_deduplicating() {
+        let mut history: Vec<_> = (0..201).rev().map(|i| format!("q{i:03}")).collect();
+        history.push("q008".into());
+        let mut prompt = Prompt::new(Query::Forward, &history);
+        assert_eq!(prompt.candidates().len(), 199);
+        assert_eq!(prompt.candidates().first().unwrap(), "q000");
+        assert_eq!(prompt.candidates().last().unwrap(), "q198");
+        prompt.paste("q19");
+        assert_eq!(prompt.candidates().len(), 9);
+        prompt.cycle(true);
+        assert_eq!(prompt.line, "q198");
+        assert!(Prompt::new(Query::Select, &history).candidates().is_empty());
     }
 }

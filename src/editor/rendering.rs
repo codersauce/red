@@ -4420,12 +4420,7 @@ impl Editor {
         buffer.fill_ascii_spaces(0, y, width, &style);
 
         #[cfg(feature = "helix")]
-        if let Some((row, column, suggestion)) = self.felix_prompt_row() {
-            buffer.set_text(0, y, &row, &style);
-            if let Some((_, value)) = row.split_once(':').filter(|_| suggestion) {
-                let muted = self.theme.get_style("comment").unwrap_or(style);
-                buffer.set_text(column, y, value, &muted);
-            }
+        if self.draw_felix_prompt(buffer) {
             return;
         }
 
@@ -4676,7 +4671,7 @@ impl Editor {
         }
 
         #[cfg(feature = "helix")]
-        if let Some((_, column, _)) = self.felix_prompt_row() {
+        if let Some(column) = self.felix_prompt_caret() {
             return Some((column, usize::from(self.size.1).saturating_sub(1)));
         }
 

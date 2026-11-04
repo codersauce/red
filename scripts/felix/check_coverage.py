@@ -30,6 +30,9 @@ def validate(inventory, suite):
                     raise ValueError(f"{case['name']} input {index}: missing prompt state")
                 prompt = event["prompt"]
                 if prompt is not None:
+                    candidates, selected = prompt["candidates"], prompt["selected"]
+                    if candidates != sorted(set(candidates)) or (selected is not None and not 0 <= selected < len(candidates)):
+                        raise ValueError(f"{case['name']} input {index}: invalid completion list or selection")
                     line, cursor = prompt["line"].encode(), prompt["cursor"]
                     if not 0 <= cursor <= len(line):
                         raise ValueError(f"{case['name']} input {index}: invalid prompt cursor")

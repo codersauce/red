@@ -563,6 +563,14 @@ impl Session {
         }
     }
 
+    /// Visible history completions and the highlighted index in the active prompt.
+    pub fn prompt_completions(&self) -> Option<(&[String], Option<usize>)> {
+        match &self.pending {
+            Pending::Regex { input, .. } => Some((input.candidates(), input.selected)),
+            _ => None,
+        }
+    }
+
     pub fn awaiting_input(&self) -> bool {
         !matches!(self.pending, Pending::None)
     }
@@ -606,6 +614,13 @@ impl Session {
                         p.set(original.clone());
                         p.viewport_start = Some(*viewport_start);
                         p.next.pending = Pending::None;
+                        return p;
+                    }
+                    "<tab>" | "<backtab>" => prompt.cycle(key == "<backtab>"),
+                    "<enter>" if prompt.keep_directory_completion() => {
+                        if let Pending::Regex { input, .. } = &mut p.next.pending {
+                            *input = prompt;
+                        }
                         return p;
                     }
                     "<enter>" => {
@@ -813,7 +828,7 @@ impl Session {
                     kind,
                     original: selections.clone(),
                     viewport_start: context.viewport_start,
-                    input: Prompt::default(),
+                    input: Prompt::new(kind, context.search_history),
                 };
             }
             "r" => p.next.pending = Pending::Replace,

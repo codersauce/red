@@ -1,5 +1,7 @@
 //! Red adapter for document-window Felix sessions.
 
+mod prompt;
+
 use super::*;
 use crate::theme::SelectionForegroundPriority;
 use anyhow::Context as _;
@@ -408,6 +410,12 @@ impl Editor {
             KeyCode::Char(ch) => ch.to_string(),
             KeyCode::Esc => "<esc>".into(),
             KeyCode::Enter => "<enter>".into(),
+            KeyCode::Tab
+                if key.modifiers.contains(KeyModifiers::SHIFT)
+                    && self.felix.session.prompt().is_some() =>
+            {
+                "<backtab>".into()
+            }
             code @ (KeyCode::Left | KeyCode::Right | KeyCode::Backspace | KeyCode::Delete)
                 if self.felix.session.prompt().is_some()
                     && key
@@ -1004,36 +1012,6 @@ impl Editor {
                 .history
                 .insert((doc, tx.id.clone()), (before, selections.clone()));
         }
-    }
-
-    pub(super) fn felix_prompt(&self) -> Option<(&'static str, &str, usize)> {
-        let prompt = self.felix.session.prompt()?;
-        (!self.has_term()
-            && self.current_dialog.is_none()
-            && !self.panel_manager.has_focused_panel())
-        .then_some(prompt)
-    }
-
-    /// Visible prompt text and caret column, clipped together on narrow terminals.
-    pub(super) fn felix_prompt_row(&self) -> Option<(String, usize, bool)> {
-        let (label, line, cursor) = self.felix_prompt()?;
-        let width = usize::from(self.size.0);
-        let prefix = format!("{label}:");
-        let available = width.saturating_sub(prefix.len() + 1);
-        let before =
-            crate::unicode_utils::truncate_display_width_from_end(&line[..cursor], available);
-        let column = (prefix.len() + display_width(&before)).min(width.saturating_sub(1));
-        let suggestion = line.is_empty() && !self.felix.search.is_empty();
-        let rest = if suggestion {
-            self.felix.search.last()?.as_str()
-        } else {
-            &line[cursor..]
-        };
-        let row = format!(
-            "{prefix}{before}{}",
-            crate::unicode_utils::truncate_display_width(rest, width.saturating_sub(column))
-        );
-        Some((row, column, suggestion))
     }
 
     pub(super) fn felix_status(&self) -> Option<String> {
@@ -1651,6 +1629,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_completion_pages_keep_the_selected_candidate_visible() {
+        let (mut editor, mut frame, mut runtime) = fixture_editor("doc\n");
+        editor.felix.search = (0..23).map(|i| format!("item{i:02}")).collect();
+        for key in ["/", "<backtab>"] {
+            let owner = editor.felix_owner().unwrap();
+            editor
+                .execute_felix(Input::Key(key), owner, &mut frame, &mut runtime)
+                .await
+                .unwrap();
+        }
+        let row = |y: usize| {
+            frame.cells[y * 80..y * 80 + 6]
+                .iter()
+                .map(|c| c.c)
+                .collect::<String>()
+        };
+        assert_eq!(row(13), "item20");
+        assert_eq!(row(15), "item22");
+        let selected = editor
+            .theme
+            .list_selection_style()
+            .fallback_bg(&editor.theme.ui_style.popup.fallback_bg(&editor.theme.style));
+        assert_eq!(frame.cells[15 * 80].style, selected);
+        assert_ne!(frame.cells[13 * 80].style, selected);
+        let owner = editor.felix_owner().unwrap();
+        editor
+            .execute_felix(Input::Key("<tab>"), owner, &mut frame, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(frame.cells[13 * 80].style, selected);
+        assert_eq!(
+            frame.cells[13 * 80 + 40..13 * 80 + 46]
+                .iter()
+                .map(|c| c.c)
+                .collect::<String>(),
+            "item10"
+        );
+    }
+
+    #[tokio::test]
     async fn render_distinguishes_secondary_cursor_and_trailing_eof() {
         let (mut editor, _, _) = fixture_editor("ab\n");
         let text = editor.current_buffer().contents_snapshot();
@@ -1770,6 +1788,7 @@ mod tests {
                 "<esc>" => KeyCode::Esc,
                 "<enter>" => KeyCode::Enter,
                 "<tab>" => KeyCode::Tab,
+                "<backtab>" => KeyCode::BackTab,
                 _ => KeyCode::Char(token.chars().next().unwrap()),
             };
             let event = match expected.get("paste") {
@@ -1796,11 +1815,10 @@ mod tests {
                 actual["paste"] = json!(value);
             }
             if expected.get("prompt").is_some() {
-                actual["prompt"] = json!(editor
-                    .felix
-                    .session
-                    .prompt()
-                    .map(|(_, line, cursor)| json!({"line":line,"cursor":cursor})));
+                actual["prompt"] = json!(editor.felix.session.prompt().map(|(_, line, cursor)| {
+                    let (candidates, selected) = editor.felix.session.prompt_completions().unwrap();
+                    json!({"line":line,"cursor":cursor,"candidates":candidates,"selected":selected})
+                }));
                 if let Some((label, line, cursor)) = editor.felix.session.prompt() {
                     assert_eq!(
                         editor.render_cursor_position(),

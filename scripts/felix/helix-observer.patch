@@ -1,5 +1,5 @@
 diff --git a/helix-term/src/application.rs b/helix-term/src/application.rs
-index cf09aac..e8e5fb1 100644
+index cf09aac..af64942 100644
 --- a/helix-term/src/application.rs
 +++ b/helix-term/src/application.rs
 @@ -642,7 +642,11 @@ pub async fn handle_terminal_events(&mut self, event: std::io::Result<CrosstermE
@@ -15,7 +15,7 @@ index cf09aac..e8e5fb1 100644
              CrosstermEvent::Resize(width, height) => {
                  self.terminal
                      .resize(Rect::new(0, 0, width, height))
-@@ -663,6 +667,40 @@ pub async fn handle_terminal_events(&mut self, event: std::io::Result<CrosstermE
+@@ -663,6 +667,41 @@ pub async fn handle_terminal_events(&mut self, event: std::io::Result<CrosstermE
              event => self.compositor.handle_event(&event.into(), &mut cx),
          };
  
@@ -29,7 +29,8 @@ index cf09aac..e8e5fb1 100644
 +            let read_register = |name| self.editor.registers.read(name, &self.editor)
 +                .map(|values| values.map(|v| v.into_owned()).collect::<Vec<_>>());
 +            let prompt = self.compositor.find::<ui::Prompt>()
-+                .map(|p| json!({"line": p.line(), "cursor": p.cursor}));
++                .map(|p| json!({"line": p.line(), "cursor": p.position(), "selected": p.selection,
++                    "candidates": p.completion.iter().map(|(_, item)| item.content.as_ref()).collect::<Vec<_>>()}));
 +            let ui = self.compositor.find::<ui::EditorView>().unwrap();
 +            let insert_events = ui.last_insert.1.iter().map(|event| match event {
 +                ui::editor::InsertEvent::Key(key) => json!({"key": key.to_string()}),
@@ -57,15 +58,17 @@ index cf09aac..e8e5fb1 100644
              self.render().await;
          }
 diff --git a/helix-term/src/ui/prompt.rs b/helix-term/src/ui/prompt.rs
-index ff4ca1f..cda3410 100644
+index ff4ca1f..3643364 100644
 --- a/helix-term/src/ui/prompt.rs
 +++ b/helix-term/src/ui/prompt.rs
-@@ -31,7 +31,7 @@
- pub struct Prompt {
-     prompt: Cow<'static, str>,
-     line: String,
--    cursor: usize,
-+    pub(crate) cursor: usize,
-     // Fields used for Component callbacks and rendering:
-     line_area: Rect,
-     anchor: usize,
+@@ -38,8 +38,8 @@ pub struct Prompt {
+     truncate_start: bool,
+     truncate_end: bool,
+     // ---
+-    completion: Vec<Completion>,
+-    selection: Option<usize>,
++    pub(crate) completion: Vec<Completion>,
++    pub(crate) selection: Option<usize>,
+     history_register: Option<char>,
+     history_pos: Option<usize>,
+     completion_fn: CompletionFn,

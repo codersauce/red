@@ -28,6 +28,11 @@ def scenarios(seed, steps):
     yield "prompt-history", "red green blue red\n", (list("/green") + enter + list("/blue") + enter
         + ["?", "<up>", "<c-p>", "<up>", "<down>", "<c-n>", "<enter>", "/", "<down>", "<esc>"]
         + list("%s") + ["<up>", "<up>", "<enter>"])
+    yield "prompt-completions", "foo far fox far/ zoo\n", (
+        list("/fox") + enter + list("/foo") + enter + list("/far") + enter + list("/foo") + enter
+        + list("?f") + ["<backtab>", "<tab>", "<tab>", "<c-q>", "<tab>", "<backspace>", "<tab>", "<esc>"]
+        + list("/far/") + enter + ["/", "<tab>", "<tab>", "<enter>", "<enter>"]
+        + list("%sf") + ["<tab>", "<backtab>", "<esc>"])
     yield "prompt-edit", "red café e\u0301 😀 cats dog cat/dogs\n", (list("/cats") + ["<left>", "<backspace>", "r",
         "<home>", "<delete>", "<end>", "<c-b>", "<c-k>", "<c-a>", "<c-f>", "<c-d>", "<c-e>", "<c-u>"]
         + list("e\u0301😀") + ["<left>", "<right>", "<backspace>", "<c-h>", "<c-c>"])
@@ -113,7 +118,7 @@ def capture(observer, runtime, root, name, text, keys):
         events = []
         trace_offset = 0
         for index, key in enumerate(keys):
-            named = {"<backspace>": "BSpace", "<pageup>": "PageUp", "<pagedown>": "PageDown", "<esc>": "Escape", "<enter>": "Enter", "<tab>": "Tab", "<a-;>": "M-;", "<a-,>": "M-,"}
+            named = {"<backspace>": "BSpace", "<pageup>": "PageUp", "<pagedown>": "PageDown", "<esc>": "Escape", "<enter>": "Enter", "<tab>": "Tab", "<backtab>": "BTab", "<a-;>": "M-;", "<a-,>": "M-,"}
             named.update(ARROW_AND_EDIT_KEYS)
             paste = key["paste"] if isinstance(key, dict) else None
             if paste is not None:
@@ -145,7 +150,7 @@ def capture(observer, runtime, root, name, text, keys):
                 time.sleep(.01)
             record = json.loads(line)
             raw_event = record["event"]
-            special = {"<backspace>": "Backspace", "<pageup>": "PageUp", "<pagedown>": "PageDown", "<esc>": "Esc", "<enter>": "Enter", "<tab>": "Tab", "<a-;>": "Char(';')", "<a-,>": "Char(',')"}
+            special = {"<backspace>": "Backspace", "<pageup>": "PageUp", "<pagedown>": "PageDown", "<esc>": "Esc", "<enter>": "Enter", "<tab>": "Tab", "<backtab>": "BackTab", "<a-;>": "Char(';')", "<a-,>": "Char(',')"}
             special.update(ARROW_AND_EDIT_KEYS)
             ch = key[3:-1] if key.startswith(("<a-", "<c-")) else key
             code = special.get(key, f"Char('{ch}')")

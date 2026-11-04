@@ -146,16 +146,17 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
              str(executable or bundle / "hx"), str(fixture), str(other))
         if scenario == "prompt":
             observe("open", "foo foo", "NOR", "1 sel")
-            def check_prompt(label, value, column):
+            def check_prompt(label, value, column, menu_rows=()):
                 deadline = time.monotonic() + 5
                 while True:
                     rows = tmux("capture-pane", "-p", "-t", "oracle:0.0").stdout.splitlines()
                     caret = tmux("display-message", "-p", "-t", "oracle:0.0", "#{cursor_flag} #{cursor_x} #{cursor_y}").stdout.strip()
-                    if rows[-1] == "search:" + value and caret == f"1 {column} 23":
-                        checkpoints.append({"step": label, "prompt": rows[-1], "caret": caret})
+                    menu = rows[-1-len(menu_rows):-1]
+                    if rows[-1] == "search:" + value and caret == f"1 {column} 23" and menu == list(menu_rows):
+                        checkpoints.append({"step": label, "prompt": rows[-1], "caret": caret, "menu": menu})
                         return
                     if time.monotonic() >= deadline:
-                        raise RuntimeError(f"{label}: saw {rows[-1]!r}, caret {caret}")
+                        raise RuntimeError(f"{label}: saw {rows[-1]!r}, caret {caret}, menu {menu!r}")
                     time.sleep(.02)
             tmux("send-keys", "-l", "/foo")
             check_prompt("type query", "foo", 10)
@@ -169,6 +170,27 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
             check_prompt("delete before caret", "foo", 9)
             tmux("send-keys", "C-c")
             observe("cancel search", "foo foo", "NOR", "1 sel")
+            tmux("send-keys", "/", "f", "o", "x", "Enter", "/", "f", "a", "r", "Enter", "/", "f")
+            menu = ("far" + " " * 37 + "fox", "foo")
+            check_prompt("filter search history", "f", 8, menu)
+            tmux("send-keys", "BTab")
+            check_prompt("backward completion wraps", "fox", 10, menu)
+            tmux("send-keys", "Tab")
+            check_prompt("forward completion wraps", "far", 10, menu)
+            tmux("send-keys", "BSpace")
+            check_prompt("editing refilters history", "fa", 9, ("far",))
+            tmux("send-keys", "Escape")
+            observe("dismiss history menu", "foo foo", "NOR", "1 sel")
+            tmux("resize-window", "-x", "30", "-y", "24", "-t", "oracle:0")
+            tmux("send-keys", "-l", "/abcdefghijklmnopqrstuv界xyz")
+            check_prompt("clip long query", "abcdefghijklmnopqrstu", 29)
+            tmux("send-keys", "Home")
+            check_prompt("move to start of long query", "abcdefghijklmnopqrstu", 7)
+            tmux("send-keys", "End", "C-u")
+            tmux("send-keys", "-l", "12345 12345 12345 12345 12界xy")
+            check_prompt("wrap long query at a word", "12345 12345 12345", 29)
+            tmux("resize-window", "-x", "80", "-y", "24", "-t", "oracle:0")
+            check_prompt("reveal query after resize", "12345 12345 12345 12345 12界xy", 37)
             return checkpoints
         if scenario == "completion":
             observe("open", "foo foo", "NOR", "1 sel")

@@ -29,7 +29,7 @@ python3 scripts/felix/reference_smoke.py ~/.cache/red-felix/reference/helix-25.0
 
 The runner compares the observer with tracing disabled and enabled against the release's visible frames, checks all 17 reference events against the fixture, and exercises Red at the same 11 terminal checkpoints. Separate traces compare five paging frames and eight repeat checkpoints, including undo after a counted repeat in another document opened in a split.
 
-The search-prompt trace checks the bottom row and terminal caret in both editors while recalling a previous query, moving inside it, inserting a wide character, deleting it, and cancelling. The per-key fixtures also compare the prompt text and its UTF-8 cursor offset against the observer after every key, including bracketed paste and history traversal in a selection prompt.
+The search-prompt trace checks the bottom row and terminal caret in both editors while recalling a previous query, moving inside it, inserting a wide character, deleting it, and cancelling. It also checks the search-history menu, Tab and Shift-Tab wraparound, and the visible query and caret after narrowing and widening the terminal. The per-key fixtures also compare the prompt text and its UTF-8 cursor offset against the observer after every key, including bracketed paste and history traversal in a selection prompt.
 
 The completion trace exercises 45 checkpoints with two active selections. Up, Tab, and Ctrl-P cycle through candidates. The language server still sees the original document during preview. Ctrl-C discards the preview and keeps any filter text typed at both cursors. Typing or pressing Escape with a candidate selected accepts the preview before processing the key. One candidate requires deferred resolution.
 

@@ -166,12 +166,12 @@ fn reference_sequences() {
                 "search":(!search.is_empty()).then(||search.iter().rev().collect::<Vec<_>>()),
                 "unnamed":(!register.is_empty()).then_some(&register)});
             if let Some(expected) = event.get("prompt") {
+                let prompt = session.prompt().map(|(_, line, cursor)| {
+                    let (candidates, selected) = session.prompt_completions().unwrap();
+                    json!({"line":line, "cursor":cursor, "candidates":candidates, "selected":selected})
+                });
                 assert_eq!(
-                    json!(
-                        session
-                            .prompt()
-                            .map(|(_, line, cursor)| json!({ "line": line, "cursor": cursor }))
-                    ),
+                    json!(prompt),
                     *expected,
                     "{} input {} ({key}) prompt",
                     case["name"],
