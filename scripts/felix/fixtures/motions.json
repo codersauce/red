@@ -2022,6 +2022,70 @@
     {"key": "u", "mode": "Normal", "text": "abc de f\nxy\n", "ranges": [[0, 3]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
     {"key": "U", "mode": "Normal", "text": "abc de f xy\n", "ranges": [[8, 9]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"}
   ]},
+  {"name": "newline-pairs", "text": "    aa\r\n    bb\r\n", "events": [
+    {"key": "%", "mode": "Normal", "text": "    aa\r\n    bb\r\n", "ranges": [[0, 16]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "s", "mode": "Normal", "text": "    aa\r\n    bb\r\n", "ranges": [[0, 16]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "[", "mode": "Normal", "text": "    aa\r\n    bb\r\n", "ranges": [[0, 16]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "a", "mode": "Normal", "text": "    aa\r\n    bb\r\n", "ranges": [[0, 16]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "-", "mode": "Normal", "text": "    aa\r\n    bb\r\n", "ranges": [[0, 16]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "z", "mode": "Normal", "text": "    aa\r\n    bb\r\n", "ranges": [[0, 16]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "]", "mode": "Normal", "text": "    aa\r\n    bb\r\n", "ranges": [[4, 5], [5, 6], [12, 13], [13, 14]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "+", "mode": "Normal", "text": "    aa\r\n    bb\r\n", "ranges": [[4, 6], [12, 14]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<enter>", "mode": "Normal", "text": "    aa\r\n    bb\r\n", "ranges": [[4, 6], [12, 14]], "primary": 0, "unnamed": null, "search": ["[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "a", "mode": "Insert", "text": "    aa\r\n    bb\r\n", "ranges": [[4, 8], [12, 16]], "primary": 0, "unnamed": null, "search": ["[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": " ", "mode": "Insert", "text": "    aa \r\n    bb \r\n", "ranges": [[4, 9], [13, 18]], "primary": 0, "unnamed": null, "search": ["[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "(", "mode": "Insert", "text": "    aa ()\r\n    bb ()\r\n", "ranges": [[4, 9], [15, 20]], "primary": 0, "unnamed": null, "search": ["[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<enter>", "mode": "Insert", "text": "    aa (\r\n        \r\n    )\r\n    bb (\r\n        \r\n    )\r\n", "ranges": [[4, 20], [31, 47]], "primary": 0, "unnamed": null, "search": ["[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "X", "mode": "Insert", "text": "    aa (\r\n        X\r\n    )\r\n    bb (\r\n        X\r\n    )\r\n", "ranges": [[4, 21], [32, 49]], "primary": 0, "unnamed": null, "search": ["[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<esc>", "mode": "Normal", "text": "    aa (\r\n        X\r\n    )\r\n    bb (\r\n        X\r\n    )\r\n", "ranges": [[4, 19], [32, 47]], "primary": 0, "unnamed": null, "search": ["[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "u", "mode": "Normal", "text": "    aa\r\n    bb\r\n", "ranges": [[4, 8], [12, 16]], "primary": 0, "unnamed": null, "search": ["[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "U", "mode": "Normal", "text": "    aa (\r\n        X\r\n    )\r\n    bb (\r\n        X\r\n    )\r\n", "ranges": [[4, 19], [32, 47]], "primary": 0, "unnamed": null, "search": ["[a-z]+"], "pending": [], "count": null, "document": "~/example.txt"}
+  ]},
+  {"name": "newline-whitespace", "text": "  ax   bx\n    cx\n", "events": [
+    {"key": "5", "mode": "Normal", "text": "  ax   bx\n    cx\n", "ranges": [[0, 1]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": 5, "document": "~/example.txt"},
+    {"key": "l", "mode": "Normal", "text": "  ax   bx\n    cx\n", "ranges": [[5, 6]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "i", "mode": "Insert", "text": "  ax   bx\n    cx\n", "ranges": [[6, 5]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<enter>", "mode": "Insert", "text": "  ax\n    bx\n    cx\n", "ranges": [[8, 7]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "X", "mode": "Insert", "text": "  ax\n  X  bx\n    cx\n", "ranges": [[9, 8]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<esc>", "mode": "Normal", "text": "  ax\n  X  bx\n    cx\n", "ranges": [[9, 8]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "u", "mode": "Normal", "text": "  ax   bx\n    cx\n", "ranges": [[6, 5]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "g", "mode": "Normal", "text": "  ax   bx\n    cx\n", "ranges": [[6, 5]], "primary": 0, "unnamed": null, "search": null, "pending": ["g"], "count": null, "document": "~/example.txt"},
+    {"key": "g", "mode": "Normal", "text": "  ax   bx\n    cx\n", "ranges": [[0, 1]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "j", "mode": "Normal", "text": "  ax   bx\n    cx\n", "ranges": [[10, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "i", "mode": "Insert", "text": "  ax   bx\n    cx\n", "ranges": [[11, 10]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<enter>", "mode": "Insert", "text": "  ax   bx\n\n    cx\n", "ranges": [[12, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "X", "mode": "Insert", "text": "  ax   bx\n\nX    cx\n", "ranges": [[13, 12]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<esc>", "mode": "Normal", "text": "  ax   bx\n\nX    cx\n", "ranges": [[13, 12]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "u", "mode": "Normal", "text": "  ax   bx\n    cx\n", "ranges": [[11, 10]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"}
+  ]},
+  {"name": "mixed-insert-aliases", "text": "a bc\rde\r\nfgh\n", "events": [
+    {"key": "2", "mode": "Normal", "text": "a bc\rde\r\nfgh\n", "ranges": [[0, 1]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": "l", "mode": "Normal", "text": "a bc\rde\r\nfgh\n", "ranges": [[2, 3]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "i", "mode": "Insert", "text": "a bc\rde\r\nfgh\n", "ranges": [[3, 2]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<end>", "mode": "Insert", "text": "a bc\rde\r\nfgh\n", "ranges": [[7, 9]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<home>", "mode": "Insert", "text": "a bc\rde\r\nfgh\n", "ranges": [[0, 1]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<down>", "mode": "Insert", "text": "a bc\rde\r\nfgh\n", "ranges": [[9, 10]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<right>", "mode": "Insert", "text": "a bc\rde\r\nfgh\n", "ranges": [[10, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<up>", "mode": "Insert", "text": "a bc\rde\r\nfgh\n", "ranges": [[1, 2]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<left>", "mode": "Insert", "text": "a bc\rde\r\nfgh\n", "ranges": [[0, 1]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<esc>", "mode": "Normal", "text": "a bc\rde\r\nfgh\n", "ranges": [[0, 1]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "g", "mode": "Normal", "text": "a bc\rde\r\nfgh\n", "ranges": [[0, 1]], "primary": 0, "unnamed": null, "search": null, "pending": ["g"], "count": null, "document": "~/example.txt"},
+    {"key": "g", "mode": "Normal", "text": "a bc\rde\r\nfgh\n", "ranges": [[0, 1]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "2", "mode": "Normal", "text": "a bc\rde\r\nfgh\n", "ranges": [[0, 1]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": "l", "mode": "Normal", "text": "a bc\rde\r\nfgh\n", "ranges": [[2, 3]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "A", "mode": "Insert", "text": "a bc\rde\r\nfgh\n", "ranges": [[7, 9]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "!", "mode": "Insert", "text": "a bc\rde!\r\nfgh\n", "ranges": [[8, 10]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<esc>", "mode": "Normal", "text": "a bc\rde!\r\nfgh\n", "ranges": [[8, 10]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "u", "mode": "Normal", "text": "a bc\rde\r\nfgh\n", "ranges": [[7, 9]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "g", "mode": "Normal", "text": "a bc\rde\r\nfgh\n", "ranges": [[7, 9]], "primary": 0, "unnamed": null, "search": null, "pending": ["g"], "count": null, "document": "~/example.txt"},
+    {"key": "g", "mode": "Normal", "text": "a bc\rde\r\nfgh\n", "ranges": [[0, 1]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "2", "mode": "Normal", "text": "a bc\rde\r\nfgh\n", "ranges": [[0, 1]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": 2, "document": "~/example.txt"},
+    {"key": "l", "mode": "Normal", "text": "a bc\rde\r\nfgh\n", "ranges": [[2, 3]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "I", "mode": "Insert", "text": "a bc\rde\r\nfgh\n", "ranges": [[0, 1]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "!", "mode": "Insert", "text": "!a bc\rde\r\nfgh\n", "ranges": [[1, 2]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<esc>", "mode": "Normal", "text": "!a bc\rde\r\nfgh\n", "ranges": [[1, 2]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "u", "mode": "Normal", "text": "a bc\rde\r\nfgh\n", "ranges": [[0, 1]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"}
+  ]},
   {"name": "open-line", "text": "abc\nxyz\n", "events": [
     {"key": "o", "mode": "Insert", "text": "abc\n\nxyz\n", "ranges": [[4, 5]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
     {"key": "H", "mode": "Insert", "text": "abc\nH\nxyz\n", "ranges": [[5, 6]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},

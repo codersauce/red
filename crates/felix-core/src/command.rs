@@ -119,8 +119,14 @@ impl Context<'_> {
         if let Some(resolve) = self.visual_motion {
             return resolve(pos, delta, Some(0)).0;
         }
-        let line = text.char_to_line(pos).saturating_add_signed(delta);
-        text.line_to_char(line.min(text.len_lines()))
+        let start = crate::motion::logical_start(text, pos);
+        let (target, crossed) =
+            crate::motion::shift_lines(text, start, delta > 0, delta.unsigned_abs());
+        if delta > 0 && crossed < delta.unsigned_abs() {
+            text.len_chars()
+        } else {
+            target
+        }
     }
 
     fn search_viewport(&self, text: RopeSlice<'_>, cursor: usize) -> usize {

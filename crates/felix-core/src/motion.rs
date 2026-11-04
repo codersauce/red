@@ -149,7 +149,7 @@ pub(crate) fn line_end(text: RopeSlice<'_>, line: usize) -> usize {
 
 // Ropey also indexes standalone CR, VT, FF, NEL and Unicode separators.
 // Helix's release indexes LF, with CRLF forming one cursor stop.
-fn logical_start(text: RopeSlice<'_>, pos: usize) -> usize {
+pub(crate) fn logical_start(text: RopeSlice<'_>, pos: usize) -> usize {
     let mut row = text.char_to_line(pos);
     let mut start = text.line_to_char(row);
     while start > 0 && text.char(start - 1) != '\n' {
@@ -164,7 +164,12 @@ fn move_lines(text: RopeSlice<'_>, start: usize, down: bool, count: usize) -> us
 }
 
 // Return how many logical lines were actually crossed before reaching the edge.
-fn shift_lines(text: RopeSlice<'_>, start: usize, down: bool, count: usize) -> (usize, usize) {
+pub(crate) fn shift_lines(
+    text: RopeSlice<'_>,
+    start: usize,
+    down: bool,
+    count: usize,
+) -> (usize, usize) {
     let mut pos = start;
     let mut left = count;
     if down {
@@ -192,7 +197,7 @@ fn shift_lines(text: RopeSlice<'_>, start: usize, down: bool, count: usize) -> (
     (pos, count - left)
 }
 
-fn logical_end(text: RopeSlice<'_>, start: usize) -> usize {
+pub(crate) fn logical_end(text: RopeSlice<'_>, start: usize) -> usize {
     let next = move_lines(text, start, true, 1);
     if next == start {
         text.len_chars()

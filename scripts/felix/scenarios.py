@@ -162,6 +162,13 @@ def scenarios(seed, steps):
     yield "explicit-objects", "(ab cd) \"ef gh\"\n", list("lmiwmawmi(ma(ggmm") + ["<esc>"]
     yield "insert-controls", "  abc def\n", list("A") + ["<c-w>", "z", "<c-s>", "<c-u>", "q", "<esc>", "u", "u", "U"]
     yield "indent-join", "abc\n  de f\nxy\n", list("x>") + ["<", "J", "<a-J>", "u", "U"]
+    yield "newline-pairs", "    aa\r\n    bb\r\n", (
+        list("%s[a-z]+") + enter + list("a (") + ["<enter>", "X", "<esc>", "u", "U"])
+    yield "newline-whitespace", "  ax   bx\n    cx\n", (
+        list("5li") + ["<enter>", "X", "<esc>", "u"] + list("ggji") + ["<enter>", "X", "<esc>", "u"])
+    yield "mixed-insert-aliases", "a\u2028bc\rde\r\nf\u0085gh\n", (
+        list("2li") + ["<end>", "<home>", "<down>", "<right>", "<up>", "<left>", "<esc>"]
+        + list("gg2lA!") + ["<esc>", "u"] + list("gg2lI!") + ["<esc>", "u"])
     yield "open-line", "abc\nxyz\n", list("oHi") + ["<esc>", "u", "O", "z", "<esc>", "u"]
     yield "selection-jumplist", "abc de\nxyz\n", list("e") + ["<c-s>"] + list("gegg") + ["<c-o>", "<c-o>", "<tab>"]
     yield "jump-follows-edit", "one two three\n", list("ww") + ["<c-s>"] + list("ggiéé") + ["<esc>", "<c-o>", "<c-o>", "<tab>"]

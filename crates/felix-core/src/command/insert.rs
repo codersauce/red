@@ -1,5 +1,5 @@
 use super::*;
-use crate::motion::{self, line_end};
+use crate::motion::{self, logical_end, logical_start};
 
 impl Plan {
     /// Rebase all endpoints against the planned set of ordered edits once.
@@ -78,13 +78,14 @@ impl Plan {
                     }
                 }
                 _ => {
-                    let line = text.char_to_line(r.cursor(text));
+                    let start = logical_start(text, r.cursor(text));
+                    let end = logical_end(text, start);
                     let pos = if key == "A" {
-                        line_end(text, line)
+                        end
                     } else {
-                        text.line_to_char(line)
+                        start
                             + text
-                                .line(line)
+                                .slice(start..end)
                                 .chars()
                                 .position(|c| !c.is_whitespace())
                                 .unwrap_or(0)
@@ -182,6 +183,80 @@ impl Plan {
         }
     }
 
+    fn insert_newline(&mut self, text: RopeSlice<'_>, selections: &Selections, ctx: &Context<'_>) {
+        let newline = document_newline(text);
+        let mut displacement = 0isize;
+        let mut previous_cursor = 0;
+        for (index, &range) in selections.ranges().iter().enumerate() {
+            let pos = range.cursor(text);
+            let line = logical_start(text, pos);
+            let prefix = text.slice(line..pos);
+            let trailing = prefix
+                .chars_at(prefix.len_chars())
+                .reversed()
+                .take_while(|c| c.is_whitespace())
+                .count();
+            let (start, end, mut insert) = if trailing == prefix.len_chars() {
+                (line, line, newline.to_owned())
+            } else {
+                let width = ctx.tab_width.max(1);
+                let columns = prefix
+                    .chars()
+                    .take_while(|c| matches!(c, ' ' | '\t'))
+                    .fold(0, |col, ch| {
+                        col + if ch == '\t' { width - col % width } else { 1 }
+                    });
+                let unit = if ctx.indent == "\t" {
+                    width
+                } else {
+                    ctx.indent.len().max(1)
+                };
+                let indent = ctx.indent.repeat(columns / unit);
+                (
+                    (pos - trailing).max(previous_cursor),
+                    pos,
+                    format!("{newline}{indent}"),
+                )
+            };
+            let paired = pos
+                .checked_sub(1)
+                .and_then(|i| text.get_char(i))
+                .zip(text.get_char(pos))
+                .is_some_and(|pair| {
+                    matches!(
+                        pair,
+                        ('(', ')')
+                            | ('[', ']')
+                            | ('{', '}')
+                            | ('"', '"')
+                            | ('\'', '\'')
+                            | ('`', '`')
+                    )
+                });
+            let inner = if paired {
+                let outer = insert.clone();
+                insert.push_str(ctx.indent);
+                let inner = insert.chars().count();
+                insert.push_str(&outer);
+                inner
+            } else {
+                insert.chars().count()
+            };
+            let advance = inner as isize - (end - start) as isize;
+            self.ranges[index] = Range {
+                anchor: range.anchor.saturating_add_signed(if pos > range.anchor {
+                    displacement
+                } else {
+                    displacement + advance
+                }),
+                head: range.head.saturating_add_signed(displacement + advance),
+            };
+            displacement += insert.chars().count() as isize - (end - start) as isize;
+            self.edits.push(Edit { start, end, insert });
+            previous_cursor = pos;
+        }
+    }
+
     pub(super) fn insert_key(
         &mut self,
         text: RopeSlice<'_>,
@@ -211,7 +286,7 @@ impl Plan {
             "<tab>"
                 if selections.ranges().iter().any(|r| {
                     let cursor = r.cursor(text);
-                    let start = text.line_to_char(text.char_to_line(cursor));
+                    let start = logical_start(text, cursor);
                     text.slice(start..cursor)
                         .chars()
                         .any(|c| !c.is_whitespace())
@@ -224,12 +299,12 @@ impl Plan {
             "<left>" | "<right>" | "<home>" | "<end>" => {
                 self.set(selections.transform(text, |r| {
                     let pos = r.cursor(text);
-                    let line = text.char_to_line(pos);
+                    let start = logical_start(text, pos);
                     let dest = match key {
                         "<left>" => boundary(text, pos, false),
                         "<right>" => boundary(text, pos, true),
-                        "<home>" => text.line_to_char(line),
-                        _ => line_end(text, line),
+                        "<home>" => start,
+                        _ => logical_end(text, start),
                     };
                     Range::at(text, dest)
                 }))
@@ -243,21 +318,21 @@ impl Plan {
                 let mut append_eol = false;
                 for (i, &r) in selections.ranges().iter().enumerate() {
                     let pos = r.cursor(text);
-                    let line = text.char_to_line(pos);
-                    let start = text.line_to_char(line);
+                    let start = logical_start(text, pos);
+                    let end = logical_end(text, start);
                     let other = match key {
-                        "<c-u>" if pos == start && line > 0 => line_end(text, line - 1),
+                        "<c-u>" if pos == start && start > 0 => boundary(text, start, false),
                         "<c-u>" => {
                             let first = start
                                 + text
-                                    .line(line)
+                                    .slice(start..end)
                                     .chars()
                                     .position(|c| !c.is_whitespace())
                                     .unwrap_or(0);
                             if first < pos { first } else { start }
                         }
-                        "<c-k>" if pos == line_end(text, line) => text.line_to_char(line + 1),
-                        "<c-k>" => line_end(text, line),
+                        "<c-k>" if pos == end => boundary(text, end, true),
+                        "<c-k>" => end,
                         "<c-w>" => motion::word(text, r, "b", 1, false).start(),
                         "<a-d>" => motion::word(text, r, "e", 1, false).end(),
                         _ => boundary(text, pos, forward),
@@ -288,19 +363,11 @@ impl Plan {
                     });
                 }
             }
+            "<enter>" | "<c-j>" => self.insert_newline(text, selections, ctx),
             _ => {
                 for &r in selections.ranges() {
                     let pos = r.cursor(text);
                     let insert = match key {
-                        "<enter>" | "<c-j>" => {
-                            let start = text.line_to_char(text.char_to_line(pos));
-                            let indent: String = text
-                                .slice(start..pos)
-                                .chars()
-                                .take_while(|c| matches!(c, ' ' | '\t'))
-                                .collect();
-                            format!("{}{}", document_newline(text), indent)
-                        }
                         "<tab>" | "<backtab>" => ctx.indent.into(),
                         _ if key.chars().count() == 1 => key.into(),
                         _ => return,
