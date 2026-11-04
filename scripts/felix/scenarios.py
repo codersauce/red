@@ -76,6 +76,10 @@ def scenarios(seed, steps):
         keys += list("g2gm2i(ggf2r3") + ["<esc>"]
         yield f"cancel-arguments-{mode}", "abc 123 abc\nline two\n", keys
     yield "typed-selection", "abcd\n", list("eliX") + ["<esc>"] + list("uU")
+    yield "unicode-vertical-goal", "ab界cd\n\tx\nabcdefg\n👩‍💻x\n", (
+        list("3ljjjkkkvjj") + ["<esc>"] + list("ggllgjgjgk"))
+    yield "logical-separators", "ab\vcd\u2028ef\rgh\r\n\t世界ok\u0085qr\nlast", (
+        list("4lghglgg2gggsglgjgjgkgkgeghgg2j2k"))
     yield "vertical-goal", "abcdef\nxy\nuvwxyz\n", list("4ljjkkvjj") + ["<esc>"]
     yield "repeat-bracketed-paste", "ab cd\n", ["i", "X", {"paste":"é😀"}, "Y", "<esc>", ".", "u", "u", "u", "u", "U"]
     yield "bracketed-paste-modes", "one two\r\n", ["2", {"paste":"x\ny"}, "u", "v", "l", {"paste":"Z"}, "u"]
@@ -93,6 +97,11 @@ def scenarios(seed, steps):
     yield "whole-line-change", "one\ntwo\n", list("xcX") + ["<esc>", "u", "%", "c", "Y", "<esc>", "u"]
     yield "paragraph-and-copies", "abc\ndef\n\nnext\n", list("lC") + ["<a-C>", ","] + list("mipmap")
     yield "page-movement", "abc\n" * 90, ["l", "<pagedown>", "2", "<c-f>", "<c-b>", "<c-d>", "v", "<c-u>", "<esc>", "<pageup>"]
+    yield "wrapped-edges", "abcdefghijklmnopqrst\nxy\n" + "界" * 10 + "\n", list("ljjjkkkgg18ljjkkgjgk")
+    yield "wrapped-mixed-goals", "abcdefghij" * 5 + "\n" + "12" * 15 + "\n" + "界" * 18 + "\n", (
+        list("4ljgjgkjgjgjgkgg24lgjgjgkgk"))
+    yield "wrapped-unicode-motion", "abcdefghijklmnopqr界\tbcde界fg👩‍💻hijklmnopqrstuv\nabc界de\tz\n", (
+        list("4ljjkk11ljjkkvjj") + ["<esc>"] + list("gg17ljkgj"))
     yield "wrapped-motion", "abcdefghijklmnopqrstuvwxyz" * 3 + "\nabc\n" + "ABCDEF" * 12 + "\n", list("4ljjkkvj") + ["<esc>"] + list("gjgkk")
     yield "page-wrapped-continuations", "abcd" * 290 + "\nxy\n" + "EFGH" * 170 + "\n", (
         ["l", "<c-f>", "<c-d>", "v", "<c-u>", "<esc>", "2", "<pagedown>", "<pageup>", "<c-b>"])
@@ -123,7 +132,7 @@ def capture(observer, runtime, root, name, text, keys):
     path = root / "example.txt"
     path.write_bytes(text.encode())
     trace = root / "trace.jsonl"
-    wrap_width = 20 if name in ("wrapped-motion", "search-wrapped-viewport", "page-wrapped-continuations") else None
+    wrap_width = 20 if name.startswith("wrapped-") or name in ("search-wrapped-viewport", "page-wrapped-continuations") else None
     if wrap_width:
         config = root / "config" / "helix"
         config.mkdir(parents=True)

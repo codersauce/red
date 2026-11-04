@@ -38,7 +38,7 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
     wrapped = scenario == "wrapped-split-search"
     if wrapped:
         # Each tag starts one 36-cell display row on the same logical line.
-        fixture.write_text("".join(f"ROW-{n:03}" + "x" * 29 for n in range(1, 101)) + "\n")
+        fixture.write_text("".join(f"ROW-{n:03}\t👩‍💻界" + "x" * 22 for n in range(1, 101)) + "\n")
     elif split_search or scenario == "paging":
         row_count = 100 if split_search else 40
         fixture.write_text("".join(f"ROW-{n:03}\n" for n in range(1, row_count + 1)))

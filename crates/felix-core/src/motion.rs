@@ -145,6 +145,54 @@ pub(crate) fn line_end(text: RopeSlice<'_>, line: usize) -> usize {
     }
 }
 
+// Ropey also indexes standalone CR, VT, FF, NEL and Unicode separators.
+// Helix's release indexes LF, with CRLF forming one cursor stop.
+fn logical_start(text: RopeSlice<'_>, pos: usize) -> usize {
+    let mut row = text.char_to_line(pos);
+    let mut start = text.line_to_char(row);
+    while start > 0 && text.char(start - 1) != '\n' {
+        row -= 1;
+        start = text.line_to_char(row);
+    }
+    start
+}
+
+fn move_lines(text: RopeSlice<'_>, start: usize, down: bool, count: usize) -> usize {
+    let mut pos = start;
+    if down {
+        let mut left = count;
+        let mut end = start;
+        for line in text.lines_at(text.char_to_line(start)) {
+            if left == 0 {
+                break;
+            }
+            let len = line.len_chars();
+            end += len;
+            if len != 0 && line.char(len - 1) == '\n' {
+                left -= 1;
+                pos = end;
+            }
+        }
+    } else {
+        for _ in 0..count {
+            if pos == 0 {
+                break;
+            }
+            pos = logical_start(text, pos - 1);
+        }
+    }
+    pos
+}
+
+fn logical_end(text: RopeSlice<'_>, start: usize) -> usize {
+    let next = move_lines(text, start, true, 1);
+    if next == start {
+        text.len_chars()
+    } else {
+        boundary(text, next, false)
+    }
+}
+
 pub(crate) fn goto(
     text: RopeSlice<'_>,
     r: Range,
@@ -152,28 +200,24 @@ pub(crate) fn goto(
     count: Option<usize>,
     extend: bool,
 ) -> Range {
-    let line = text.char_to_line(r.cursor(text));
-    let last = text.len_lines() - 1;
-    let last_non_eof = if text.line(last).len_chars() == 0 {
-        last.saturating_sub(1)
-    } else {
-        last
-    };
+    let start = logical_start(text, r.cursor(text));
     let pos = match key {
-        "g" => text.line_to_char(count.unwrap_or(1).saturating_sub(1).min(last_non_eof)),
-        "e" => {
-            // Red's rope indexes additional Unicode separators; the pinned Helix
-            // release counts LF (including CRLF) when jumping to the last line.
-            let mut last_line = last_non_eof;
-            while last_line > 0 && text.char(text.line_to_char(last_line) - 1) != '\n' {
-                last_line -= 1;
+        "g" | "e" => {
+            let last = logical_start(text, text.len_chars().saturating_sub(1));
+            if key == "e" {
+                last
+            } else {
+                move_lines(text, 0, true, count.unwrap_or(1).saturating_sub(1)).min(last)
             }
-            text.line_to_char(last_line)
         }
-        "h" => text.line_to_char(line),
-        "l" => boundary(text, line_end(text, line), false).max(text.line_to_char(line)),
-        "s" => match text.line(line).chars().position(|c| !c.is_whitespace()) {
-            Some(n) => text.line_to_char(line) + n,
+        "h" => start,
+        "l" => boundary(text, logical_end(text, start), false).max(start),
+        "s" => match text
+            .slice(start..logical_end(text, start))
+            .chars()
+            .position(|c| !c.is_whitespace())
+        {
+            Some(n) => start + n,
             None => return r,
         },
         _ => return r,
@@ -365,6 +409,19 @@ pub(crate) fn pair_object(
     }
 }
 
+/// Cell width used by Helix 25.07.1 for a single display grapheme.
+pub fn cell_width(grapheme: &str, column: usize, tab_width: usize) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    if grapheme == "\t" {
+        let stop = tab_width.max(1);
+        stop - column % stop
+    } else if grapheme.starts_with(|c: char| c.is_ascii()) {
+        1
+    } else {
+        grapheme.width().max(1)
+    }
+}
+
 pub(crate) fn vertical(
     text: RopeSlice<'_>,
     r: Range,
@@ -374,19 +431,18 @@ pub(crate) fn vertical(
     goal: Option<usize>,
     extend: bool,
 ) -> (Range, usize) {
-    use unicode_width::UnicodeWidthStr;
     let cursor = r.cursor(text);
-    let row = text.char_to_line(cursor);
+    let start = logical_start(text, cursor);
     let width = |a, b, x| {
-        if text.char(a) == '\t' {
-            tab_width.max(1) - x % tab_width.max(1)
-        } else {
-            UnicodeWidthStr::width(std::borrow::Cow::<str>::from(text.slice(a..b)).as_ref()).max(1)
-        }
+        cell_width(
+            std::borrow::Cow::<str>::from(text.slice(a..b)).as_ref(),
+            x,
+            tab_width,
+        )
     };
     let goal = goal.unwrap_or_else(|| {
         let mut col = 0;
-        let mut i = text.line_to_char(row);
+        let mut i = start;
         while i < cursor {
             let next = boundary(text, i, true);
             col += width(i, next, col);
@@ -394,16 +450,11 @@ pub(crate) fn vertical(
         }
         col
     });
-    let row = if down {
-        row.saturating_add(count).min(text.len_lines() - 1)
-    } else {
-        row.saturating_sub(count)
-    };
-    if extend && text.line(row).len_chars() == 0 {
+    let mut pos = move_lines(text, start, down, count);
+    if extend && pos == text.len_chars() {
         return (r, goal);
     }
-    let mut pos = text.line_to_char(row);
-    let end = line_end(text, row);
+    let end = logical_end(text, pos);
     let mut col = 0;
     while pos < end {
         let next = boundary(text, pos, true);

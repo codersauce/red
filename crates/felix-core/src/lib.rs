@@ -245,6 +245,7 @@ mod command;
 mod jumps;
 mod motion;
 pub use jumps::Jumps;
+pub use motion::cell_width;
 mod repeat;
 mod search;
 pub use command::{Context, Edit, History, HostAction, Mode, Paste, Plan, Session};

@@ -34,30 +34,47 @@ fn reference_sequences() {
                 let Some(input) = step.map(|step| step.event).or(physical_event.as_ref()) else {
                     break;
                 };
-                // A fixed-cell layout for the explicitly ASCII, unindented wrap fixture.
-                // Red's parallel replay uses its production Unicode display layout.
+                // Plain unindented fixture layout, with no retained indent, word
+                // wrapping, or annotations. Red independently uses its real rows.
                 let wrap_width = case["wrap_width"].as_u64().map(|w| w as usize);
-                let mut rows = Vec::new();
+                let mut rows: Vec<Vec<(usize, usize)>> = Vec::new();
                 if let Some(width) = wrap_width {
-                    assert!(
-                        width > 0 && text.chars().all(|ch| ch == '\n' || ch.is_ascii_graphic())
-                    );
+                    use unicode_segmentation::UnicodeSegmentation;
+                    assert!(width > 0);
                     for line in 0..text.len_lines() {
-                        let start = text.line_to_char(line);
-                        let length = text.line(line).len_chars();
-                        for col in (0..length.max(1)).step_by(width) {
-                            rows.push(start + col);
+                        let mut offset = text.line_to_char(line);
+                        let source = std::borrow::Cow::<str>::from(text.line(line));
+                        let mut row = Vec::new();
+                        let mut col = 0;
+                        for grapheme in source
+                            .graphemes(true)
+                            .chain((line + 1 == text.len_lines()).then_some(""))
+                        {
+                            let mut cells = felix_core::cell_width(grapheme, col, 4);
+                            // A line terminator or the EOF caret belongs to the last
+                            // visual row even when its text fills every cell.
+                            if !matches!(grapheme, "" | "\n" | "\r\n")
+                                && col > 0
+                                && col + cells > width
+                            {
+                                rows.push(std::mem::take(&mut row));
+                                col = 0;
+                                cells = felix_core::cell_width(grapheme, col, 4);
+                            }
+                            row.push((offset, col));
+                            col += cells;
+                            offset += grapheme.chars().count();
                         }
+                        rows.push(row);
                     }
                 }
                 let visual_motion = |pos: usize, delta: isize, goal: Option<usize>| {
-                    let row = rows.partition_point(|&start| start <= pos) - 1;
-                    let goal = goal.unwrap_or(pos - rows[row]);
-                    let destination = row.saturating_add_signed(delta).min(rows.len() - 1);
-                    let end = rows
-                        .get(destination + 1)
-                        .map_or(text.len_chars(), |next| next - 1);
-                    ((rows[destination] + goal).min(end), goal)
+                    let row = rows.partition_point(|r| r[0].0 <= pos) - 1;
+                    let cursor = rows[row].partition_point(|&(offset, _)| offset <= pos) - 1;
+                    let goal = goal.unwrap_or(rows[row][cursor].1);
+                    let dest = &rows[row.saturating_add_signed(delta).min(rows.len() - 1)];
+                    let cell = dest.partition_point(|&(_, col)| col <= goal) - 1;
+                    (dest[cell].0, goal)
                 };
                 let mut plan = match (input, event["paste"].as_str()) {
                     (_, Some(value)) => session.bracketed_paste(text.slice(..), &sel, value),

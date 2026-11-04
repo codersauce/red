@@ -1298,7 +1298,7 @@ fn render_source_segment(
         }
     };
     let text = &line[segment.start_byte..segment.end_byte];
-    if segment.concealed.is_empty() && text.bytes().all(|byte| (b' '..=b'~').contains(&byte)) {
+    if segment.column_changes.is_empty() && text.bytes().all(|byte| (b' '..=b'~').contains(&byte)) {
         let skipped = segment
             .start_col
             .saturating_sub(segment.start_grapheme_col)
@@ -1402,7 +1402,14 @@ fn render_source_segment(
             }
         }
         if grapheme == "\t" {
-            buffer.fill_ascii_spaces(geometry.x + local_x, geometry.y, width, style);
+            let cells = segment.visible_columns_before(grapheme_col + width)
+                - segment.visible_columns_before(grapheme_col);
+            buffer.fill_ascii_spaces(
+                geometry.x + local_x,
+                geometry.y,
+                cells.min(geometry.width - local_x),
+                style,
+            );
         } else {
             buffer.set_text(geometry.x + local_x, geometry.y, grapheme, style);
         }
@@ -5219,7 +5226,7 @@ mod tests {
             first_segment,
             last_segment: true,
             visual_offset: 0,
-            concealed: Vec::new(),
+            column_changes: Vec::new(),
             image: None,
         }
     }
@@ -5290,6 +5297,51 @@ mod tests {
         assert!(buffer.cells[7..]
             .iter()
             .all(|cell| cell.style == theme.style));
+    }
+
+    #[cfg(feature = "helix")]
+    #[test]
+    fn wrapped_helix_cells_match_painted_text_cursor_and_selection() {
+        use crate::editor::display_layout::{wrap_line_segments, BreakIndentOptions};
+        let text = "a👩‍💻b\tx界y";
+        let rows = wrap_line_segments(
+            text,
+            0,
+            10,
+            0,
+            BreakIndentOptions {
+                enabled: false,
+                tab_width: 4,
+                helix: true,
+            },
+        );
+        let theme = Theme::default();
+        let mut buffer = RenderBuffer::new(10, 2, &theme.style);
+        assert_eq!(rows.len(), 2);
+        for (y, row) in rows.iter().enumerate() {
+            render_source_segment(
+                &mut buffer,
+                row,
+                text,
+                SourceSegmentGeometry {
+                    x: 0,
+                    y,
+                    width: 10,
+                    tab_width: 4,
+                },
+                &mut StyleCursor::new(&[]),
+                &theme.style,
+                &theme,
+            );
+        }
+        assert_eq!(buffer.cells[5].text, "b");
+        assert_eq!(buffer.cells[8].text, "x");
+        assert_eq!(buffer.cells[10].text, "界");
+        assert_eq!(buffer.cells[12].text, "y");
+        // In Red source columns, b is at 3. In Helix screen cells it is at 5.
+        assert_eq!(rows[0].screen_col_for_display_col(3, 10), 5);
+        assert_eq!(rows[0].display_col_for_screen_col(5), 3);
+        assert_eq!(rows[0].visible_screen_spans(1, 3), [(1, 5)]);
     }
 
     #[test]

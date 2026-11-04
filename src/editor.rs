@@ -7587,6 +7587,8 @@ impl Editor {
     fn break_indent_options_for_buffer_index(&self, buffer_index: usize) -> BreakIndentOptions {
         BreakIndentOptions {
             enabled: self.config.breakindent.unwrap_or(true),
+            #[cfg(feature = "helix")]
+            helix: self.config.editing_model == crate::config::EditingModel::Helix,
             tab_width: self
                 .indentation_for_buffer_index(buffer_index)
                 .tab_width
@@ -9306,7 +9308,7 @@ impl Editor {
             let display_col = if target.projection.is_some() {
                 mapped
             } else {
-                let limit = if target.concealed.is_empty() {
+                let limit = if !target.has_hidden_columns() {
                     target.end_col.saturating_sub(1)
                 } else {
                     target.last_visible_source_col()

@@ -1095,7 +1095,7 @@ fn projected_segment(
         first_segment: index == 0,
         last_segment: index + 1 == count,
         visual_offset: 0,
-        concealed: Vec::new(),
+        column_changes: Vec::new(),
         image: None,
         projection: Some(Arc::new(projection)),
         projection_left: 0,

@@ -10,8 +10,8 @@ remaining = ["Complete mode/count/argument/cancellation matrix"]
 
 [[area]]
 name = "Movement and navigation"
-cases = ["word-boundaries", "character-arguments", "vertical-goal", "wrapped-motion", "page-movement", "page-multiple", "page-edges", "page-through-eof", "page-wrapped-continuations", "selection-jumplist", "jump-follows-edit", "motion-seed-{seed}"]
-remaining = ["Wrapping with tabs, wide glyphs and inline decorations", "Other logical and visual line motions at non-LF separators", "All aliases and repeated motions"]
+cases = ["word-boundaries", "character-arguments", "vertical-goal", "unicode-vertical-goal", "logical-separators", "wrapped-motion", "wrapped-unicode-motion", "wrapped-edges", "wrapped-mixed-goals", "page-movement", "page-multiple", "page-edges", "page-through-eof", "page-wrapped-continuations", "selection-jumplist", "jump-follows-edit", "motion-seed-{seed}"]
+remaining = ["Motion across inline decorations and zero-width graphemes", "Other logical and visual line motions at non-LF separators", "All aliases and repeated motions"]
 
 [[area]]
 name = "Selections"
