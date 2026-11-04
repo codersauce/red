@@ -48,6 +48,8 @@ jobs:
       - name: Verify ordinary Red build and configuration
         run: |
           cargo build --locked --bin red
+          export XDG_CONFIG_HOME="$RUNNER_TEMP/felix-config"
+          mkdir -p "$XDG_CONFIG_HOME/red"
           target/debug/red --check-config
           if target/debug/red --check-config -c editing_model=helix > "$RUNNER_TEMP/config-error" 2>&1; then exit 1; fi
           grep -F -- '--features helix' "$RUNNER_TEMP/config-error"
