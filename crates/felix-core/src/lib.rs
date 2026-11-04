@@ -222,8 +222,10 @@ mod command;
 mod jumps;
 mod motion;
 pub use jumps::Jumps;
+mod repeat;
 mod search;
 pub use command::{Context, Edit, History, HostAction, Mode, Paste, Plan, Session};
+pub use repeat::{LastInsert, ReplayKey};
 
 impl Selections {
     /// Carry endpoints across a host replacement expressed in original offsets.

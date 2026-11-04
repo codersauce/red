@@ -255,6 +255,47 @@
     {"key": "j", "mode": "Select", "text": "abcdef\nxy\nuvwxyz\n", "ranges": [[4, 15]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
     {"key": "<esc>", "mode": "Normal", "text": "abcdef\nxy\nuvwxyz\n", "ranges": [[4, 15]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"}
   ]},
+  {"name": "repeat-count", "text": "ab cd ef\n", "events": [
+    {"key": "i", "mode": "Insert", "text": "ab cd ef\n", "ranges": [[1, 0]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["i"]},
+    {"key": "a", "mode": "Insert", "text": "aab cd ef\n", "ranges": [[2, 1]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["i", "a"]},
+    {"key": "<esc>", "mode": "Normal", "text": "aab cd ef\n", "ranges": [[2, 1]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["i", "a", "<esc>"]},
+    {"key": "w", "mode": "Normal", "text": "aab cd ef\n", "ranges": [[1, 4]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["i", "a", "<esc>"]},
+    {"key": ".", "mode": "Normal", "text": "aaab cd ef\n", "ranges": [[5, 2]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["i", "a", "<esc>"]},
+    {"key": "2", "mode": "Normal", "text": "aaab cd ef\n", "ranges": [[5, 2]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": 2, "document": "~/example.txt", "last_insert": ["i", "a", "<esc>"]},
+    {"key": ".", "mode": "Normal", "text": "aaaaab cd ef\n", "ranges": [[7, 4]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["i", "a", "<esc>"]},
+    {"key": "u", "mode": "Normal", "text": "aaab cd ef\n", "ranges": [[5, 2]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["i", "a", "<esc>"]},
+    {"key": "U", "mode": "Normal", "text": "aaaaab cd ef\n", "ranges": [[7, 4]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["i", "a", "<esc>"]}
+  ]},
+  {"name": "repeat-change", "text": "foo foo baz\n", "events": [
+    {"key": "%", "mode": "Normal", "text": "foo foo baz\n", "ranges": [[0, 12]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "last_insert": []},
+    {"key": "s", "mode": "Normal", "text": "foo foo baz\n", "ranges": [[0, 12]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "last_insert": []},
+    {"key": "f", "mode": "Normal", "text": "foo foo baz\n", "ranges": [[0, 1], [4, 5]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "last_insert": []},
+    {"key": "o", "mode": "Normal", "text": "foo foo baz\n", "ranges": [[0, 2], [4, 6]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "last_insert": []},
+    {"key": "o", "mode": "Normal", "text": "foo foo baz\n", "ranges": [[0, 3], [4, 7]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "last_insert": []},
+    {"key": "<enter>", "mode": "Normal", "text": "foo foo baz\n", "ranges": [[0, 3], [4, 7]], "primary": 0, "unnamed": null, "search": ["foo"], "pending": [], "count": null, "document": "~/example.txt", "last_insert": []},
+    {"key": "c", "mode": "Insert", "text": "  baz\n", "ranges": [[0, 1], [1, 2]], "primary": 0, "unnamed": ["foo", "foo"], "search": ["foo"], "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["c"]},
+    {"key": "Z", "mode": "Insert", "text": "Z Z baz\n", "ranges": [[1, 2], [3, 4]], "primary": 0, "unnamed": ["foo", "foo"], "search": ["foo"], "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["c", "Z"]},
+    {"key": "<esc>", "mode": "Normal", "text": "Z Z baz\n", "ranges": [[1, 2], [3, 4]], "primary": 0, "unnamed": ["foo", "foo"], "search": ["foo"], "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["c", "Z", "<esc>"]},
+    {"key": ",", "mode": "Normal", "text": "Z Z baz\n", "ranges": [[1, 2]], "primary": 0, "unnamed": ["foo", "foo"], "search": ["foo"], "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["c", "Z", "<esc>"]},
+    {"key": "w", "mode": "Normal", "text": "Z Z baz\n", "ranges": [[2, 4]], "primary": 0, "unnamed": ["foo", "foo"], "search": ["foo"], "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["c", "Z", "<esc>"]},
+    {"key": ".", "mode": "Normal", "text": "Z Zbaz\n", "ranges": [[3, 4]], "primary": 0, "unnamed": ["Z "], "search": ["foo"], "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["c", "Z", "<esc>"]},
+    {"key": "u", "mode": "Normal", "text": "Z Z baz\n", "ranges": [[2, 4]], "primary": 0, "unnamed": ["Z "], "search": ["foo"], "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["c", "Z", "<esc>"]},
+    {"key": "U", "mode": "Normal", "text": "Z Zbaz\n", "ranges": [[3, 4]], "primary": 0, "unnamed": ["Z "], "search": ["foo"], "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["c", "Z", "<esc>"]}
+  ]},
+  {"name": "repeat-checkpoint", "text": "abc def\n", "events": [
+    {"key": "A", "mode": "Insert", "text": "abc def\n", "ranges": [[7, 8]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["A"]},
+    {"key": "x", "mode": "Insert", "text": "abc defx\n", "ranges": [[8, 9]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["A", "x"]},
+    {"key": "<c-s>", "mode": "Insert", "text": "abc defx\n", "ranges": [[8, 9]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["A", "x", "<c-s>"]},
+    {"key": "y", "mode": "Insert", "text": "abc defxy\n", "ranges": [[9, 10]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["A", "x", "<c-s>", "y"]},
+    {"key": "<esc>", "mode": "Normal", "text": "abc defxy\n", "ranges": [[9, 10]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["A", "x", "<c-s>", "y", "<esc>"]},
+    {"key": "2", "mode": "Normal", "text": "abc defxy\n", "ranges": [[9, 10]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": 2, "document": "~/example.txt", "last_insert": ["A", "x", "<c-s>", "y", "<esc>"]},
+    {"key": ".", "mode": "Normal", "text": "abc defxyxyxy\n", "ranges": [[13, 14]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["A", "x", "<c-s>", "y", "<esc>"]},
+    {"key": "u", "mode": "Normal", "text": "abc defxyxyx\n", "ranges": [[12, 13]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["A", "x", "<c-s>", "y", "<esc>"]},
+    {"key": "u", "mode": "Normal", "text": "abc defxyx\n", "ranges": [[10, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["A", "x", "<c-s>", "y", "<esc>"]},
+    {"key": "u", "mode": "Normal", "text": "abc defxy\n", "ranges": [[9, 10]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["A", "x", "<c-s>", "y", "<esc>"]},
+    {"key": "U", "mode": "Normal", "text": "abc defxyx\n", "ranges": [[10, 11]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["A", "x", "<c-s>", "y", "<esc>"]},
+    {"key": "U", "mode": "Normal", "text": "abc defxyxyx\n", "ranges": [[12, 13]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt", "last_insert": ["A", "x", "<c-s>", "y", "<esc>"]}
+  ]},
   {"name": "append-and-undo", "text": "ab cd\n", "events": [
     {"key": "e", "mode": "Normal", "text": "ab cd\n", "ranges": [[0, 2]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
     {"key": "a", "mode": "Insert", "text": "ab cd\n", "ranges": [[0, 3]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},

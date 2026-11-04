@@ -40,5 +40,5 @@ remaining = ["Snippet and completion precedence with multiple selections", "Lang
 
 [[area]]
 name = "Undo and repeat"
-cases = ["append-and-undo"]
-remaining = ["Differential last-insert and repeat state across document and split changes"]
+cases = ["append-and-undo", "repeat-count", "repeat-change", "repeat-checkpoint"]
+remaining = ["Repeat recipes containing pasted text, snippets or completion edits"]

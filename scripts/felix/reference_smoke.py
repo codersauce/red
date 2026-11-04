@@ -25,7 +25,7 @@ ARCHIVES = {
 }
 
 
-def run_trace(bundle, root, executable=None, trace=None, red=False, paging=False):
+def run_trace(bundle, root, executable=None, trace=None, red=False, paging=False, repeat=False):
     root.mkdir()
     fixture = root / "example.txt"
     fixture.write_text("".join(f"ROW-{number:03}\n" for number in range(1, 41)) if paging else "foo foo\n")
@@ -48,7 +48,7 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, paging=False
         config.mkdir(parents=True)
         # Compare equal document heights. Red's optional breadcrumb plugin
         # can reserve a screen row asynchronously after the document opens.
-        window_config = 'disabled_plugins = ["barbecue"]\n' if paging else ""
+        window_config = 'disabled_plugins = ["barbecue"]\n' if paging or repeat else ""
         (config / "config.toml").write_text(
             window_config + 'editing_model = "helix"\ndisable_ai = true\nsplash = false\n'
             'show_whats_new = false\nfetch_release_notes = false\n[lsp]\nenabled = false\n'
@@ -65,7 +65,7 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, paging=False
 
     checkpoints = []
 
-    def observe(label, line, mode, sels="1/2 sels", name="example.txt"):
+    def observe(label, line, mode, sels="1/2 sels", name="example.txt", copies=1):
         # Reading the tmux screen sends no input to the editor.
         deadline = time.monotonic() + (30 if label == "open" else 5)
         expected_line = f"    1  {line}".rstrip()
@@ -81,6 +81,8 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, paging=False
             else:
                 matches = (expected_line in rows and status[:2] == [mode, f"~/{name}"]
                            and status[-3:-1] == sels.split())
+            if copies > 1:
+                matches &= sum(row.strip() == (f"1 {line}" if red else f"1  {line}") for row in rows) == copies
             if matches:
                 checkpoints.append({"step": label, "frame": rows})
                 return
@@ -109,6 +111,23 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, paging=False
             for key, first in [("PageDown", 23), ("PageDown", 36), ("PageUp", 14), ("PageUp", 1)]:
                 tmux("send-keys", key)
                 observe_page(first)
+            return checkpoints
+        if repeat:
+            observe("open", "foo foo", "NOR", "1 sel")
+            tmux("send-keys", "i", "X", "Escape")
+            observe("record insert", "Xfoo foo", "NOR", "1 sel")
+            tmux("send-keys", "g", "n")
+            observe("switch document", "other buffer", "NOR", "1 sel", "other.txt")
+            tmux("send-keys", ".")
+            observe("repeat in second document", "Xother buffer", "NOR", "1 sel", "other.txt")
+            tmux("send-keys", "C-w", "s")
+            observe("split document", "Xother buffer", "NOR", "1 sel", "other.txt", copies=2)
+            tmux("send-keys", "2", ".")
+            observe("repeat twice in split", "XXXother buffer", "NOR", "1 sel", "other.txt", copies=2)
+            tmux("send-keys", "u")
+            observe("undo counted repeat", "Xother buffer", "NOR", "1 sel", "other.txt", copies=2)
+            tmux("send-keys", "U")
+            observe("redo counted repeat", "XXXother buffer", "NOR", "1 sel", "other.txt", copies=2)
             return checkpoints
         observe("open", "foo foo", "NOR", "1 sel")
         tmux("send-keys", "-l", "%sfoo")
@@ -184,6 +203,9 @@ def main():
             pages = run_trace(bundle, root / "release-pages", paging=True)
             red_pages = (run_trace(bundle, root / "red-pages", args.candidate.resolve(strict=True), red=True,
                                    paging=True) if args.candidate else None)
+            repeats = run_trace(bundle, root / "release-repeat", repeat=True)
+            red_repeats = (run_trace(bundle, root / "red-repeat", args.candidate.resolve(strict=True),
+                                     red=True, repeat=True) if args.candidate else None)
             records = None
             if args.observer:
                 observer = args.observer.resolve(strict=True)
@@ -198,7 +220,7 @@ def main():
                 verify_records(records)
     print(json.dumps({"release": VERSION, "commit": COMMIT, "archive_sha256": digest,
                       "target": target, "checkpoints": checkpoints, "events": records, "red_checkpoints": red_frames,
-                      "paging": pages, "red_paging": red_pages}, indent=2))
+                      "paging": pages, "red_paging": red_pages, "repeat": repeats, "red_repeat": red_repeats}, indent=2))
 
 
 if __name__ == "__main__":

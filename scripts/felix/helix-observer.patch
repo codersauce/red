@@ -1,5 +1,5 @@
 diff --git a/helix-term/src/application.rs b/helix-term/src/application.rs
-index cf09aac..c0ae41f 100644
+index cf09aac..b646264 100644
 --- a/helix-term/src/application.rs
 +++ b/helix-term/src/application.rs
 @@ -642,7 +642,11 @@ pub async fn handle_terminal_events(&mut self, event: std::io::Result<CrosstermE
@@ -15,7 +15,7 @@ index cf09aac..c0ae41f 100644
              CrosstermEvent::Resize(width, height) => {
                  self.terminal
                      .resize(Rect::new(0, 0, width, height))
-@@ -663,6 +667,30 @@ pub async fn handle_terminal_events(&mut self, event: std::io::Result<CrosstermE
+@@ -663,6 +667,38 @@ pub async fn handle_terminal_events(&mut self, event: std::io::Result<CrosstermE
              event => self.compositor.handle_event(&event.into(), &mut cx),
          };
  
@@ -29,6 +29,13 @@ index cf09aac..c0ae41f 100644
 +            let read_register = |name| self.editor.registers.read(name, &self.editor)
 +                .map(|values| values.map(|v| v.into_owned()).collect::<Vec<_>>());
 +            let ui = self.compositor.find::<ui::EditorView>().unwrap();
++            let insert_events = ui.last_insert.1.iter().map(|event| match event {
++                ui::editor::InsertEvent::Key(key) => json!({"key": key.to_string()}),
++                ui::editor::InsertEvent::TriggerCompletion => json!("trigger-completion"),
++                ui::editor::InsertEvent::RequestCompletion => json!("request-completion"),
++                ui::editor::InsertEvent::CompletionApply { trigger_offset, changes } =>
++                    json!({"completion_at": trigger_offset, "changes": format!("{changes:?}")}),
++            }).collect::<Vec<_>>();
 +            let record = json!({
 +                "event": event, "mode": format!("{:?}", self.editor.mode),
 +                "text": doc.text().to_string(), "primary": selections.primary_index(),
@@ -36,6 +43,7 @@ index cf09aac..c0ae41f 100644
 +                "unnamed": read_register('"'), "search": read_register('/'),
 +                "pending": ui.keymaps.pending().iter().map(ToString::to_string).collect::<Vec<_>>(),
 +                "count": self.editor.count, "last_insert": format!("{:?}", ui.last_insert),
++                "insert_recipe": {"command": ui.last_insert.0.name(), "events": insert_events},
 +                "revision": doc.version(), "document": doc.display_name(),
 +                "viewport": {"anchor": doc.view_offset(view.id).anchor, "height": view.inner_height()},
 +                "history_revision": self.editor.document_mut(view.doc).unwrap().get_current_revision()

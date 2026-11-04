@@ -24,6 +24,7 @@ pub(super) fn native_keys() -> &'static crate::config::Keys {
 #[derive(Clone, Copy)]
 pub(super) enum Input<'a> {
     Key(&'a str),
+    Replay(felix_core::ReplayKey<'a>),
     Bracketed(&'a str),
     ClipboardPaste(felix_core::Paste),
     ClipboardReplace,
@@ -35,7 +36,7 @@ type Owner = (BufferId, WindowId, u64, u64);
 #[derive(Default)]
 pub(super) struct FelixHost {
     session: Session,
-    last_insert: Vec<String>,
+    last_insert: felix_core::LastInsert,
     jumps: HashMap<WindowId, felix_core::Jumps<BufferId>>,
     indent: HashMap<BufferId, String>,
     selections: HashMap<(BufferId, WindowId), Selections>,
@@ -381,11 +382,18 @@ impl Editor {
             felix_core::detect_indent(text)
                 .unwrap_or_else(|| indentation.whitespace_for_columns(indentation.shift_width))
         });
-        let plan = match input {
+        let mut plan = match input {
             Input::Key(key) => self.plan_felix_key(
                 text,
                 &initial,
                 key,
+                &self.felix.unnamed,
+                indentation.tab_width,
+            ),
+            Input::Replay(step) => self.plan_felix_key(
+                text,
+                &initial,
+                step.key,
                 &self.felix.unnamed,
                 indentation.tab_width,
             ),
@@ -463,15 +471,14 @@ impl Editor {
         if let Some(saved) = &plan.save_jump {
             self.felix.jumps.entry(id.1).or_default().save(id.0, saved);
         }
-        if let Input::Key(key) = input {
-            if self.felix.session.mode != felix_core::Mode::Insert
-                && plan.next.mode == felix_core::Mode::Insert
-            {
-                self.felix.last_insert.clear();
-                self.felix.last_insert.push(key.into());
-            } else if self.felix.session.mode == felix_core::Mode::Insert {
-                self.felix.last_insert.push(key.into());
+        match input {
+            Input::Key(key) => {
+                self.felix
+                    .last_insert
+                    .record(key, self.felix.session.mode, plan.next.mode)
             }
+            Input::Replay(step) => plan.history = step.history(plan.history),
+            _ => {}
         }
         if matches!(plan.history, History::Begin | History::Atomic) {
             self.begin_transaction("Helix edit");
@@ -566,20 +573,10 @@ impl Editor {
                 }
                 HostAction::RepeatInsert(count) => {
                     let recipe = self.felix.last_insert.clone();
-                    if !recipe.is_empty() {
-                        for _ in 0..count {
-                            for key in &recipe {
-                                let owner =
-                                    self.felix_owner().context("missing repeat destination")?;
-                                Box::pin(self.execute_felix(
-                                    Input::Key(key),
-                                    owner,
-                                    frame,
-                                    runtime,
-                                ))
-                                .await?;
-                            }
-                        }
+                    for step in recipe.replay(count) {
+                        let owner = self.felix_owner().context("missing repeat destination")?;
+                        Box::pin(self.execute_felix(Input::Replay(step), owner, frame, runtime))
+                            .await?;
                     }
                 }
                 HostAction::Jump { forward, count } => {
@@ -642,7 +639,11 @@ impl Editor {
         if !plan.edits.is_empty() {
             self.notify_change(runtime).await?;
         }
-        self.render(frame)
+        if matches!(input, Input::Replay(_)) {
+            Ok(())
+        } else {
+            self.render(frame)
+        }
     }
 }
 
@@ -1118,6 +1119,9 @@ mod tests {
                 "search":(!editor.felix.search.is_empty()).then(|| editor.felix.search.iter().rev().collect::<Vec<_>>()),
                 "unnamed":(!editor.felix.unnamed.is_empty()).then_some(&editor.felix.unnamed),
                 "pending":editor.felix.session.pending_keys()});
+            if expected.get("last_insert").is_some() {
+                actual["last_insert"] = json!(editor.felix.last_insert.keys());
+            }
             if expected.get("viewport").is_some() {
                 actual["viewport"] = json!({"height":editor.vheight(),"anchor":editor.current_buffer().contents_snapshot().line_to_char(editor.vtop)});
             }

@@ -33,6 +33,9 @@ def scenarios(seed, steps):
     yield "line-selections", "a\r\nbc\r\ndef", list("x2x") + ["<a-s>", ")", "<a-->", "<a-;>", "X", "<a-x>"]
     yield "typed-selection", "abcd\n", list("eliX") + ["<esc>"] + list("uU")
     yield "vertical-goal", "abcdef\nxy\nuvwxyz\n", list("4ljjkkvjj") + ["<esc>"]
+    yield "repeat-count", "ab cd ef\n", list("ia") + ["<esc>"] + list("w.2.uU")
+    yield "repeat-change", "foo foo baz\n", list("%sfoo") + enter + list("cZ") + ["<esc>", ",", "w", ".", "u", "U"]
+    yield "repeat-checkpoint", "abc def\n", ["A", "x", "<c-s>", "y", "<esc>", "2", ".", "u", "u", "u", "U", "U"]
     yield "append-and-undo", "ab cd\n", list("eaXY") + ["<esc>"] + list("uU") + ["%", "a", "!", "<esc>", "u"]
     yield "explicit-objects", "(ab cd) \"ef gh\"\n", list("lmiwmawmi(ma(ggmm") + ["<esc>"]
     yield "insert-controls", "  abc def\n", list("A") + ["<c-w>", "z", "<c-s>", "<c-u>", "q", "<esc>", "u", "u", "U"]
@@ -120,6 +123,15 @@ def capture(observer, runtime, root, name, text, keys):
                 raise ValueError(f"{name}: input {index+1} expected {key}, observed {raw_event}")
             events.append({"key": key, **{k: record[k] for k in
                 ("mode", "text", "ranges", "primary", "unnamed", "search", "pending", "count", "document")}})
+            if name.startswith("repeat-"):
+                recipe = record["insert_recipe"]
+                commands = {"normal_mode": "", "insert_mode": "i", "append_mode": "a", "change_selection": "c",
+                            "insert_at_line_start": "I", "insert_at_line_end": "A", "open_below": "o", "open_above": "O"}
+                keys = [commands[recipe["command"]]] if recipe["command"] != "normal_mode" else []
+                for item in recipe["events"]:
+                    token = item["key"]
+                    keys.append(token if len(token) == 1 else "<" + token.lower() + ">")
+                events[-1]["last_insert"] = keys
             if name.startswith("page-") or name == "search-viewport":
                 events[-1]["viewport"] = record["viewport"]
         case = {"name": name, "text": text, "events": events}
