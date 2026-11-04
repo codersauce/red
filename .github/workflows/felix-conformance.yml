@@ -55,8 +55,8 @@ jobs:
           target/debug/red --check-config
           if target/debug/red --check-config -c editing_model=helix > "$RUNNER_TEMP/config-error" 2>&1; then exit 1; fi
           grep -F -- '--features helix' "$RUNNER_TEMP/config-error"
-          cargo tree --locked -p red --edges normal > "$RUNNER_TEMP/red-tree"
-          if grep -Fq felix-core "$RUNNER_TEMP/red-tree"; then exit 1; fi
+          cargo tree --locked -p red --edges normal --prefix none > "$RUNNER_TEMP/red-tree"
+          if grep -Eq '^felix-core v[0-9]' "$RUNNER_TEMP/red-tree"; then exit 1; fi
           cargo clippy --locked -p red --all-targets -- -D warnings
           cargo test --locked -p red --lib --test completion -- --test-threads=1
       - name: Fetch release and build candidate
