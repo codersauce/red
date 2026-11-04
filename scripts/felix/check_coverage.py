@@ -25,6 +25,15 @@ def validate(inventory, suite):
                 raise ValueError(f"{case['name']} input {index}: missing fields {sorted(missing)}")
             if event["key"] == "<paste>" and not isinstance(event.get("paste"), str):
                 raise ValueError(f"{case['name']} input {index}: missing paste text")
+            if case["name"].startswith("prompt-"):
+                if "prompt" not in event:
+                    raise ValueError(f"{case['name']} input {index}: missing prompt state")
+                prompt = event["prompt"]
+                if prompt is not None:
+                    line, cursor = prompt["line"].encode(), prompt["cursor"]
+                    if not 0 <= cursor <= len(line):
+                        raise ValueError(f"{case['name']} input {index}: invalid prompt cursor")
+                    line[:cursor].decode()  # The cursor is a UTF-8 byte offset.
             if case["name"].startswith("repeat-") and not isinstance(event.get("last_insert"), list):
                 raise ValueError(f"{case['name']} input {index}: missing insert recipe")
             if case["name"].startswith("page-") or case["name"] == "search-viewport":

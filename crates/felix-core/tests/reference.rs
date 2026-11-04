@@ -66,7 +66,7 @@ fn reference_sequences() {
                         &sel,
                         token,
                         &felix_core::Context {
-                            search: search.last().map(String::as_str),
+                            search_history: &search,
                             register: &register,
                             visual_motion: wrap_width.map(|_| &visual_motion as &_),
                             viewport_start,
@@ -165,6 +165,19 @@ fn reference_sequences() {
                 "primary":sel.primary_index(),"pending":session.pending_keys(),"count":session.count(),
                 "search":(!search.is_empty()).then(||search.iter().rev().collect::<Vec<_>>()),
                 "unnamed":(!register.is_empty()).then_some(&register)});
+            if let Some(expected) = event.get("prompt") {
+                assert_eq!(
+                    json!(
+                        session
+                            .prompt()
+                            .map(|(_, line, cursor)| json!({ "line": line, "cursor": cursor }))
+                    ),
+                    *expected,
+                    "{} input {} ({key}) prompt",
+                    case["name"],
+                    i + 1
+                );
+            }
             if let Some(viewport) = event.get("viewport") {
                 assert_eq!(
                     json!({"anchor":viewport_start, "height":felix_core::Context::default().page_height}),

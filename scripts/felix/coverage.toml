@@ -20,8 +20,8 @@ remaining = ["Full count and direction matrix for merging, trimming, copying and
 
 [[area]]
 name = "Search"
-cases = ["search-and-navigate", "cancel-invalid-search", "empty-and-keep", "search-jump-history", "search-identical-selections", "search-viewport"]
-remaining = ["Prompt editing and history traversal, Search viewport across wrapped and split views"]
+cases = ["search-and-navigate", "cancel-invalid-search", "empty-and-keep", "search-jump-history", "search-identical-selections", "search-viewport", "prompt-history", "prompt-edit", "prompt-words-and-paste"]
+remaining = ["Tab completion and horizontal scrolling in long prompts, and search viewport across wrapped and split views"]
 
 [[area]]
 name = "Text objects"

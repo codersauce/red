@@ -25,6 +25,15 @@ def scenarios(seed, steps):
     yield "search-viewport", "home\n" + "a\n" * 40 + "target\n" + "a\n" * 25, list("/ta") + ["<esc>"] + list("/ta[") + ["<esc>"] + list("/ta") + enter + list("?ho") + ["<c-c>"]
     yield "empty-and-keep", "ab abc abc\n", list("%sab") + enter + list("Kx") + enter + ["<a-K>", "a", "<enter>", "<esc>"]
     yield "search-jump-history", "a1 ab a2 ab a3\n", list("/ab") + enter + ["<c-o>", "<tab>", "/", "<enter>"] + list("?a") + ["<backspace>", "<c-c>"]
+    yield "prompt-history", "red green blue red\n", (list("/green") + enter + list("/blue") + enter
+        + ["?", "<up>", "<c-p>", "<up>", "<down>", "<c-n>", "<enter>", "/", "<down>", "<esc>"]
+        + list("%s") + ["<up>", "<up>", "<enter>"])
+    yield "prompt-edit", "red café e\u0301 😀 cats dog cat/dogs\n", (list("/cats") + ["<left>", "<backspace>", "r",
+        "<home>", "<delete>", "<end>", "<c-b>", "<c-k>", "<c-a>", "<c-f>", "<c-d>", "<c-e>", "<c-u>"]
+        + list("e\u0301😀") + ["<left>", "<right>", "<backspace>", "<c-h>", "<c-c>"])
+    yield "prompt-words-and-paste", "word red fox cat/dogs\n", (["/", {"paste": "red fox cat/dogs"}]
+        + ["<a-b>", "<a-d>", "<c-w>", "<home>", "<a-f>", "<c-k>", "<c-u>", "<c-s>", "<enter>"]
+        + ["?", {"paste": "fox"}, "<enter>"])
     yield "search-identical-selections", "foo foo BAR foo\n", list("%sfoo") + enter + ["*", "n", "N", "<a-*>"]
     yield "quoted-objects", '(one (two)) "foo" bar\n', list('5lmi(2ma(gg13lmi"ma"ggmm')
     yield "regex-select-split-keep", "red blue red\n", list("%S ") + enter + list("Kred") + enter + list(")") + [",", "<a-;>"]
@@ -66,6 +75,10 @@ def scenarios(seed, steps):
     yield f"motion-seed-{seed}", text, keys
 
 
+ARROW_AND_EDIT_KEYS = {f"<{name}>": name.title()
+                       for name in ("left", "right", "up", "down", "home", "end", "delete")}
+
+
 def capture(observer, runtime, root, name, text, keys):
     # Helix abbreviates paths inside its working directory before folding HOME.
     # Keep documents in HOME and launch from its child so snapshots always use ~/.
@@ -101,6 +114,7 @@ def capture(observer, runtime, root, name, text, keys):
         trace_offset = 0
         for index, key in enumerate(keys):
             named = {"<backspace>": "BSpace", "<pageup>": "PageUp", "<pagedown>": "PageDown", "<esc>": "Escape", "<enter>": "Enter", "<tab>": "Tab", "<a-;>": "M-;", "<a-,>": "M-,"}
+            named.update(ARROW_AND_EDIT_KEYS)
             paste = key["paste"] if isinstance(key, dict) else None
             if paste is not None:
                 key = "<paste>"
@@ -132,15 +146,19 @@ def capture(observer, runtime, root, name, text, keys):
             record = json.loads(line)
             raw_event = record["event"]
             special = {"<backspace>": "Backspace", "<pageup>": "PageUp", "<pagedown>": "PageDown", "<esc>": "Esc", "<enter>": "Enter", "<tab>": "Tab", "<a-;>": "Char(';')", "<a-,>": "Char(',')"}
+            special.update(ARROW_AND_EDIT_KEYS)
             ch = key[3:-1] if key.startswith(("<a-", "<c-")) else key
             code = special.get(key, f"Char('{ch}')")
             if paste is not None:
                 if record["paste"] != paste:
                     raise ValueError(f"{name}: input {index+1} expected paste {paste!r}, observed {raw_event}")
-            elif f"code: {code}," not in raw_event or ("ALT" in raw_event) != key.startswith("<a-") or ("CONTROL" in raw_event) != key.startswith("<c-"):
+            elif (f"code: {code}," not in raw_event and
+                  not (len(ch) == 1 and f"code: Char('\\u{{{ord(ch):x}}}')," in raw_event)) or ("ALT" in raw_event) != key.startswith("<a-") or ("CONTROL" in raw_event) != key.startswith("<c-"):
                 raise ValueError(f"{name}: input {index+1} expected {key}, observed {raw_event}")
             events.append({"key": key, **{k: record[k] for k in
                 ("mode", "text", "ranges", "primary", "unnamed", "search", "pending", "count", "document")}})
+            if name.startswith("prompt-"):
+                events[-1]["prompt"] = record["prompt"]
             if paste is not None:
                 events[-1]["paste"] = paste
             if name.startswith("repeat-"):

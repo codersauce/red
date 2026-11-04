@@ -1635,6 +1635,11 @@ impl Editor {
     }
 
     pub(crate) fn uses_synthetic_block_cursor(&self) -> bool {
+        #[cfg(feature = "helix")]
+        if self.felix_prompt().is_some() {
+            return false;
+        }
+
         let dialog_allows_editor_cursor = self
             .current_dialog
             .as_ref()
@@ -4414,6 +4419,16 @@ impl Editor {
         let y = self.size.1 as usize - 1;
         buffer.fill_ascii_spaces(0, y, width, &style);
 
+        #[cfg(feature = "helix")]
+        if let Some((row, column, suggestion)) = self.felix_prompt_row() {
+            buffer.set_text(0, y, &row, &style);
+            if let Some((_, value)) = row.split_once(':').filter(|_| suggestion) {
+                let muted = self.theme.get_style("comment").unwrap_or(style);
+                buffer.set_text(column, y, value, &muted);
+            }
+            return;
+        }
+
         if !self.has_term() {
             let wc = if let Some(ref waiting_command) = self.waiting_command {
                 waiting_command.clone()
@@ -4660,6 +4675,11 @@ impl Editor {
                 .focused_text_panel_cursor_position(self.size.0 as usize, self.size.1 as usize);
         }
 
+        #[cfg(feature = "helix")]
+        if let Some((_, column, _)) = self.felix_prompt_row() {
+            return Some((column, usize::from(self.size.1).saturating_sub(1)));
+        }
+
         if self.has_term() {
             Some((
                 display_width(self.term()) + 1,
@@ -4741,6 +4761,11 @@ impl Editor {
     }
 
     pub(crate) fn active_cursor_shape(&self) -> CursorShape {
+        #[cfg(feature = "helix")]
+        if self.felix_prompt().is_some() {
+            return self.config.cursor.insert;
+        }
+
         if self.is_waiting_for_key_sequence() {
             return self.config.cursor.waiting;
         }

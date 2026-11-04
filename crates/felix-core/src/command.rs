@@ -2,7 +2,7 @@
 //! commits them in reverse order, then resolves the new selection against its Rope.
 mod insert;
 mod lines;
-use crate::search::Query;
+use crate::search::{Prompt, Query};
 use crate::{Range, Selections, boundary};
 use ropey::RopeSlice;
 
@@ -31,7 +31,7 @@ enum Pending {
     },
     Regex {
         kind: Query,
-        input: String,
+        input: Prompt,
         original: Selections,
         viewport_start: usize,
     },
@@ -43,7 +43,8 @@ pub type VisualMotion<'a> = dyn Fn(usize, isize, Option<usize>) -> (usize, usize
 
 /// Document settings and register contents supplied by the current host.
 pub struct Context<'a> {
-    pub search: Option<&'a str>,
+    /// Search register entries, oldest first.
+    pub search_history: &'a [String],
     pub register: &'a [String],
     pub tab_width: usize,
     pub indent: &'a str,
@@ -56,7 +57,7 @@ pub struct Context<'a> {
 impl Default for Context<'_> {
     fn default() -> Self {
         Self {
-            search: None,
+            search_history: &[],
             register: &[],
             tab_width: 4,
             indent: "    ",
@@ -523,6 +524,13 @@ impl Session {
         selections: &Selections,
         value: &str,
     ) -> Plan {
+        if matches!(self.pending, Pending::Regex { .. }) {
+            let mut plan = self.unchanged(selections);
+            if let Pending::Regex { input, .. } = &mut plan.next.pending {
+                input.paste(value);
+            }
+            return plan;
+        }
         let placement = if self.mode == Mode::Normal {
             Paste::Before
         } else {
@@ -547,6 +555,14 @@ impl Session {
         self.count
     }
 
+    /// The active prompt label, text and UTF-8 byte offset of its caret.
+    pub fn prompt(&self) -> Option<(&'static str, &str, usize)> {
+        match &self.pending {
+            Pending::Regex { kind, input, .. } => Some((kind.label(), &input.line, input.cursor)),
+            _ => None,
+        }
+    }
+
     pub fn awaiting_input(&self) -> bool {
         !matches!(self.pending, Pending::None)
     }
@@ -566,7 +582,7 @@ impl Session {
         context: &Context<'_>,
     ) -> Plan {
         let mut p = self.unchanged(selections);
-        let search = context.search;
+        let search = context.search_history.last().map(String::as_str);
         let register = context.register;
         let count = self.count.unwrap_or(1);
         let extend = self.mode == Mode::Select;
@@ -583,7 +599,7 @@ impl Session {
                 kind,
                 viewport_start,
             } => {
-                let mut query = input.clone();
+                let mut prompt = input.clone();
                 let submit = key == "<enter>";
                 match key {
                     "<esc>" | "<c-c>" => {
@@ -594,20 +610,40 @@ impl Session {
                     }
                     "<enter>" => {
                         p.next.pending = Pending::None;
-                        if query.is_empty() {
-                            query = search.unwrap_or_default().to_owned();
-                        } else if search != Some(query.as_str()) {
-                            p.search = Some(query.clone());
+                        if prompt.line.is_empty() {
+                            prompt.line = search.unwrap_or_default().to_owned();
+                        } else if search != Some(prompt.line.as_str()) {
+                            p.search = Some(prompt.line.clone());
                         }
                     }
-                    "<backspace>" => {
-                        query.pop();
+                    "<up>" | "<c-p>" | "<down>" | "<c-n>" => {
+                        p.set(original.clone());
+                        p.viewport_start = Some(*viewport_start);
+                        prompt.recall(context.search_history, matches!(key, "<up>" | "<c-p>"));
+                        if context.search_history.is_empty() {
+                            return p;
+                        }
                     }
-                    _ if key.chars().count() == 1 => query.push_str(key),
-                    _ => return p,
+                    "<c-s>" => {
+                        let word =
+                            crate::motion::word_object(text, selections.primary(), false, false);
+                        if word.start() == word.end() {
+                            return p;
+                        }
+                        prompt.paste(&text.slice(word.start()..word.end()).to_string());
+                    }
+                    _ => {
+                        if !prompt.edit(key) {
+                            if let Pending::Regex { input, .. } = &mut p.next.pending {
+                                *input = prompt;
+                            }
+                            return p;
+                        }
+                    }
                 }
+                let query = &prompt.line;
                 if !query.is_empty() {
-                    if let Some(regex) = Query::compile(&query) {
+                    if let Some(regex) = Query::compile(query) {
                         let preview = kind.apply(text, original, &regex, extend);
                         if let Some(ref found) = preview
                             && matches!(kind, Query::Forward | Query::Backward)
@@ -628,12 +664,11 @@ impl Session {
                     }
                 }
                 if !submit {
-                    p.message = Some(format!("{}: {query}", kind.label()));
                     p.next.pending = Pending::Regex {
                         kind: *kind,
                         original: original.clone(),
                         viewport_start: *viewport_start,
-                        input: query,
+                        input: prompt,
                     };
                 }
                 return p;
@@ -778,9 +813,8 @@ impl Session {
                     kind,
                     original: selections.clone(),
                     viewport_start: context.viewport_start,
-                    input: String::new(),
+                    input: Prompt::default(),
                 };
-                p.message = Some(format!("{}: ", kind.label()));
             }
             "r" => p.next.pending = Pending::Replace,
             "f" | "F" | "t" | "T" => {

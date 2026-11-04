@@ -144,6 +144,32 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
     try:
         tmux("new-session", "-d", "-x", "80", "-y", "24", "-s", "oracle",
              str(executable or bundle / "hx"), str(fixture), str(other))
+        if scenario == "prompt":
+            observe("open", "foo foo", "NOR", "1 sel")
+            def check_prompt(label, value, column):
+                deadline = time.monotonic() + 5
+                while True:
+                    rows = tmux("capture-pane", "-p", "-t", "oracle:0.0").stdout.splitlines()
+                    caret = tmux("display-message", "-p", "-t", "oracle:0.0", "#{cursor_flag} #{cursor_x} #{cursor_y}").stdout.strip()
+                    if rows[-1] == "search:" + value and caret == f"1 {column} 23":
+                        checkpoints.append({"step": label, "prompt": rows[-1], "caret": caret})
+                        return
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(f"{label}: saw {rows[-1]!r}, caret {caret}")
+                    time.sleep(.02)
+            tmux("send-keys", "-l", "/foo")
+            check_prompt("type query", "foo", 10)
+            tmux("send-keys", "Enter", "?")
+            check_prompt("suggest previous query", "foo", 7)
+            tmux("send-keys", "Up", "Left")
+            check_prompt("move within recalled query", "foo", 9)
+            tmux("send-keys", "-l", "界")
+            check_prompt("insert wide character", "fo界o", 11)
+            tmux("send-keys", "BSpace")
+            check_prompt("delete before caret", "foo", 9)
+            tmux("send-keys", "C-c")
+            observe("cancel search", "foo foo", "NOR", "1 sel")
+            return checkpoints
         if scenario == "completion":
             observe("open", "foo foo", "NOR", "1 sel")
             observe_server("foo foo\n")
@@ -361,6 +387,9 @@ def main():
             completion = run_trace(bundle, root / "release-completion", scenario="completion")
             red_completion = (run_trace(bundle, root / "red-completion", args.candidate.resolve(strict=True),
                                         red=True, scenario="completion") if args.candidate else None)
+            prompts = run_trace(bundle, root / "release-prompt", scenario="prompt")
+            red_prompts = (run_trace(bundle, root / "red-prompt", args.candidate.resolve(strict=True),
+                                     red=True, scenario="prompt") if args.candidate else None)
             records = None
             if args.observer:
                 observer = args.observer.resolve(strict=True)
@@ -380,7 +409,8 @@ def main():
     print(json.dumps({"release": VERSION, "commit": COMMIT, "archive_sha256": digest,
                       "target": target, "checkpoints": checkpoints, "events": records, "red_checkpoints": red_frames,
                       "paging": pages, "red_paging": red_pages, "repeat": repeats, "red_repeat": red_repeats,
-                      "completion": completion, "red_completion": red_completion}, indent=2))
+                      "completion": completion, "red_completion": red_completion,
+                      "prompt": prompts, "red_prompt": red_prompts}, indent=2))
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 diff --git a/helix-term/src/application.rs b/helix-term/src/application.rs
-index cf09aac..21fe3db 100644
+index cf09aac..e8e5fb1 100644
 --- a/helix-term/src/application.rs
 +++ b/helix-term/src/application.rs
 @@ -642,7 +642,11 @@ pub async fn handle_terminal_events(&mut self, event: std::io::Result<CrosstermE
@@ -15,7 +15,7 @@ index cf09aac..21fe3db 100644
              CrosstermEvent::Resize(width, height) => {
                  self.terminal
                      .resize(Rect::new(0, 0, width, height))
-@@ -663,6 +667,38 @@ pub async fn handle_terminal_events(&mut self, event: std::io::Result<CrosstermE
+@@ -663,6 +667,40 @@ pub async fn handle_terminal_events(&mut self, event: std::io::Result<CrosstermE
              event => self.compositor.handle_event(&event.into(), &mut cx),
          };
  
@@ -28,6 +28,8 @@ index cf09aac..21fe3db 100644
 +            let selections = doc.selection(view.id);
 +            let read_register = |name| self.editor.registers.read(name, &self.editor)
 +                .map(|values| values.map(|v| v.into_owned()).collect::<Vec<_>>());
++            let prompt = self.compositor.find::<ui::Prompt>()
++                .map(|p| json!({"line": p.line(), "cursor": p.cursor}));
 +            let ui = self.compositor.find::<ui::EditorView>().unwrap();
 +            let insert_events = ui.last_insert.1.iter().map(|event| match event {
 +                ui::editor::InsertEvent::Key(key) => json!({"key": key.to_string()}),
@@ -41,7 +43,7 @@ index cf09aac..21fe3db 100644
 +                "text": doc.text().to_string(), "primary": selections.primary_index(),
 +                "ranges": selections.iter().map(|r| [r.anchor, r.head]).collect::<Vec<_>>(),
 +                "unnamed": read_register('"'), "search": read_register('/'),
-+                "pending": ui.keymaps.pending().iter().map(ToString::to_string).collect::<Vec<_>>(),
++                "prompt": prompt, "pending": ui.keymaps.pending().iter().map(ToString::to_string).collect::<Vec<_>>(),
 +                "count": self.editor.count, "last_insert": format!("{:?}", ui.last_insert),
 +                "insert_recipe": {"command": ui.last_insert.0.name(), "events": insert_events},
 +                "revision": doc.version(), "document": doc.display_name(),
@@ -54,3 +56,16 @@ index cf09aac..21fe3db 100644
          if should_redraw && !self.editor.should_close() {
              self.render().await;
          }
+diff --git a/helix-term/src/ui/prompt.rs b/helix-term/src/ui/prompt.rs
+index ff4ca1f..cda3410 100644
+--- a/helix-term/src/ui/prompt.rs
++++ b/helix-term/src/ui/prompt.rs
+@@ -31,7 +31,7 @@
+ pub struct Prompt {
+     prompt: Cow<'static, str>,
+     line: String,
+-    cursor: usize,
++    pub(crate) cursor: usize,
+     // Fields used for Component callbacks and rendering:
+     line_area: Rect,
+     anchor: usize,

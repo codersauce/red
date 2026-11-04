@@ -119,3 +119,105 @@ impl Query {
         Selections::new(text, ranges, 0)
     }
 }
+
+/// A regex prompt uses UTF-8 byte offsets. Cursor movement follows Helix's
+/// grapheme boundaries, while word movement also stops at path separators.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Prompt {
+    pub line: String,
+    pub cursor: usize,
+    history_index: Option<usize>,
+}
+
+impl Prompt {
+    pub fn paste(&mut self, value: &str) {
+        self.line.insert_str(self.cursor, value);
+        self.cursor += value.len();
+    }
+
+    fn grapheme(&self, forward: bool) -> usize {
+        let mut cursor =
+            unicode_segmentation::GraphemeCursor::new(self.cursor, self.line.len(), false);
+        let boundary = if forward {
+            cursor.next_boundary(&self.line, 0)
+        } else {
+            cursor.prev_boundary(&self.line, 0)
+        };
+        boundary.ok().flatten().unwrap_or(self.cursor)
+    }
+
+    fn word(&self, forward: bool) -> usize {
+        let separator = |c: char| c.is_whitespace() || c == std::path::MAIN_SEPARATOR;
+        if forward {
+            let mut chars = self.line[self.cursor..].char_indices().peekable();
+            while chars.next_if(|(_, c)| !separator(*c)).is_some() {}
+            while chars.next_if(|(_, c)| separator(*c)).is_some() {}
+            return chars
+                .next()
+                .map_or(self.line.len(), |(i, _)| self.cursor + i);
+        }
+        // The reference starts at the last character when the cursor is at EOF,
+        // and looks for a separator strictly before the preceding character.
+        let mut chars = self.line[..self.cursor].char_indices().rev();
+        if self.cursor == self.line.len() {
+            chars.next();
+        }
+        chars.next();
+        chars
+            .find(|(_, c)| separator(*c))
+            .map_or(0, |(i, c)| i + c.len_utf8())
+    }
+
+    pub fn recall(&mut self, history: &[String], older: bool) {
+        let Some(last) = history.len().checked_sub(1) else {
+            return;
+        };
+        let index = if older {
+            self.history_index
+                .unwrap_or(history.len())
+                .saturating_sub(1)
+        } else {
+            self.history_index.map_or(0, |i| i + 1).min(last)
+        };
+        self.line.clone_from(&history[index]);
+        self.cursor = self.line.len();
+        self.history_index = Some(index);
+    }
+
+    /// Returns whether the editor should refresh the live regex selection.
+    pub fn edit(&mut self, key: &str) -> bool {
+        let (target, delete) = match key {
+            "<left>" | "<c-b>" => (self.grapheme(false), false),
+            "<right>" | "<c-f>" => (self.grapheme(true), false),
+            "<backspace>" | "<c-h>" => (self.grapheme(false), true),
+            "<delete>" | "<c-d>" => (self.grapheme(true), true),
+            "<a-b>" | "<c-left>" => (self.word(false), false),
+            "<a-f>" | "<c-right>" => (self.word(true), false),
+            "<c-w>" | "<a-backspace>" | "<c-backspace>" => (self.word(false), true),
+            "<a-d>" | "<a-delete>" | "<c-delete>" => (self.word(true), true),
+            "<home>" | "<c-a>" => (0, false),
+            "<end>" | "<c-e>" => (self.line.len(), false),
+            "<c-u>" => (0, true),
+            "<c-k>" => (self.line.len(), true),
+            _ => {
+                let mut chars = key.chars();
+                if let Some(ch) = chars.next()
+                    && chars.next().is_none()
+                {
+                    self.line.insert(self.cursor, ch);
+                    self.cursor = self.grapheme(true);
+                    return true;
+                }
+                return false;
+            }
+        };
+        if delete {
+            self.line
+                .replace_range(target.min(self.cursor)..target.max(self.cursor), "");
+            self.cursor = target.min(self.cursor);
+        } else {
+            self.cursor = target;
+        }
+        delete
+    }
+}

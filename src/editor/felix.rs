@@ -408,6 +408,19 @@ impl Editor {
             KeyCode::Char(ch) => ch.to_string(),
             KeyCode::Esc => "<esc>".into(),
             KeyCode::Enter => "<enter>".into(),
+            code @ (KeyCode::Left | KeyCode::Right | KeyCode::Backspace | KeyCode::Delete)
+                if self.felix.session.prompt().is_some()
+                    && key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                let modifier = if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    "c"
+                } else {
+                    "a"
+                };
+                format!("<{modifier}-{code:?}>").to_lowercase()
+            }
             KeyCode::Backspace => "<backspace>".into(),
             KeyCode::Left => "<left>".into(),
             KeyCode::Right => "<right>".into(),
@@ -487,7 +500,7 @@ impl Editor {
             .unwrap_or((offset, goal.unwrap_or(col)))
         };
         let context = felix_core::Context {
-            search: self.felix.search.last().map(String::as_str),
+            search_history: &self.felix.search,
             register,
             tab_width,
             indent: &self.felix.indent[&self.current_buffer().id()],
@@ -991,6 +1004,36 @@ impl Editor {
                 .history
                 .insert((doc, tx.id.clone()), (before, selections.clone()));
         }
+    }
+
+    pub(super) fn felix_prompt(&self) -> Option<(&'static str, &str, usize)> {
+        let prompt = self.felix.session.prompt()?;
+        (!self.has_term()
+            && self.current_dialog.is_none()
+            && !self.panel_manager.has_focused_panel())
+        .then_some(prompt)
+    }
+
+    /// Visible prompt text and caret column, clipped together on narrow terminals.
+    pub(super) fn felix_prompt_row(&self) -> Option<(String, usize, bool)> {
+        let (label, line, cursor) = self.felix_prompt()?;
+        let width = usize::from(self.size.0);
+        let prefix = format!("{label}:");
+        let available = width.saturating_sub(prefix.len() + 1);
+        let before =
+            crate::unicode_utils::truncate_display_width_from_end(&line[..cursor], available);
+        let column = (prefix.len() + display_width(&before)).min(width.saturating_sub(1));
+        let suggestion = line.is_empty() && !self.felix.search.is_empty();
+        let rest = if suggestion {
+            self.felix.search.last()?.as_str()
+        } else {
+            &line[cursor..]
+        };
+        let row = format!(
+            "{prefix}{before}{}",
+            crate::unicode_utils::truncate_display_width(rest, width.saturating_sub(column))
+        );
+        Some((row, column, suggestion))
     }
 
     pub(super) fn felix_status(&self) -> Option<String> {
@@ -1715,6 +1758,13 @@ mod tests {
                     KeyCode::Char(token.chars().nth(3).unwrap())
                 }
                 "<backspace>" => KeyCode::Backspace,
+                "<up>" => KeyCode::Up,
+                "<down>" => KeyCode::Down,
+                "<left>" => KeyCode::Left,
+                "<right>" => KeyCode::Right,
+                "<home>" => KeyCode::Home,
+                "<end>" => KeyCode::End,
+                "<delete>" => KeyCode::Delete,
                 "<pageup>" => KeyCode::PageUp,
                 "<pagedown>" => KeyCode::PageDown,
                 "<esc>" => KeyCode::Esc,
@@ -1744,6 +1794,24 @@ mod tests {
                 "pending":editor.felix.session.pending_keys()});
             if let Event::Paste(value) = &event {
                 actual["paste"] = json!(value);
+            }
+            if expected.get("prompt").is_some() {
+                actual["prompt"] = json!(editor
+                    .felix
+                    .session
+                    .prompt()
+                    .map(|(_, line, cursor)| json!({"line":line,"cursor":cursor})));
+                if let Some((label, line, cursor)) = editor.felix.session.prompt() {
+                    assert_eq!(
+                        editor.render_cursor_position(),
+                        Some((
+                            label.len() + 1 + display_width(&line[..cursor]),
+                            usize::from(editor.size.1) - 1
+                        )),
+                        "{name} input {} caret",
+                        index + 1
+                    );
+                }
             }
             if expected.get("last_insert").is_some() {
                 actual["last_insert"] = json!(editor.felix.last_insert.keys());
