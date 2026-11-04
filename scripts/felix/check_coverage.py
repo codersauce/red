@@ -23,7 +23,7 @@ def validate(inventory, suite):
             missing = required - event.keys()
             if missing:
                 raise ValueError(f"{case['name']} input {index}: missing fields {sorted(missing)}")
-            if case["name"].startswith("page-"):
+            if case["name"].startswith("page-") or case["name"] == "search-viewport":
                 view = event.get("viewport", {})
                 if not (isinstance(view.get("anchor"), int) and 0 <= view["anchor"] <= len(event["text"])
                         and isinstance(view.get("height"), int) and view["height"] > 0):

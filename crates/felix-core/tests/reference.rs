@@ -64,8 +64,8 @@ fn reference_sequences() {
                 .viewport_start
                 .unwrap_or(viewport_start)
                 .min(text.len_chars());
-            if plan.save_jump {
-                jumps.save((), &sel);
+            if let Some(saved) = &plan.save_jump {
+                jumps.save((), saved);
             }
             if !plan.edits.is_empty() && before.is_none() {
                 before = Some((text.clone(), sel.clone()));

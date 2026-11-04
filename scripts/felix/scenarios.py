@@ -21,6 +21,12 @@ def scenarios(seed, steps):
     yield "keep-and-rotate", "ab ab abc\n", list("%sab") + ["<enter>", ")", "(", "2", ")", "<a-,>", ","]
     enter = ["<enter>"]
     yield "search-and-navigate", "foo xFOO foo\n", list("/foo") + enter + list("nnNvN") + ["<esc>"] + list("?x") + enter
+    yield "cancel-invalid-search", "foo 😀 bar foo\n", list("/foo") + enter + list("?ba") + ["<esc>"] + list("/[") + enter + ["<esc>", "n"]
+    yield "search-viewport", "home\n" + "a\n" * 40 + "target\n" + "a\n" * 25, list("/ta") + ["<esc>"] + list("/ta[") + ["<esc>"] + list("/ta") + enter + list("?ho") + ["<c-c>"]
+    yield "empty-and-keep", "ab abc abc\n", list("%sab") + enter + list("Kx") + enter + ["<a-K>", "a", "<enter>", "<esc>"]
+    yield "search-jump-history", "a1 ab a2 ab a3\n", list("/ab") + enter + ["<c-o>", "<tab>", "/", "<enter>"] + list("?a") + ["<backspace>", "<c-c>"]
+    yield "search-identical-selections", "foo foo BAR foo\n", list("%sfoo") + enter + ["*", "n", "N", "<a-*>"]
+    yield "quoted-objects", '(one (two)) "foo" bar\n', list('5lmi(2ma(gg13lmi"ma"ggmm')
     yield "regex-select-split-keep", "red blue red\n", list("%S ") + enter + list("Kred") + enter + list(")") + [",", "<a-;>"]
     yield "yank-paste-replace", "one two\n", list("eywpP;Rl") + ["<a-;>"] + list("rX")
     yield "character-arguments", "abc db e!\n", list("fb") + ["<a-.>"] + list("TbFr") + ["<esc>"] + list("ggvre") + ["<esc>"]
@@ -81,7 +87,7 @@ def capture(observer, runtime, root, name, text, keys):
         events = []
         trace_offset = 0
         for index, key in enumerate(keys):
-            named = {"<pageup>": "PageUp", "<pagedown>": "PageDown", "<esc>": "Escape", "<enter>": "Enter", "<tab>": "Tab", "<a-;>": "M-;", "<a-,>": "M-,"}
+            named = {"<backspace>": "BSpace", "<pageup>": "PageUp", "<pagedown>": "PageDown", "<esc>": "Escape", "<enter>": "Enter", "<tab>": "Tab", "<a-;>": "M-;", "<a-,>": "M-,"}
             if key.startswith("<a-"):
                 raw = b"\x1b" + key[3:-1].encode()
                 tmux("send-keys","-t","h","-H",*[format(byte,"02x") for byte in raw])
@@ -107,14 +113,14 @@ def capture(observer, runtime, root, name, text, keys):
                 time.sleep(.01)
             record = json.loads(line)
             raw_event = record["event"]
-            special = {"<pageup>": "PageUp", "<pagedown>": "PageDown", "<esc>": "Esc", "<enter>": "Enter", "<tab>": "Tab", "<a-;>": "Char(';')", "<a-,>": "Char(',')"}
+            special = {"<backspace>": "Backspace", "<pageup>": "PageUp", "<pagedown>": "PageDown", "<esc>": "Esc", "<enter>": "Enter", "<tab>": "Tab", "<a-;>": "Char(';')", "<a-,>": "Char(',')"}
             ch = key[3:-1] if key.startswith(("<a-", "<c-")) else key
             code = special.get(key, f"Char('{ch}')")
             if f"code: {code}," not in raw_event or ("ALT" in raw_event) != key.startswith("<a-") or ("CONTROL" in raw_event) != key.startswith("<c-"):
                 raise ValueError(f"{name}: input {index+1} expected {key}, observed {raw_event}")
             events.append({"key": key, **{k: record[k] for k in
                 ("mode", "text", "ranges", "primary", "unnamed", "search", "pending", "count", "document")}})
-            if name.startswith("page-"):
+            if name.startswith("page-") or name == "search-viewport":
                 events[-1]["viewport"] = record["viewport"]
         case = {"name": name, "text": text, "events": events}
         if wrap_width:

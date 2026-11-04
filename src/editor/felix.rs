@@ -460,12 +460,8 @@ impl Editor {
             self.set_legacy_message(Some("Directory buffers are read-only".into()));
             return self.render(frame);
         }
-        if plan.save_jump {
-            self.felix
-                .jumps
-                .entry(id.1)
-                .or_default()
-                .save(id.0, &initial);
+        if let Some(saved) = &plan.save_jump {
+            self.felix.jumps.entry(id.1).or_default().save(id.0, saved);
         }
         if let Input::Key(key) = input {
             if self.felix.session.mode != felix_core::Mode::Insert
@@ -1097,6 +1093,7 @@ mod tests {
                     };
                     KeyCode::Char(token.chars().nth(3).unwrap())
                 }
+                "<backspace>" => KeyCode::Backspace,
                 "<pageup>" => KeyCode::PageUp,
                 "<pagedown>" => KeyCode::PageDown,
                 "<esc>" => KeyCode::Esc,

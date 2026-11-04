@@ -20,12 +20,12 @@ remaining = ["Full count and direction matrix for merging, trimming, copying and
 
 [[area]]
 name = "Search"
-cases = ["search-and-navigate"]
-remaining = ["Invalid patterns, prompt cancellation and search from multiple selections"]
+cases = ["search-and-navigate", "cancel-invalid-search", "empty-and-keep", "search-jump-history", "search-identical-selections", "search-viewport"]
+remaining = ["Prompt editing and history traversal, Search viewport across wrapped and split views"]
 
 [[area]]
 name = "Text objects"
-cases = ["explicit-objects"]
+cases = ["explicit-objects", "quoted-objects"]
 remaining = ["Delimiters, nesting, counts and failure on unmatched objects"]
 
 [[area]]

@@ -33,6 +33,7 @@ enum Pending {
         kind: Query,
         input: String,
         original: Selections,
+        viewport_start: usize,
     },
 }
 
@@ -74,6 +75,18 @@ impl Context<'_> {
         }
         let line = text.char_to_line(pos).saturating_add_signed(delta);
         text.line_to_char(line.min(text.len_lines()))
+    }
+
+    fn search_viewport(&self, text: RopeSlice<'_>, cursor: usize) -> usize {
+        let last_row = self.page_height.max(1) - 1;
+        let target = self.row_start(text, cursor, 0);
+        let bottom = self.row_start(text, self.viewport_start, last_row as isize);
+        let top = if (self.viewport_start..=bottom).contains(&target) {
+            self.viewport_start
+        } else {
+            self.row_start(text, cursor, -((last_row / 2) as isize))
+        };
+        self.reveal(text, top, cursor)
     }
 
     fn reveal(&self, text: RopeSlice<'_>, top: usize, cursor: usize) -> usize {
@@ -138,7 +151,7 @@ pub struct Plan {
     pub register: Option<Vec<String>>,
     pub search: Option<String>,
     pub host: Option<HostAction>,
-    pub save_jump: bool,
+    pub save_jump: Option<Selections>,
     /// New top display row, as a document character offset.
     pub viewport_start: Option<usize>,
     pub message: Option<String>,
@@ -416,7 +429,7 @@ impl Session {
             register: None,
             search: None,
             host: None,
-            save_jump: false,
+            save_jump: None,
             viewport_start: None,
             message: None,
             ranges: selections.ranges.clone(),
@@ -474,20 +487,24 @@ impl Session {
                 original,
                 input,
                 kind,
+                viewport_start,
             } => {
                 let mut query = input.clone();
+                let submit = key == "<enter>";
                 match key {
-                    "<esc>" => {
+                    "<esc>" | "<c-c>" => {
                         p.set(original.clone());
+                        p.viewport_start = Some(*viewport_start);
                         p.next.pending = Pending::None;
                         return p;
                     }
                     "<enter>" => {
-                        if Query::compile(input).is_some() {
-                            p.search = Some(input.clone());
-                        }
                         p.next.pending = Pending::None;
-                        return p;
+                        if query.is_empty() {
+                            query = search.unwrap_or_default().to_owned();
+                        } else if search != Some(query.as_str()) {
+                            p.search = Some(query.clone());
+                        }
                     }
                     "<backspace>" => {
                         query.pop();
@@ -495,15 +512,36 @@ impl Session {
                     _ if key.chars().count() == 1 => query.push_str(key),
                     _ => return p,
                 }
-                let preview = Query::compile(&query)
-                    .and_then(|regex| kind.apply(text, original, &regex, extend));
-                p.set(preview.unwrap_or_else(|| original.clone()));
-                p.message = Some(format!("{}: {query}", kind.label()));
-                p.next.pending = Pending::Regex {
-                    kind: *kind,
-                    original: original.clone(),
-                    input: query,
-                };
+                if !query.is_empty() {
+                    if let Some(regex) = Query::compile(&query) {
+                        let preview = kind.apply(text, original, &regex, extend);
+                        if let Some(ref found) = preview
+                            && matches!(kind, Query::Forward | Query::Backward)
+                        {
+                            p.viewport_start =
+                                Some(context.search_viewport(text, found.primary().cursor(text)));
+                        }
+                        p.set(preview.unwrap_or_else(|| original.clone()));
+                        if submit {
+                            p.save_jump = Some(original.clone());
+                        }
+                    } else {
+                        p.set(original.clone());
+                        p.viewport_start = Some(*viewport_start);
+                        if submit {
+                            p.message = Some(format!("Invalid regex: {query}"));
+                        }
+                    }
+                }
+                if !submit {
+                    p.message = Some(format!("{}: {query}", kind.label()));
+                    p.next.pending = Pending::Regex {
+                        kind: *kind,
+                        original: original.clone(),
+                        viewport_start: *viewport_start,
+                        input: query,
+                    };
+                }
                 return p;
             }
             Pending::Match => {
@@ -583,7 +621,7 @@ impl Session {
             Pending::Goto => {
                 p.next.count = None;
                 p.next.pending = Pending::None;
-                p.save_jump = matches!(key, "g" | "e");
+                p.save_jump = matches!(key, "g" | "e").then(|| selections.clone());
                 match key {
                     "n" => p.host = Some(HostAction::NextBuffer),
                     "p" => p.host = Some(HostAction::PreviousBuffer),
@@ -621,9 +659,9 @@ impl Session {
         if key != "g" && key != "m" {
             p.next.count = None;
         }
-        p.save_jump = key == "G" && self.count.is_some();
+        p.save_jump = (key == "G" && self.count.is_some()).then(|| selections.clone());
         match key {
-            "<c-s>" => p.save_jump = true,
+            "<c-s>" => p.save_jump = Some(selections.clone()),
             "<c-o>" | "<c-i>" | "<tab>" => {
                 p.host = Some(HostAction::Jump {
                     forward: key != "<c-o>",
@@ -645,6 +683,7 @@ impl Session {
                 p.next.pending = Pending::Regex {
                     kind,
                     original: selections.clone(),
+                    viewport_start: context.viewport_start,
                     input: String::new(),
                 };
                 p.message = Some(format!("{}: ", kind.label()));
@@ -787,6 +826,8 @@ impl Session {
                         }
                         state = next;
                     }
+                    p.viewport_start =
+                        Some(context.search_viewport(text, state.primary().cursor(text)));
                     p.set(state);
                 }
             }
