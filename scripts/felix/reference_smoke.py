@@ -91,7 +91,7 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
         config.mkdir(parents=True)
         # Compare equal document heights. Red's optional breadcrumb plugin
         # can reserve a screen row asynchronously after the document opens.
-        window_config = 'disabled_plugins = ["barbecue"]\n' if split_search or horizontal or scenario in ("paging", "repeat") else ""
+        window_config = 'disabled_plugins = ["barbecue"]\n' if split_search or horizontal or scenario in ("paging", "repeat", "prefix-count") else ""
         if wrapped:
             window_config += "wrap = true\n"
         (config / "config.toml").write_text(
@@ -430,6 +430,21 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
                 tmux("send-keys", key)
                 observe_page(first)
             return checkpoints
+        if scenario == "prefix-count":
+            observe("open", "foo foo", "NOR", "1 sel")
+            tmux("send-keys", "2", "Space", "3", "Home", "l", "r", "X")
+            observe("cancel leader and move once", "fXo foo", "NOR", "1 sel")
+            tmux("send-keys", "Space", "2")
+            paste = b"\x1b[200~Y\x1b[201~"
+            tmux("send-keys", "-H", *(format(byte, "02x") for byte in paste))
+            observe("paste twice from the pending leader", "fYYXo foo", "NOR", "1 sel")
+            tmux("send-keys", "l", "r", "Z")
+            observe("move once after paste", "fYYZo foo", "NOR", "1 sel")
+            tmux("send-keys", "C-w", "2", "s")
+            observe("split after a prefix count", "fYYZo foo", "NOR", "1 sel", copies=2)
+            tmux("send-keys", "l", "r", "Q")
+            observe("move once in the new split", "fYYZQ foo", "NOR", "1 sel", copies=2)
+            return checkpoints
         if scenario == "repeat":
             observe("open", "foo foo", "NOR", "1 sel")
             tmux("send-keys", "i", "X", "Escape")
@@ -538,6 +553,9 @@ def main():
                 for expected, actual in zip(horizontal, red_horizontal, strict=True):
                     if actual != expected:
                         raise ValueError(f"horizontal viewport: expected {expected!r}, saw {actual!r}")
+            prefixes = run_trace(bundle, root / "release-prefix", scenario="prefix-count")
+            red_prefixes = (run_trace(bundle, root / "red-prefix", args.candidate.resolve(strict=True),
+                                      red=True, scenario="prefix-count") if args.candidate else None)
             split_traces = {}
             for scenario, directory in (("split-search", "split"), ("wrapped-split-search", "wrap")):
                 key = scenario.replace("-", "_")
@@ -566,6 +584,7 @@ def main():
                       "paging": pages, "red_paging": red_pages, "repeat": repeats, "red_repeat": red_repeats,
                       "completion": completion, "red_completion": red_completion,
                       "prompt": prompts, "red_prompt": red_prompts,
+                      "prefix_count": prefixes, "red_prefix_count": red_prefixes,
                       "horizontal": horizontal, "red_horizontal": red_horizontal, **split_traces}, indent=2))
 
 

@@ -269,6 +269,68 @@ pub(crate) fn goto(
     r.move_to(text, pos, extend)
 }
 
+fn nth_character(
+    text: RopeSlice<'_>,
+    from: usize,
+    backward: bool,
+    wanted: char,
+    nth: usize,
+) -> Option<usize> {
+    let mut chars = text.chars_at(from);
+    if backward {
+        chars.reverse();
+    }
+    let (offset, _) = chars.enumerate().filter(|(_, ch)| *ch == wanted).nth(nth)?;
+    Some(if backward {
+        from - offset - 1
+    } else {
+        from + offset
+    })
+}
+
+fn select_find_target(text: RopeSlice<'_>, range: Range, target: usize, extend: bool) -> Range {
+    let cursor = range.cursor(text);
+    let origin = if extend {
+        range
+    } else {
+        Range {
+            anchor: cursor,
+            head: cursor,
+        }
+    };
+    origin.move_to(text, target, true)
+}
+
+/// Enter searches for LF or CRLF as a unit. It leaves the saved motion intact.
+pub(crate) fn find_line_ending(
+    text: RopeSlice<'_>,
+    range: Range,
+    command: char,
+    count: usize,
+    extend: bool,
+) -> Range {
+    let cursor = range.cursor(text);
+    let backward = matches!(command, 'F' | 'T');
+    let till = matches!(command, 't' | 'T');
+    // T stops at the start of a line. Skip the adjacent ending when
+    // already there so another T can reach the preceding line.
+    let from = if backward {
+        cursor.saturating_sub(usize::from(till))
+    } else {
+        boundary(text, cursor, true)
+    };
+    let Some(lf) = nth_character(text, from, backward, '\n', count - 1) else {
+        return range;
+    };
+    let newline = boundary(text, lf + 1, false);
+    let target = match (backward, till) {
+        (true, true) => lf + 1,
+        (false, true) => newline.saturating_sub(1),
+        _ => newline,
+    };
+    select_find_target(text, range, target, extend)
+}
+
 pub(crate) fn find(
     text: RopeSlice<'_>,
     r: Range,
@@ -292,29 +354,16 @@ pub(crate) fn find(
     };
     let skip = usize::from(till && adjacent.and_then(|i| text.get_char(i)) == Some(ch));
     let nth = (count - 1).saturating_add(skip);
-    let matched = if backward {
-        (0..start).rev().filter(|&i| text.char(i) == ch).nth(nth)
-    } else {
-        (next..text.len_chars())
-            .filter(|&i| text.char(i) == ch)
-            .nth(nth)
+    let from = if backward { start } else { next };
+    let Some(pos) = nth_character(text, from, backward, ch, nth) else {
+        return r;
     };
-    let Some(pos) = matched else { return r };
     let target = match (backward, till) {
         (true, true) => pos + 1,
         (false, true) => pos.saturating_sub(1),
         _ => pos,
     };
-    let origin = if extend {
-        r
-    } else {
-        let cursor = r.cursor(text);
-        Range {
-            anchor: cursor,
-            head: cursor,
-        }
-    };
-    origin.move_to(text, target, true)
+    select_find_target(text, r, target, extend)
 }
 
 pub(crate) fn word_object(text: RopeSlice<'_>, r: Range, long: bool, around: bool) -> Range {

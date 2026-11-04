@@ -37,6 +37,51 @@ enum Pending {
     },
 }
 
+// Helix character callbacks receive the character even when Ctrl or Alt is held.
+fn argument_character(key: &str) -> Option<char> {
+    let value = key
+        .strip_prefix("<c-")
+        .or_else(|| key.strip_prefix("<a-"))
+        .and_then(|modified| modified.strip_suffix('>'))
+        .unwrap_or(key);
+    let mut chars = value.chars();
+    let ch = chars.next()?;
+    chars.next().is_none().then_some(ch)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ArgumentMotion {
+    Find {
+        command: char,
+        ch: char,
+        count: usize,
+        extend: bool,
+    },
+    Object {
+        ch: char,
+        count: usize,
+        around: bool,
+    },
+}
+
+impl ArgumentMotion {
+    fn apply(self, text: RopeSlice<'_>, selections: &Selections) -> Selections {
+        selections.transform(text, |range| match self {
+            Self::Find {
+                command,
+                ch,
+                count,
+                extend,
+            } => crate::motion::find(text, range, command, ch, count, extend),
+            Self::Object { ch, count, around } => match ch {
+                'p' => crate::motion::paragraph(text, range, count, around),
+                'w' | 'W' => crate::motion::word_object(text, range, ch == 'W', around),
+                _ => crate::motion::pair_object(text, range, ch, around, count),
+            },
+        })
+    }
+}
+
 /// Map a character offset to a destination on another display row, retaining
 /// the preferred screen column across consecutive vertical movements.
 pub type VisualMotion<'a> = dyn Fn(usize, isize, Option<usize>) -> (usize, usize) + 'a;
@@ -111,7 +156,7 @@ pub struct Session {
     goals: Vec<usize>,
     visual_goals: Vec<usize>,
     restore_append: bool,
-    last_find: Option<(char, char, usize, bool)>,
+    last_motion: Option<ArgumentMotion>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -551,6 +596,19 @@ impl Session {
         plan.next.cancel_pending();
         plan
     }
+    /// Consume a decimal count digit while a document or host keymap awaits a command.
+    /// A leading zero is available as a binding. Excess digits leave the count intact.
+    pub fn push_count_digit(&mut self, ch: char) -> bool {
+        if !ch.is_ascii_digit() || (ch == '0' && self.count.is_none()) {
+            return false;
+        }
+        let next = self.count.unwrap_or(0) * 10 + usize::from(ch as u8 - b'0');
+        if next <= 100_000_000 {
+            self.count = Some(next);
+        }
+        true
+    }
+
     pub fn count(&self) -> Option<usize> {
         self.count
     }
@@ -604,13 +662,9 @@ impl Session {
         // a character (such as f and r) consume a digit as their argument.
         if self.mode != Mode::Insert
             && matches!(self.pending, Pending::None | Pending::Goto | Pending::Match)
-            && let [digit @ b'0'..=b'9'] = key.as_bytes()
-            && (*digit != b'0' || self.count.is_some())
+            && let [digit] = key.as_bytes()
+            && p.next.push_count_digit(char::from(*digit))
         {
-            let next = self.count.unwrap_or(0) * 10 + (digit - b'0') as usize;
-            if next <= 100_000_000 {
-                p.next.count = Some(next);
-            }
             return p;
         }
         match &self.pending {
@@ -721,28 +775,27 @@ impl Session {
             }
             Pending::Object { around, count } => {
                 p.next.pending = Pending::None;
-                if key.chars().count() == 1 {
-                    p.set(selections.transform(text, |r| match key {
-                        "p" => crate::motion::paragraph(text, r, *count, *around),
-                        "w" | "W" => crate::motion::word_object(text, r, key == "W", *around),
-                        _ => crate::motion::pair_object(
-                            text,
-                            r,
-                            key.chars().next().unwrap(),
-                            *around,
-                            *count,
-                        ),
-                    }));
+                if let Some(ch) = argument_character(key) {
+                    let motion = ArgumentMotion::Object {
+                        ch,
+                        count: *count,
+                        around: *around,
+                    };
+                    p.set(motion.apply(text, selections));
+                    p.next.last_motion = Some(motion);
                 }
                 return p;
             }
             Pending::Replace => {
                 p.next.pending = Pending::None;
+                let mut encoded = [0; 4];
                 let replacement = match key {
                     "<enter>" => document_newline(text),
                     "<tab>" => "\t",
-                    ch if ch.chars().count() == 1 => ch,
-                    _ => return p,
+                    _ => match argument_character(key) {
+                        Some(ch) => ch.encode_utf8(&mut encoded),
+                        None => return p,
+                    },
                 };
                 p.replace_fragments(text, selections, |_, slice| {
                     use unicode_segmentation::UnicodeSegmentation;
@@ -752,16 +805,27 @@ impl Session {
             }
             Pending::Find { command, count } => {
                 p.next.pending = Pending::None;
+                if key == "<enter>" {
+                    p.set(selections.transform(text, |range| {
+                        crate::motion::find_line_ending(text, range, *command, *count, extend)
+                    }));
+                    return p;
+                }
                 let ch = match key {
                     "<tab>" => '\t',
-                    "<enter>" => '\n',
-                    ch if ch.chars().count() == 1 => ch.chars().next().unwrap(),
-                    _ => return p,
+                    _ => match argument_character(key) {
+                        Some(ch) => ch,
+                        None => return p,
+                    },
                 };
-                p.next.last_find = Some((*command, ch, *count, extend));
-                p.set(selections.transform(text, |r| {
-                    crate::motion::find(text, r, *command, ch, *count, extend)
-                }));
+                let motion = ArgumentMotion::Find {
+                    command: *command,
+                    ch,
+                    count: *count,
+                    extend,
+                };
+                p.set(motion.apply(text, selections));
+                p.next.last_motion = Some(motion);
                 return p;
             }
             Pending::Goto => {
@@ -832,10 +896,16 @@ impl Session {
                 };
             }
             "<a-.>" => {
-                if let Some((cmd, ch, count, extend)) = self.last_find {
-                    p.set(selections.transform(text, |r| {
-                        crate::motion::find(text, r, cmd, ch, count, extend)
-                    }));
+                if let Some(motion) = self.last_motion {
+                    let mut current = selections.clone();
+                    for _ in 0..count {
+                        let next = motion.apply(text, &current);
+                        if next == current {
+                            break;
+                        }
+                        current = next;
+                    }
+                    p.set(current);
                 }
             }
             "R" => p.replace_from_register(text, selections, register, count),

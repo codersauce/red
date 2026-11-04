@@ -13,6 +13,31 @@ import time
 COMMIT = tomllib.loads(Path(__file__).with_name("coverage.toml").read_text())["reference"]
 
 
+def pending_input_cases():
+    for mode, start in (("normal", []), ("select", ["v"])):
+        yield f"modified-arguments-{mode}", "aa b c x c w (aa bb) x 2 🦊 2\n", (
+            start + ["2", "f", "<c-c>", "T", "<a-b>", "t", "<a-x>", "F", "<c-b>", "r", "<a-y>", "u"]
+            + list("ggmi") + ["<a-w>", "r", "<c-c>", "u"] + list("ggf") + ["<a-2>", "r", "🦊", "u"])
+        yield f"line-ending-arguments-{mode}", "ab\r\nc\n\n界z\r\nx\u2028y\nend", (
+            start + list("fbf") + ["<enter>", "2", "<a-.>"] + list("ggt") + ["<enter>", "2", "f", "<enter>",
+            "T", "<enter>", "F", "<enter>", "3", "t", "<enter>", "2", "T", "<enter>"]
+            + list("geF") + ["<enter>"] + list("gh2T") + ["<enter>"] + list("gg2f") + ["<tab>", "<a-.>"])
+        yield f"count-recovery-{mode}", "first 2 (abc def) 2\nnext\nlast", (
+            start + list("090") + ["<backspace>"] + list("l2") + ["<esc>"] + list("hg0lm0l7g")
+            + ["<esc>"] + list("l3f") + ["<up>"] + list("w2mi") + ["<esc>"] + list("e2ma")
+            + ["<left>"] + list("bgg1000000001") + ["<esc>", "w"])
+        yield f"repeat-argument-{mode}", "ab cb db eb fb gb\n(ab cd) (ef gh)\n", (
+            start + list("2fb2") + ["<a-.>"] + list("ggfbf") + ["<esc>", "<a-.>"]
+            + list("miww") + ["<a-.>"] + list("gelmi(w") + ["<a-.>"] + list("ggmi") + ["<up>", "<a-.>"])
+        # A bracketed paste exits Select mode. Re-enter it for each waiting command.
+        yield f"paste-pending-{mode}", "ab b b b b x\nline two\n", (
+            start + ["2", "g", {"paste": "X"}, "l"] + start + ["2", "f", {"paste": "a"}, "b"]
+            + start + ["r", {"paste": "x"}, "h"] + start + ["m", "i", {"paste": "Q"}, "w"]
+            + ["/", "2", {"paste": "X"}, "<esc>"])
+    yield "repeat-multiple-finds", "a b b b b\na b b b b\n", (
+        list("%sa") + ["<enter>"] + list("fb2") + ["<a-.>", "2", "r", "<a-x>", "u"])
+
+
 def scenarios(seed, steps):
     text = "éclair e\u0301!  👩‍💻\r\n\tlast line\r\n"
     yield "word-boundaries", text, list("wwb2EW3BveB") + ["<esc>"] + list("gggsglge")
@@ -75,6 +100,7 @@ def scenarios(seed, steps):
         keys += list("2g9l3m4ll") + ["<esc>"] + list("123456789012345") + ["<esc>"]
         keys += list("g2gm2i(ggf2r3") + ["<esc>"]
         yield f"cancel-arguments-{mode}", "abc 123 abc\nline two\n", keys
+    yield from pending_input_cases()
     yield "typed-selection", "abcd\n", list("eliX") + ["<esc>"] + list("uU")
     yield "unicode-vertical-goal", "ab界cd\n\tx\nabcdefg\n👩‍💻x\n", (
         list("3ljjjkkkvjj") + ["<esc>"] + list("ggllgjgjgk"))

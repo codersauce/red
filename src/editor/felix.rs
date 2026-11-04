@@ -33,11 +33,25 @@ pub(super) enum Input<'a> {
     ClipboardYank { primary: bool },
 }
 
+impl Input<'static> {
+    fn clipboard_action(action: &Action) -> Option<Self> {
+        Some(match action {
+            Action::FelixClipboardBefore => Self::ClipboardPaste(felix_core::Paste::Before),
+            Action::FelixClipboardAfter => Self::ClipboardPaste(felix_core::Paste::After),
+            Action::FelixClipboardReplace => Self::ClipboardReplace,
+            Action::FelixClipboardYank => Self::ClipboardYank { primary: false },
+            Action::FelixClipboardYankPrimary => Self::ClipboardYank { primary: true },
+            _ => return None,
+        })
+    }
+}
+
 pub(super) type Owner = (BufferId, WindowId, u64, u64);
 
 #[derive(Default)]
 pub(super) struct FelixHost {
     session: Session,
+    native_prefix_owner: Option<Owner>,
     pub(super) preview: Option<CompletionPreview>,
     last_insert: felix_core::LastInsert,
     jumps: HashMap<WindowId, felix_core::Jumps<BufferId>>,
@@ -384,6 +398,71 @@ impl Editor {
         }
     }
 
+    pub(super) async fn execute_felix_clipboard(
+        &mut self,
+        action: &Action,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        let (Some(input), Some(owner)) = (Input::clipboard_action(action), self.felix_owner())
+        else {
+            return Ok(());
+        };
+        let result = self.execute_felix(input, owner, buffer, runtime).await;
+        // A failed or empty clipboard operation also ends its key sequence.
+        self.felix.session.cancel_pending();
+        result
+    }
+
+    /// Route the tail of a Red-owned document binding without starting a Vim count.
+    pub(super) fn felix_native_prefix_event(&mut self, event: &Event) -> Option<KeyAction> {
+        let owner = self.felix.native_prefix_owner?;
+        let same_document = self.felix_owner() == Some(owner)
+            && self.current_dialog.is_none()
+            && self.panel_manager.focused_panel_id().is_none()
+            && !self.workspace_manager.is_active();
+        let pointer_press =
+            matches!(event, Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Down(_)));
+        if !same_document || pointer_press || self.waiting_key_action.is_none() {
+            self.felix.native_prefix_owner = None;
+            self.felix.session.cancel_pending();
+            self.waiting_key_action = None;
+            self.waiting_command = None;
+            self.clear_keymap_hints();
+            return None;
+        }
+        if matches!(event, Event::Paste(_)) {
+            // The document paste consumes the count and dismisses the shared keymap.
+            self.felix.native_prefix_owner = None;
+            return None;
+        }
+        let Event::Key(key) = event else { return None };
+        let name = Self::key_string_for_event(event);
+        let Some(KeyAction::Nested(bindings)) = &self.waiting_key_action else {
+            return None;
+        };
+        let binding = name.as_ref().and_then(|name| bindings.get(name));
+        if (binding.is_none() || self.felix.session.count().is_some())
+            && key.modifiers.is_empty()
+            && matches!(key.code, KeyCode::Char(ch) if self.felix.session.push_count_digit(ch))
+        {
+            return Some(KeyAction::None);
+        }
+        let action = binding.cloned().unwrap_or(KeyAction::None);
+        self.waiting_key_action = None;
+        self.waiting_command = None;
+        if !matches!(action, KeyAction::Nested(_)) {
+            self.clear_keymap_hints();
+            self.felix.native_prefix_owner = None;
+            // Clipboard plans need the count while producing their edits.
+            if !matches!(&action, KeyAction::Single(leaf) if Input::clipboard_action(leaf).is_some())
+            {
+                self.felix.session.cancel_pending();
+            }
+        }
+        Some(action)
+    }
+
     pub(super) fn felix_input_action(&mut self, key: &KeyEvent) -> Option<KeyAction> {
         if !self.felix.session.awaiting_input() {
             let bindings = if self.felix.session.mode == felix_core::Mode::Insert {
@@ -394,6 +473,11 @@ impl Editor {
             let name = Self::key_string_for_event(&Event::Key(*key))?;
             let lookup = if name == "Space" { " " } else { &name };
             if let Some(action) = bindings.get(lookup) {
+                if matches!(action, KeyAction::Nested(_)) {
+                    self.felix.native_prefix_owner = self.felix_owner();
+                } else {
+                    self.felix.session.cancel_pending();
+                }
                 return Some(action.clone());
             }
         }
@@ -1764,6 +1848,69 @@ mod tests {
         assert_ne!(selected, secondary);
         assert_eq!(eof, &editor.theme.synthetic_cursor_style(&Style::default()));
         assert_eq!(editor.cursor_text_position(), TextPosition::new(1, 0));
+    }
+
+    #[tokio::test]
+    async fn native_prefixes_consume_counts_on_completion_cancel_and_paste() {
+        let (mut editor, _, _) = fixture_editor("0123456789\n");
+        let key = |ch| Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        let escape = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let window = Event::Key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+
+        for prefix in [key(' '), window] {
+            for event in [key('2'), prefix, key('3')] {
+                editor.test_execute_event(event).await.unwrap();
+            }
+            assert_eq!(editor.felix.session.count(), Some(23));
+            assert!(editor.waiting_key_action.is_some());
+            editor.test_execute_event(escape.clone()).await.unwrap();
+            assert_eq!(editor.felix.session.count(), None);
+            assert!(editor.waiting_key_action.is_none());
+        }
+        for event in [key(' '), key('w'), key('n'), key('2'), escape.clone()] {
+            editor.test_execute_event(event).await.unwrap();
+        }
+        assert_eq!(editor.felix.session.count(), None);
+        assert!(editor.waiting_key_action.is_none());
+
+        editor.config.clipboard.enabled = false;
+        for event in [key('2'), key(' '), key('p')] {
+            editor.test_execute_event(event).await.unwrap();
+        }
+        assert_eq!(editor.felix.session.count(), None);
+
+        for event in [key('2'), key(' '), key('f')] {
+            editor.test_execute_event(event).await.unwrap();
+        }
+        assert!(editor.current_dialog.is_some());
+        editor.test_execute_event(escape).await.unwrap();
+        editor.test_execute_event(key('l')).await.unwrap();
+        assert_eq!(editor.cx, 1);
+
+        for event in [key(' '), key('2'), Event::Paste("X".into()), key('l')] {
+            editor.test_execute_event(event).await.unwrap();
+        }
+        assert_eq!(
+            editor.current_buffer().contents_snapshot().to_string(),
+            "0XX123456789\n"
+        );
+        assert_eq!(editor.cx, 3);
+    }
+
+    #[tokio::test]
+    async fn native_prefix_cannot_open_a_picker_after_a_document_switch() {
+        let (mut editor, mut frame, _) = fixture_editor("first document\n");
+        let key = |ch| Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        for event in [key('2'), key(' ')] {
+            editor.test_execute_event(event).await.unwrap();
+        }
+        editor.set_current_buffer(&mut frame, 1).await.unwrap();
+        // f is a fresh find in the second document, rather than Space f in the first.
+        editor.test_execute_event(key('f')).await.unwrap();
+        assert!(editor.current_dialog.is_none());
+        editor.test_execute_event(key('b')).await.unwrap();
+        assert_eq!(editor.cx, 6);
+        assert_eq!(editor.felix.session.count(), None);
     }
 
     #[tokio::test]

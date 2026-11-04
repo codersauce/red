@@ -17509,6 +17509,10 @@ impl Editor {
             self.mouse_selection.last_click = None;
             self.note_user_input();
         }
+        #[cfg(feature = "helix")]
+        if let Some(action) = self.felix_native_prefix_event(ev) {
+            return Ok(Some(action));
+        }
         if let Some(action) = self.handle_keyboard_shortcuts_event(ev, runtime) {
             return Ok(Some(action));
         }
@@ -22451,21 +22455,8 @@ impl Editor {
             | Action::FelixClipboardYank
             | Action::FelixClipboardYankPrimary
             | Action::FelixClipboardReplace => {
-                if let Some(owner) = self.felix_owner() {
-                    let input = match action {
-                        Action::FelixClipboardBefore => {
-                            felix::Input::ClipboardPaste(felix_core::Paste::Before)
-                        }
-                        Action::FelixClipboardAfter => {
-                            felix::Input::ClipboardPaste(felix_core::Paste::After)
-                        }
-                        Action::FelixClipboardReplace => felix::Input::ClipboardReplace,
-                        _ => felix::Input::ClipboardYank {
-                            primary: matches!(action, Action::FelixClipboardYankPrimary),
-                        },
-                    };
-                    self.execute_felix(input, owner, buffer, runtime).await?;
-                }
+                self.execute_felix_clipboard(action, buffer, runtime)
+                    .await?;
                 return Ok(Some((true, false)));
             }
             Action::MousePress {

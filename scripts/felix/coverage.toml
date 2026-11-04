@@ -5,8 +5,11 @@ fields = ["key", "document", "text", "mode", "ranges", "primary", "pending", "co
 
 [[area]]
 name = "Modes and pending input"
-cases = ["typed-selection", "reverse-at-eof", "empty-rope", "cancel-arguments-normal", "cancel-arguments-select"]
-remaining = ["Complete mode/count/argument/cancellation matrix"]
+cases = ["typed-selection", "reverse-at-eof", "empty-rope", "cancel-arguments-normal", "cancel-arguments-select",
+         "modified-arguments-normal", "modified-arguments-select", "line-ending-arguments-normal", "line-ending-arguments-select",
+         "count-recovery-normal", "count-recovery-select", "repeat-argument-normal", "repeat-argument-select",
+         "paste-pending-normal", "paste-pending-select", "repeat-multiple-finds"]
+remaining = ["Command-by-command count coverage and asynchronous focus changes while awaiting an argument"]
 
 [[area]]
 name = "Movement and navigation"
