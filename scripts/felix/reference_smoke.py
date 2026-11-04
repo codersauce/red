@@ -33,7 +33,8 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
     root.mkdir()
     workdir = root / "work"
     workdir.mkdir()
-    fixture = root / ("example.rs" if scenario == "completion" else "example.txt")
+    completion = scenario in ("completion", "completion-repeat")
+    fixture = root / ("example.rs" if completion else "example.txt")
     split_search = scenario in ("split-search", "wrapped-split-search")
     wrapped = scenario == "wrapped-split-search"
     horizontal = scenario == "horizontal"
@@ -41,6 +42,8 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
     if horizontal:
         fixture.write_text("a👩‍💻B\t界C" + "0123456789" * 8 + "\n" + ruler
                            + "\n" + "." * 22 + "👩‍💻Z\n")
+    elif scenario == "clipboard":
+        fixture.write_text("a bb\n")
     elif wrapped:
         # Each tag starts one 36-cell display row on the same logical line.
         fixture.write_text("".join(f"ROW-{n:03}\t👩‍💻界\u200b" + "x" * 21 for n in range(1, 101)) + "\n")
@@ -64,17 +67,21 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
     }
 
     state = root / "lsp-state.json"
-    if scenario == "completion":
+    if completion:
         server = Path(__file__).resolve().parents[1] / "edit_replay_lsp.py"
         args = [str(server), "--mode", "incremental", "--state", str(state), "--completion"]
         command = f"command = {json.dumps(sys.executable)}\nargs = {json.dumps(args)}\n"
-    if scenario == "completion" and not red:
+    if completion and not red:
         config = root / "config/helix"
         config.mkdir(parents=True)
         (config / "languages.toml").write_text(
             '[[language]]\nname = "rust"\nlanguage-servers = ["felix-test"]\n[language-server.felix-test]\n' + command
         )
         (config / "config.toml").write_text('[editor]\nauto-completion = false\n')
+    if scenario == "clipboard" and not red:
+        config = root / "config/helix"
+        config.mkdir(parents=True)
+        (config / "config.toml").write_text('[editor]\nclipboard-provider = "termcode"\n')
     if horizontal and not red:
         config = root / "config/helix"
         config.mkdir(parents=True)
@@ -97,9 +104,12 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
         (config / "config.toml").write_text(
             window_config + 'editing_model = "helix"\ndisable_ai = true\nsplash = false\n'
             'show_whats_new = false\nfetch_release_notes = false\n[lsp]\n'
-            + ('enabled = true\n[completion]\nauto_trigger = false\n[lsp.servers.rust]\n'
+            + ('enabled = true\n[completion]\nauto_trigger = false\n'
+               + ('buffer_words = false\n' if scenario == "completion-repeat" else "")
+               + '[lsp.servers.rust]\n'
                'language_id = "rust"\nfile_extensions = ["rs"]\nroot_markers = []\n' + command
-               if scenario == "completion" else 'enabled = false\n')
+               if completion else 'enabled = false\n')
+            + ('[clipboard]\nbackend = "osc52"\nenabled = true\n' if scenario == "clipboard" else "")
         )
 
     if trace is not None:
@@ -312,6 +322,37 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
             tmux("resize-window", "-x", "80", "-y", "24", "-t", "oracle:0")
             check_prompt("reveal query after resize", "12345 12345 12345 12345 12界xy", 37)
             return checkpoints
+        if scenario == "completion-repeat":
+            observe("open", "foo foo", "NOR", "1 sel")
+            observe_server("foo foo\n")
+            line = "foo foo"
+            tmux("send-keys", "A")
+            for keys, word in [(["C-n"], "FelixCandidate"), (["C-n", "C-n"], "FelixOther")]:
+                tmux("send-keys", "Space", "F", "C-x")
+                observe("request " + word, line + " F", "INS", "1 sel", menu=True)
+                tmux("send-keys", *keys, "Enter")
+                line += " " + word
+                observe("accept " + word, line, "INS", "1 sel", menu=False)
+                observe_server(line + "\n")
+            tmux("send-keys", "!", "Escape")
+            line += "!"
+            observe("finish insert", line, "NOR", "1 sel")
+            requests = observe_server(line + "\n")["completion_requests"]
+            tmux("send-keys", "g", "n")
+            observe("switch document", "other buffer", "NOR", "1 sel", other.name)
+            repeated = "other buffer" + " FelixCandidate FelixOther!" * 2
+            for keys, label, expected in [
+                (["2", "."], "counted completion replay", repeated),
+                (["u"], "undo both repetitions", "other buffer"),
+                (["U"], "redo both repetitions", repeated),
+            ]:
+                tmux("send-keys", *keys)
+                observe(label, expected, "NOR", "1 sel", other.name)
+            tmux("send-keys", "g", "p")
+            observe("return to original", line, "NOR", "1 sel")
+            if observe_server(line + "\n")["completion_requests"] != requests:
+                raise RuntimeError("replay requested a new completion")
+            return checkpoints
         if scenario == "completion":
             observe("open", "foo foo", "NOR", "1 sel")
             observe_server("foo foo\n")
@@ -431,6 +472,21 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
             for key, first in [("PageDown", 23), ("PageDown", 36), ("PageUp", 14), ("PageUp", 1)]:
                 tmux("send-keys", key)
                 observe_page(first)
+            return checkpoints
+        if scenario == "clipboard":
+            observe("open", "a bb", "NOR", "1 sel")
+            tmux("send-keys", "%", "s", "[a-z]+", "Enter")
+            observe("select both words", "a bb", "NOR")
+            for keys, line in [
+                (["Space", "y", "Space", "p"], "aa bbbb"),
+                (["u"], "a bb"),
+                (["Space", "P"], "aa bbbb"),
+                (["u", "r", "x"], "x xx"),
+                (["Space", "R"], "a bb"),
+                (["Space", "Y", "Space", "R"], "a a"),
+            ]:
+                tmux("send-keys", *keys)
+                observe(" ".join(keys), line, "NOR")
             return checkpoints
         if scenario == "selection-errors":
             observe("open", "foo foo", "NOR", "1 sel")
@@ -573,7 +629,8 @@ def main():
                                       red=True, scenario="prefix-count") if args.candidate else None)
             additional_traces = {}
             for scenario, directory in (("split-search", "split"), ("wrapped-split-search", "wrap"),
-                                        ("selection-errors", "sel")):
+                                        ("selection-errors", "sel"), ("clipboard", "clip"),
+                                        ("completion-repeat", "cr")):
                 key = scenario.replace("-", "_")
                 additional_traces[key] = run_trace(bundle, root / f"release-{directory}", scenario=scenario)
                 additional_traces[f"red_{key}"] = (run_trace(bundle, root / f"red-{directory}",

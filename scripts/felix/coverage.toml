@@ -43,7 +43,8 @@ remaining = []
 [[area]]
 name = "Editing and clipboard"
 cases = ["yank-paste-replace", "counted-register-edits", "bracketed-paste-modes", "reverse-register-edits", "empty-register", "whole-line-change", "indent-join"]
-remaining = ["Clipboard transport interoperability", "Language-specific indentation and joins"]
+terminal = ["clipboard"]
+remaining = ["Language-specific indentation and joins"]
 
 [[area]]
 name = "Insert behavior"
@@ -53,4 +54,5 @@ remaining = ["Completion preview layout in decorated and split views, nested or 
 [[area]]
 name = "Undo and repeat"
 cases = ["append-and-undo", "repeat-count", "repeat-bracketed-paste", "repeat-change", "repeat-checkpoint"]
-remaining = ["Counted completion repeats across documents, and repeats containing multiple accepted completions"]
+terminal = ["repeat", "completion", "completion-repeat"]
+remaining = []

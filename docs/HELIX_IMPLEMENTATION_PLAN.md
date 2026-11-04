@@ -232,10 +232,11 @@ Helix editing in embedded surfaces is a separately scoped follow-up, to revisit 
 
 ## Agreed application policies
 
-The user accepted all four application policies below.
+The user accepted the application policies below.
 
 | Policy | Agreed behavior | Consequence |
 | --- | --- | --- |
+| External clipboard changes | Use the entire external value whenever it differs from the last successful clipboard yank, including an appended suffix. | Helix 25.07.1 treats a prefix match as unchanged. Red preserves per-selection fragments only on an exact match or a successful yank to a write-only transport. |
 | Save behavior | Use Red's configured formatting and whitespace policy in both editing modes. | Record save-policy differences from Helix explicitly and test that save-time edits correctly transform selections and history. Do not change the pinned oracle's defaults to hide the difference. |
 | Embedded editing after M1 | Keep M2 focused on document windows; scope Helix editing in composers and panel inputs as a separate follow-up. | Broad document compatibility can proceed immediately without adding a second class of editing surfaces to its gate. Revisit embedded editing after M2 acceptance. |
 | Ordinary-release inclusion | Include compiled-in Helix in the next planned ordinary release after the full M1 acceptance gate passes, with Vim still selected by default. | M2 starts immediately after M1 acceptance and does not wait for that release. Feature-disabled builds remain supported and tested. |

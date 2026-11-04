@@ -8,6 +8,8 @@ use anyhow::Context as _;
 use felix_core::{History, HostAction, Range as FelixRange, Selections, Session};
 use std::collections::HashMap;
 
+const CLIPBOARD_SEPARATOR: &str = if cfg!(windows) { "\r\n" } else { "\n" };
+
 static NATIVE_KEYS: std::sync::LazyLock<crate::config::Keys> = std::sync::LazyLock::new(|| {
     let mut keys: crate::config::Keys = toml::from_str(include_str!("felix_bindings.toml"))
         .expect("invalid built-in Felix host bindings");
@@ -685,7 +687,10 @@ impl Editor {
                     self.set_legacy_message(Some("Clipboard is disabled".into()));
                     return self.render(frame);
                 }
-                if let Err(err) = self.clipboard.copy(&values.join("\n"), &mut self.stdout) {
+                if let Err(err) = self
+                    .clipboard
+                    .copy(&values.join(CLIPBOARD_SEPARATOR), &mut self.stdout)
+                {
                     self.set_legacy_message(Some(format!("Clipboard write failed: {err}")));
                     return self.render(frame);
                 }
@@ -698,19 +703,26 @@ impl Editor {
                     return self.render(frame);
                 }
                 let value = match self.clipboard.read_text().await {
-                    Ok(Some(value)) => value,
+                    Ok(value @ Some(_)) => value,
+                    Ok(None)
+                        if self.clipboard.uses_saved_yank() && !self.felix.clipboard.is_empty() =>
+                    {
+                        None
+                    }
                     Ok(None) => return Ok(()),
                     Err(err) => {
                         self.set_legacy_message(Some(format!("Clipboard read failed: {err}")));
                         return self.render(frame);
                     }
                 };
-                let values = if !self.felix.clipboard.is_empty()
-                    && self.felix.clipboard.join("\n") == value
-                {
-                    &self.felix.clipboard[..]
-                } else {
-                    std::slice::from_ref(&value)
+                let values = match &value {
+                    Some(external)
+                        if self.felix.clipboard.is_empty()
+                            || self.felix.clipboard.join(CLIPBOARD_SEPARATOR) != *external =>
+                    {
+                        std::slice::from_ref(external)
+                    }
+                    _ => &self.felix.clipboard,
                 };
                 if let Input::ClipboardPaste(placement) = input {
                     self.felix.session.paste(text, &initial, values, placement)
@@ -1701,6 +1713,50 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attached_clipboard_keeps_matching_fragments_and_reads_external_changes() {
+        let (mut editor, _, _) = fixture_editor("a bb\n");
+        let clipboard = crate::clipboard::ClientClipboard::default();
+        clipboard.set_attached(true);
+        editor.test_set_clipboard(Box::new(clipboard.clone()));
+        editor.config.clipboard.enabled = true;
+        let key = |ch| Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        for event in "%s[a-z]+".chars().map(key).chain([
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            key('y'),
+            key(' '),
+            key('y'),
+        ]) {
+            editor.test_execute_event(event).await.unwrap();
+        }
+        assert_eq!(clipboard.take_write().as_deref(), Some("a\nbb"));
+        clipboard.finish_input();
+        for (response, expected) in [
+            (Ok(None), "a bb\n"),
+            (Err("client failed".into()), "a bb\n"),
+            (Ok(Some("a\nbb".into())), "aa bbbb\n"),
+            (Ok(Some("ZZ".into())), "aZZ bbZZ\n"),
+            (Ok(Some("a\nbbXYZ".into())), "aa\nbbXYZ bba\nbbXYZ\n"),
+        ] {
+            clipboard.begin_input(None);
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            clipboard.set_reader(tx);
+            let reply =
+                tokio::spawn(async move { rx.recv().await.unwrap().send(response).unwrap() });
+            for ch in [' ', 'p'] {
+                editor.test_execute_event(key(ch)).await.unwrap();
+            }
+            reply.await.unwrap();
+            clipboard.finish_input();
+            assert_eq!(editor.current_buffer().contents(), expected);
+            if expected != "a bb\n" {
+                editor.test_execute_event(key('u')).await.unwrap();
+            }
+            assert_eq!(editor.felix.unnamed, ["a", "bb"]);
+        }
+    }
+
     #[tokio::test]
     async fn clipboard_replace_repeats_external_text_with_document_line_endings() {
         let (mut editor, mut frame, mut runtime) = fixture_editor("aa bb\r\n");
@@ -1759,7 +1815,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(storage.lock().unwrap().as_deref(), Some("a\nbb"));
+        assert_eq!(
+            storage.lock().unwrap().as_deref(),
+            Some(["a", "bb"].join(CLIPBOARD_SEPARATOR).as_str())
+        );
         let owner = editor.felix_owner().unwrap();
         editor
             .execute_felix(

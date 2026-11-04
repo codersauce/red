@@ -27,6 +27,11 @@ pub trait ClipboardProvider: Send {
     fn is_available(&self) -> bool {
         true
     }
+    /// True for a configured write-only clipboard route. Its last successful yank
+    /// is the only value the editor can paste until the terminal sends a paste event.
+    fn uses_saved_yank(&self) -> bool {
+        false
+    }
     /// Reads the current text value, returning `None` when no text is available.
     fn get_text(&mut self) -> anyhow::Result<Option<String>>;
     /// The detached bridge requests text only when an editing action actually pastes.

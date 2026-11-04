@@ -172,6 +172,11 @@ impl ClipboardProvider for SessionClipboard {
         self.backend != ClipboardBackend::None
     }
 
+    fn uses_saved_yank(&self) -> bool {
+        self.backend == ClipboardBackend::Osc52
+            || (self.backend == ClipboardBackend::Native && !self.config.sync_on_paste)
+    }
+
     fn get_text(&mut self) -> anyhow::Result<Option<String>> {
         if !self.config.sync_on_paste {
             return Ok(None);
