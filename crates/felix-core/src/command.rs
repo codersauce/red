@@ -600,6 +600,19 @@ impl Session {
             p.next.goals.clear();
             p.next.visual_goals.clear();
         }
+        // Prefix maps still accept counts. Prompts and commands waiting for
+        // a character (such as f and r) consume a digit as their argument.
+        if self.mode != Mode::Insert
+            && matches!(self.pending, Pending::None | Pending::Goto | Pending::Match)
+            && let [digit @ b'0'..=b'9'] = key.as_bytes()
+            && (*digit != b'0' || self.count.is_some())
+        {
+            let next = self.count.unwrap_or(0) * 10 + (digit - b'0') as usize;
+            if next <= 100_000_000 {
+                p.next.count = Some(next);
+            }
+            return p;
+        }
         match &self.pending {
             Pending::Regex {
                 original,
@@ -778,15 +791,6 @@ impl Session {
         }
         if self.mode == Mode::Insert {
             p.insert_key(text, selections, key, context);
-            return p;
-        }
-        if let [digit @ b'0'..=b'9'] = key.as_bytes()
-            && (*digit != b'0' || self.count.is_some())
-        {
-            let next = self.count.unwrap_or(0) * 10 + (digit - b'0') as usize;
-            if next <= 100_000_000 {
-                p.next.count = Some(next);
-            }
             return p;
         }
         if key != "g" && key != "m" {

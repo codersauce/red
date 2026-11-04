@@ -67,6 +67,14 @@ def scenarios(seed, steps):
     yield "reverse-register-edits", "abc def\n", list("wywe") + ["<a-;>", "2", "R", "u", "U"]
     yield "character-arguments", "abc db e!\n", list("fb") + ["<a-.>"] + list("TbFr") + ["<esc>"] + list("ggvre") + ["<esc>"]
     yield "line-selections", "a\r\nbc\r\ndef", list("x2x") + ["<a-s>", ")", "<a-->", "<a-;>", "X", "<a-x>"]
+    for mode, initial in (("normal", []), ("select", ["v"])):
+        keys = initial.copy()
+        for prefix in ("g", "m", "mi", "ma", "f", "F", "t", "T", "r"):
+            for cancel in ("<esc>", "<left>"):
+                keys.extend(["2", *prefix, cancel])
+        keys += list("2g9l3m4ll") + ["<esc>"] + list("123456789012345") + ["<esc>"]
+        keys += list("g2gm2i(ggf2r3") + ["<esc>"]
+        yield f"cancel-arguments-{mode}", "abc 123 abc\nline two\n", keys
     yield "typed-selection", "abcd\n", list("eliX") + ["<esc>"] + list("uU")
     yield "vertical-goal", "abcdef\nxy\nuvwxyz\n", list("4ljjkkvjj") + ["<esc>"]
     yield "repeat-bracketed-paste", "ab cd\n", ["i", "X", {"paste":"é😀"}, "Y", "<esc>", ".", "u", "u", "u", "u", "U"]

@@ -5,7 +5,7 @@ fields = ["key", "document", "text", "mode", "ranges", "primary", "pending", "co
 
 [[area]]
 name = "Modes and pending input"
-cases = ["typed-selection", "reverse-at-eof", "empty-rope"]
+cases = ["typed-selection", "reverse-at-eof", "empty-rope", "cancel-arguments-normal", "cancel-arguments-select"]
 remaining = ["Complete mode/count/argument/cancellation matrix"]
 
 [[area]]
