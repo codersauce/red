@@ -12,6 +12,7 @@ import sys
 import time
 
 sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import workspace_scroll_bench as base
 
 FRAME_START = b"\x1b[?25l\x1b[?7l"
@@ -66,9 +67,8 @@ class Driver(base.Driver):
         raise TimeoutError("terminal output did not settle")
 
     def position(self, phase):
-        # All phases begin in the same source region. M and a short alternating
-        # motion stay inside the viewport; repeated directional keys reach its
-        # boundary before the measured interval starts.
+        # Short alternating motions stay inside the viewport. Directional phases
+        # approach a viewport boundary before the measured interval starts.
         # Counted G sets the document cursor in both editing models.
         self.send(f"{self.args.start_line}G".encode())
         if phase in ("down", "up"):

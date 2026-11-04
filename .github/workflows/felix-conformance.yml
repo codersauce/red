@@ -25,6 +25,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Check benchmark trace parsing
+        run: python3 -m unittest discover -s scripts -p test_perf_trace.py
       - name: Check out pinned Helix
         uses: actions/checkout@v4
         with:

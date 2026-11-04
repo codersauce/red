@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 import tempfile
 import threading
@@ -15,7 +16,7 @@ import time
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from workspace_scroll_bench import Driver, stats
-from perf_trace import TIMING
+from perf_trace import EVENT, TIMING
 
 BEGIN = b"\x1b[?2026h"
 END = b"\x1b[?2026l"
@@ -27,6 +28,7 @@ class InputDriver(Driver):
     """Observe the position Red actually emitted at the end of synchronized frames."""
 
     def __init__(self, args):
+        self.launched = time.monotonic_ns()
         self.changed = threading.Condition()
         self.frames = []
         super().__init__(args)
@@ -84,42 +86,74 @@ class InputDriver(Driver):
 def workload(args):
     binary = Path(args.binary).resolve(strict=True)
     fixture_line = 'fn value() { let x = 123; }'
-    with tempfile.TemporaryDirectory(prefix="felix-input-") as scratch:
+    if args.unicode:
+        fixture_line += ' // 界 👩‍💻 é'
+    scratch_parent = args.project_root.resolve() / "target" if args.project_root else None
+    with tempfile.TemporaryDirectory(prefix="felix-input-", dir=scratch_parent) as scratch:
         root = Path(scratch)
         file = root / ("fixture." + args.extension)
-        source = ((fixture_line + 'x' * args.padding + '\n') * args.lines).encode()
+        source = ((fixture_line + 'x' * args.padding + ('\r\n' if args.crlf else '\n')) * args.lines).encode()
         if args.source:
             source = args.source.read_bytes()
             file = root / args.source.name
         file.write_bytes(source)
-        args.root, args.file, args.split_file = root, file, file
+        args.root = args.project_root.resolve() if args.project_root else root
+        args.file, args.split_file = file, file
         args.output = root / "capture"
         args.binary = binary
         args.lsp = False
         args.config_override = [f"editing_model={args.model}", "disable_ai=true",
                                 "formatting.on_save=false", *args.config_override]
         driver = InputDriver(args)
+        sampler = None
         try:
             if args.split:
                 driver.send(b"\x17v")
                 time.sleep(0.25)
             row = args.line or max(2, len(source.splitlines()) // 2)
             now = time.monotonic_ns()
-            driver.send(f"{row}G".encode())
+            if args.command_jump:
+                driver.command(str(row))
+            else:
+                driver.send(f"{row}G".encode())
             driver.wait_position((row, 1), now)
-            if args.scenario == "typing":
+            typing = args.scenario in ("typing", "newline")
+            if typing:
                 driver.send(b"i")
-                cycle = [(b"x", 0, 1), (b" ", 0, 1), (b"\x7f", 0, -1), (b"\x7f", 0, -1)]
+                cycle = [(("λ" if args.unicode else "x").encode(), 0, 1), (b" ", 0, 1), (b"\x7f", 0, -1), (b"\x7f", 0, -1)]
+                if args.scenario == "newline":
+                    cycle = [(b"\r", 1, 0), (b"\x7f", -1, 0)]
+            elif args.scenario == "word":
+                # On "fn value", Helix selects through the space and Vim lands on v.
+                distance = 2 if args.model == "helix" else 3
+                cycle = [(b"w", 0, distance), (b"b", 0, -distance)]
+            elif args.scenario == "arrows":
+                cycle = [(b"\x1b[C", 0, 1), (b"\x1b[D", 0, -1)]
+            elif args.scenario == "select":
+                driver.send(b"v")
+                cycle = [(b"l", 0, 1), (b"h", 0, -1)]
             elif args.scenario == "horizontal":
                 cycle = [(b"l", 0, 1), (b"h", 0, -1)]
             else:
                 cycle = [(b"j", 1, 0), (b"k", -1, 0)]
             time.sleep(0.15)
+            warmup_event_start = (sum(1 for _ in EVENT.finditer(driver.read_log()))
+                                  if args.perf_mode == "trace" else 0)
             col = 1
             latencies = []
             bytes_before = offset = 0
             for index in range(args.warmup + args.events):
                 if index == args.warmup:
+                    # The frame can precede its enclosing event's trace record.
+                    # Wait for the final warmup handler to finish outside the sample window.
+                    if args.perf_mode == "trace" and args.warmup:
+                        driver.wait_for(lambda: sum(1 for _ in EVENT.finditer(driver.read_log()))
+                                        >= warmup_event_start + args.warmup, 10, "warmup events")
+                    if args.sample:
+                        sampler = subprocess.Popen(["sample", str(driver.process.pid), "3", "1",
+                                                    "-file", str(args.sample.resolve())],
+                                                   stdout=subprocess.DEVNULL)
+                    frame_start = len(driver.frames)
                     bytes_before = driver.bytes
                     offset = driver.log.stat().st_size if driver.log.exists() else 0
                 key, dy, dx = cycle[index % len(cycle)]
@@ -134,6 +168,7 @@ def workload(args):
                 if remaining > 0:
                     time.sleep(remaining)
             output_bytes = driver.bytes - bytes_before
+            frame_count = len(driver.frames) - frame_start
             time.sleep(0.05)
             spans = {}
             if args.perf_mode == "trace":
@@ -147,12 +182,13 @@ def workload(args):
             inserted = b""
             if args.burst:
                 # For motion, the final j is an unambiguous barrier after a reversal.
-                if args.scenario == "typing":
+                if typing:
                     inserted = b"ordinary typing "
                     keys = inserted
                     col += len(inserted)
                 else:
-                    keys = b"l" * 12 + b"h" * 12 + b"j"
+                    keys = b"l" * 12 + b"h" * 5 + b"j"
+                    col += 7
                     row += 1
                 start = time.monotonic_ns()
                 for key in keys:
@@ -164,7 +200,10 @@ def workload(args):
                 burst = dict(inputs=len(keys), elapsed_us=(shown - start) // 1000,
                              drain_us=max(0, (shown - last_send) // 1000))
             # The edit marker verifies the document cursor independently of the statusline.
-            if args.scenario != "typing":
+            if args.scenario == "select":
+                driver.send(b"\x1b")
+                time.sleep(0.1)
+            if not typing:
                 driver.send(b"i")
             driver.send(b"Z\x1b")
             time.sleep(0.1)
@@ -178,23 +217,33 @@ def workload(args):
             with binary.open("rb") as stream:
                 binary_hash = hashlib.file_digest(stream, "sha256").hexdigest()
             return dict(model=args.model, scenario=args.scenario, events=args.events,
-                        warmup=args.warmup, lines=len(expected), extension=args.extension,
+                        warmup=args.warmup, lines=len(expected), extension=file.suffix.lstrip("."),
+                        unicode=args.unicode, crlf=args.crlf, project_root=str(args.project_root or ""),
                         rows=args.rows, cols=args.cols, padding=args.padding, split=args.split,
                         perf_mode=args.perf_mode, interval_ms=args.interval_ms,
-                        binary_sha256=binary_hash,
+                        binary_sha256=binary_hash, config_overrides=args.config_override,
+                        frames_with_position=frame_count,
+                        launch_to_first_status_us=(driver.frames[0][0] - driver.launched) // 1000,
                         source_file=file.name, source_sha256=hashlib.sha256(source).hexdigest(),
                         output_bytes=output_bytes, burst=burst, latency=stats(latencies), latency_us=latencies,
                         spans={key: stats(values) for key, values in spans.items()})
         finally:
-            driver.close()
+            try:
+                if sampler and sampler.wait(timeout=15) != 0:
+                    raise RuntimeError("process sampling failed")
+            finally:
+                driver.close()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True)
     parser.add_argument("--model", choices=("helix", "vim"), required=True)
-    parser.add_argument("--scenario", choices=("typing", "horizontal", "vertical"), required=True)
+    parser.add_argument("--scenario", choices=("typing", "horizontal", "vertical", "arrows", "select", "newline", "word"), required=True)
+    parser.add_argument("--project-root", type=Path, help="use this workspace and put scratch files under its target directory")
     parser.add_argument("--source", type=Path, help="copy a real fixture into the isolated workspace")
+    parser.add_argument("--sample", type=Path, help="write a three-second macOS process sample during measurement")
+    parser.add_argument("--command-jump", action="store_true", help="position using Red's numeric colon command")
     parser.add_argument("--line", type=int, help="one-based unindented starting line")
     parser.add_argument("--lines", type=int, default=2000)
     parser.add_argument("--events", type=int, default=1000)
@@ -207,9 +256,12 @@ if __name__ == "__main__":
     parser.add_argument("--rows", type=int, default=40)
     parser.add_argument("--cols", type=int, default=120)
     parser.add_argument("--split", action="store_true")
+    parser.add_argument("--unicode", action="store_true")
+    parser.add_argument("--crlf", action="store_true")
     parser.add_argument("--burst", action="store_true")
     parser.add_argument("--burst-ms", type=float, default=0)
     args = parser.parse_args()
-    if args.lines < 4 or args.events < 4 or args.warmup % 4 or args.events % 4:
+    if (args.lines < 4 or args.events < 4 or args.warmup < 0 or args.warmup % 4
+            or args.events % 4 or args.padding < 0 or min(args.interval_ms, args.burst_ms) < 0):
         parser.error("use at least four lines and whole four-input cycles")
     print(json.dumps(workload(args)))

@@ -67,3 +67,28 @@ python3 scripts/edit_replay_bench.py --binary target/debug/red --scenario felix-
 ```
 
 See the [milestone acceptance criteria](../../docs/HELIX_IMPLEMENTATION_PLAN.md) for the remaining command families and host workflows.
+
+### Ordinary typing and cursor latency
+
+Run from the repository root on an idle machine with Python 3.11 or newer. Build the same revision with the same dependencies in both profiles. On the reference Mac, set `CARGO_RESOLVER_LOCKFILE_PATH="$PWD/target/red-local/Cargo.lock"` in the environment of the Cargo commands. The local override is recorded in [input-baseline.json](input-baseline.json).
+
+```sh
+CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 cargo build --locked --features helix --bin red
+CARGO_INCREMENTAL=0 cargo build --locked --release --features helix --bin red
+sh scripts/felix/input-matrix.sh target/debug/red target/release/red target/felix-perf/results local
+python3 scripts/felix/performance.py --binary target/debug/red
+```
+
+The matrix alternates editing-model order across five repetitions. Each run sends 100 warmup inputs followed by 1,000 measured inputs and writes its raw observations to a separate JSON file. A sample ends when a complete PTY frame shows the expected source position. Each run also saves and compares the entire disposable fixture. The gate compares the median of the five run percentiles to the [recorded calibration](input-baseline.json). Absolute timings are specific to the reference machine. CI checks behavior and redraw counts.
+
+For a quick investigation, substitute a real file with `--source`. The runner copies it and edits only the copy. Use an unindented, nonempty line with text to its right for this workload. To include project discovery, pass `--project-root "$PWD"`. The scratch copy then lives under the project's existing `target` directory.
+
+```sh
+python3 scripts/felix/input_bench.py --binary target/debug/red --model helix \
+  --source README.md --line 4 --scenario typing --cols 200 --rows 60 \
+  --events 40 --warmup 4 --perf-mode trace
+python3 scripts/felix/input_bench.py --binary target/release/red --model helix \
+  --scenario horizontal --events 40 --warmup 4 --burst --burst-ms 10
+```
+
+The paced burst reports time through the last expected frame and time from the last write until that frame. Motion reverses direction and ends on a distinct row and column. The document marker verifies the destination. On macOS, add `--sample FILE` to a longer diagnostic run to collect a separate process sample. Compare gating runs with instrumentation disabled.

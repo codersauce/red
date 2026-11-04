@@ -9,9 +9,9 @@ import json
 from pathlib import Path
 from statistics import median
 
+BASELINE = Path(__file__).with_name("input-baseline.json")
+
 SCENARIOS = ("typing", "horizontal", "vertical")
-MATCH = ("source_sha256", "rows", "cols", "events", "warmup", "perf_mode",
-         "interval_ms", "scenario", "model", "split", "padding")
 
 
 def runs(directory, label, profile, scenario, model):
@@ -24,26 +24,38 @@ def main():
     parser.add_argument("directory", type=Path)
     parser.add_argument("label")
     args = parser.parse_args()
+    calibration = json.loads(BASELINE.read_text())
     report = []
+    profile_hashes = {}
     for profile in ("dev", "release"):
         for scenario in SCENARIOS:
-            control = runs(args.directory, "baseline", profile, scenario, "vim")
+            reference = calibration["profiles"][profile]["runs"][scenario]
+            control = reference["vim"]
             for model in ("helix", "vim"):
-                base = runs(args.directory, "baseline", profile, scenario, model)
+                base = reference[model]
                 candidate = runs(args.directory, args.label, profile, scenario, model)
-                for row in base + candidate:
-                    if (any(row[key] != base[0][key] for key in MATCH) or
-                            row["events"] != row["latency"]["count"] or row["events"] < 1000):
+                overrides = [f"editing_model={model}", "disable_ai=true", "formatting.on_save=false"]
+                for row in candidate:
+                    if row["config_overrides"] != overrides or row["burst"] or row["project_root"]:
+                        raise ValueError("candidate uses different editor settings or pacing")
+                    if profile_hashes.setdefault(profile, row["binary_sha256"]) != row["binary_sha256"]:
+                        raise ValueError(f"mixed {profile} binaries in candidate series")
+                    if (row["model"] != model or row["scenario"] != scenario or
+                            any(row[k] != v for k, v in calibration["workload"].items()) or
+                            row["events"] != row["latency"]["count"] or
+                            len(row["latency_us"]) != row["events"] or row["events"] < 1000):
                         raise ValueError("input workload or measurement count mismatch")
                 for percentile, ceiling in (("p95_us", 16000), ("p99_us", 33000)):
                     # The absolute user-facing cap also applies when both modes are slow.
                     # Allow one millisecond of workstation jitter on fast interactions.
-                    limit = min(ceiling, 1000 + max(r["latency"][percentile] for r in base),
-                                1000 + max(r["latency"][percentile] for r in control))
+                    limit = min(ceiling, 1000 + max(base[percentile]),
+                                1000 + max(control[percentile]))
                     measured = median(r["latency"][percentile] for r in candidate)
                     report.append(dict(profile=profile, scenario=scenario, model=model,
                                        metric=percentile, limit_us=limit, result_us=measured,
                                        passed=measured <= limit))
+    if profile_hashes["dev"] == profile_hashes["release"]:
+        raise ValueError("development and release profiles use the same binary")
     print(json.dumps(report, indent=2))
     return 0 if all(row["passed"] for row in report) else 1
 
