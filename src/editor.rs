@@ -24160,8 +24160,10 @@ impl Editor {
                     }
                 }
                 Action::GoToLine(line) => {
-                    self.go_to_line(*line, buffer, runtime, GoToLinePosition::Center)
-                        .await?
+                    self.position_at_line(*line, GoToLinePosition::Center);
+                    #[cfg(feature = "helix")]
+                    self.sync_felix_host_jump();
+                    self.render(buffer)?;
                 }
                 Action::ExploreCommand(command) => {
                     add_to_history = false;
@@ -24455,10 +24457,11 @@ impl Editor {
                         .await?;
                 }
                 Action::MoveTo(x, y) => {
-                    self.go_to_line(*y, buffer, runtime, GoToLinePosition::Center)
-                        .await?;
+                    self.position_at_line(*y, GoToLinePosition::Center);
                     self.cx = std::cmp::min(*x, self.line_length().saturating_sub(1));
                     self.check_bounds();
+                    #[cfg(feature = "helix")]
+                    self.sync_felix_host_jump();
                     self.render(buffer)?;
                 }
                 Action::MoveToFilePos(file, x, y) => {
@@ -24746,8 +24749,8 @@ impl Editor {
                         if self.is_within_viewport(y) {
                             self.cy = y - self.vtop;
                         } else {
-                            self.go_to_line(y + 1, buffer, runtime, GoToLinePosition::Top)
-                                .await?;
+                            self.position_at_line(y + 1, GoToLinePosition::Top);
+                            self.render(buffer)?;
                         }
                         self.finish_cursor_motion(buffer, false)?;
                     }
@@ -24762,8 +24765,8 @@ impl Editor {
                         if self.is_within_viewport(y) {
                             self.cy = y - self.vtop;
                         } else {
-                            self.go_to_line(y + 1, buffer, runtime, GoToLinePosition::Top)
-                                .await?;
+                            self.position_at_line(y + 1, GoToLinePosition::Top);
+                            self.render(buffer)?;
                         }
                         self.finish_cursor_motion(buffer, false)?;
                     }
@@ -24838,8 +24841,8 @@ impl Editor {
                     let percent = (*percent).clamp(1, 100);
                     let line_count = self.current_buffer().navigable_line_count();
                     let line = (percent * line_count).div_ceil(100);
-                    self.go_to_line(line, buffer, runtime, GoToLinePosition::Center)
-                        .await?;
+                    self.position_at_line(line, GoToLinePosition::Center);
+                    self.render(buffer)?;
                     self.move_to_first_non_blank_on_current_line();
                     self.finish_cursor_motion(buffer, false)?;
                 }
@@ -29439,19 +29442,12 @@ impl Editor {
         Ok(())
     }
 
-    async fn go_to_line(
-        &mut self,
-        line: usize,
-        buffer: &mut RenderBuffer,
-        _runtime: &mut Runtime,
-        pos: GoToLinePosition,
-    ) -> anyhow::Result<()> {
+    fn position_at_line(&mut self, line: usize, pos: GoToLinePosition) {
         if line == 0 {
             self.vtop = 0;
             self.cy = 0;
             self.skipcol = 0;
-            self.render(buffer)?;
-            return Ok(());
+            return;
         }
 
         let y = line.saturating_sub(1).min(self.last_navigable_line());
@@ -29464,9 +29460,6 @@ impl Editor {
         };
         self.cy = y.saturating_sub(self.vtop);
         self.check_bounds();
-        self.render(buffer)?;
-
-        Ok(())
     }
 
     fn go_to_definition(&self, definition: &Map<String, Value>) -> Option<Action> {

@@ -141,15 +141,36 @@ impl Editor {
         }
     }
 
+    /// A host jump already positioned the viewport. Start the next Felix edit
+    /// at that destination without applying a second scroll operation.
+    pub(super) fn sync_felix_host_jump(&mut self) {
+        if self.config.editing_model != crate::config::EditingModel::Helix {
+            return;
+        }
+        let Some((doc, view, _, _)) = self.felix_owner() else {
+            return;
+        };
+        let state = self.felix_selection_at_cursor();
+        self.felix.selections.insert((doc, view), state);
+        self.snippet_session = None;
+        self.felix.session.cancel_pending();
+        self.felix.generation = self.felix.generation.wrapping_add(1);
+    }
+
+    fn felix_selection_at_cursor(&self) -> Selections {
+        let buffer = self.current_buffer();
+        let pos = buffer.position_to_char_idx(self.cursor_text_position());
+        let rope = buffer.contents_snapshot();
+        let text = rope.slice(..);
+        Selections::single(text, FelixRange::at(text, pos))
+    }
+
     pub(super) fn restore_felix_view(&mut self) {
         self.snippet_session = None;
-        let text = self.current_buffer().contents_snapshot();
-        let state = self.felix_active_selection().cloned().unwrap_or_else(|| {
-            let offset = self
-                .current_buffer()
-                .position_to_char_idx(self.cursor_text_position());
-            Selections::single(text.slice(..), FelixRange::at(text.slice(..), offset))
-        });
+        let state = self
+            .felix_active_selection()
+            .cloned()
+            .unwrap_or_else(|| self.felix_selection_at_cursor());
         self.set_felix_active_selection(state);
         self.felix.generation = self.felix.generation.wrapping_add(1);
         self.felix.session.cancel_pending();
@@ -1511,21 +1532,49 @@ mod tests {
     #[tokio::test]
     async fn cursor_row_repaint_matches_full_frame_including_the_previous_selection() {
         let (mut editor, mut frame, mut runtime) = fixture_editor("ab界c\nsecond\n");
+        editor.terminal_output_enabled = true;
         editor.render(&mut frame).unwrap();
         for key in ["l", "l", "j", "k", "h"] {
-            let before = frame.cells.clone();
-            let old_cursor = editor.last_rendered_cursor_position;
+            let full_renders = editor.full_render_count;
             let owner = editor.felix_owner().unwrap();
             editor
                 .execute_felix(Input::Key(key), owner, &mut frame, &mut runtime)
                 .await
                 .unwrap();
+            assert_eq!(
+                editor.full_render_count, full_renders,
+                "full redraw after {key}"
+            );
+            let presented = frame.cells.clone();
             editor.render(&mut frame).unwrap();
-            let expected = frame.cells.clone();
-            frame.cells = before;
-            editor.last_rendered_cursor_position = old_cursor;
-            editor.render_cursor_motion_delta(&mut frame).unwrap();
-            assert_eq!(frame.cells, expected, "after {key}");
+            assert_eq!(presented, frame.cells, "presented frame after {key}");
+        }
+    }
+
+    #[tokio::test]
+    async fn host_jumps_position_the_following_felix_edit() {
+        for (jump, expected) in [
+            (Action::GoToLine(3), "one\ntwo\n界Xthree\n"),
+            (Action::MoveTo(2, 3), "one\ntwo\n界tXhree\n"),
+        ] {
+            let (mut editor, mut frame, mut runtime) = fixture_editor("one\ntwo\n界three\n");
+            let owner = editor.felix_owner().unwrap();
+            editor
+                .execute_felix(Input::Key("l"), owner, &mut frame, &mut runtime)
+                .await
+                .unwrap();
+            editor
+                .execute(&jump, &mut frame, &mut runtime)
+                .await
+                .unwrap();
+            for key in ["i", "X", "<esc>"] {
+                let owner = editor.felix_owner().unwrap();
+                editor
+                    .execute_felix(Input::Key(key), owner, &mut frame, &mut runtime)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(editor.current_buffer().contents(), expected);
         }
     }
 

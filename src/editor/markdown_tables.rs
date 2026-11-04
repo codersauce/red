@@ -1739,6 +1739,21 @@ mod tests {
     }
 
     #[test]
+    fn reuse_table_layout_after_prose_edits_but_invalidate_when_a_fence_hides_it() {
+        let mut editor = editor("Intro\n\nA | B\n--- | ---\none | two\n", 60, 15);
+        let window = editor.active_window_with_editor_view().unwrap();
+        let original = editor.markdown_table_layout(&window).unwrap();
+        assert!(projected(&editor, 2));
+        editor.current_buffer_mut().insert_str(0, 0, "Updated ");
+        let updated = editor.markdown_table_layout(&window).unwrap();
+        assert!(Arc::ptr_eq(&original, &updated));
+        editor.current_buffer_mut().replace_line(0, "```".into());
+        let fenced = editor.markdown_table_layout(&window).unwrap();
+        assert!(!Arc::ptr_eq(&updated, &fenced));
+        assert!(!projected(&editor, 2));
+    }
+
+    #[test]
     fn reveal_changes_layout_only_for_intersected_markdown_tables() {
         let mut editor = editor("Intro\n\nA | B\n--- | ---\none | two\n", 60, 15);
         editor.mode = Mode::Insert;
