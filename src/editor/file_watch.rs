@@ -16,7 +16,6 @@ use crate::{
     buffer::{BufferId, ExternalFileChange},
     notification::{Notice, NotificationSource, Severity},
     plugin::Runtime,
-    undo::{TextPosition, TextRange},
 };
 
 use super::{Editor, RenderBuffer};
@@ -526,9 +525,8 @@ impl Editor {
             self.select_buffer_for_lsp_edit(index);
         }
         let resume_insert_transaction = self.commit_active_transaction_before_save();
-        let end = self.current_buffer().char_idx_to_position(usize::MAX);
         self.begin_transaction("reload externally changed file");
-        self.replace_range(TextRange::new(TextPosition::new(0, 0), end), &contents);
+        self.replace_reloaded_contents(&contents);
         self.current_buffer_mut().file = Some(path.clone());
         self.commit_transaction(self.cursor_snapshot());
         self.current_buffer_mut().mark_saved();

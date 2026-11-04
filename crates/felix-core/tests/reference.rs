@@ -43,6 +43,11 @@ fn reference_sequences() {
             for edit in plan.edits.iter().rev() {
                 text.remove(edit.start..edit.end);
                 text.insert(edit.start, &edit.insert);
+                jumps.rebase(
+                    (),
+                    text.slice(..),
+                    std::iter::once((edit.start, edit.end, edit.insert.chars().count())),
+                );
             }
             sel = plan.selections(text.slice(..));
             session = plan.next;

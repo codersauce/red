@@ -125,18 +125,77 @@ impl Editor {
         let buffer = self.current_buffer();
         let id = buffer.id();
         let snapshot = buffer.contents_snapshot();
+        let text = snapshot.slice(..);
+        let changes = edits
+            .iter()
+            .map(|e| (e.start_char, e.end_char, e.new_char_len));
         for ((doc, _), selections) in &mut self.felix.selections {
             if *doc == id {
-                *selections = selections.rebase(
-                    snapshot.slice(..),
-                    edits
-                        .iter()
-                        .map(|edit| (edit.start_char, edit.end_char, edit.new_char_len)),
-                );
+                *selections = selections.rebase(text, changes.clone());
             }
         }
-        self.felix.generation = self.felix.generation.wrapping_add(1);
-        self.felix.session.cancel_pending();
+        for jumps in self.felix.jumps.values_mut() {
+            jumps.rebase(id, text, changes.clone());
+        }
+        // Workspace edits can temporarily activate a buffer without switching the window.
+        if self
+            .window_manager
+            .active_window()
+            .is_some_and(|window| window.buffer_index == self.buffer_manager.active_index())
+        {
+            self.felix.generation = self.felix.generation.wrapping_add(1);
+            self.felix.session.cancel_pending();
+        }
+    }
+
+    /// Keep selections on unchanged characters inside a rewritten line. Pure
+    /// insertions and deletions can go directly through the shared transaction.
+    pub(super) fn replace_felix_hunks(&mut self, hunks: &[crate::editing::LineHunk]) {
+        let before = self.current_buffer().contents_snapshot();
+        for hunk in hunks.iter().rev() {
+            let start = hunk.old_chars.start;
+            let old = before.slice(hunk.old_chars.clone());
+            let apply = |editor: &mut Self, from, to, replacement: &str| {
+                let doc = editor.current_buffer();
+                let range =
+                    TextRange::new(doc.char_idx_to_position(from), doc.char_idx_to_position(to));
+                editor.replace_range(range, replacement);
+            };
+            if old.len_chars() == 0
+                || hunk.new_text.is_empty()
+                || hunk.old_lines.len() + hunk.new_lines.len() > 200
+            {
+                apply(self, start, hunk.old_chars.end, &hunk.new_text);
+                continue;
+            }
+            let old = old.to_string();
+            let diff = similar::TextDiff::configure()
+                .timeout(std::time::Duration::from_millis(250))
+                .diff_chars(old.as_str(), hunk.new_text.as_str());
+            for op in diff
+                .ops()
+                .iter()
+                .rev()
+                .filter(|op| op.tag() != similar::DiffTag::Equal)
+            {
+                let range = op.old_range();
+                let insert = diff.new_slices()[op.new_range()].concat();
+                apply(self, start + range.start, start + range.end, &insert);
+            }
+        }
+        if self
+            .window_manager
+            .active_window()
+            .is_some_and(|w| w.buffer_index == self.buffer_manager.active_index())
+        {
+            self.sync_felix_cursor();
+        }
+    }
+
+    pub(super) fn sync_felix_cursor(&mut self) {
+        if let Some(selection) = self.felix_active_selection().cloned() {
+            self.place_felix_cursor(&selection);
+        }
     }
 
     pub(super) fn restore_felix_history(&mut self, transaction: Option<&str>, undo: bool) {
@@ -706,6 +765,113 @@ mod tests {
         );
         let request = editor.felix_code_action_range().unwrap();
         assert_eq!((request.start.character, request.end.character), (4, 7));
+    }
+
+    #[tokio::test]
+    async fn language_server_edit_preserves_view_and_rejects_stale_response() {
+        let (mut editor, mut frame, mut runtime) = fixture_editor("😀foo foo\n");
+        let root = tempfile::tempdir().unwrap();
+        for (index, file) in ["active.txt", "background.txt"].into_iter().enumerate() {
+            editor.buffer_manager[index].file =
+                Some(root.path().join(file).to_str().unwrap().into());
+        }
+        for key in ["%", "s", "f", "o", "o", "<enter>"] {
+            let owner = editor.felix_owner().unwrap();
+            editor
+                .execute_felix(Input::Key(key), owner, &mut frame, &mut runtime)
+                .await
+                .unwrap();
+        }
+        let selection = editor.felix_active_selection().unwrap().clone();
+        let owner = editor.felix_owner().unwrap();
+        let make_action = |buffer: &Buffer, replacement: &str| {
+            let uri = buffer.uri().unwrap().unwrap();
+            let start = crate::lsp::Position {
+                line: 0,
+                character: 0,
+            };
+            Action::ApplyLspWorkspaceEdit {
+                documents: vec![LspDocumentEdit {
+                    uri: uri.clone(),
+                    version: None,
+                    edits: vec![LspTextEdit {
+                        range: crate::lsp::Range { start, end: start },
+                        new_text: replacement.into(),
+                    }],
+                }],
+                expected_revisions: vec![(uri, buffer.revision())],
+                command: None,
+                source: None,
+                label: "server insertion".into(),
+            }
+        };
+        let background = make_action(&editor.buffer_manager[1], "other ");
+        editor
+            .execute(&background, &mut frame, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(editor.felix_owner(), Some(owner));
+        assert_eq!(editor.felix_active_selection(), Some(&selection));
+        assert_eq!(editor.buffer_manager[1].contents(), "other other buffer\n");
+        let edit = make_action(editor.current_buffer(), "éé");
+        editor
+            .execute(&edit, &mut frame, &mut runtime)
+            .await
+            .unwrap();
+        let moved = editor.felix_active_selection().unwrap().clone();
+        assert_eq!(
+            moved.ranges(),
+            &[
+                FelixRange { anchor: 3, head: 6 },
+                FelixRange {
+                    anchor: 7,
+                    head: 10
+                }
+            ]
+        );
+        assert_eq!(editor.cursor_text_position(), TextPosition::new(0, 5));
+        let revision = editor.current_buffer().revision();
+        editor
+            .execute(&edit, &mut frame, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().revision(), revision);
+        assert_eq!(editor.felix_active_selection(), Some(&moved));
+        assert_eq!(editor.current_buffer().contents(), "éé😀foo foo\n");
+    }
+
+    #[tokio::test]
+    async fn file_reload_preserves_selections_amid_separate_edits_on_one_line() {
+        let (mut editor, mut frame, mut runtime) = fixture_editor("A foo B foo C\r\n");
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("example.txt");
+        editor.current_buffer_mut().file = Some(path.to_str().unwrap().into());
+        for key in ["%", "s", "f", "o", "o", "<enter>"] {
+            let owner = editor.felix_owner().unwrap();
+            editor
+                .execute_felix(Input::Key(key), owner, &mut frame, &mut runtime)
+                .await
+                .unwrap();
+        }
+        let updated = "🎈A foo ééB foo C\r\n";
+        std::fs::write(path, updated).unwrap();
+        editor
+            .execute(&Action::ReloadFile(false), &mut frame, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), updated);
+        assert_eq!(
+            editor.felix_active_selection().unwrap().ranges(),
+            &[
+                FelixRange { anchor: 3, head: 6 },
+                FelixRange {
+                    anchor: 11,
+                    head: 14
+                }
+            ]
+        );
+        assert_eq!(editor.cursor_text_position(), TextPosition::new(0, 5));
+        assert!(!editor.current_buffer().is_dirty());
     }
 
     #[tokio::test]

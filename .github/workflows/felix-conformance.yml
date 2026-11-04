@@ -75,6 +75,8 @@ jobs:
           if [ "$EXTENDED" = true ]; then steps=512; seed="$GITHUB_RUN_ID"; fi
           export FELIX_SCENARIOS="$PWD/evidence/scenarios.json"
           python3 scripts/felix/scenarios.py --observer reference/target/debug/hx --runtime helix-25.07.1-x86_64-linux/runtime --steps "$steps" --seed "$seed" > "$FELIX_SCENARIOS"
+          python3 scripts/felix/check_coverage.py "$FELIX_SCENARIOS" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$EXTENDED" != true ]; then cmp scripts/felix/fixtures/motions.json "$FELIX_SCENARIOS"; fi
           cargo test --locked -p felix-core
           cargo test --locked -p red --features helix --lib editor::felix
       - uses: actions/upload-artifact@v4

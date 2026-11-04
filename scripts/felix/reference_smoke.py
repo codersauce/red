@@ -10,10 +10,11 @@ import subprocess
 import tarfile
 import tempfile
 import time
+import tomllib
 
 
 VERSION = "25.07.1"
-COMMIT = "a05c151bb6e8e9c65ec390b0ae2afe7a5efd619b"
+COMMIT = tomllib.loads(Path(__file__).with_name("coverage.toml").read_text())["reference"]
 # SHA-256 digests published with the official release archives.
 ARCHIVES = {
     "aarch64-macos": "00b1651b4fdbbe0a2ae981c8e76b858bd26a7c33f5b3583f3b6bb9137d54f1ff",

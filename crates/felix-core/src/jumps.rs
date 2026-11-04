@@ -70,6 +70,19 @@ impl<D: Copy + Eq> Jumps<D> {
         self.entries.get(dest).cloned()
     }
 
+    pub fn rebase(
+        &mut self,
+        doc: D,
+        text: ropey::RopeSlice<'_>,
+        edits: impl Iterator<Item = (usize, usize, usize)> + Clone,
+    ) {
+        for (entry_doc, selection) in &mut self.entries {
+            if *entry_doc == doc {
+                *selection = selection.rebase(text, edits.clone());
+            }
+        }
+    }
+
     pub fn forget(&mut self, doc: D) {
         self.cursor -= self.entries[..self.cursor]
             .iter()

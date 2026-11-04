@@ -8521,6 +8521,10 @@ impl Editor {
     }
 
     fn max_cursor_x_for_line_length(&self, line_length: usize) -> usize {
+        #[cfg(feature = "helix")]
+        if self.config.editing_model == crate::config::EditingModel::Helix {
+            return line_length;
+        }
         if self.is_insert() || self.mouse_visual_allows_line_end() {
             line_length
         } else {
@@ -10745,6 +10749,17 @@ impl Editor {
         }
     }
 
+    fn replace_reloaded_contents(&mut self, contents: &str) {
+        #[cfg(feature = "helix")]
+        if self.config.editing_model == crate::config::EditingModel::Helix {
+            let before = self.current_buffer().contents();
+            self.replace_with_line_hunks(&before, contents);
+            return;
+        }
+        let end = self.current_buffer().char_idx_to_position(usize::MAX);
+        self.replace_range(TextRange::new(TextPosition::new(0, 0), end), contents);
+    }
+
     /// Replaces the current buffer's `before` text with `after` by rewriting only the
     /// lines that differ, inside the caller's transaction. The cursor and viewport stay
     /// on the text they showed: lines inserted or removed above them shift them, and a
@@ -10752,6 +10767,11 @@ impl Editor {
     fn replace_with_line_hunks(&mut self, before: &str, after: &str) {
         let hunks = crate::editing::line_hunks(before, after);
         if hunks.is_empty() {
+            return;
+        }
+        #[cfg(feature = "helix")]
+        if self.config.editing_model == crate::config::EditingModel::Helix {
+            self.replace_felix_hunks(&hunks);
             return;
         }
         let cursor = self.cursor_snapshot();
@@ -25020,12 +25040,8 @@ impl Editor {
                     match self.current_buffer().read_backing_file() {
                         Ok((file, contents)) => {
                             let byte_count = contents.len();
-                            let end = self.current_buffer().char_idx_to_position(usize::MAX);
                             self.begin_transaction("reload file");
-                            self.replace_range(
-                                TextRange::new(TextPosition::new(0, 0), end),
-                                &contents,
-                            );
+                            self.replace_reloaded_contents(&contents);
                             self.current_buffer_mut().file = Some(file.clone());
                             self.check_bounds();
                             self.sync_to_window();
@@ -33163,6 +33179,9 @@ impl Editor {
             }
         }
         self.sync_diagnostic_gutter_signs();
+        #[cfg(feature = "helix")]
+        let active_helix_changed = self.config.editing_model == crate::config::EditingModel::Helix
+            && changed.contains(&original_index);
         for index in changed {
             self.select_buffer_for_lsp_edit(index);
             if let Err(error) = self.notify_change(runtime).await {
@@ -33174,6 +33193,10 @@ impl Editor {
         self.select_buffer_for_lsp_edit(original_index);
         (self.cx, self.cy, self.vtop, self.vleft, self.skipcol) = original_view;
         self.check_bounds();
+        #[cfg(feature = "helix")]
+        if active_helix_changed {
+            self.sync_felix_cursor();
+        }
         if let Some(command) = command {
             if let Err(error) = self
                 .execute_lsp_command(

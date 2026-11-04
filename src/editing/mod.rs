@@ -12,6 +12,8 @@ mod reflow;
 mod textarea;
 mod transaction;
 
+#[cfg(feature = "helix")]
+pub(crate) use line_hunks::LineHunk;
 pub(crate) use line_hunks::{
     line_hunks, map_line, preview_line_text, unified_diff, DiffLine, DiffLineKind, DiffStat,
 };

@@ -231,6 +231,20 @@
     {"key": "<c-o>", "mode": "Normal", "text": "abc de\nxyz\n", "ranges": [[0, 3]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
     {"key": "<tab>", "mode": "Normal", "text": "abc de\nxyz\n", "ranges": [[7, 8]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"}
   ]},
+  {"name": "jump-follows-edit", "text": "one two three\n", "events": [
+    {"key": "w", "mode": "Normal", "text": "one two three\n", "ranges": [[0, 4]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "w", "mode": "Normal", "text": "one two three\n", "ranges": [[4, 8]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<c-s>", "mode": "Normal", "text": "one two three\n", "ranges": [[4, 8]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "g", "mode": "Normal", "text": "one two three\n", "ranges": [[4, 8]], "primary": 0, "unnamed": null, "search": null, "pending": ["g"], "count": null, "document": "~/example.txt"},
+    {"key": "g", "mode": "Normal", "text": "one two three\n", "ranges": [[0, 1]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "i", "mode": "Insert", "text": "one two three\n", "ranges": [[1, 0]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "é", "mode": "Insert", "text": "éone two three\n", "ranges": [[2, 1]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "é", "mode": "Insert", "text": "ééone two three\n", "ranges": [[3, 2]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<esc>", "mode": "Normal", "text": "ééone two three\n", "ranges": [[3, 2]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<c-o>", "mode": "Normal", "text": "ééone two three\n", "ranges": [[6, 10]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<c-o>", "mode": "Normal", "text": "ééone two three\n", "ranges": [[6, 10]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
+    {"key": "<tab>", "mode": "Normal", "text": "ééone two three\n", "ranges": [[3, 2]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"}
+  ]},
   {"name": "auto-pairs", "text": "abc \n", "events": [
     {"key": "A", "mode": "Insert", "text": "abc \n", "ranges": [[4, 5]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},
     {"key": "(", "mode": "Insert", "text": "abc ()\n", "ranges": [[5, 6]], "primary": 0, "unnamed": null, "search": null, "pending": [], "count": null, "document": "~/example.txt"},

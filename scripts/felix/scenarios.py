@@ -5,12 +5,12 @@ import json
 import os
 from pathlib import Path
 import random
-import runpy
+import tomllib
 import subprocess
 import tempfile
 import time
 
-COMMIT = runpy.run_path(str(Path(__file__).with_name("reference_smoke.py")))["COMMIT"]
+COMMIT = tomllib.loads(Path(__file__).with_name("coverage.toml").read_text())["reference"]
 
 
 def scenarios(seed, steps):
@@ -33,6 +33,7 @@ def scenarios(seed, steps):
     yield "indent-join", "abc\n  de f\nxy\n", list("x>") + ["<", "J", "<a-J>", "u", "U"]
     yield "open-line", "abc\nxyz\n", list("oHi") + ["<esc>", "u", "O", "z", "<esc>", "u"]
     yield "selection-jumplist", "abc de\nxyz\n", list("e") + ["<c-s>"] + list("gegg") + ["<c-o>", "<c-o>", "<tab>"]
+    yield "jump-follows-edit", "one two three\n", list("ww") + ["<c-s>"] + list("ggiéé") + ["<esc>", "<c-o>", "<c-o>", "<tab>"]
     yield "auto-pairs", "abc \n", list("A(x)") + ["<esc>", "u", "U"]
     yield "whole-line-change", "one\ntwo\n", list("xcX") + ["<esc>", "u", "%", "c", "Y", "<esc>", "u"]
     yield "paragraph-and-copies", "abc\ndef\n\nnext\n", list("lC") + ["<a-C>", ","] + list("mipmap")
