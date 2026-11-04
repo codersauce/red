@@ -18,7 +18,6 @@ import json
 import os
 from pathlib import Path
 import pty
-import re
 import struct
 import subprocess
 import sys
@@ -28,9 +27,11 @@ import threading
 import time
 
 
+from perf_trace import STARTUP, TIMING
+
+
 ROOT = Path(__file__).resolve().parent.parent
 BIN = ROOT / "target" / "release" / "red"
-TIMING = re.compile(r"\[PERF\] (\S+)(?: (.*?))?: (\d+)us")
 
 
 def percentile(samples, value):
@@ -65,6 +66,12 @@ def run(args):
             f"log_file = {json.dumps(str(log))}\n"
             "show_whats_new = false\nfetch_release_notes = false\n"
         )
+        typing = args.scenario in ("typing", "signature")
+        if typing:
+            # The saved copy verifies that both editing models applied the workload.
+            original = file_path.read_bytes()
+            file_path = temp / file_path.name
+            file_path.write_bytes(original)
         if args.scenario == "signature":
             server_args = [
                 str(ROOT / "tests" / "fixtures" / "signature_help_lsp.py"),
@@ -96,6 +103,8 @@ def run(args):
         ]
         for override in args.config_override:
             argv.extend(["--config-override", override])
+        if typing:
+            argv.extend(["--config-override", "formatting.on_save=false"])
         argv.append(str(file_path))
 
         launched = time.monotonic()
@@ -124,9 +133,9 @@ def run(args):
 
         deadline = launched + args.startup_timeout
         while time.monotonic() < deadline:
-            if log.exists() and "[PERF] startup:interactive:" in log.read_text(
+            if log.exists() and STARTUP.search(log.read_text(
                 encoding="utf-8", errors="replace"
-            ):
+            )):
                 break
             if process.poll() is not None:
                 raise SystemExit(f"editor exited before first paint: {process.returncode}")
@@ -210,7 +219,8 @@ def run(args):
         started = time.monotonic()
         delay = args.delay_ms / 1000
 
-        if args.scenario in ("typing", "signature"):
+        typed = bytearray()
+        if typing:
             if args.scenario == "typing":
                 os.write(master, b"i")
             for index in range(args.cycles):
@@ -219,6 +229,7 @@ def run(args):
                 else:
                     punctuation = b"." if args.typing_context != "source" else b"a"
                     inserted = punctuation if index % 2 == 0 else "\u03bb".encode()
+                typed.extend(inserted)
                 os.write(master, inserted)
                 time.sleep(delay)
             os.write(master, b"\x1b")
@@ -245,7 +256,7 @@ def run(args):
         elapsed = time.monotonic() - started
         with log.open("a", encoding="utf-8") as stream:
             stream.write("[BENCH] end\n")
-        os.write(master, b":q!\r")
+        os.write(master, b":wq\r" if typing else b":q!\r")
         try:
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
@@ -273,13 +284,12 @@ def run(args):
                     label = f"{label} {detail.split()[0]}"
                 samples[label].append(micros)
 
-        if args.scenario in ("typing", "signature"):
-            observed_edits = len(samples.get("edit:replace_char", []))
-            if observed_edits < args.cycles:
-                raise SystemExit(
-                    "typing benchmark did not observe the expected text insertions "
-                    f"({observed_edits}/{args.cycles}); a modal dialog may be intercepting input"
-                )
+        if not samples.get("event"):
+            raise SystemExit("interaction benchmark recorded no completed events")
+        if typing:
+            saved = file_path.read_bytes()
+            if saved.count(typed) <= original.count(typed):
+                raise SystemExit("typing benchmark could not verify the inserted sequence")
 
         print(
             f"\n=== {args.scenario} {args.rows}x{args.cols}, cycles={args.cycles}, "

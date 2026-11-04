@@ -22,8 +22,10 @@ import termios
 import threading
 import time
 
+from perf_trace import STARTUP, TIMING
+
+
 ROOT = Path(__file__).resolve().parent.parent
-TIMING = re.compile(r"\[PERF\] (\S+)(?: (.*?))?: (\d+)us")
 
 
 def response_text():
@@ -139,7 +141,7 @@ class Driver:
             close_fds=True)
         os.close(slave)
         threading.Thread(target=self.drain, daemon=True).start()
-        self.wait_for(lambda: ("[PERF] startup:interactive:" in self.read_log()
+        self.wait_for(lambda: (STARTUP.search(self.read_log())
                                if args.perf_mode == "trace" else len(self.capture) > 1000),
                       90, "first paint")
         time.sleep(0.3)
@@ -273,7 +275,8 @@ class Driver:
                 return stream.read().decode(errors="replace")
 
         def delivered():
-            return len(re.findall(r"\[PERF\] event (?:Mouse|Key)\(", phase_log()))
+            return sum(m[1] == "event" and (m[2] or "").startswith(("Mouse(", "Key("))
+                       for m in TIMING.finditer(phase_log()))
 
         if self.args.perf_mode != "trace":
             last_bytes, last_change = self.bytes, time.monotonic()

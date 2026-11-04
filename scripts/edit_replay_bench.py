@@ -24,10 +24,11 @@ import threading
 import time
 import tomllib
 
+from perf_trace import END, EVENT, TIMING
+
+
 ROOT = Path(__file__).resolve().parent.parent
-END = r"\[PERF\] (?:end id=\d+ t=\d+us )?"
-EVENT = re.compile(END + r"event (?:Key\(|Paste\().*?: (\d+)us$")
-TIMING = re.compile(END + r"([\w:+-]+)(?: (.*?))?: (\d+)us$")
+
 SCENARIOS = ("dot", "macro", "delete", "block", "paste", "substitute", "indent", "undo")
 
 

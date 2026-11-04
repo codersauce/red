@@ -69,15 +69,14 @@ class Driver(base.Driver):
         # All phases begin in the same source region. M and a short alternating
         # motion stay inside the viewport; repeated directional keys reach its
         # boundary before the measured interval starts.
-        self.command(str(self.args.start_line))
-        if phase == "inside":
-            self.send(b"M")
-        elif phase in ("down", "up"):
+        # Counted G sets the document cursor in both editing models.
+        self.send(f"{self.args.start_line}G".encode())
+        if phase in ("down", "up"):
             self.send(str(self.args.rows * 2).encode() + (b"j" if phase == "down" else b"k"))
         elif phase == "bof":
             self.send(b"gg")
         elif phase == "eof":
-            self.send(b"G")
+            self.send(b"ge" if self.args.model == "helix" else b"G")
         self.quiet(seconds=0.6)
 
     def keyboard_phase(self, name):
@@ -142,6 +141,7 @@ class Driver(base.Driver):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True)
+    parser.add_argument("--model", choices=("vim", "helix"), default="vim")
     parser.add_argument("--root", default=str(base.ROOT))
     parser.add_argument("--file", default=str(base.ROOT / "src/editor.rs"))
     parser.add_argument("--split-file", default=str(base.ROOT / "src/editor/rendering.rs"))
@@ -161,6 +161,7 @@ def main():
                         choices=("inside", "down", "up", "bof", "eof"))
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
+    args.config_override.append("editing_model=" + args.model)
     args.mouse_coordinate_width = 4
     driver = Driver(args)
     try:
