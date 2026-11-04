@@ -281,6 +281,18 @@ Shared-workflow performance baselines are captured in stage 1 before implementat
 
 The observer remains an early feasibility risk until stage 1 proves it. If required state cannot be captured reliably, resolve the instrumentation or revise the approach before expanding implementation; do not substitute fabricated fields, destructive probes, or a weaker comparison contract. Later Red observer work must satisfy the same non-mutation checks when stage 3 introduces the candidate path.
 
+### Remaining M1 work before the next push
+
+Starting from `e91d6017`, keep the remaining changes on the local Felix branch in small, tested commits. The next planned push is the M1 acceptance candidate. Use the following order for the remaining work.
+
+1. **Audit the acceptance evidence.** Map the agreed command and host workflows to executable cases and identify missing observations. Reconcile the coverage inventory with all eight gates above. Locate the original performance baselines, workloads and budgets before measuring the candidate. Record any missing baseline evidence explicitly.
+2. **Finish editing and command state.** Verify multi-selection yank, paste and replace across clipboard transports, including an external clipboard change and provider failure. Close the remaining counts, aliases, repeated motions and pending-input cases. Exercise focus or document changes between a prefix and its argument.
+3. **Finish layout and Insert behavior.** Compare movement and search with inline text, projected Markdown and mixed line endings. Verify language-specific indentation, joins and smart Tab. Cover completion previews in splits, nested and mirrored snippet stops, multiple accepted completions, and counted repeat after switching documents.
+4. **Run the host and acceptance checks.** Exercise substantive LSP, plugin and reload edits, stale requests, mouse and panel handoff, and Red's save policy. Run the full Vim and feature matrix, deterministic and extended reference comparisons, terminal checks, Clippy and performance workloads. Keep the seeds, failures and minimized regressions. Arrange for both deterministic and extended Linux comparisons to run on the candidate revision before handoff.
+5. **Hand off one candidate.** Request a push of the accumulated commits after the local checks pass. Record which checks used the local dependency mirror. Verify the pushed SHA, follow Linux CI using the repository lockfile, and finish the acceptance report against that SHA. A Linux-only defect may require a corrective push. Start M2 with named registers and register insertion once all eight M1 gates pass.
+
+During this stint, provide progress updates as work lands. Request an earlier handoff only for a decision outside the agreed scope or a specific acceptance check that genuinely requires the user's environment.
+
 ### Immediate broad-compatibility follow-up
 
 Prepare the M2 inventory while closing M1, but begin its implementation only after the M1 gate passes. The first M2 group is explicit named registers and register insertion, followed by macros using the already-tested command/replay and host protocol. Continue with syntax selections/objects and closest-pair/surround editing; shell filters and output insertion; then the remaining navigation, history, view, and native-host command families.
