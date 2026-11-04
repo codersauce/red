@@ -8039,11 +8039,23 @@ impl Editor {
         self.config.sidescroll.unwrap_or(1).max(1)
     }
 
-    fn sidescrolloff(&self, width: usize) -> usize {
-        self.config
+    /// Left margin, right margin, and step for automatic horizontal scrolling.
+    fn horizontal_scroll_settings(&self, width: usize) -> (usize, usize, usize) {
+        #[cfg(feature = "helix")]
+        if self.config.editing_model == crate::config::EditingModel::Helix {
+            let margin = self.config.scrolloff.unwrap_or(5);
+            return (
+                margin.min(width.saturating_sub(1) / 2),
+                margin.min(width / 2),
+                1,
+            );
+        }
+        let margin = self
+            .config
             .sidescrolloff
             .unwrap_or(0)
-            .min(width.saturating_sub(1))
+            .min(width.saturating_sub(1));
+        (margin, margin, self.sidescroll())
     }
 
     pub fn cursor_position(&self) -> (usize, usize) {
@@ -32370,14 +32382,13 @@ impl Editor {
 
         if !self.wrap {
             self.skipcol = 0;
-            let off = self.sidescrolloff(width);
-            let right_edge = self.vleft + width;
-            if display_col < self.vleft + off {
-                self.vleft = display_col.saturating_sub(off + self.sidescroll().saturating_sub(1));
-            } else if display_col >= right_edge.saturating_sub(off) {
+            let (left, right, step) = self.horizontal_scroll_settings(width);
+            if display_col < self.vleft + left {
+                self.vleft = display_col.saturating_sub(left + step.saturating_sub(1));
+            } else if display_col >= (self.vleft + width).saturating_sub(right) {
                 self.vleft = display_col
-                    .saturating_add(off)
-                    .saturating_add(self.sidescroll())
+                    .saturating_add(right)
+                    .saturating_add(step)
                     .saturating_sub(width);
             }
             return;

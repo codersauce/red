@@ -4730,7 +4730,17 @@ impl Editor {
                 let display_col =
                     if let Some(line) = self.buffer_manager[window.buffer_index].get(buffer_y) {
                         let line = trim_line_ending(&line);
-                        self.display_col_for_cursor_goal(line, window.cursor_goal)
+                        match self.config.editing_model {
+                            #[cfg(feature = "helix")]
+                            crate::config::EditingModel::Helix => {
+                                self.config.editing_model.source_column(
+                                    line,
+                                    window.cx,
+                                    self.tab_width_for_buffer_index(window.buffer_index),
+                                )
+                            }
+                            _ => self.display_col_for_cursor_goal(line, window.cursor_goal),
+                        }
                     } else {
                         window.cx
                     };
@@ -5367,12 +5377,12 @@ mod tests {
         assert_eq!(buffer.cells[10].text, "界");
         assert_eq!(buffer.cells[12].text, "y");
         // The zero-width space owns one cursor stop after the emoji.
-        assert_eq!(rows[0].screen_col_for_display_col(3, 10), 5);
-        assert_eq!(rows[0].display_col_for_screen_col(5), 3);
-        assert_eq!(rows[0].visible_screen_spans(1, 3), [(1, 5)]);
-        assert_eq!(rows[0].visible_screen_spans(3, 4), [(5, 6)]);
+        assert_eq!(rows[0].screen_col_for_display_col(5, 10), 5);
+        assert_eq!(rows[0].display_col_for_screen_col(5), 5);
+        assert_eq!(rows[0].visible_screen_spans(1, 5), [(1, 5)]);
+        assert_eq!(rows[0].visible_screen_spans(5, 6), [(5, 6)]);
         let mut marker = decoration(DecorationAnchor::Column, "|");
-        marker.column = 4;
+        marker.column = 6;
         assert_eq!(
             decoration_local_x(&marker, &rows[0], rows[1].end_col, false, 10),
             Some(6)

@@ -411,19 +411,18 @@ pub fn column_to_grapheme_with_tabs(line: &str, target_column: usize, tab_width:
 }
 
 // Source columns are the coordinates shared by document layout, hit testing,
-// and overlays. Helix needs a distinct stop even for an invisible grapheme.
+// and overlays. Use the active editing model’s unwrapped document columns.
 impl crate::config::EditingModel {
     pub(crate) fn source_cell_width(self, grapheme: &str, col: usize, tab_width: usize) -> usize {
+        #[cfg(feature = "helix")]
+        if self == Self::Helix {
+            return felix_core::cell_width(grapheme, col, tab_width);
+        }
         if grapheme == "\t" {
             let stop = tab_width.max(1);
             return stop - col % stop;
         }
-        let width = display_width(grapheme);
-        #[cfg(feature = "helix")]
-        if self == Self::Helix {
-            return width.max(1);
-        }
-        width
+        display_width(grapheme)
     }
 
     pub(crate) fn source_column(self, line: &str, grapheme: usize, tab_width: usize) -> usize {

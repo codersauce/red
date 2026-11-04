@@ -36,7 +36,12 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
     fixture = root / ("example.rs" if scenario == "completion" else "example.txt")
     split_search = scenario in ("split-search", "wrapped-split-search")
     wrapped = scenario == "wrapped-split-search"
-    if wrapped:
+    horizontal = scenario == "horizontal"
+    ruler = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+    if horizontal:
+        fixture.write_text("a👩‍💻B\t界C" + "0123456789" * 8 + "\n" + ruler
+                           + "\n" + "." * 22 + "👩‍💻Z\n")
+    elif wrapped:
         # Each tag starts one 36-cell display row on the same logical line.
         fixture.write_text("".join(f"ROW-{n:03}\t👩‍💻界\u200b" + "x" * 21 for n in range(1, 101)) + "\n")
     elif split_search or scenario == "paging":
@@ -70,6 +75,10 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
             '[[language]]\nname = "rust"\nlanguage-servers = ["felix-test"]\n[language-server.felix-test]\n' + command
         )
         (config / "config.toml").write_text('[editor]\nauto-completion = false\n')
+    if horizontal and not red:
+        config = root / "config/helix"
+        config.mkdir(parents=True)
+        (config / "config.toml").write_text('[editor.cursor-shape]\ninsert = "bar"\n')
     if wrapped and not red:
         config = root / "config/helix"
         config.mkdir(parents=True)
@@ -82,7 +91,7 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
         config.mkdir(parents=True)
         # Compare equal document heights. Red's optional breadcrumb plugin
         # can reserve a screen row asynchronously after the document opens.
-        window_config = 'disabled_plugins = ["barbecue"]\n' if split_search or scenario in ("paging", "repeat") else ""
+        window_config = 'disabled_plugins = ["barbecue"]\n' if split_search or horizontal or scenario in ("paging", "repeat") else ""
         if wrapped:
             window_config += "wrap = true\n"
         (config / "config.toml").write_text(
@@ -160,8 +169,50 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
             time.sleep(0.02)
 
     try:
-        tmux("new-session", "-d", "-x", "81" if wrapped else "80", "-y", "24", "-s", "oracle",
+        # Red and Helix use four and seven gutter columns respectively.
+        columns = (28 if red else 31) if horizontal else (81 if wrapped else 80)
+        tmux("new-session", "-d", "-x", str(columns), "-y", "24", "-s", "oracle",
              str(executable or bundle / "hx"), str(fixture), str(other))
+        if horizontal:
+            gutter = 4 if red else 7
+            # Each count is a grapheme count. The ruler independently identifies
+            # the horizontal viewport even when the cursor line contains tabs.
+            for label, keys, offset, position in [
+                ("open", [], 0, 1), ("after emoji", ["2", "l"], 0, 3),
+                ("insert caret", ["i"], 0, 3), ("leave insert", ["Escape"], 0, 3),
+                ("return to start", ["g", "g"], 0, 1),
+                ("clip emoji on left", ["1", "5", "l"], 2, 16),
+                ("one emoji cell left", ["2", "l"], 4, 18),
+                ("tab at left edge", ["2", "l"], 6, 20),
+                ("wide character at left edge", ["2", "l"], 8, 22),
+                ("scroll right", ["1", "8", "l"], 26, 40),
+                ("scroll left", ["1", "5", "h"], 24, 25),
+                ("end of line", ["g", "l"], 72, 86), ("line start", ["g", "h"], 0, 1),
+            ]:
+                if keys:
+                    tmux("send-keys", *keys)
+                deadline = time.monotonic() + (30 if not keys else 5)
+                cursor = []
+                while True:
+                    rows = tmux("capture-pane", "-p").stdout.splitlines()
+                    insert = label == "insert caret"
+                    mode = ("INSERT" if red else "INS") if insert else ("NORMAL" if red else "NOR")
+                    if (len(rows) >= 5 and rows[1][gutter:] == ruler[offset:offset + 24]
+                            and rows[-2].strip().startswith(mode + " ")
+                            and rows[-2].rstrip().endswith(f" 1:{position}")):
+                        caret = None
+                        if insert:
+                            cursor = tmux("display-message", "-p", "#{cursor_flag} #{cursor_x} #{cursor_y}").stdout.split()
+                            if cursor == ["1", str(gutter + 5), "0"]:
+                                caret = 5
+                        if not insert or caret is not None:
+                            checkpoints.append({"step": label, "rows": [row[gutter:] for row in rows[:3]],
+                                                "caret": caret})
+                            break
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(f"{label}: expected offset {offset} and position 1:{position}, saw caret {cursor!r}, rows {rows!r}")
+                    time.sleep(.02)
+            return checkpoints
         if split_search:
             def check_views(label, left, right, prompt=""):
                 deadline = time.monotonic() + 5
@@ -479,6 +530,14 @@ def main():
             prompts = run_trace(bundle, root / "release-prompt", scenario="prompt")
             red_prompts = (run_trace(bundle, root / "red-prompt", args.candidate.resolve(strict=True),
                                      red=True, scenario="prompt") if args.candidate else None)
+            horizontal = run_trace(bundle, root / "release-horizontal", scenario="horizontal")
+            red_horizontal = None
+            if args.candidate:
+                red_horizontal = run_trace(bundle, root / "red-horizontal", args.candidate.resolve(strict=True),
+                                           red=True, scenario="horizontal")
+                for expected, actual in zip(horizontal, red_horizontal, strict=True):
+                    if actual != expected:
+                        raise ValueError(f"horizontal viewport: expected {expected!r}, saw {actual!r}")
             split_traces = {}
             for scenario, directory in (("split-search", "split"), ("wrapped-split-search", "wrap")):
                 key = scenario.replace("-", "_")
@@ -507,7 +566,7 @@ def main():
                       "paging": pages, "red_paging": red_pages, "repeat": repeats, "red_repeat": red_repeats,
                       "completion": completion, "red_completion": red_completion,
                       "prompt": prompts, "red_prompt": red_prompts,
-                      **split_traces}, indent=2))
+                      "horizontal": horizontal, "red_horizontal": red_horizontal, **split_traces}, indent=2))
 
 
 if __name__ == "__main__":

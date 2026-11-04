@@ -1180,6 +1180,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clicking_a_partly_visible_joined_emoji_edits_the_whole_grapheme() {
+        let (mut editor, mut frame, mut runtime) = fixture_editor("a👩‍💻B\t界C0123456789\n");
+        editor.wrap = false;
+        editor.vleft = 3; // The emoji spans unwrapped columns 1..5.
+        editor.sync_to_window();
+        let window = editor.window_manager.active_window().unwrap();
+        let x = editor.window_to_terminal_x(window, editor.gutter_width_for_window(window) + 1);
+        let y = editor.window_to_terminal_y(window, 0);
+        editor
+            .execute_mouse_press(
+                x as u16,
+                y as u16,
+                KeyModifiers::NONE,
+                &mut frame,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        for key in ["r", "X"] {
+            let owner = editor.felix_owner().unwrap();
+            editor
+                .execute_felix(Input::Key(key), owner, &mut frame, &mut runtime)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            editor.current_buffer().contents_snapshot().to_string(),
+            "aXB\t界C0123456789\n"
+        );
+    }
+
+    #[tokio::test]
     async fn preview_leaves_unicode_document_and_undo_untouched_and_rejects_stale_selections() {
         let (mut editor, mut frame, mut runtime) = fixture_editor("😀foo foo\n");
         for key in ["%", "s", "f", "o", "o", "<enter>", "c", "F"] {

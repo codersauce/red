@@ -991,13 +991,11 @@ fn wrap_line_segments_with_limit(
             .source_cell_width(grapheme, col, tab_width);
         let hidden = concealment.hides_span(byte_offset, grapheme.len());
         let occupied = visual_col - segment_visual;
-        let width_at = |_screen_col: usize| {
-            #[cfg(feature = "helix")]
-            if break_indent.model == crate::config::EditingModel::Helix && !hidden {
-                return felix_core::cell_width(grapheme, _screen_col, tab_width);
-            }
+        let width_at = |screen_col| {
             if hidden {
                 0
+            } else if grapheme == "\t" && break_indent.model == crate::config::EditingModel::Helix {
+                tab_width - screen_col % tab_width
             } else {
                 raw_width
             }
@@ -1195,6 +1193,20 @@ pub(super) fn nowrap_line_segment(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "helix")]
+    #[test]
+    fn wrapped_tab_uses_its_screen_column_after_a_wide_character() {
+        let options = BreakIndentOptions {
+            model: crate::config::EditingModel::Helix,
+            ..BreakIndentOptions::disabled()
+        };
+        let rows = wrap_line_segments("abcde界\tQ", 0, 6, 0, options);
+        let continuation = &rows[1];
+        assert_eq!(continuation.visible_screen_spans(7, 8), [(2, 4)]);
+        assert_eq!(continuation.display_col_for_screen_col(3), 7);
+        assert_eq!(continuation.screen_col_for_display_col(8, 6), 4);
+    }
 
     #[test]
     fn inline_prediction_inserts_virtual_rows_and_preserves_source_offsets() {
