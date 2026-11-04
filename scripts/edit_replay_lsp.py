@@ -70,6 +70,12 @@ def main():
                 if document[:cursor].endswith("S"):
                     item = {"label": "SnippetCandidate", "kind": 15, "insertTextFormat": 2,
                             "insertText": "${1:one}=${2:two}$0"}
+                elif document[:cursor].endswith("M"):
+                    item = {"label": "MirrorCandidate", "kind": 15, "insertTextFormat": 2,
+                            "insertText": "${1:one}=$1 ${2:two}$0"}
+                elif document[:cursor].endswith("N"):
+                    item = {"label": "NestedCandidate", "kind": 15, "insertTextFormat": 2,
+                            "insertText": "${1:outer ${2:inner}}:${3:end}$0"}
                 items = [item]
                 if document[:cursor].endswith("F"):
                     items.append({"label": "FelixOther", "kind": 6, "data": {"id": "other"}})

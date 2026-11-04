@@ -39,6 +39,8 @@ The clipboard trace uses an isolated OSC 52 transport in both editors. It checks
 
 The completion trace exercises 45 checkpoints with two active selections. Up, Tab, and Ctrl-P cycle through candidates. The language server still sees the original document during preview. Ctrl-C discards the preview and keeps any filter text typed at both cursors. Typing or pressing Escape with a candidate selected accepts the preview before processing the key. One candidate requires deferred resolution.
 
+The snippet-stops trace replaces four mirrored defaults across two selections, navigates to the two independent second stops, and verifies that replacing an enclosing placeholder skips its removed child.
+
 The trace also accepts a snippet at both selections, replaces two successive placeholders, and undoes the changes. Undo after accepting a filtered completion restores the text from the time of the request. Dot repeats the saved completion at the primary cursor and replays ordinary typing at both cursors. The language server independently verifies the resulting document and counts completion requests during repeat. Helix 25.07.1 crashes when advancing from the second replaced placeholder to the final stop in this trace. A Red regression advances to that stop and types at both cursors.
 
 The pending-input cases compare Normal and Select mode after every key. They cover modified character arguments, counts before and inside prefixes, canceled finds, bracketed paste while waiting for an argument, and counted motion repeats across multiple selections. Enter searches for a line ending across LF and CRLF while retaining the previous character motion for `Alt-.`.

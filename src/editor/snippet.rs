@@ -4,6 +4,8 @@
 //! completion is applied they become edit anchors at the canonical mutation boundary,
 //! keeping later placeholders aligned while earlier arguments are replaced.
 
+use std::collections::BTreeMap;
+
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
 use crate::{
@@ -77,9 +79,39 @@ pub(super) struct SnippetSession {
 }
 
 pub(super) fn parse_snippet(source: &str) -> ParsedSnippet {
+    parse_with_defaults(source, &BTreeMap::new())
+}
+
+#[cfg(feature = "helix")]
+pub(super) fn parse_felix_snippet(source: &str) -> ParsedSnippet {
+    let parsed = parse_snippet(source);
+    if !parsed
+        .placeholders
+        .windows(2)
+        .any(|pair| pair[0].index == pair[1].index)
+    {
+        return parsed;
+    }
+    let mut defaults = BTreeMap::new();
+    for stop in &parsed.placeholders {
+        if stop.start < stop.end {
+            defaults.entry(stop.index).or_insert_with(|| {
+                parsed
+                    .text
+                    .chars()
+                    .skip(stop.start)
+                    .take(stop.end - stop.start)
+                    .collect()
+            });
+        }
+    }
+    parse_with_defaults(source, &defaults)
+}
+
+fn parse_with_defaults(source: &str, defaults: &BTreeMap<usize, String>) -> ParsedSnippet {
     let characters = source.chars().collect::<Vec<_>>();
     let mut parsed = ParsedSnippet::default();
-    parse_fragment(&characters, 0, &mut parsed, false);
+    parse_fragment(&characters, 0, &mut parsed, false, defaults);
     parsed
         .placeholders
         .sort_by_key(|placeholder| placeholder.index);
@@ -91,6 +123,7 @@ fn parse_fragment(
     mut position: usize,
     parsed: &mut ParsedSnippet,
     stop_at_brace: bool,
+    defaults: &BTreeMap<usize, String>,
 ) -> Option<usize> {
     while let Some(&character) = characters.get(position) {
         if stop_at_brace && character == '}' {
@@ -124,7 +157,7 @@ fn parse_fragment(
             }
             Some(digit) if digit.is_ascii_digit() => {
                 let (next, index) = parse_index(characters, position + 1);
-                record_placeholder(parsed, index, parsed.text.chars().count(), None);
+                record_mirror(parsed, index, defaults);
                 position = next;
             }
             Some('{') => {
@@ -148,7 +181,9 @@ fn parse_fragment(
                 let text_length = parsed.text.len();
                 let placeholder_count = parsed.placeholders.len();
                 let previous_final = parsed.final_cursor;
-                if let Some(next) = parse_braced_placeholder(characters, position + 2, parsed) {
+                if let Some(next) =
+                    parse_braced_placeholder(characters, position + 2, parsed, defaults)
+                {
                     position = next;
                 } else {
                     parsed.text.truncate(text_length);
@@ -187,6 +222,7 @@ fn parse_braced_placeholder(
     characters: &[char],
     start: usize,
     parsed: &mut ParsedSnippet,
+    defaults: &BTreeMap<usize, String>,
 ) -> Option<usize> {
     if !characters.get(start)?.is_ascii_digit() {
         return None;
@@ -196,11 +232,11 @@ fn parse_braced_placeholder(
     let placeholder_start = parsed.text.chars().count();
     match characters.get(position)? {
         '}' => {
-            record_placeholder(parsed, index, placeholder_start, None);
+            record_mirror(parsed, index, defaults);
             Some(position + 1)
         }
         ':' => {
-            let next = parse_fragment(characters, position + 1, parsed, true)?;
+            let next = parse_fragment(characters, position + 1, parsed, true, defaults)?;
             record_placeholder(
                 parsed,
                 index,
@@ -240,6 +276,14 @@ fn parse_braced_placeholder(
     }
 }
 
+fn record_mirror(parsed: &mut ParsedSnippet, index: usize, defaults: &BTreeMap<usize, String>) {
+    let start = parsed.text.chars().count();
+    if let Some(value) = defaults.get(&index) {
+        parsed.text.push_str(value);
+    }
+    record_placeholder(parsed, index, start, Some(parsed.text.chars().count()));
+}
+
 fn record_placeholder(parsed: &mut ParsedSnippet, index: usize, start: usize, end: Option<usize>) {
     if index == 0 {
         parsed.final_cursor = Some(start);
@@ -255,7 +299,7 @@ fn record_placeholder(parsed: &mut ParsedSnippet, index: usize, start: usize, en
 impl Editor {
     pub(super) fn activate_snippet_session(&mut self, start: TextPosition, parsed: &ParsedSnippet) {
         let base = self.current_buffer().position_to_char_idx(start);
-        self.activate_snippet_instances(&[base], 0, parsed);
+        self.activate_snippet_instances(&[base], 0, parsed, false);
     }
 
     pub(super) fn activate_snippet_instances(
@@ -263,6 +307,7 @@ impl Editor {
         bases: &[usize],
         primary: usize,
         parsed: &ParsedSnippet,
+        keep_mirrors: bool,
     ) {
         self.snippet_session = None;
         if parsed.placeholders.is_empty() {
@@ -281,7 +326,9 @@ impl Editor {
                         end: self.anchor_at_char(base + placeholder.end, AnchorAffinity::Right),
                     })
                     .collect();
-                stops.dedup_by_key(|stop| stop.index);
+                if !keep_mirrors {
+                    stops.dedup_by_key(|stop| stop.index);
+                }
                 SnippetInstance {
                     stops,
                     final_cursor: self.anchor_at_char(
@@ -417,9 +464,17 @@ impl Editor {
             return;
         };
 
-        if backwards {
-            session.active = session.active.saturating_sub(1);
-        } else if session.active + 1 == session.instances[session.primary].stops.len() {
+        let stops = &session.instances[session.primary].stops;
+        let index = stops[session.active].index;
+        let next = if backwards {
+            let prev = stops
+                .partition_point(|stop| stop.index < index)
+                .saturating_sub(1);
+            stops.partition_point(|stop| stop.index < stops[prev].index)
+        } else {
+            stops.partition_point(|stop| stop.index <= index)
+        };
+        if next == stops.len() {
             let final_cursor = session.instances[session.primary].final_cursor.char_index;
             #[cfg(feature = "helix")]
             if self.felix_active_selection().is_some() {
@@ -431,9 +486,8 @@ impl Editor {
             let position = self.current_buffer().char_idx_to_position(final_cursor);
             self.move_to_insert_text_position(position);
             return;
-        } else {
-            session.active += 1;
         }
+        session.active = next;
 
         session.selected = true;
         let char_index = session.instances[session.primary].stops[session.active]
@@ -455,43 +509,48 @@ impl Editor {
         };
         // While typing into a stop, an adjacent stop on either side must
         // stay outside the inserted text even when a deletion joins them.
-        for instance in &mut session.instances {
-            let target = &instance.stops[session.active];
-            let start = target.start.char_index;
-            let end = target.end.char_index;
-            for (i, stop) in instance.stops.iter_mut().enumerate() {
-                stop.start.affinity = if i != session.active && stop.start.char_index >= end {
+        let active = session.instances[session.primary].stops[session.active].index;
+        let mut ranges = Vec::new();
+        let mut primary = 0;
+        for (i, instance) in session.instances.iter_mut().enumerate() {
+            if i == session.primary {
+                primary = ranges.len();
+            }
+            if final_stop {
+                let pos = instance.final_cursor.char_index;
+                ranges.push(felix_core::Range {
+                    anchor: pos,
+                    head: pos,
+                });
+                continue;
+            }
+            let targets: Vec<_> = instance
+                .stops
+                .iter()
+                .filter(|stop| stop.index == active)
+                .map(|stop| stop.start.char_index..stop.end.char_index)
+                .collect();
+            for stop in &mut instance.stops {
+                stop.start.affinity = if stop.index != active
+                    && targets.iter().any(|r| r.end == stop.start.char_index)
+                {
                     AnchorAffinity::Right
                 } else {
                     AnchorAffinity::Left
                 };
-                stop.end.affinity = if i != session.active && stop.end.char_index <= start {
+                stop.end.affinity = if stop.index != active
+                    && targets.iter().any(|r| r.start == stop.end.char_index)
+                {
                     AnchorAffinity::Left
                 } else {
                     AnchorAffinity::Right
                 };
             }
+            ranges.extend(targets.into_iter().map(|r| felix_core::Range {
+                anchor: r.start,
+                head: r.end,
+            }));
         }
-        let primary = session.primary;
-        let ranges: Vec<_> = session
-            .instances
-            .iter()
-            .map(|instance| {
-                if final_stop {
-                    let pos = instance.final_cursor.char_index;
-                    felix_core::Range {
-                        anchor: pos,
-                        head: pos,
-                    }
-                } else {
-                    let stop = &instance.stops[session.active];
-                    felix_core::Range {
-                        anchor: stop.start.char_index,
-                        head: stop.end.char_index,
-                    }
-                }
-            })
-            .collect();
         let text = self.current_buffer().contents_snapshot();
         if let Some(state) = felix_core::Selections::new(text.slice(..), ranges, primary) {
             self.set_felix_active_selection(state);
@@ -518,15 +577,32 @@ impl Editor {
         if key.chars().count() != 1 {
             return false;
         }
-        let ranges: Vec<_> = session
-            .instances
-            .iter()
-            .map(|instance| {
-                let stop = &instance.stops[session.active];
-                stop.start.char_index..stop.end.char_index
-            })
-            .filter(|r| !r.is_empty())
-            .collect();
+        let active = session.instances[session.primary].stops[session.active].index;
+        let mut ranges = Vec::new();
+        for instance in &mut session.instances {
+            let targets: Vec<_> = instance
+                .stops
+                .iter()
+                .filter(|stop| stop.index == active)
+                .map(|stop| stop.start.char_index..stop.end.char_index)
+                .filter(|r| !r.is_empty())
+                .collect();
+            // Replacing the enclosing default removes its nested placeholders.
+            instance.stops.retain(|stop| {
+                stop.index == active
+                    || !targets.iter().any(|r| {
+                        r.start <= stop.start.char_index
+                            && stop.end.char_index <= r.end
+                            && (stop.start.char_index != stop.end.char_index
+                                || (r.start < stop.start.char_index && stop.end.char_index < r.end))
+                    })
+            });
+            ranges.extend(targets);
+        }
+        session.active = session.instances[session.primary]
+            .stops
+            .partition_point(|stop| stop.index < active);
+        ranges.sort_unstable_by_key(|r| r.start);
         // An intervening edit can collapse originally disjoint placeholders.
         // Applying overlapping deletions in sequence would delete unrelated text.
         if ranges.windows(2).any(|pair| pair[0].end > pair[1].start) {

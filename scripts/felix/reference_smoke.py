@@ -33,7 +33,7 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
     root.mkdir()
     workdir = root / "work"
     workdir.mkdir()
-    completion = scenario in ("completion", "completion-repeat")
+    completion = scenario in ("completion", "completion-repeat", "snippet-stops")
     fixture = root / ("example.rs" if completion else "example.txt")
     split_search = scenario in ("split-search", "wrapped-split-search")
     wrapped = scenario == "wrapped-split-search"
@@ -105,7 +105,7 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
             window_config + 'editing_model = "helix"\ndisable_ai = true\nsplash = false\n'
             'show_whats_new = false\nfetch_release_notes = false\n[lsp]\n'
             + ('enabled = true\n[completion]\nauto_trigger = false\n'
-               + ('buffer_words = false\n' if scenario == "completion-repeat" else "")
+               + ('buffer_words = false\n' if scenario in ("completion-repeat", "snippet-stops") else "")
                + '[lsp.servers.rust]\n'
                'language_id = "rust"\nfile_extensions = ["rs"]\nroot_markers = []\n' + command
                if completion else 'enabled = false\n')
@@ -147,7 +147,7 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
             if copies > 1:
                 matches &= sum(row.strip() == (f"1 {line}" if red else f"1  {line}") for row in rows) == copies
             if menu is not None:
-                menu_visible = any(("FelixCandidate" in row or "SnippetCandidate" in row) and not re.match(r"^\s*1\s", row) for row in rows)
+                menu_visible = any(any(label in row for label in ("FelixCandidate", "SnippetCandidate", "MirrorCandidate", "NestedCandidate")) and not re.match(r"^\s*1\s", row) for row in rows)
                 matches &= menu_visible == menu
             if matches:
                 checkpoints.append({"step": label, "frame": rows})
@@ -321,6 +321,29 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
             check_prompt("wrap long query at a word", "12345 12345 12345", 29)
             tmux("resize-window", "-x", "80", "-y", "24", "-t", "oracle:0")
             check_prompt("reveal query after resize", "12345 12345 12345 12345 12界xy", 37)
+            return checkpoints
+        if scenario == "snippet-stops":
+            observe("open", "foo foo", "NOR", "1 sel")
+            observe_server("foo foo\n")
+            tmux("send-keys", "%", "s", "foo", "Enter", "c", "M", "C-x")
+            observe("request mirrors", "M M", "INS", menu=True)
+            tmux("send-keys", "C-n", "Enter")
+            observe("select mirrored defaults", "one=one two one=one two", "INS", "1/4 sels")
+            tmux("send-keys", "X")
+            observe("edit four mirrors", "X=X two X=X two", "INS", "1/4 sels")
+            tmux("send-keys", "Tab", "Y")
+            observe("edit independent second stop", "X=X Y X=X Y", "INS")
+            tmux("send-keys", "Escape")
+            observe("leave mirrored snippet", "X=X Y X=X Y", "NOR")
+            tmux("send-keys", "u", "u")
+            observe("undo mirrored insert", "foo foo", "NOR")
+            tmux("send-keys", "c", "N", "C-x")
+            observe("request nested stops", "N N", "INS", menu=True)
+            tmux("send-keys", "C-n", "Enter")
+            observe("select outer defaults", "outer inner:end outer inner:end", "INS")
+            tmux("send-keys", "X", "Tab", "Y")
+            observe("skip replaced children", "X:Y X:Y", "INS")
+            observe_server("X:Y X:Y\n")
             return checkpoints
         if scenario == "completion-repeat":
             observe("open", "foo foo", "NOR", "1 sel")
@@ -630,7 +653,7 @@ def main():
             additional_traces = {}
             for scenario, directory in (("split-search", "split"), ("wrapped-split-search", "wrap"),
                                         ("selection-errors", "sel"), ("clipboard", "clip"),
-                                        ("completion-repeat", "cr")):
+                                        ("completion-repeat", "cr"), ("snippet-stops", "st")):
                 key = scenario.replace("-", "_")
                 additional_traces[key] = run_trace(bundle, root / f"release-{directory}", scenario=scenario)
                 additional_traces[f"red_{key}"] = (run_trace(bundle, root / f"red-{directory}",

@@ -49,7 +49,8 @@ remaining = ["Language-specific indentation and joins"]
 [[area]]
 name = "Insert behavior"
 cases = ["open-line", "auto-pairs", "insert-controls", "newline-pairs", "newline-whitespace", "mixed-insert-aliases"]
-remaining = ["Completion preview layout in decorated and split views, nested or mirrored snippet stops with multiple selections", "Language-specific smart Tab"]
+terminal = ["snippet-stops", "completion"]
+remaining = ["Completion preview layout in decorated and split views", "Language-specific smart Tab"]
 
 [[area]]
 name = "Undo and repeat"

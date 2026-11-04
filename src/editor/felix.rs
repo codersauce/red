@@ -300,7 +300,7 @@ impl Editor {
         }
         let (ranges, state) = selections.completion_ranges(text.slice(..), start..end);
         let parsed = matches!(item.insert_text_format, Some(InsertTextFormat::Snippet))
-            .then(|| snippet::parse_snippet(&edit.new_text));
+            .then(|| snippet::parse_felix_snippet(&edit.new_text));
         let value = parsed
             .as_ref()
             .map_or(edit.new_text.as_str(), |s| s.text.as_str());
@@ -1002,7 +1002,7 @@ impl Editor {
         };
         let (ranges, selection) = before.completion_ranges(rope.slice(..), start..end);
         let mut snippet = matches!(format, Some(InsertTextFormat::Snippet))
-            .then(|| snippet::parse_snippet(&main.new_text));
+            .then(|| snippet::parse_felix_snippet(&main.new_text));
         if let (Some(snippet), Some(ch)) = (&mut snippet, commit_character) {
             snippet.insert_commit_character(ch);
         }
@@ -1079,7 +1079,7 @@ impl Editor {
             self.replace_range(range, value);
         }
         if let Some(snippet) = snippet {
-            self.activate_snippet_instances(&bases, primary, &snippet);
+            self.activate_snippet_instances(&bases, primary, &snippet, true);
             if snippet.placeholders.is_empty() {
                 let text = self.current_buffer().contents_snapshot();
                 let final_offset = snippet
