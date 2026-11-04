@@ -1194,6 +1194,8 @@ fn queue_diff_cells(
     theme: &Style,
     terminal_width: usize,
 ) -> anyhow::Result<()> {
+    let _span = super::perf::PerfSpan::start("render:encode_and_queue");
+    super::perf::increment("terminal:changed_cells", change_set.len() as u64);
     let mut previous_style = None;
     let mut cursor_position = None;
     let mut text = String::new();
@@ -1446,6 +1448,7 @@ impl Editor {
     /// frame is updated after its diff has been sent to the terminal, so later
     /// partial renders can continue to draw into the caller-owned buffer.
     fn render_buffer_changes<'a>(&mut self, buffer: &'a RenderBuffer) -> Vec<Change<'a>> {
+        let _span = super::perf::PerfSpan::start("render:compare_cells");
         let previous = self.previous_render_buffer.get_or_insert_with(|| {
             RenderBuffer::new(buffer.width, buffer.height, &Style::default())
         });
@@ -1864,14 +1867,26 @@ impl Editor {
         rows.sort_unstable();
         rows.dedup();
 
-        let snapshots = buffer.snapshot_rows(&rows);
+        if self.force_full_redraw
+            || self
+                .previous_render_buffer
+                .as_ref()
+                .is_none_or(|frame| (frame.width, frame.height) != (buffer.width, buffer.height))
+        {
+            return self.render(buffer);
+        }
         self.render_window_rows(buffer, active_window_id, &rows)?;
         self.draw_statusline(buffer);
         self.draw_commandline(buffer);
         self.update_terminal_cursor_surface(buffer, new_cursor_position);
         self.render_cursor_cell(buffer, new_cursor_position);
 
-        let changes = buffer.diff_row_snapshots(&snapshots);
+        // The last successful flush already owns the cells we need for comparison.
+        let previous = self
+            .previous_render_buffer
+            .as_ref()
+            .expect("validated frame");
+        let changes = buffer.diff_rows(previous, &rows);
         self.render_diff(&changes)?;
         self.commit_render_buffer_changes(&changes);
         self.last_rendered_cursor_position = new_cursor_position;

@@ -57,7 +57,7 @@ def main():
     def capture(name):
         (output / name).write_text(tmux("capture-pane", "-p", "-e", "-t", target, capture=True))
 
-    wait_for("[PERF] startup:interactive:")
+    wait_for(" startup:interactive:")
     cmd("sp " + str(root / "src/editor/rendering.rs"))
     tmux("send-keys", "-t", target, "C-w", "k")
     cmd("Agent")

@@ -23,7 +23,9 @@ import threading
 import time
 
 ROOT = Path(__file__).resolve().parent.parent
-TIMING = re.compile(r"\[PERF\] (\S+)(?: (.*?))?: (\d+)us")
+# Current traces include a span ID and clock. Archived binaries emit the
+# same completed-span payload immediately after the PERF marker.
+TIMING = re.compile(r"\[PERF\] (?:end id=\d+ t=\d+us )?(?!begin |end |timing )(\S+)(?: (.*?))?: (\d+)us$", re.MULTILINE)
 
 
 def response_text():
@@ -139,7 +141,7 @@ class Driver:
             close_fds=True)
         os.close(slave)
         threading.Thread(target=self.drain, daemon=True).start()
-        self.wait_for(lambda: ("[PERF] startup:interactive:" in self.read_log()
+        self.wait_for(lambda: (" startup:interactive:" in self.read_log()
                                if args.perf_mode == "trace" else len(self.capture) > 1000),
                       90, "first paint")
         time.sleep(0.3)
@@ -273,7 +275,8 @@ class Driver:
                 return stream.read().decode(errors="replace")
 
         def delivered():
-            return len(re.findall(r"\[PERF\] event (?:Mouse|Key)\(", phase_log()))
+            return sum(match[1] == "event" and (match[2] or "").startswith(("Mouse(", "Key("))
+                       for match in TIMING.finditer(phase_log()))
 
         if self.args.perf_mode != "trace":
             last_bytes, last_change = self.bytes, time.monotonic()

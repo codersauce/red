@@ -1180,7 +1180,9 @@ fn wrap_protocol(tmux: bool, sequence: &str) -> String {
 }
 
 pub(super) fn probe_terminal() -> Probe {
-    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+    // Only the Unix backend consumes raw probe replies. ConPTY delivers an
+    // unanswered device-attributes reply to the editor as ordinary keystrokes.
+    if !cfg!(unix) || !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         return Probe::default();
     }
     let query = probe_query(std::env::var_os("TMUX").is_some());

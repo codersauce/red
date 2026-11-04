@@ -3792,6 +3792,8 @@ pub struct Editor {
     /// Whether render operations should write terminal escape sequences
     terminal_output_enabled: bool,
 
+    input_trace: Option<perf::InputTrace>,
+
     /// Final terminal cursor command queued since the last flush.
     #[cfg(test)]
     pending_terminal_cursor: Option<TerminalCursorState>,
@@ -5966,6 +5968,7 @@ impl Editor {
             keyboard_protocol: crate::keyboard::KeyboardProtocol::default(),
             terminal_active: false,
             terminal_output_enabled: true,
+            input_trace: perf::InputTrace::start(),
             #[cfg(test)]
             pending_terminal_cursor: None,
             #[cfg(test)]
@@ -6578,7 +6581,17 @@ impl Editor {
     }
 
     fn flush_terminal_output(&mut self) -> std::io::Result<()> {
+        let _span = perf::PerfSpan::start("terminal:flush");
         self.stdout.flush()?;
+        if let Some(trace) = &mut self.input_trace {
+            let buffer = self.buffer_manager.active_buffer().expect("active buffer");
+            trace.flushed(
+                (self.cx, self.vtop + self.cy),
+                (self.vleft, self.vtop),
+                buffer.id().as_u64(),
+                buffer.revision(),
+            );
+        }
         #[cfg(test)]
         {
             self.flushed_terminal_cursor = self.pending_terminal_cursor;
@@ -14547,6 +14560,9 @@ impl Editor {
             });
         }
 
+        if let Some(trace) = &mut self.input_trace {
+            trace.dispatch();
+        }
         let sensitive_input = self
             .current_dialog
             .as_ref()
