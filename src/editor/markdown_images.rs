@@ -12,10 +12,10 @@
 //! the renderer instead of pulling in a second terminal stack.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     io::Cursor,
     path::{Path, PathBuf},
-    sync::{mpsc, Arc},
+    sync::{mpsc, Arc, OnceLock, Weak},
     time::{Duration, SystemTime},
 };
 
@@ -213,6 +213,7 @@ pub(super) struct DecodedImage {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
+    pixel_hash: OnceLock<u64>,
 }
 
 #[derive(Clone)]
@@ -261,7 +262,7 @@ struct PendingDraw {
     rows: u16,
     signature: u64,
     protocol: GraphicsProtocol,
-    payload: String,
+    staged_index: usize,
     source: Option<KittySourceRect>,
     placement_id: u32,
 }
@@ -286,6 +287,27 @@ struct StagedImage {
     decoded: Option<Arc<DecodedImage>>,
     /// Cell fingerprint taken after every image row is painted, before overlays.
     cells: Option<u64>,
+}
+
+impl StagedImage {
+    /// Encode only when the terminal needs pixels. Cursor motion, typing, and
+    /// moving a Kitty placement can reuse an image already on screen.
+    fn encode_pixels(&self) -> String {
+        let Some(decoded) = &self.decoded else {
+            return self.payload.clone();
+        };
+        let _span = super::perf::PerfSpan::start("markdown_images:encode");
+        let rgba = resample_rgba(decoded, self.pixel_w, self.pixel_h);
+        if self.protocol == GraphicsProtocol::Kitty {
+            return kitty_transmit_data(self.id, &rgba, self.pixel_w, self.pixel_h);
+        }
+        let (width, height, cropped) = crop_rgba(&rgba, self.pixel_w, self.pixel_h, self.source);
+        if self.protocol == GraphicsProtocol::Iterm2 {
+            iterm_transmit_rgba(&cropped, width, height, self.cols, self.rows)
+        } else {
+            encode_sixel(&cropped, width as usize, height as usize)
+        }
+    }
 }
 
 struct ObservedGraphics {
@@ -316,6 +338,13 @@ impl ImageLayout {
     }
 }
 
+struct TextGrid {
+    source: Weak<DecodedImage>,
+    cols: u16,
+    rows: u16,
+    samples: Arc<DecodedImage>,
+}
+
 pub(super) struct ImageRuntime {
     epoch: u64,
     hints: TerminalHints,
@@ -338,7 +367,7 @@ pub(super) struct ImageRuntime {
     next_id: u32,
     frame_open: bool,
     cell: CellPixels,
-    text_grid: Option<(u64, u16, u16, Arc<DecodedImage>)>,
+    text_grids: VecDeque<TextGrid>,
 }
 
 impl ImageRuntime {
@@ -364,7 +393,7 @@ impl ImageRuntime {
             next_id: 0,
             frame_open: false,
             cell: CellPixels::default(),
-            text_grid: None,
+            text_grids: VecDeque::new(),
         }
     }
 
@@ -383,7 +412,7 @@ impl ImageRuntime {
         if probe != self.probe || cell != self.cell {
             self.probe = probe;
             self.cell = cell;
-            self.text_grid = None;
+            self.text_grids.clear();
             self.epoch = self.epoch.wrapping_add(1);
         }
     }
@@ -392,22 +421,41 @@ impl ImageRuntime {
         choose_presentation(mode, &self.hints, self.probe)
     }
 
-    fn text_samples(&mut self, image: &DecodedImage, cols: u16, rows: u16) -> Arc<DecodedImage> {
-        let key = text_sample_key(image);
-        if let Some((cached, cached_cols, cached_rows, grid)) = &self.text_grid {
-            if *cached == key && *cached_cols == cols && *cached_rows == rows {
-                return Arc::clone(grid);
-            }
+    fn text_samples(
+        &mut self,
+        image: &Arc<DecodedImage>,
+        cols: u16,
+        rows: u16,
+    ) -> Arc<DecodedImage> {
+        let source = Arc::downgrade(image);
+        if let Some(grid) = self
+            .text_grids
+            .iter()
+            .find(|grid| grid.source.ptr_eq(&source) && grid.cols == cols && grid.rows == rows)
+        {
+            return Arc::clone(&grid.samples);
         }
+        let _span = super::perf::PerfSpan::start("markdown_images:text_samples");
         let width = u32::from(cols).saturating_mul(2).max(1);
         let height = u32::from(rows).saturating_mul(2).max(1);
         let rgba = resample_rgba(image, width, height);
         let grid = Arc::new(DecodedImage {
+            pixel_hash: OnceLock::new(),
             width,
             height,
             rgba,
         });
-        self.text_grid = Some((key, cols, rows, Arc::clone(&grid)));
+        // Keep several image/size pairs for documents and splits while bounding
+        // the number of sampled grids retained after scrolling or resizing.
+        if self.text_grids.len() == 16 {
+            self.text_grids.pop_front();
+        }
+        self.text_grids.push_back(TextGrid {
+            source,
+            cols,
+            rows,
+            samples: Arc::clone(&grid),
+        });
         grid
     }
 
@@ -567,8 +615,7 @@ impl ImageRuntime {
         });
     }
 
-    /// Hashes each image after its visible rows exist, and builds a cropped
-    /// Kitty payload when the block does not fit in the viewport.
+    /// Record the visible source rectangle and fingerprint before overlays paint.
     pub(super) fn seal_fingerprints(&mut self, buffer: &crate::editor::RenderBuffer) {
         if !self.frame_open {
             return;
@@ -576,53 +623,17 @@ impl ImageRuntime {
         self.staged
             .retain(|image| image.decoded.is_none() || image.painted > 0);
         for image in &mut self.staged {
-            if let Some(decoded) = image.decoded.clone() {
-                let visible = image.painted.max(1);
-                match image.protocol {
-                    GraphicsProtocol::Kitty => {
-                        let (pixel_w, pixel_h) =
-                            graphics_pixel_size(&decoded, image.cols, image.total_rows, self.cell);
-                        image.source = kitty_source_rect(
-                            pixel_w,
-                            pixel_h,
-                            image.total_rows,
-                            image.first_index,
-                            visible,
-                        );
-                        image.rows = visible;
-                        image.pixel_w = pixel_w;
-                        image.pixel_h = pixel_h;
-                        image.payload = kitty_transmit_data(
-                            image.id,
-                            &decoded,
-                            image.cols,
-                            image.total_rows,
-                            self.cell,
-                        );
-                    }
-                    GraphicsProtocol::Iterm2 | GraphicsProtocol::Sixel => {
-                        let (pixel_w, pixel_h) =
-                            graphics_pixel_size(&decoded, image.cols, image.total_rows, self.cell);
-                        let source = kitty_source_rect(
-                            pixel_w,
-                            pixel_h,
-                            image.total_rows,
-                            image.first_index,
-                            visible,
-                        );
-                        let rgba = resample_rgba(&decoded, pixel_w, pixel_h);
-                        let (width, height, cropped) = crop_rgba(&rgba, pixel_w, pixel_h, source);
-                        image.rows = visible;
-                        image.pixel_w = width;
-                        image.pixel_h = height;
-                        image.source = source;
-                        image.payload = if image.protocol == GraphicsProtocol::Iterm2 {
-                            iterm_transmit_rgba(&cropped, width, height, image.cols, visible)
-                        } else {
-                            encode_sixel(&cropped, width as usize, height as usize)
-                        };
-                    }
-                }
+            if let Some(decoded) = &image.decoded {
+                (image.pixel_w, image.pixel_h) =
+                    graphics_pixel_size(decoded, image.cols, image.total_rows, self.cell);
+                image.rows = image.painted.max(1);
+                image.source = kitty_source_rect(
+                    image.pixel_w,
+                    image.pixel_h,
+                    image.total_rows,
+                    image.first_index,
+                    image.rows,
+                );
             }
             if image.cells.is_none() && image.painted > 0 && image.painted >= image.rows {
                 let rect = crate::ui::ScreenRect {
@@ -641,9 +652,8 @@ impl ImageRuntime {
         if !self.frame_open {
             return false;
         }
-        let staged = std::mem::take(&mut self.staged);
         let mut visible = Vec::new();
-        for image in staged {
+        for (staged_index, image) in self.staged.iter().enumerate() {
             let rect = crate::ui::ScreenRect {
                 x: usize::from(image.x),
                 y: usize::from(image.y),
@@ -688,7 +698,7 @@ impl ImageRuntime {
                         rows: u16::try_from(piece.height).unwrap_or(u16::MAX),
                         signature: image.signature,
                         protocol: image.protocol,
-                        payload: image.payload.clone(),
+                        staged_index,
                         source,
                         placement_id,
                     });
@@ -711,7 +721,7 @@ impl ImageRuntime {
                 rows: image.rows,
                 signature: image.signature,
                 protocol: image.protocol,
-                payload: image.payload,
+                staged_index,
                 source: image.source,
                 placement_id: 1,
             });
@@ -728,6 +738,7 @@ impl ImageRuntime {
         }
         self.frame_open = false;
         let pending = std::mem::take(&mut self.pending);
+        let staged = std::mem::take(&mut self.staged);
         let mut out = String::new();
         // A forced redraw used to drop `placed` before emitting deletes, so the
         // ids were gone and the last image stayed on screen forever.
@@ -750,7 +761,6 @@ impl ImageRuntime {
             self.placed.clear();
         }
         let mut next = HashMap::new();
-        let mut saw_transmit = std::collections::HashSet::new();
         for draw in &pending {
             let key = (draw.id, draw.placement_id);
             let previous = self.placed.get(&key).copied();
@@ -765,8 +775,11 @@ impl ImageRuntime {
             });
             if draw.protocol == GraphicsProtocol::Kitty {
                 let needs_pixels = self.transmitted.get(&draw.id) != Some(&draw.signature);
-                if needs_pixels && saw_transmit.insert(draw.id) && !draw.payload.is_empty() {
-                    out.push_str(&wrap_protocol(self.hints.tmux, &draw.payload));
+                if needs_pixels {
+                    out.push_str(&wrap_protocol(
+                        self.hints.tmux,
+                        &staged[draw.staged_index].encode_pixels(),
+                    ));
                     self.transmitted.insert(draw.id, draw.signature);
                 }
                 if unchanged && !force && !needs_pixels {
@@ -793,7 +806,10 @@ impl ImageRuntime {
                 continue;
             } else {
                 out.push_str(&format!("\u{1b}[{};{}H", draw.y + 1, draw.x + 1));
-                out.push_str(&wrap_protocol(self.hints.tmux, &draw.payload));
+                out.push_str(&wrap_protocol(
+                    self.hints.tmux,
+                    &staged[draw.staged_index].encode_pixels(),
+                ));
             }
             next.insert(
                 key,
@@ -1645,6 +1661,7 @@ pub(super) fn decode_image_bytes(bytes: &[u8]) -> Result<DecodedImage, String> {
         return Err("unsupported image".to_string());
     }
     Ok(DecodedImage {
+        pixel_hash: OnceLock::new(),
         width: rgba.width(),
         height: rgba.height(),
         rgba: rgba.into_raw(),
@@ -1893,16 +1910,8 @@ pub(super) fn kitty_source_rect(
     })
 }
 
-fn kitty_transmit_data(
-    id: u32,
-    image: &DecodedImage,
-    cols: u16,
-    rows: u16,
-    cell: CellPixels,
-) -> String {
-    let (width, height) = graphics_pixel_size(image, cols, rows.max(1), cell);
-    let rgba = resample_rgba(image, width, height);
-    let payload = base64::engine::general_purpose::STANDARD.encode(&rgba);
+fn kitty_transmit_data(id: u32, rgba: &[u8], width: u32, height: u32) -> String {
+    let payload = base64::engine::general_purpose::STANDARD.encode(rgba);
     chunk_kitty(
         &format!("a=t,f=32,s={width},v={height},i={id},q=2"),
         &payload,
@@ -2310,12 +2319,23 @@ impl super::Editor {
         &mut self,
         buffer: &crate::editor::RenderBuffer,
     ) {
-        if self.markdown_images.borrow_mut().commit_visible(buffer) {
-            // Sixel and iTerm2 have no z-order. Rewriting every cell clears
-            // their pixels when a popup covers them, and again when they return.
-            // A switch away from block glyphs also needs the whole image region
-            // sent, not only the cells whose text happened to differ.
-            self.force_full_redraw = true;
+        let mut images = self.markdown_images.borrow_mut();
+        if images.commit_visible(buffer) {
+            // Kitty moves and deletes individual placements without disturbing
+            // cells or resident pixels. A full redraw would upload every image
+            // again whenever another screenshot entered or left the viewport.
+            let kitty_placements = images.presentation(self.config.markdown_images)
+                == ImagePresentation::Graphics(GraphicsProtocol::Kitty)
+                && !images.placed.is_empty()
+                && images
+                    .placed
+                    .values()
+                    .all(|p| p.protocol == GraphicsProtocol::Kitty);
+            if !kitty_placements {
+                // Repaint cells when switching presentations or covering an
+                // iTerm2/Sixel image, which has no independent placement.
+                self.force_full_redraw = true;
+            }
         }
     }
 
@@ -2427,6 +2447,7 @@ impl super::Editor {
             let buffer_id = self.buffer_manager[window.buffer_index].id();
             let mut runtime = self.markdown_images.borrow_mut();
             let id = runtime.id_for(buffer_id, segment.line);
+            let signature = image_signature(&image, span.cols, span.rows, protocol, runtime.cell);
             runtime.observe_graphics_row(ObservedGraphics {
                 id,
                 x,
@@ -2434,7 +2455,7 @@ impl super::Editor {
                 cols: span.cols,
                 total_rows: span.rows,
                 index: span.index,
-                signature: image_signature(&image, span.cols, span.rows, protocol),
+                signature,
                 protocol,
                 image: Arc::clone(&image),
             });
@@ -2443,27 +2464,28 @@ impl super::Editor {
     }
 }
 
-fn text_sample_key(image: &DecodedImage) -> u64 {
+fn image_signature(
+    image: &DecodedImage,
+    cols: u16,
+    rows: u16,
+    protocol: GraphicsProtocol,
+    cell: CellPixels,
+) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
     image.width.hash(&mut hasher);
     image.height.hash(&mut hasher);
-    image.rgba.len().hash(&mut hasher);
-    image.rgba.first().hash(&mut hasher);
-    image.rgba.last().hash(&mut hasher);
-    hasher.finish()
-}
-
-fn image_signature(image: &DecodedImage, cols: u16, rows: u16, protocol: GraphicsProtocol) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    image.width.hash(&mut hasher);
-    image.height.hash(&mut hasher);
-    image.rgba.len().hash(&mut hasher);
-    image.rgba.first().hash(&mut hasher);
-    image.rgba.last().hash(&mut hasher);
+    image
+        .pixel_hash
+        .get_or_init(|| {
+            let mut pixels = DefaultHasher::new();
+            image.rgba.hash(&mut pixels);
+            pixels.finish()
+        })
+        .hash(&mut hasher);
+    cell.width.hash(&mut hasher);
+    cell.height.hash(&mut hasher);
     cols.hash(&mut hasher);
     rows.hash(&mut hasher);
     protocol_tag(protocol).hash(&mut hasher);
@@ -2488,6 +2510,36 @@ mod tests {
                 .find(|(name, _)| *name == key)
                 .map(|(_, value)| (*value).to_string())
         })
+    }
+
+    #[test]
+    fn text_images_reuse_each_source_and_size_across_redraws() {
+        let mut runtime = ImageRuntime::new();
+        let first = Arc::new(DecodedImage {
+            pixel_hash: OnceLock::new(),
+            width: 2,
+            height: 2,
+            rgba: vec![255; 16],
+        });
+        let mut different = (*first).clone();
+        different.rgba[4] = 0;
+        let second = Arc::new(different);
+        let signature = |image, cell| image_signature(image, 1, 1, GraphicsProtocol::Kitty, cell);
+        assert_ne!(
+            signature(&first, CellPixels::default()),
+            signature(&second, CellPixels::default())
+        );
+        assert_ne!(
+            signature(&first, CellPixels::default()),
+            signature(&first, CellPixels::measured(12, 24))
+        );
+        let grid = runtime.text_samples(&first, 1, 1);
+        let other = runtime.text_samples(&second, 1, 1);
+        assert_ne!(grid.rgba, other.rgba);
+        let resized = runtime.text_samples(&first, 2, 1);
+        assert_eq!(resized.width, 4);
+        assert!(Arc::ptr_eq(&grid, &runtime.text_samples(&first, 1, 1)));
+        assert!(Arc::ptr_eq(&other, &runtime.text_samples(&second, 1, 1)));
     }
 
     #[test]
@@ -2574,6 +2626,7 @@ mod tests {
     #[test]
     fn layout_reserves_vertical_space_for_an_image_line() {
         let image = DecodedImage {
+            pixel_hash: OnceLock::new(),
             width: 200,
             height: 100,
             rgba: vec![255, 0, 0, 255, 0, 0, 255, 255],
@@ -2752,6 +2805,7 @@ mod tests {
     #[test]
     fn halfblocks_sample_top_and_bottom_pixels() {
         let image = DecodedImage {
+            pixel_hash: OnceLock::new(),
             width: 1,
             height: 2,
             rgba: vec![255, 0, 0, 255, 0, 0, 255, 255],
@@ -2764,6 +2818,7 @@ mod tests {
     #[test]
     fn kitty_sixel_and_iterm_payloads_carry_the_image() {
         let image = DecodedImage {
+            pixel_hash: OnceLock::new(),
             width: 1,
             height: 1,
             rgba: vec![255, 0, 0, 255],
@@ -2790,6 +2845,7 @@ mod tests {
     #[test]
     fn graphics_rasters_use_cell_pixels_not_cell_counts() {
         let image = DecodedImage {
+            pixel_hash: OnceLock::new(),
             width: 80,
             height: 40,
             rgba: vec![200u8; 80 * 40 * 4],
@@ -2811,6 +2867,7 @@ mod tests {
         let sixel = sixel_transmit(&image, 4, 2, cell);
         let tiny = sixel_transmit(
             &DecodedImage {
+                pixel_hash: OnceLock::new(),
                 width: 4,
                 height: 2,
                 rgba: vec![1u8; 4 * 2 * 4],
@@ -2831,6 +2888,7 @@ mod tests {
     #[test]
     fn resampling_mixes_neighbors_instead_of_copying_one_pixel() {
         let image = DecodedImage {
+            pixel_hash: OnceLock::new(),
             width: 2,
             height: 2,
             rgba: vec![
@@ -2842,6 +2900,7 @@ mod tests {
         assert_eq!(&nearest[..3], &[255, 0, 0]);
         assert_ne!(&mixed[..3], &[255, 0, 0]);
         let grid = DecodedImage {
+            pixel_hash: OnceLock::new(),
             width: 2,
             height: 2,
             rgba: vec![
@@ -3662,6 +3721,7 @@ mod tests {
         let mut runtime = ImageRuntime::new();
         let buffer = crate::editor::RenderBuffer::new(10, 6, &Style::default());
         let image = Arc::new(DecodedImage {
+            pixel_hash: OnceLock::new(),
             width: 4,
             height: 16,
             rgba: vec![200u8; 4 * 16 * 4],
@@ -3691,8 +3751,10 @@ mod tests {
         assert!(place.contains("r=2"), "{place}");
         assert!(!place.contains("r=4"), "{place}");
         assert!(place.contains(&format!("y={}", source.y)), "{place}");
-        assert!(staged.payload.contains("a=t,"), "{}", staged.payload);
-        assert!(!staged.payload.contains("a=T,"), "{}", staged.payload);
+        runtime.commit_visible(&buffer);
+        let output = runtime.graphics_payload(false);
+        assert!(output.contains("a=t,"), "{output}");
+        assert!(!output.contains("a=T,"), "{output}");
         assert!(kitty_source_rect(10, 40, 4, 0, 4).is_none());
         let top = kitty_source_rect(10, 40, 4, 1, 2).unwrap();
         assert_eq!((top.y, top.h), (10, 20));
@@ -3721,6 +3783,7 @@ mod tests {
         let mut runtime = ImageRuntime::new();
         let buffer = crate::editor::RenderBuffer::new(10, 6, &Style::default());
         let image = Arc::new(DecodedImage {
+            pixel_hash: OnceLock::new(),
             width: 4,
             height: 16,
             rgba: vec![180u8; 4 * 16 * 4],
@@ -3758,6 +3821,7 @@ mod tests {
     fn sixel_and_iterm_crop_the_bitmap_to_the_visible_rows() {
         use crate::theme::Style;
         let image = Arc::new(DecodedImage {
+            pixel_hash: OnceLock::new(),
             width: 4,
             height: 16,
             rgba: vec![90u8; 4 * 16 * 4],
@@ -3782,20 +3846,14 @@ mod tests {
             runtime.seal_fingerprints(&buffer);
             let staged = &runtime.staged[0];
             assert_eq!(staged.rows, 2, "{protocol:?}");
-            assert_eq!(staged.pixel_h, 8, "{protocol:?}");
-            assert!(staged.pixel_h < 16, "{protocol:?}");
+            assert_eq!(staged.source.unwrap().h, 8, "{protocol:?}");
+            runtime.commit_visible(&buffer);
+            let output = runtime.graphics_payload(false);
             if protocol == GraphicsProtocol::Iterm2 {
-                assert!(
-                    staged.payload.contains("height=2;"),
-                    "{protocol:?} {}",
-                    staged.payload
-                );
-                assert!(!staged.payload.contains("height=4;"), "{}", staged.payload);
+                assert!(output.contains("height=2;"), "{output}");
+                assert!(!output.contains("height=4;"), "{output}");
             } else {
-                assert!(
-                    staged.payload.contains("SIXEL") || staged.payload.contains("\u{1b}P"),
-                    "{protocol:?}"
-                );
+                assert!(output.contains("\u{1b}P"), "{output}");
             }
         }
     }

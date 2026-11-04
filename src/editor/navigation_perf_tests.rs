@@ -75,6 +75,18 @@ fn assert_matches_full_frame(editor: &mut Editor, buffer: &RenderBuffer) {
     assert_eq!(buffer.cells, full.cells);
 }
 
+#[test]
+fn revealing_a_wrapped_cursor_in_the_top_margin_scrolls_up_one_row() {
+    let (mut editor, _, _) = workspace(false, false, true);
+    editor.config.scrolloff = Some(3);
+    editor.vtop = 100;
+    editor.cy = 3;
+    editor.cx = 0;
+    editor.sync_to_window();
+    editor.reveal_cursor_destination(102);
+    assert_eq!((editor.vtop, editor.buffer_line()), (99, 102));
+}
+
 #[tokio::test]
 async fn keyboard_edge_frame_matches_full_frame() {
     let mut failures = Vec::new();
