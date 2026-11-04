@@ -110,20 +110,20 @@ impl ProjectedRow {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 struct SourceGlyph {
     text: String,
     bytes: Range<usize>,
     style: CellStyle,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 struct Cell {
     bytes: Range<usize>,
     glyphs: Vec<SourceGlyph>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 struct TableRow {
     line: usize,
     text: String,
@@ -131,7 +131,7 @@ struct TableRow {
     header: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 struct Table {
     lines: Range<usize>,
     alignments: Vec<Alignment>,
@@ -139,7 +139,7 @@ struct Table {
     delimiter: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 pub(super) struct MarkdownTables {
     tables: Vec<Table>,
 }
@@ -203,11 +203,15 @@ impl super::Editor {
             layouts: HashMap::new(),
         });
         if cached.revision != buffer.revision() {
-            *cached = CachedTables {
-                revision: buffer.revision(),
-                parsed: MarkdownTables::parse(&buffer.contents()),
-                layouts: HashMap::new(),
-            };
+            // Edits outside a table can still change its parse (for example
+            // by opening a fence). Reparse, but reuse every window's geometry
+            // when the complete table model and its source positions agree.
+            let parsed = MarkdownTables::parse(&buffer.contents());
+            if cached.parsed != parsed {
+                cached.parsed = parsed;
+                cached.layouts.clear();
+            }
+            cached.revision = buffer.revision();
         }
         let key = TableLayoutOptions {
             width: self.window_content_width(window),

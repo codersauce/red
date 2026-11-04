@@ -524,6 +524,9 @@ struct CachedHighlight {
 pub struct Highlighter {
     highlighters: HashMap<String, LanguageHighlighter>,
     cached_highlight: Option<CachedHighlight>,
+    // Relative spans for independent regions (inline text and fenced code) in
+    // the previous Markdown slice. Parent styles and offsets are applied afresh.
+    markdown_injections: Vec<CachedHighlight>,
     registry: Arc<LanguageRegistry>,
     theme: Theme,
     husk_styles: HuskStyles,
@@ -660,6 +663,7 @@ impl Highlighter {
         Ok(Self {
             highlighters: HashMap::new(),
             cached_highlight: None,
+            markdown_injections: Vec::new(),
             registry,
             theme: theme.clone(),
             husk_styles: HuskStyles::new(theme),
@@ -1486,13 +1490,44 @@ impl Highlighter {
             .collect::<Vec<_>>();
 
         let block_color_count = colors.len();
+        let reuse_injections =
+            depth == 0 && language_id == "markdown" && code.len() <= MAX_CACHED_HIGHLIGHT_BYTES;
+        let mut previous = if reuse_injections {
+            std::mem::take(&mut self.markdown_injections)
+        } else {
+            Vec::new()
+        }
+        .into_iter();
+        let mut cached_bytes = 0;
+        let mut cached_spans = 0;
         for injection in injections {
             let Some(injected_code) = code.get(injection.content_start..injection.content_end)
             else {
                 continue;
             };
-            let mut injected_colors =
-                self.highlight_with_depth(&injection.language_id, injected_code, depth + 1)?;
+            let cached = previous.next().filter(|entry| {
+                entry.language_id == injection.language_id && entry.code == injected_code
+            });
+            let mut injected_colors = match &cached {
+                Some(entry) => entry.styles.clone(),
+                None => {
+                    self.highlight_with_depth(&injection.language_id, injected_code, depth + 1)?
+                }
+            };
+            if reuse_injections
+                && self.markdown_injections.len() < 128
+                && cached_bytes + injected_code.len() <= MAX_CACHED_HIGHLIGHT_BYTES
+                && cached_spans + injected_colors.len() <= MAX_CACHED_HIGHLIGHT_SPANS
+            {
+                cached_bytes += injected_code.len();
+                cached_spans += injected_colors.len();
+                self.markdown_injections
+                    .push(cached.unwrap_or_else(|| CachedHighlight {
+                        language_id: injection.language_id.clone(),
+                        code: injected_code.to_owned(),
+                        styles: injected_colors.clone(),
+                    }));
+            }
             for color in &mut injected_colors {
                 color.start += injection.content_start;
                 color.end += injection.content_start;
@@ -4208,6 +4243,27 @@ mod tests {
             .tree
             .root_node()
             .has_changes());
+    }
+
+    #[test]
+    fn retained_markdown_regions_take_their_new_offsets_and_parent_style() {
+        let mut reused = highlighter();
+        for doc in [
+            "**word**\n\n```rust\nfn a() {}\n```\n",
+            "# **word**\n\n```rust\nfn a() {}\n```\n",
+            "# **word**\n\n```text\nfn a() {}\n```\n",
+            "prefix\n\n# **word**\n\n```rust\nfn b() {}\n```\n",
+        ] {
+            let expected = highlighter().highlight("markdown", doc).unwrap();
+            let actual = reused.highlight("markdown", doc).unwrap();
+            let spans = |styles: Vec<StyleInfo>| {
+                styles
+                    .into_iter()
+                    .map(|span| (span.start, span.end, span.style))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(spans(actual), spans(expected));
+        }
     }
 
     #[test]
