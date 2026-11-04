@@ -186,7 +186,7 @@ impl Editor {
         let buffer = &self.buffer_manager[window.buffer_index];
         let line = buffer.get(segment.line).unwrap_or_default();
         let display_col = segment.display_col_for_screen_col(content_x);
-        let x = column_to_grapheme_with_tabs(
+        let x = self.config.editing_model.source_grapheme(
             trim_line_ending(&line),
             display_col,
             self.tab_width_for_buffer_index(window.buffer_index),

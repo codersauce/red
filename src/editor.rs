@@ -94,9 +94,9 @@ use std::{
 };
 
 use crate::unicode_utils::{
-    char_prefix, char_slice, char_suffix, char_to_grapheme, column_to_grapheme_with_tabs,
-    display_width, display_width_with_tabs, grapheme_char_range, grapheme_len, grapheme_to_byte,
-    grapheme_to_char, grapheme_to_column_with_tabs, trim_line_ending, truncate_chars,
+    char_prefix, char_slice, char_suffix, char_to_grapheme, display_width, display_width_with_tabs,
+    grapheme_char_range, grapheme_len, grapheme_to_byte, grapheme_to_char,
+    grapheme_to_column_with_tabs, trim_line_ending, truncate_chars,
 };
 
 use crossterm::{
@@ -7587,8 +7587,7 @@ impl Editor {
     fn break_indent_options_for_buffer_index(&self, buffer_index: usize) -> BreakIndentOptions {
         BreakIndentOptions {
             enabled: self.config.breakindent.unwrap_or(true),
-            #[cfg(feature = "helix")]
-            helix: self.config.editing_model == crate::config::EditingModel::Helix,
+            model: self.config.editing_model,
             tab_width: self
                 .indentation_for_buffer_index(buffer_index)
                 .tab_width
@@ -7651,7 +7650,7 @@ impl Editor {
         buf_y: usize,
     ) -> Option<(usize, usize)> {
         let line = self.buffer_manager.get(window.buffer_index)?.get(buf_y)?;
-        let display_col = grapheme_to_column_with_tabs(
+        let display_col = self.config.editing_model.source_column(
             line.trim_end_matches('\n'),
             buf_x,
             self.tab_width_for_buffer_index(window.buffer_index),
@@ -8126,7 +8125,10 @@ impl Editor {
     fn line_display_width(&self) -> usize {
         if let Some(line) = self.viewport_line(self.cy) {
             let line = line.trim_end_matches('\n');
-            return display_width_with_tabs(line, self.active_tab_width());
+            return self
+                .config
+                .editing_model
+                .source_width(line, self.active_tab_width());
         }
         0
     }
@@ -8429,7 +8431,10 @@ impl Editor {
         };
 
         let x = self.gutter_width()
-            + display_width_with_tabs(line.trim_end_matches('\n'), self.active_tab_width())
+            + self
+                .config
+                .editing_model
+                .source_width(line.trim_end_matches('\n'), self.active_tab_width())
             + 5;
 
         // otherwise, clear the line
@@ -8585,7 +8590,7 @@ impl Editor {
             }
         }
         if let Some(line) = self.current_line_contents() {
-            return grapheme_to_column_with_tabs(
+            return self.config.editing_model.source_column(
                 trim_line_ending(&line),
                 self.cx,
                 self.active_tab_width(),
@@ -8600,7 +8605,10 @@ impl Editor {
     }
 
     fn line_goal_limit(&self, line: &str) -> usize {
-        let line_width = display_width_with_tabs(line, self.active_tab_width());
+        let line_width = self
+            .config
+            .editing_model
+            .source_width(line, self.active_tab_width());
         if self.is_insert() {
             line_width
         } else {
@@ -8615,11 +8623,10 @@ impl Editor {
                 let tab_width = self.active_tab_width();
                 let mut width = 0;
                 for grapheme in line.graphemes(true) {
-                    width += if grapheme == "\t" {
-                        tab_width - (width % tab_width)
-                    } else {
-                        display_width(grapheme)
-                    };
+                    width += self
+                        .config
+                        .editing_model
+                        .source_cell_width(grapheme, width, tab_width);
                     if width >= required_width {
                         return display_col;
                     }
@@ -8639,7 +8646,9 @@ impl Editor {
         match goal {
             CursorGoal::DisplayCol(display_col) | CursorGoal::ScreenCol { display_col, .. } => {
                 let max_cursor_x = self.max_cursor_x_for_line_length(grapheme_len(line));
-                column_to_grapheme_with_tabs(line, display_col, self.active_tab_width())
+                self.config
+                    .editing_model
+                    .source_grapheme(line, display_col, self.active_tab_width())
                     .min(max_cursor_x)
             }
             CursorGoal::LineEnd => self.max_cursor_x_for_line_length(grapheme_len(line)),
@@ -8660,7 +8669,10 @@ impl Editor {
         let line_index = self.buffer_line();
         let line = self.current_line_contents()?;
         let line = trim_line_ending(&line);
-        let display_col = grapheme_to_column_with_tabs(line, self.cx, self.active_tab_width());
+        let display_col =
+            self.config
+                .editing_model
+                .source_column(line, self.cx, self.active_tab_width());
         let window = self.window_manager.active_window()?;
         let layout = self.layout_for_window(window);
         layout.segment_for_cursor(line_index, display_col).cloned()
@@ -8686,7 +8698,7 @@ impl Editor {
                 line_index,
                 usize::MAX,
                 0,
-                self.active_tab_width(),
+                self.break_indent_options_for_buffer_index(self.buffer_manager.active_index()),
             );
         }
         let line = trim_line_ending(&line);
@@ -8742,7 +8754,7 @@ impl Editor {
                 line_index,
                 usize::MAX,
                 0,
-                self.active_tab_width(),
+                self.break_indent_options_for_buffer_index(self.buffer_manager.active_index()),
             );
         }
         let break_indent =
@@ -9172,7 +9184,7 @@ impl Editor {
             .current_buffer()
             .get(line_index)
             .map(|line| {
-                grapheme_to_column_with_tabs(
+                self.config.editing_model.source_column(
                     trim_line_ending(&line),
                     self.cx,
                     self.active_tab_width(),
@@ -9448,7 +9460,10 @@ impl Editor {
             .graphemes(true)
             .enumerate()
             .find_map(|(index, grapheme)| {
-                let col = grapheme_to_column_with_tabs(line, index, self.active_tab_width());
+                let col =
+                    self.config
+                        .editing_model
+                        .source_column(line, index, self.active_tab_width());
                 (col >= segment.start_col
                     && col < segment.end_col
                     && !segment.hides_source_column(col)
@@ -9503,7 +9518,11 @@ impl Editor {
                 .get(window.buffer_index)
                 .and_then(|buffer| buffer.get(buffer_y))
                 .map(|line| {
-                    grapheme_to_column_with_tabs(line.trim_end_matches('\n'), window.cx, tab_width)
+                    self.config.editing_model.source_column(
+                        line.trim_end_matches('\n'),
+                        window.cx,
+                        tab_width,
+                    )
                 })
                 .unwrap_or(window.cx);
             window.cursor_goal = CursorGoal::DisplayCol(display_col);
@@ -13473,7 +13492,11 @@ impl Editor {
                 PluginRequest::GetCursorDisplayColumn { request_id } => {
                     let display_col = if let Some(line) = self.current_line_contents() {
                         let line = line.trim_end_matches('\n');
-                        grapheme_to_column_with_tabs(line, self.cx, self.active_tab_width())
+                        self.config.editing_model.source_column(
+                            line,
+                            self.cx,
+                            self.active_tab_width(),
+                        )
                     } else {
                         self.cx
                     };
@@ -13511,8 +13534,11 @@ impl Editor {
                     // Convert display column to character index
                     if let Some(line) = self.viewport_line(y.saturating_sub(self.vtop)) {
                         let line = line.trim_end_matches('\n');
-                        self.cx =
-                            column_to_grapheme_with_tabs(line, column, self.active_tab_width());
+                        self.cx = self.config.editing_model.source_grapheme(
+                            line,
+                            column,
+                            self.active_tab_width(),
+                        );
                     }
                     let viewport_height = self.vheight().max(1);
                     // Adjust viewport if needed
@@ -32326,7 +32352,10 @@ impl Editor {
         let buffer_line = self.buffer_line();
         let line = self.current_line_contents().unwrap_or_default();
         let line = line.trim_end_matches('\n');
-        let display_col = grapheme_to_column_with_tabs(line, self.cx, self.active_tab_width());
+        let display_col =
+            self.config
+                .editing_model
+                .source_column(line, self.cx, self.active_tab_width());
 
         // Image scrolling stores the visible image row in skipcol. Showing the
         // source again must not treat that row index as a horizontal offset.

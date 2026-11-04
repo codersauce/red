@@ -385,19 +385,7 @@ pub fn grapheme_to_column(line: &str, grapheme_idx: usize) -> usize {
 
 /// Calculate a grapheme's display column while expanding tabs.
 pub fn grapheme_to_column_with_tabs(line: &str, grapheme_idx: usize, tab_width: usize) -> usize {
-    if let Some(column) = printable_ascii_coordinate(line, grapheme_idx, /*reverse*/ false) {
-        return column;
-    }
-    let tab_width = tab_width.max(1);
-    let mut column = 0;
-    for grapheme in line.graphemes(true).take(grapheme_idx) {
-        column += if grapheme == "\t" {
-            tab_width - (column % tab_width)
-        } else {
-            display_width(grapheme)
-        };
-    }
-    column
+    crate::config::EditingModel::Vim.source_column(line, grapheme_idx, tab_width)
 }
 
 /// Find the grapheme index that contains the given display column.
@@ -419,27 +407,50 @@ pub fn column_to_grapheme(line: &str, target_column: usize) -> usize {
 
 /// Find the grapheme containing a display column while expanding tabs.
 pub fn column_to_grapheme_with_tabs(line: &str, target_column: usize, tab_width: usize) -> usize {
-    if let Some(grapheme) = printable_ascii_coordinate(line, target_column, /*reverse*/ true) {
-        return grapheme;
-    }
-    let tab_width = tab_width.max(1);
-    let mut current_column = 0;
-    let mut grapheme_count = 0;
+    crate::config::EditingModel::Vim.source_grapheme(line, target_column, tab_width)
+}
 
-    for (idx, grapheme) in line.graphemes(true).enumerate() {
-        let grapheme_width = if grapheme == "\t" {
-            tab_width - (current_column % tab_width)
-        } else {
-            display_width(grapheme)
-        };
-        if current_column + grapheme_width > target_column {
-            return idx;
+// Source columns are the coordinates shared by document layout, hit testing,
+// and overlays. Helix needs a distinct stop even for an invisible grapheme.
+impl crate::config::EditingModel {
+    pub(crate) fn source_cell_width(self, grapheme: &str, col: usize, tab_width: usize) -> usize {
+        if grapheme == "\t" {
+            let stop = tab_width.max(1);
+            return stop - col % stop;
         }
-        current_column += grapheme_width;
-        grapheme_count = idx + 1;
+        let width = display_width(grapheme);
+        #[cfg(feature = "helix")]
+        if self == Self::Helix {
+            return width.max(1);
+        }
+        width
     }
 
-    grapheme_count
+    pub(crate) fn source_column(self, line: &str, grapheme: usize, tab_width: usize) -> usize {
+        if let Some(col) = printable_ascii_coordinate(line, grapheme, false) {
+            return col;
+        }
+        line.graphemes(true)
+            .take(grapheme)
+            .fold(0, |col, g| col + self.source_cell_width(g, col, tab_width))
+    }
+
+    pub(crate) fn source_width(self, line: &str, tab_width: usize) -> usize {
+        self.source_column(line, usize::MAX, tab_width)
+    }
+
+    pub(crate) fn source_grapheme(self, line: &str, column: usize, tab_width: usize) -> usize {
+        if let Some(index) = printable_ascii_coordinate(line, column, true) {
+            return index;
+        }
+        let mut col = 0;
+        line.graphemes(true)
+            .take_while(|g| {
+                col += self.source_cell_width(g, col, tab_width);
+                col <= column
+            })
+            .count()
+    }
 }
 
 fn printable_ascii_coordinate(line: &str, position: usize, reverse: bool) -> Option<usize> {

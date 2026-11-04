@@ -37,9 +37,9 @@ use crate::{
     ui::IconCatalog,
     undo::{TextPosition, TextRange},
     unicode_utils::{
-        char_prefix, display_width, display_width_with_tabs, fit_display_width, grapheme_len,
-        grapheme_to_column_with_tabs, is_printable_ascii, trim_line_ending, truncate_display_width,
-        truncate_display_width_with_marker, TruncationSide,
+        char_prefix, display_width, fit_display_width, grapheme_len, is_printable_ascii,
+        trim_line_ending, truncate_display_width, truncate_display_width_with_marker,
+        TruncationSide,
     },
     utils::{expand_user_path, get_workspace_path},
     window::WindowId,
@@ -1103,7 +1103,7 @@ fn decoration_local_x(
                 (decoration.column >= segment.start_col)
                     .then(|| decoration.column.saturating_sub(segment.start_col))
             } else if segment.contains_display_col(decoration.column) {
-                Some(decoration.column.saturating_sub(segment.start_col))
+                Some(segment.visual_offset + segment.visible_columns_before(decoration.column))
             } else {
                 None
             }
@@ -1113,7 +1113,7 @@ fn decoration_local_x(
                 return None;
             }
 
-            Some(segment.visual_offset + line_width.saturating_sub(segment.start_col))
+            Some(segment.visual_offset + segment.visible_columns_before(line_width))
         }
         DecorationAnchor::RightAlign => {
             if segment.end_col < line_width {
@@ -1275,6 +1275,7 @@ pub(super) fn resolve_cell_colors(cell_style: &Style, theme_style: &Style) -> (C
 
 #[derive(Clone, Copy)]
 struct SourceSegmentGeometry {
+    model: crate::config::EditingModel,
     x: usize,
     y: usize,
     width: usize,
@@ -1348,11 +1349,9 @@ fn render_source_segment(
         let Some(grapheme) = remaining.graphemes(true).next() else {
             break;
         };
-        let width = if grapheme == "\t" {
-            geometry.tab_width - (grapheme_col % geometry.tab_width)
-        } else {
-            display_width(grapheme)
-        };
+        let width = geometry
+            .model
+            .source_cell_width(grapheme, grapheme_col, geometry.tab_width);
         if grapheme_col < segment.start_col || segment.hides_source_column(grapheme_col) {
             grapheme_col += width;
             byte_offset += grapheme.len();
@@ -1401,7 +1400,7 @@ fn render_source_segment(
                 continue;
             }
         }
-        if grapheme == "\t" {
+        if grapheme == "\t" || (width > 0 && display_width(grapheme) == 0) {
             let cells = segment.visible_columns_before(grapheme_col + width)
                 - segment.visible_columns_before(grapheme_col);
             buffer.fill_ascii_spaces(
@@ -2193,6 +2192,7 @@ impl Editor {
                 segment,
                 line,
                 SourceSegmentGeometry {
+                    model: self.config.editing_model,
                     x: self.window_to_terminal_x(window, content_start),
                     y: term_y,
                     width: content_width,
@@ -2377,7 +2377,7 @@ impl Editor {
         let preview = self.felix_preview(window)?;
         let row = preview.text.char_to_line(offset);
         let prefix = preview.text.slice(preview.text.line_to_char(row)..offset);
-        let col = display_width_with_tabs(
+        let col = self.config.editing_model.source_width(
             &std::borrow::Cow::from(prefix),
             self.tab_width_for_buffer_index(window.buffer_index),
         );
@@ -2434,6 +2434,7 @@ impl Editor {
                 segment,
                 trim_line_ending(line),
                 SourceSegmentGeometry {
+                    model: self.config.editing_model,
                     x,
                     y: self.window_to_terminal_y(window, segment.row),
                     width,
@@ -3037,6 +3038,7 @@ impl Editor {
                 segment,
                 line,
                 SourceSegmentGeometry {
+                    model: self.config.editing_model,
                     x: self.window_to_terminal_x(window, content_start),
                     y: term_y,
                     width: content_width,
@@ -3137,10 +3139,10 @@ impl Editor {
             return;
         }
 
-        let tab_width = self.indentation().shift_width.max(1);
+        let tab_width = self.tab_width_for_buffer_index(window.buffer_index);
         let leading_width = leading_whitespace_display_width(line, tab_width);
         let line_is_blank = line.trim().is_empty();
-        let line_width = display_width_with_tabs(line, tab_width);
+        let line_width = self.config.editing_model.source_width(line, tab_width);
 
         for decoration in decorations {
             let Some(mut local_x) = decoration_local_x(
@@ -3164,14 +3166,13 @@ impl Editor {
                 }
 
                 let grapheme_width = display_width(grapheme).max(1);
-                // The cell at `local_x` displays the line's display column
-                // `start_col + (local_x - visual_offset)`. Cells inside the
+                // Cells inside the
                 // break-indent virtual area (`line_col` of None) display
                 // nothing and count as whitespace, so indent guides repeat
                 // there like in vim; cells showing wrapped text are past the
                 // leading whitespace and must not be painted over.
                 let line_col = (local_x >= segment.visual_offset)
-                    .then(|| segment.start_col + local_x - segment.visual_offset);
+                    .then(|| segment.display_col_for_screen_col(local_x));
                 let over_whitespace = line_is_blank
                     || line_col.is_none()
                     || line_col.is_some_and(|c| c < leading_width);
@@ -3251,14 +3252,20 @@ impl Editor {
             };
             let line = trim_line_ending(&line);
             let tab_width = self.tab_width_for_buffer_index(window.buffer_index);
-            let start_col =
-                display_width_with_tabs(char_prefix(line, range.start.character), tab_width);
+            let start_col = self
+                .config
+                .editing_model
+                .source_width(char_prefix(line, range.start.character), tab_width);
             let end_col = if collapsed {
                 let next_character = (range.start.character + 1).min(line.chars().count());
-                display_width_with_tabs(char_prefix(line, next_character), tab_width)
+                self.config
+                    .editing_model
+                    .source_width(char_prefix(line, next_character), tab_width)
                     .max(start_col + 1)
             } else {
-                display_width_with_tabs(char_prefix(line, range.end.character), tab_width)
+                self.config
+                    .editing_model
+                    .source_width(char_prefix(line, range.end.character), tab_width)
             };
             let points = self.display_col_range_points_in_window(
                 window,
@@ -3304,8 +3311,14 @@ impl Editor {
                     continue;
                 }
                 let tab_width = self.tab_width_for_buffer_index(window.buffer_index);
-                let start_col = display_width_with_tabs(char_prefix(line, start), tab_width);
-                let end_col = display_width_with_tabs(char_prefix(line, end), tab_width);
+                let start_col = self
+                    .config
+                    .editing_model
+                    .source_width(char_prefix(line, start), tab_width);
+                let end_col = self
+                    .config
+                    .editing_model
+                    .source_width(char_prefix(line, end), tab_width);
                 let points =
                     self.display_col_range_points_in_window(window, line_index, start_col, end_col);
                 buffer.apply_selection_for_points(
@@ -3391,9 +3404,11 @@ impl Editor {
             };
             let line = trim_line_ending(&line);
             let tab_width = self.tab_width_for_buffer_index(window.buffer_index);
-            let start_col =
-                display_width_with_tabs(char_prefix(line, position.character), tab_width);
-            let end_col = display_width_with_tabs(
+            let start_col = self
+                .config
+                .editing_model
+                .source_width(char_prefix(line, position.character), tab_width);
+            let end_col = self.config.editing_model.source_width(
                 char_prefix(line, position.character.saturating_add(1)),
                 tab_width,
             );
@@ -3576,8 +3591,12 @@ impl Editor {
                     (start_x, end_x)
                 } else {
                     (
-                        display_width_with_tabs(char_prefix(line, start_x), tab_width),
-                        display_width_with_tabs(char_prefix(line, end_x), tab_width),
+                        self.config
+                            .editing_model
+                            .source_width(char_prefix(line, start_x), tab_width),
+                        self.config
+                            .editing_model
+                            .source_width(char_prefix(line, end_x), tab_width),
                     )
                 };
                 if let Some(bg) = bg {
@@ -3781,7 +3800,7 @@ impl Editor {
 
             // Calculate diagnostic indicator position within window
             let gutter_width = self.gutter_width_for_window(window);
-            let line_width = display_width_with_tabs(
+            let line_width = self.config.editing_model.source_width(
                 trim_line_ending(&line),
                 self.tab_width_for_buffer_index(window.buffer_index),
             );
@@ -3791,7 +3810,7 @@ impl Editor {
             let content_end = gutter_width
                 + 1
                 + segment.projection.as_ref().map_or_else(
-                    || segment.visual_offset + line_width.saturating_sub(segment.start_col),
+                    || segment.visual_offset + segment.visible_columns_before(line_width),
                     |projection| projection.width.saturating_sub(segment.projection_left),
                 );
             let indicator_x = content_end + 5; // Add some padding
@@ -3864,15 +3883,21 @@ impl Editor {
             };
             let line = trim_line_ending(&line);
             let tab_width = self.tab_width_for_buffer_index(window.buffer_index);
-            let start_col = grapheme_to_column_with_tabs(line, start_x, tab_width);
-            let end_col = grapheme_to_column_with_tabs(line, end_x.saturating_add(1), tab_width);
+            let start_col = self
+                .config
+                .editing_model
+                .source_column(line, start_x, tab_width);
+            let end_col =
+                self.config
+                    .editing_model
+                    .source_column(line, end_x.saturating_add(1), tab_width);
             cells.extend(self.display_col_range_points_in_window(window, y, start_col, end_col));
             if (line.is_empty() && start_x == 0 && end_x == 0)
                 || (self.mode == Mode::Visual && end_x >= grapheme_len(line))
             {
                 // Source segments stop before their line-ending cell. Paint that
                 // cell explicitly when the inclusive selection reaches it.
-                let column = display_width_with_tabs(line, tab_width);
+                let column = self.config.editing_model.source_width(line, tab_width);
                 let layout = self.layout_for_window(window);
                 if let Some(segment) = layout.segment_for_cursor(y, column) {
                     let local_x = segment
@@ -5280,6 +5305,7 @@ mod tests {
             &source,
             "abcdefgh",
             SourceSegmentGeometry {
+                model: Default::default(),
                 x: 0,
                 y: 0,
                 width: 10,
@@ -5303,7 +5329,7 @@ mod tests {
     #[test]
     fn wrapped_helix_cells_match_painted_text_cursor_and_selection() {
         use crate::editor::display_layout::{wrap_line_segments, BreakIndentOptions};
-        let text = "a👩‍💻b\tx界y";
+        let text = "a👩‍💻\u{200b}b\tx界y";
         let rows = wrap_line_segments(
             text,
             0,
@@ -5312,7 +5338,7 @@ mod tests {
             BreakIndentOptions {
                 enabled: false,
                 tab_width: 4,
-                helix: true,
+                model: crate::config::EditingModel::Helix,
             },
         );
         let theme = Theme::default();
@@ -5324,6 +5350,7 @@ mod tests {
                 row,
                 text,
                 SourceSegmentGeometry {
+                    model: crate::config::EditingModel::Helix,
                     x: 0,
                     y,
                     width: 10,
@@ -5334,14 +5361,22 @@ mod tests {
                 &theme,
             );
         }
-        assert_eq!(buffer.cells[5].text, "b");
+        assert_eq!(buffer.cells[5].text, " ");
+        assert_eq!(buffer.cells[6].text, "b");
         assert_eq!(buffer.cells[8].text, "x");
         assert_eq!(buffer.cells[10].text, "界");
         assert_eq!(buffer.cells[12].text, "y");
-        // In Red source columns, b is at 3. In Helix screen cells it is at 5.
+        // The zero-width space owns one cursor stop after the emoji.
         assert_eq!(rows[0].screen_col_for_display_col(3, 10), 5);
         assert_eq!(rows[0].display_col_for_screen_col(5), 3);
         assert_eq!(rows[0].visible_screen_spans(1, 3), [(1, 5)]);
+        assert_eq!(rows[0].visible_screen_spans(3, 4), [(5, 6)]);
+        let mut marker = decoration(DecorationAnchor::Column, "|");
+        marker.column = 4;
+        assert_eq!(
+            decoration_local_x(&marker, &rows[0], rows[1].end_col, false, 10),
+            Some(6)
+        );
     }
 
     #[test]
@@ -5363,6 +5398,7 @@ mod tests {
             &source,
             "abc",
             SourceSegmentGeometry {
+                model: Default::default(),
                 x: 1,
                 y: 0,
                 width: 10,
@@ -5408,6 +5444,7 @@ mod tests {
             &source,
             &line,
             SourceSegmentGeometry {
+                model: Default::default(),
                 x: 0,
                 y: 0,
                 width: 10,
@@ -5448,6 +5485,7 @@ mod tests {
             &source,
             LINE,
             SourceSegmentGeometry {
+                model: Default::default(),
                 x: 0,
                 y: 0,
                 width,
@@ -5506,6 +5544,7 @@ mod tests {
             &source,
             line,
             SourceSegmentGeometry {
+                model: Default::default(),
                 x: 0,
                 y: 0,
                 width: 40,
@@ -6629,7 +6668,8 @@ mod tests {
             .flat_map(|line_index| {
                 let line = editor.current_buffer().get(line_index).unwrap();
                 let start = line.find("alpha").unwrap();
-                let start_col = display_width_with_tabs(&line[..start], tab_width);
+                let start_col =
+                    crate::unicode_utils::display_width_with_tabs(&line[..start], tab_width);
                 editor.display_col_range_points_in_window(
                     &window,
                     line_index,

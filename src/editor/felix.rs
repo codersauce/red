@@ -76,7 +76,10 @@ fn felix_display_col(
 ) -> (usize, usize) {
     let line = text.char_to_line(offset);
     let prefix: std::borrow::Cow<'_, str> = text.slice(text.line_to_char(line)..offset).into();
-    (line, display_width_with_tabs(&prefix, tab_width))
+    (
+        line,
+        crate::config::EditingModel::Helix.source_width(&prefix, tab_width),
+    )
 }
 
 impl Editor {
@@ -486,7 +489,11 @@ impl Editor {
             }
             let source = text.line(line);
             let source = std::borrow::Cow::from(source);
-            let grapheme = column_to_grapheme_with_tabs(trim_line_ending(&source), col, tab_width);
+            let grapheme = crate::config::EditingModel::Helix.source_grapheme(
+                trim_line_ending(&source),
+                col,
+                tab_width,
+            );
             text.line_to_char(line) + self.grapheme_to_char_on_line(grapheme, line)
         };
         let visual_motion = |offset, delta, goal| {
@@ -1058,7 +1065,10 @@ impl Editor {
                     continue;
                 };
                 let line = trim_line_ending(&line);
-                let col = |idx| display_width_with_tabs(char_prefix(line, idx), tab_width);
+                let col = |idx| {
+                    crate::config::EditingModel::Helix
+                        .source_width(char_prefix(line, idx), tab_width)
+                };
                 let left = if row == start.line {
                     col(start.character)
                 } else {
@@ -1067,14 +1077,14 @@ impl Editor {
                 let right = if row == end.line {
                     col(end.character)
                 } else {
-                    display_width_with_tabs(line, tab_width) + 1
+                    crate::config::EditingModel::Helix.source_width(line, tab_width) + 1
                 };
                 // Source glyph spans exclude the cell after the last glyph.
                 // Helix can select a newline and can place a cursor at EOF.
                 let points_for = |left, right| {
                     let mut points =
                         self.display_col_range_points_in_window(window, row, left, right);
-                    let eol = display_width_with_tabs(line, tab_width);
+                    let eol = crate::config::EditingModel::Helix.source_width(line, tab_width);
                     if let Some((x, y)) = (left <= eol && right > eol)
                         .then(|| self.buffer_to_window_coords(window, grapheme_len(line), row))
                         .flatten()
@@ -1138,6 +1148,35 @@ mod tests {
         let frame = RenderBuffer::new(80, 24, &Style::default());
         let runtime = Runtime::new();
         (editor, frame, runtime)
+    }
+
+    #[tokio::test]
+    async fn mouse_selects_each_zero_width_space_on_a_continuation_row() {
+        let text = format!("{}\u{200b}\u{200b}z\n", "a".repeat(20));
+        let (mut editor, mut frame, mut runtime) = fixture_editor(&text);
+        editor.wrap = true;
+        let chrome = usize::from(editor.size.0) - editor.active_content_width();
+        editor.test_set_size((20 + chrome) as u16, editor.size.1);
+        let window = editor.active_window_with_editor_view().unwrap();
+        let left = editor.gutter_width_for_window(&window) + 1;
+        for cell in 0..3 {
+            let column = left + cell;
+            assert_eq!(
+                editor.buffer_to_window_coords(&window, 20 + cell, 0),
+                Some((column, 1))
+            );
+            editor
+                .execute_mouse_press(
+                    editor.window_to_terminal_x(&window, column) as u16,
+                    editor.window_to_terminal_y(&window, 1) as u16,
+                    KeyModifiers::NONE,
+                    &mut frame,
+                    &mut runtime,
+                )
+                .await
+                .unwrap();
+            assert_eq!(editor.cx, 20 + cell);
+        }
     }
 
     #[tokio::test]

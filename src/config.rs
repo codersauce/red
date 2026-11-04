@@ -248,7 +248,7 @@ pub struct UpdateConfig {
 }
 
 /// Document editing grammar selected at startup.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum EditingModel {
     #[default]

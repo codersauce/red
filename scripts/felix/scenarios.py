@@ -102,6 +102,11 @@ def scenarios(seed, steps):
         list("4ljgjgkjgjgjgkgg24lgjgjgkgk"))
     yield "wrapped-unicode-motion", "abcdefghijklmnopqr界\tbcde界fg👩‍💻hijklmnopqrstuv\nabc界de\tz\n", (
         list("4ljjkk11ljjkkvjj") + ["<esc>"] + list("gg17ljkgj"))
+    yield "wrapped-zero-width", "ab\u200bcd" + "x" * 15 + "A\u200bB\u200bC" + "y" * 15 + "\nend\n", (
+        list("2ljjkklljkj") + ["v", "j", "k", "<esc>"] + list("gg20ljkrZ"))
+    yield "zero-width-goal", "a\u200b\u200bob\n123456\na\u200b\u200bb\n", (
+        list("2ljjkkvj") + ["<esc>"] + list("gg3ljkrX"))
+    yield "wrapped-zero-edge", "a" * 20 + "\u200b\u200bcd" + "b" * 20 + "\u200bZ\n", list("jjkk2ljjkkgg20ljkhjrZ")
     yield "wrapped-motion", "abcdefghijklmnopqrstuvwxyz" * 3 + "\nabc\n" + "ABCDEF" * 12 + "\n", list("4ljjkkvj") + ["<esc>"] + list("gjgkk")
     yield "page-wrapped-continuations", "abcd" * 290 + "\nxy\n" + "EFGH" * 170 + "\n", (
         ["l", "<c-f>", "<c-d>", "v", "<c-u>", "<esc>", "2", "<pagedown>", "<pageup>", "<c-b>"])

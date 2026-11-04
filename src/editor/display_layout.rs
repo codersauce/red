@@ -100,8 +100,7 @@ pub(super) fn inline_comment_block(
 /// matching the line's leading whitespace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BreakIndentOptions {
-    #[cfg(feature = "helix")]
-    pub helix: bool,
+    pub model: crate::config::EditingModel,
     pub enabled: bool,
     pub tab_width: usize,
 }
@@ -111,8 +110,7 @@ impl Default for BreakIndentOptions {
         Self {
             enabled: true,
             tab_width: 4,
-            #[cfg(feature = "helix")]
-            helix: false,
+            model: Default::default(),
         }
     }
 }
@@ -123,8 +121,7 @@ impl BreakIndentOptions {
         Self {
             enabled: false,
             tab_width: 4,
-            #[cfg(feature = "helix")]
-            helix: false,
+            model: Default::default(),
         }
     }
 }
@@ -601,10 +598,10 @@ impl DisplayLayout {
         if insertion.is_empty() || !line.is_char_boundary(cursor_byte) {
             return self;
         }
-        let cursor_col = crate::unicode_utils::display_width_with_tabs(
-            &line[..cursor_byte],
-            config.break_indent.tab_width,
-        );
+        let cursor_col = config
+            .break_indent
+            .model
+            .source_width(&line[..cursor_byte], config.break_indent.tab_width);
         let Some(mut anchor) = self.segment_for_cursor(line_index, cursor_col).cloned() else {
             return self;
         };
@@ -784,7 +781,7 @@ fn image_rows_with_declaration(
                 line_index,
                 config.content_width,
                 config.vleft,
-                config.break_indent.tab_width,
+                config.break_indent,
             )
         };
         let count = text.len();
@@ -894,7 +891,7 @@ pub(super) fn layout_lines_with_tables(
                     line_index,
                     config.content_width,
                     config.vleft,
-                    config.break_indent.tab_width,
+                    config.break_indent,
                 )
             };
 
@@ -989,16 +986,14 @@ fn wrap_line_segments_with_limit(
         } else {
             continuation_width
         };
-        let raw_width = if grapheme == "\t" {
-            tab_width - (col % tab_width)
-        } else {
-            display_width(grapheme)
-        };
+        let raw_width = break_indent
+            .model
+            .source_cell_width(grapheme, col, tab_width);
         let hidden = concealment.hides_span(byte_offset, grapheme.len());
         let occupied = visual_col - segment_visual;
         let width_at = |_screen_col: usize| {
             #[cfg(feature = "helix")]
-            if break_indent.helix && !hidden && raw_width != 0 {
+            if break_indent.model == crate::config::EditingModel::Helix && !hidden {
                 return felix_core::cell_width(grapheme, _screen_col, tab_width);
             }
             if hidden {
@@ -1103,11 +1098,9 @@ fn wrap_line_segments_with_limit(
             .grapheme_indices(true)
             .enumerate()
             .scan(0, |col, (index, (byte_offset, grapheme))| {
-                let width = if grapheme == "\t" {
-                    tab_width - (*col % tab_width)
-                } else {
-                    display_width(grapheme)
-                };
+                let width = break_indent
+                    .model
+                    .source_cell_width(grapheme, *col, tab_width);
                 let grapheme_col = *col;
                 *col += width;
                 Some((index, byte_offset, grapheme_col, *col))
@@ -1146,9 +1139,9 @@ pub(super) fn nowrap_line_segment(
     line_index: usize,
     width: usize,
     vleft: usize,
-    tab_width: usize,
+    options: BreakIndentOptions,
 ) -> Vec<LineSegment> {
-    let tab_width = tab_width.max(1);
+    let tab_width = options.tab_width;
     let requested_end = vleft.saturating_add(width);
     let mut start = None;
     let mut end = None;
@@ -1156,11 +1149,7 @@ pub(super) fn nowrap_line_segment(
     let mut grapheme_count = 0;
 
     for (grapheme_index, (byte_offset, grapheme)) in line.grapheme_indices(true).enumerate() {
-        let grapheme_width = if grapheme == "\t" {
-            tab_width - (col % tab_width)
-        } else {
-            display_width(grapheme)
-        };
+        let grapheme_width = options.model.source_cell_width(grapheme, col, tab_width);
         let next_col = col + grapheme_width;
 
         if start.is_none() && next_col > vleft {
@@ -1298,9 +1287,9 @@ mod tests {
         assert_eq!(clipped.len(), 1);
         assert!(!clipped[0].contains_cursor_col(3));
 
-        let nowrap = nowrap_line_segment("abcdef", 0, 3, 0, 4);
+        let nowrap = nowrap_line_segment("abcdef", 0, 3, 0, BreakIndentOptions::disabled());
         assert!(!nowrap[0].contains_cursor_col(3));
-        let nowrap_end = nowrap_line_segment("abcdef", 0, 3, 3, 4);
+        let nowrap_end = nowrap_line_segment("abcdef", 0, 3, 3, BreakIndentOptions::disabled());
         assert!(nowrap_end[0].contains_cursor_col(6));
 
         let unicode = wrap_line_segments("a\t界", 0, 4, 0, BreakIndentOptions::disabled());
