@@ -228,6 +228,52 @@ pub use command::{Context, Edit, History, HostAction, Mode, Paste, Plan, Session
 pub use repeat::{LastInsert, ReplayKey};
 
 impl Selections {
+    /// Project the primary completion replacement onto each cursor. Cursors
+    /// with a different prefix replace their own word up to the cursor. The
+    /// host supplies a validated primary range in document character offsets.
+    pub fn completion_ranges(
+        &self,
+        text: RopeSlice<'_>,
+        replaced: std::ops::Range<usize>,
+    ) -> (Vec<std::ops::Range<usize>>, Self) {
+        let primary_cursor = self.primary().cursor(text);
+        let removed = text.slice(replaced.clone());
+        let mut edits = Vec::with_capacity(self.ranges.len());
+        let mut ranges = Vec::with_capacity(self.ranges.len());
+        let mut primary = 0;
+        let mut last_end = 0;
+        for (index, range) in self.ranges.iter().enumerate() {
+            let cursor = range.cursor(text);
+            let shift = |offset: usize| {
+                cursor.checked_add_signed(offset as isize - primary_cursor as isize)
+            };
+            let projected =
+                shift(replaced.start)
+                    .zip(shift(replaced.end))
+                    .filter(|&(start, end)| {
+                        end <= text.len_chars() && text.slice(start..end) == removed
+                    });
+            let (start, end) = projected.unwrap_or_else(|| {
+                let mut chars = text.chars_at(cursor);
+                chars.reverse();
+                let prefix = chars
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .count();
+                (cursor - prefix, cursor)
+            });
+            if start < last_end {
+                continue;
+            }
+            last_end = end;
+            if index <= self.primary {
+                primary = ranges.len();
+            }
+            ranges.push(*range);
+            edits.push(start..end);
+        }
+        (edits, Self { ranges, primary })
+    }
+
     /// Carry endpoints across a host replacement expressed in original offsets.
     pub fn rebase(
         &self,
@@ -308,6 +354,33 @@ pub fn detect_indent(text: RopeSlice<'_>) -> Option<String> {
 mod tests {
     use super::*;
     use ropey::Rope;
+    #[test]
+    fn completion_replaces_matching_ranges_and_falls_back_to_each_cursors_word() {
+        let rope = ropey::Rope::from_str("é βabcd ab xyz");
+        let text = rope.slice(..);
+        let selections = Selections::new(
+            text,
+            [1, 7, 10, 14].map(|pos| Range::at(text, pos)).to_vec(),
+            2,
+        )
+        .unwrap();
+        let (ranges, retained) = selections.completion_ranges(text, 8..10);
+        assert_eq!(ranges, [0..1, 2..7, 8..10, 11..14]);
+        assert_eq!(retained, selections);
+    }
+
+    #[test]
+    fn completion_ignores_overlapping_edits_in_selection_order() {
+        let rope = ropey::Rope::from_str("foo bar");
+        let text = rope.slice(..);
+        let selections =
+            Selections::new(text, [1, 3, 7].map(|pos| Range::at(text, pos)).to_vec(), 1).unwrap();
+        let (ranges, retained) = selections.completion_ranges(text, 0..3);
+        assert_eq!(ranges, [0..1, 4..7]);
+        assert_eq!(retained.primary_index(), 0);
+        assert_eq!(retained.ranges().len(), 2);
+    }
+
     #[test]
     fn graphemes_across_rope_chunks_and_line_endings() {
         use unicode_segmentation::UnicodeSegmentation;

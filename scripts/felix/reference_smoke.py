@@ -101,7 +101,8 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
             if copies > 1:
                 matches &= sum(row.strip() == (f"1 {line}" if red else f"1  {line}") for row in rows) == copies
             if menu is not None:
-                matches &= ("FelixCandidate" in frame) == menu
+                menu_visible = any("FelixCandidate" in row and not re.match(r"^\s*1\s", row) for row in rows)
+                matches &= menu_visible == menu
             if matches:
                 checkpoints.append({"step": label, "frame": rows})
                 return
@@ -155,6 +156,18 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
             observe("escape from completion", "F F", "NOR", menu=False)
             tmux("send-keys", "u")
             observe("undo typing and change", "foo foo", "NOR")
+            observe_server("foo foo\n")
+            tmux("send-keys", "c", "F", "C-x")
+            observe("request completion at two selections", "F F", "INS", menu=True)
+            tmux("send-keys", "C-n", "Enter")
+            observe("accept at both selections", "FelixCandidate FelixCandidate", "INS", menu=False)
+            observe_server("FelixCandidate FelixCandidate\n")
+            tmux("send-keys", "!", "Escape")
+            observe("type after accepting", "FelixCandidate! FelixCandidate!", "NOR", menu=False)
+            tmux("send-keys", "u")
+            observe("undo completion and typing", "F F", "NOR")
+            tmux("send-keys", "u")
+            observe("undo initial change", "foo foo", "NOR")
             observe_server("foo foo\n")
             return checkpoints
         if scenario == "paging":

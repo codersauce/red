@@ -32814,13 +32814,72 @@ impl Editor {
             };
             additional_text_edits.push(edit);
         }
-        let validation_edits = std::iter::once(&main_text_edit)
+        if !self
+            .apply_completion_edits(
+                &contents,
+                &main_text_edit,
+                &additional_text_edits,
+                item,
+                commit_character,
+                runtime,
+            )
+            .await?
+        {
+            return Ok(());
+        }
+
+        if let Some(command) = &item.command {
+            self.execute_lsp_command(
+                command,
+                item.source.as_ref().map(|source| source.key.as_str()),
+            )
+            .await?;
+        }
+
+        if let Some(continuation) = continuation {
+            self.restore_coordinated_completion(continuation);
+        }
+
+        if let Some(character) = commit_character.filter(|c| self.is_completion_trigger_char(*c)) {
+            self.request_completion(Some(character)).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn apply_completion_edits(
+        &mut self,
+        contents: &str,
+        main_text_edit: &LspTextEdit,
+        additional_text_edits: &[LspTextEdit],
+        item: &CompletionResponseItem,
+        commit_character: Option<char>,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<bool> {
+        #[cfg(feature = "helix")]
+        if self.config.editing_model == crate::config::EditingModel::Helix
+            && self.is_insert()
+            && self.felix_active_selection().is_some()
+            && !matches!(item.insert_text_format, Some(InsertTextFormat::Snippet))
+        {
+            return self
+                .apply_felix_completion(
+                    contents,
+                    main_text_edit,
+                    additional_text_edits,
+                    commit_character,
+                    runtime,
+                )
+                .await;
+        }
+
+        let validation_edits = std::iter::once(main_text_edit)
             .chain(additional_text_edits.iter())
             .cloned()
             .collect::<Vec<_>>();
-        if let Err(error) = crate::lsp::apply_text_edits(&contents, &validation_edits) {
+        if let Err(error) = crate::lsp::apply_text_edits(contents, &validation_edits) {
             self.set_legacy_message(Some(format!("invalid LSP completion edit: {error}")));
-            return Ok(());
+            return Ok(false);
         }
         let resume_insert_transaction = self.transaction_active();
         if resume_insert_transaction {
@@ -32830,13 +32889,13 @@ impl Editor {
         self.begin_transaction("apply completion");
 
         let mut edits = vec![completion_edit_from_lsp(
-            &contents,
-            &main_text_edit,
+            contents,
+            main_text_edit,
             item.insert_text_format.as_ref(),
             true,
         )?];
-        for text_edit in &additional_text_edits {
-            edits.push(completion_edit_from_lsp(&contents, text_edit, None, false)?);
+        for text_edit in additional_text_edits {
+            edits.push(completion_edit_from_lsp(contents, text_edit, None, false)?);
         }
 
         edits.sort_by(|a, b| compare_text_positions_desc(a.range.start, b.range.start));
@@ -32895,23 +32954,7 @@ impl Editor {
             self.begin_transaction("insert");
         }
 
-        if let Some(command) = &item.command {
-            self.execute_lsp_command(
-                command,
-                item.source.as_ref().map(|source| source.key.as_str()),
-            )
-            .await?;
-        }
-
-        if let Some(continuation) = continuation {
-            self.restore_coordinated_completion(continuation);
-        }
-
-        if let Some(character) = commit_character.filter(|c| self.is_completion_trigger_char(*c)) {
-            self.request_completion(Some(character)).await?;
-        }
-
-        Ok(())
+        Ok(true)
     }
 
     async fn execute_lsp_command(

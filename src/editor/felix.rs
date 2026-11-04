@@ -659,6 +659,74 @@ impl Editor {
 }
 
 impl Editor {
+    pub(super) async fn apply_felix_completion(
+        &mut self,
+        contents: &str,
+        main: &LspTextEdit,
+        additional: &[LspTextEdit],
+        commit_character: Option<char>,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<bool> {
+        let before = self
+            .felix_active_selection()
+            .expect("active Felix completion")
+            .clone();
+        let buffer = self.current_buffer();
+        let doc = buffer.id();
+        let rope = buffer.contents_snapshot();
+        let (start, end) = match text_edit_char_range(contents, &main.range) {
+            Ok(range) => range,
+            Err(err) => {
+                self.set_legacy_message(Some(format!("invalid LSP completion edit: {err}")));
+                return Ok(false);
+            }
+        };
+        let (ranges, selection) = before.completion_ranges(rope.slice(..), start..end);
+        let mut replacement = main.new_text.clone();
+        if let Some(ch) = commit_character {
+            replacement.push(ch);
+        }
+        // Keep projected ranges in original character coordinates. Only edits
+        // received from the server require UTF-16 conversion.
+        let mut edits: Vec<_> = ranges
+            .into_iter()
+            .map(|range| (range, replacement.as_str()))
+            .collect();
+        for edit in additional {
+            match text_edit_char_range(contents, &edit.range) {
+                Ok((start, end)) => edits.push((start..end, &edit.new_text)),
+                Err(err) => {
+                    self.set_legacy_message(Some(format!("invalid LSP completion edit: {err}")));
+                    return Ok(false);
+                }
+            }
+        }
+        edits.sort_by_key(|(range, _)| (range.start, range.end));
+        if edits.windows(2).any(|pair| pair[0].0.end > pair[1].0.start) {
+            self.set_legacy_message(Some(
+                "invalid LSP completion edit: overlapping ranges".into(),
+            ));
+            return Ok(false);
+        }
+        self.commit_felix_transaction(doc, &before);
+        self.begin_transaction("Helix completion");
+        self.felix.before = Some(before);
+        self.set_felix_active_selection(selection);
+        for (range, value) in edits.into_iter().rev() {
+            let buffer = self.current_buffer();
+            let range = TextRange::new(
+                buffer.char_idx_to_position(range.start),
+                buffer.char_idx_to_position(range.end),
+            );
+            self.replace_range(range, value);
+        }
+        if let Some(selection) = self.felix_active_selection().cloned() {
+            self.place_felix_cursor(&selection);
+        }
+        self.notify_change(runtime).await?;
+        Ok(true)
+    }
+
     fn commit_felix_transaction(&mut self, doc: BufferId, selections: &Selections) {
         let before = self.felix.before.take();
         if !self.commit_transaction(self.cursor_snapshot()) {
@@ -962,6 +1030,58 @@ mod tests {
         );
         assert_eq!(editor.cursor_text_position(), TextPosition::new(0, 5));
         assert!(!editor.current_buffer().is_dirty());
+    }
+
+    #[tokio::test]
+    async fn completion_validates_additional_edits_against_every_cursor_before_changing_text() {
+        let (mut editor, mut frame, mut runtime) = fixture_editor("😀\nfoo foo\n");
+        for key in ["%", "s", "f", "o", "o", "<enter>", "c", "F"] {
+            let owner = editor.felix_owner().unwrap();
+            editor
+                .execute_felix(Input::Key(key), owner, &mut frame, &mut runtime)
+                .await
+                .unwrap();
+        }
+        let edit = |line, start, end, value: &str| LspTextEdit {
+            range: Range {
+                start: LspPosition {
+                    line,
+                    character: start,
+                },
+                end: LspPosition {
+                    line,
+                    character: end,
+                },
+            },
+            new_text: value.into(),
+        };
+        let original = editor.current_buffer().contents();
+        let state = editor.felix_active_selection().unwrap().clone();
+        let owner = editor.felix_owner();
+        let primary = edit(1, 0, 1, "Filled");
+        let overlap = edit(1, 2, 3, "conflict");
+        assert!(!editor
+            .apply_felix_completion(&original, &primary, &[overlap], None, &mut runtime)
+            .await
+            .unwrap());
+        assert_eq!(editor.felix_owner(), owner);
+        assert_eq!(editor.felix_active_selection(), Some(&state));
+        assert_eq!(editor.current_buffer().contents(), original);
+        let extra = edit(0, 0, 2, "λ");
+        assert!(editor
+            .apply_felix_completion(&original, &primary, &[extra], None, &mut runtime)
+            .await
+            .unwrap());
+        assert_eq!(editor.current_buffer().contents(), "λ\nFilled Filled\n");
+        for key in ["!", "<esc>", "u"] {
+            let owner = editor.felix_owner().unwrap();
+            editor
+                .execute_felix(Input::Key(key), owner, &mut frame, &mut runtime)
+                .await
+                .unwrap();
+        }
+        assert_eq!(editor.current_buffer().contents(), original);
+        assert_eq!(editor.felix_active_selection(), Some(&state));
     }
 
     #[tokio::test]
