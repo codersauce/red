@@ -27,7 +27,12 @@ ARCHIVES = {
 
 
 def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="edit"):
+    # Helix abbreviates paths inside its working directory before folding HOME.
+    # Keep documents in HOME and launch from its child so snapshots always use ~/.
+    root = root.resolve()
     root.mkdir()
+    workdir = root / "work"
+    workdir.mkdir()
     fixture = root / ("example.rs" if scenario == "completion" else "example.txt")
     fixture.write_text("".join(f"ROW-{number:03}\n" for number in range(1, 41)) if scenario == "paging" else "foo foo\n")
     other = root / "other.txt"
@@ -76,7 +81,7 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
     def tmux(*args, check=True):
         return subprocess.run(
             ["tmux", "-f", "/dev/null", "-S", str(root / "tmux.sock"), *args],
-            cwd=root, env=env, capture_output=True, text=True, check=check,
+            cwd=workdir, env=env, capture_output=True, text=True, check=check,
         )
 
     checkpoints = []

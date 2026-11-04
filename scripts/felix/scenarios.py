@@ -67,7 +67,12 @@ def scenarios(seed, steps):
 
 
 def capture(observer, runtime, root, name, text, keys):
+    # Helix abbreviates paths inside its working directory before folding HOME.
+    # Keep documents in HOME and launch from its child so snapshots always use ~/.
+    root = root.resolve()
     root.mkdir()
+    workdir = root / "work"
+    workdir.mkdir()
     path = root / "example.txt"
     path.write_bytes(text.encode())
     trace = root / "trace.jsonl"
@@ -84,7 +89,7 @@ def capture(observer, runtime, root, name, text, keys):
            "FELIX_REFERENCE_TRACE": str(trace), "XDG_CONFIG_HOME": str(root/"config")}
     def tmux(*args, check=True):
         return subprocess.run(["tmux", "-f", "/dev/null", "-S", str(root/"t.sock"), *args],
-                              cwd=root, env=env, capture_output=True, text=True, check=check).stdout
+                              cwd=workdir, env=env, capture_output=True, text=True, check=check).stdout
     try:
         tmux("new-session", "-d", "-s", "h", "-x", "80", "-y", "24", str(observer), str(path))
         deadline = time.monotonic() + 20
