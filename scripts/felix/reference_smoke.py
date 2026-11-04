@@ -121,7 +121,7 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
         while True:
             data = json.loads(state.read_text()) if state.exists() else {}
             if data.get("sha256") == expected:
-                return
+                return data
             if time.monotonic() >= deadline:
                 raise RuntimeError(f"completion server expected {text!r}, last state {data}")
             time.sleep(0.02)
@@ -156,12 +156,48 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
             observe("type after dismissal", "F F", "INS", menu=False)
             observe_server("F F\n")
             tmux("send-keys", "C-x")
+            observe("unselected menu", "F F", "INS", menu=True)
+            before_preview = observe_server("F F\n")["notifications"]
+            tmux("send-keys", "Up")
+            observe("previous starts at last candidate", "FelixOther FelixOther", "INS", menu=True)
+            tmux("send-keys", "Tab")
+            observe("Tab wraps to first candidate", "FelixCandidate FelixCandidate", "INS", menu=True)
+            tmux("send-keys", "C-p")
+            observe("previous wraps to last candidate", "FelixOther FelixOther", "INS", menu=True)
+            observe_server("F F\n")
+            tmux("send-keys", "C-c")
+            observe("abort preview", "F F", "INS", menu=False)
+            observe_server("F F\n")
+            tmux("send-keys", "C-x")
             observe("completion before Escape", "F F", "INS", menu=True)
+            # The next completion response is a barrier on the same LSP stream.
+            # Transient edits followed by a restore would have changed this count.
+            if observe_server("F F\n")["notifications"] != before_preview:
+                raise RuntimeError("preview sent a document change to the language server")
             tmux("send-keys", "Escape")
             observe("escape from completion", "F F", "NOR", menu=False)
             tmux("send-keys", "u")
             observe("undo typing and change", "foo foo", "NOR")
             observe_server("foo foo\n")
+            tmux("send-keys", "c", "F", "C-x")
+            observe("request before implicit acceptance", "F F", "INS", menu=True)
+            tmux("send-keys", "C-p", "!")
+            observe("type after preview", "FelixOther! FelixOther!", "INS", menu=False)
+            observe_server("FelixOther! FelixOther!\n")
+            tmux("send-keys", "Escape")
+            observe("finish implicit acceptance", "FelixOther! FelixOther!", "NOR")
+            tmux("send-keys", "u")
+            observe("undo implicit acceptance", "F F", "NOR")
+            tmux("send-keys", "u")
+            observe("undo prefix", "foo foo", "NOR")
+            tmux("send-keys", "c", "F", "C-x")
+            observe("request before preview Escape", "F F", "INS", menu=True)
+            tmux("send-keys", "C-p", "Escape")
+            observe("Escape accepts preview", "FelixOther FelixOther", "NOR", menu=False)
+            tmux("send-keys", "u")
+            observe("undo preview accepted by Escape", "F F", "NOR")
+            tmux("send-keys", "u")
+            observe("undo next prefix", "foo foo", "NOR")
             tmux("send-keys", "c", "F", "C-x")
             observe("request completion at two selections", "F F", "INS", menu=True)
             tmux("send-keys", "C-n", "Enter")

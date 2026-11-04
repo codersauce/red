@@ -2321,9 +2321,136 @@ impl Editor {
             // Render overlays within window bounds
             self.render_overlays_in_window(buffer, &window)?;
             self.render_inline_prediction_in_window(buffer, &window)?;
+            #[cfg(feature = "helix")]
+            self.render_felix_preview(buffer, &window)?;
             self.paint_explore_chrome(buffer, &window)?;
         }
 
+        Ok(())
+    }
+
+    #[cfg(feature = "helix")]
+    fn felix_preview_layout(
+        &self,
+        window: &crate::window::Window,
+    ) -> Option<(DisplayLayout, Vec<String>)> {
+        let preview = self.felix_preview(window)?;
+        let height = self.window_content_height(window);
+        let count = preview.text.len_lines();
+        let lines: Vec<_> = (window.vtop..count.min(window.vtop.saturating_add(height)))
+            .map(|line| preview.text.line(line).to_string())
+            .collect();
+        let config = super::LayoutConfig {
+            content_width: self.window_content_width(window),
+            height,
+            wrap: window.wrap,
+            vtop: window.vtop,
+            vleft: window.vleft,
+            skipcol: window.skipcol,
+            break_indent: self.break_indent_options_for_buffer_index(window.buffer_index),
+        };
+        Some((
+            super::display_layout::layout_lines(&lines, count, config),
+            lines,
+        ))
+    }
+
+    #[cfg(feature = "helix")]
+    fn felix_preview_caret(
+        &self,
+        window: &crate::window::Window,
+        layout: &DisplayLayout,
+        offset: usize,
+    ) -> Option<(usize, usize)> {
+        let preview = self.felix_preview(window)?;
+        let row = preview.text.char_to_line(offset);
+        let prefix = preview.text.slice(preview.text.line_to_char(row)..offset);
+        let col = display_width_with_tabs(
+            &std::borrow::Cow::from(prefix),
+            self.tab_width_for_buffer_index(window.buffer_index),
+        );
+        let segment = layout.segment_for_cursor(row, col)?;
+        let width = self.window_content_width(window);
+        if col < segment.start_col || col - segment.start_col >= width {
+            return None;
+        }
+        Some((
+            window.position.x
+                + self.gutter_width_for_window(window)
+                + 1
+                + segment.screen_col_for_display_col(col, width),
+            self.window_to_terminal_y(window, segment.row),
+        ))
+    }
+
+    #[cfg(feature = "helix")]
+    fn render_felix_preview(
+        &mut self,
+        frame: &mut RenderBuffer,
+        window: &crate::window::Window,
+    ) -> anyhow::Result<()> {
+        let Some((layout, lines)) = self.felix_preview_layout(window) else {
+            return Ok(());
+        };
+        let width = self.window_content_width(window);
+        let x = window.position.x + self.gutter_width_for_window(window) + 1;
+        let source_layout = self.layout_for_window(window);
+        let language = self.highlight_language_id_for_buffer_index(window.buffer_index);
+        let code = lines.concat();
+        let spans = if code.len() <= MAX_HIGHLIGHT_SLICE_BYTES {
+            self.highlight_spans_for_language(language.as_deref(), &code)?
+        } else {
+            Vec::new()
+        };
+        let mut styles = StyleCursor::new(&spans);
+        for segment in &layout.rows {
+            let line = &lines[segment.line - window.vtop];
+            // Preserve decorations on source rows outside the preview.
+            if source_layout.row(segment.row).is_some_and(|source| {
+                source.line == segment.line
+                    && source.start_byte == segment.start_byte
+                    && source.end_byte == segment.end_byte
+            }) && self.buffer_manager[window.buffer_index]
+                .get(segment.line)
+                .as_deref()
+                == Some(line.as_str())
+            {
+                continue;
+            }
+            render_source_segment(
+                frame,
+                segment,
+                trim_line_ending(line),
+                SourceSegmentGeometry {
+                    x,
+                    y: self.window_to_terminal_y(window, segment.row),
+                    width,
+                    tab_width: self.tab_width_for_buffer_index(window.buffer_index),
+                },
+                &mut styles,
+                &self.theme.style,
+                &self.theme,
+            );
+        }
+        let background = self.theme.style.clone();
+        for row in layout.screen_height()..source_layout.screen_height() {
+            self.fill_line_in_window(
+                frame,
+                x,
+                self.window_to_terminal_y(window, row),
+                width,
+                &background,
+            );
+        }
+        if let Some(preview) = self.felix_preview(window) {
+            for &caret in &preview.carets {
+                if let Some((x, y)) = self.felix_preview_caret(window, &layout, caret) {
+                    if let Some(cell) = frame.cells.get_mut(y * frame.width + x) {
+                        cell.style = self.theme.synthetic_cursor_style(&cell.style);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -4541,6 +4668,15 @@ impl Editor {
         } else {
             // Get the active window to calculate cursor position
             if let Some(window) = self.window_manager.active_window() {
+                #[cfg(feature = "helix")]
+                if let Some(preview) = self.felix_preview(window) {
+                    let (layout, _) = self.felix_preview_layout(window)?;
+                    return self.felix_preview_caret(
+                        window,
+                        &layout,
+                        preview.carets[preview.primary],
+                    );
+                }
                 let buffer_y = window.vtop + window.cy;
 
                 // Calculate the actual display column for the cursor

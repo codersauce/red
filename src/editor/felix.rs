@@ -31,11 +31,12 @@ pub(super) enum Input<'a> {
     ClipboardYank { primary: bool },
 }
 
-type Owner = (BufferId, WindowId, u64, u64);
+pub(super) type Owner = (BufferId, WindowId, u64, u64);
 
 #[derive(Default)]
 pub(super) struct FelixHost {
     session: Session,
+    pub(super) preview: Option<CompletionPreview>,
     last_insert: felix_core::LastInsert,
     jumps: HashMap<WindowId, felix_core::Jumps<BufferId>>,
     indent: HashMap<BufferId, String>,
@@ -46,6 +47,13 @@ pub(super) struct FelixHost {
     search: Vec<String>,
     before: Option<Selections>,
     history: HashMap<(BufferId, String), (Selections, Selections)>,
+}
+
+pub(super) struct CompletionPreview {
+    owner: Owner,
+    pub(super) text: ropey::Rope,
+    pub(super) carets: Vec<usize>,
+    pub(super) primary: usize,
 }
 
 fn felix_display_col(
@@ -235,7 +243,83 @@ impl Editor {
         ))
     }
 
-    pub(super) fn felix_completion_dismissal(&self, event: &Event) -> Option<KeyAction> {
+    fn projected_felix_completion(&self) -> Option<CompletionPreview> {
+        let item = self.current_dialog.as_ref()?.selected_completion()?;
+        let snapshot = self.completion_snapshot.as_ref()?;
+        if !self.completion_snapshot_is_current(snapshot) {
+            return None;
+        }
+        let edit = self.completion_main_edit(item, Some(snapshot))?;
+        let buffer = self.current_buffer();
+        let mut text = buffer.contents_snapshot();
+        let offset = |position: LspPosition| {
+            let line = text.get_line(position.line)?;
+            let ch = line.try_utf16_cu_to_char(position.character).ok()?;
+            (line.char_to_utf16_cu(ch) == position.character
+                && ch <= buffer.line_char_len_without_ending(position.line))
+            .then(|| text.line_to_char(position.line) + ch)
+        };
+        let (start, end) = (offset(edit.range.start)?, offset(edit.range.end)?);
+        if start > end {
+            return None;
+        }
+        let (ranges, state) = self
+            .felix_active_selection()?
+            .completion_ranges(text.slice(..), start..end);
+        let parsed = matches!(item.insert_text_format, Some(InsertTextFormat::Snippet))
+            .then(|| snippet::parse_snippet(&edit.new_text));
+        let value = parsed
+            .as_ref()
+            .map_or(edit.new_text.as_str(), |s| s.text.as_str());
+        let length = value.chars().count();
+        let cursor = parsed
+            .as_ref()
+            .and_then(|s| {
+                s.placeholders
+                    .first()
+                    .map(|p| p.end.saturating_sub(1).max(p.start))
+                    .or(s.final_cursor)
+            })
+            .unwrap_or(length);
+        let mut removed = 0;
+        let mut carets = Vec::with_capacity(ranges.len());
+        for (index, range) in ranges.iter().enumerate() {
+            carets.push(range.start - removed + index * length + cursor);
+            removed += range.len();
+        }
+        for range in ranges.into_iter().rev() {
+            let at = range.start;
+            text.remove(range);
+            text.insert(at, value);
+        }
+        Some(CompletionPreview {
+            owner: self.felix_owner()?,
+            text,
+            carets,
+            primary: state.primary_index(),
+        })
+    }
+
+    pub(super) fn refresh_felix_preview(&mut self) {
+        self.felix.preview = self.projected_felix_completion();
+    }
+
+    pub(super) fn felix_preview(
+        &self,
+        window: &crate::window::Window,
+    ) -> Option<&CompletionPreview> {
+        let preview = self.felix.preview.as_ref()?;
+        (window.id == preview.owner.1
+            && self.felix_owner() == Some(preview.owner)
+            && self
+                .current_dialog
+                .as_ref()?
+                .selected_completion()
+                .is_some())
+        .then_some(preview)
+    }
+
+    pub(super) fn felix_completion_key(&self, event: &Event) -> Option<KeyAction> {
         let Event::Key(key) = event else { return None };
         if self.config.editing_model != crate::config::EditingModel::Helix
             || !self.is_insert()
@@ -244,18 +328,42 @@ impl Editor {
         {
             return None;
         }
+        let selected = self.current_dialog.as_ref()?.selected_completion();
+        if self
+            .felix
+            .preview
+            .as_ref()
+            .is_some_and(|p| Some(p.owner) != self.felix_owner())
+        {
+            return Some(KeyAction::Single(Action::CloseDialog));
+        }
         match (key.code, key.modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 Some(KeyAction::Single(Action::CloseDialog))
             }
-            (KeyCode::Esc, KeyModifiers::NONE) => Some(KeyAction::Multiple(vec![
-                Action::CloseDialog,
-                Action::FelixInput {
-                    key: "<esc>".into(),
-                    owner: self.felix_owner()?,
-                },
-            ])),
-            _ => None,
+            (KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::BackTab, _)
+            | (KeyCode::Char('n' | 'p'), KeyModifiers::CONTROL) => None,
+            (KeyCode::Enter, KeyModifiers::NONE) if selected.is_some() => None,
+            (KeyCode::Esc | KeyCode::Enter, KeyModifiers::NONE) if selected.is_none() => {
+                Some(KeyAction::Multiple(vec![
+                    Action::CloseDialog,
+                    Action::FelixInput {
+                        key: if key.code == KeyCode::Esc {
+                            "<esc>"
+                        } else {
+                            "<enter>"
+                        }
+                        .into(),
+                        owner: self.felix_owner()?,
+                    },
+                ]))
+            }
+            _ => Some(KeyAction::Single(Action::FelixCompletionKey {
+                item: Box::new(selected?.clone()),
+                key: *key,
+                owner: self.felix_owner()?,
+                resolve: true,
+            })),
         }
     }
 
@@ -913,6 +1021,65 @@ mod tests {
         let frame = RenderBuffer::new(80, 24, &Style::default());
         let runtime = Runtime::new();
         (editor, frame, runtime)
+    }
+
+    #[tokio::test]
+    async fn preview_leaves_unicode_document_and_undo_untouched_and_rejects_stale_selections() {
+        let (mut editor, mut frame, mut runtime) = fixture_editor("😀foo foo\n");
+        for key in ["%", "s", "f", "o", "o", "<enter>", "c", "F"] {
+            let owner = editor.felix_owner().unwrap();
+            editor
+                .execute_felix(Input::Key(key), owner, &mut frame, &mut runtime)
+                .await
+                .unwrap();
+        }
+        let owner = editor.felix_owner();
+        let selection = editor.felix_active_selection().cloned();
+        let item = serde_json::from_value(json!({
+            "label": "Felix", "textEdit": { "range": {
+                "start": {"line": 0, "character": 2}, "end": {"line": 0, "character": 3}
+            }, "newText": "a\nλ" }
+        }))
+        .unwrap();
+        assert!(editor.show_completion_items(vec![item], editor.completion_snapshot()));
+        assert!(editor
+            .current_dialog
+            .as_ref()
+            .unwrap()
+            .selected_completion()
+            .is_none());
+        let event = Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let action = editor
+            .handle_event_with_runtime(&event, None)
+            .unwrap()
+            .unwrap();
+        editor
+            .handle_key_action(&event, &action, &mut frame, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(
+            editor.felix.preview.as_ref().unwrap().text.to_string(),
+            "😀a\nλ a\nλ\n"
+        );
+        assert_eq!(editor.felix_owner(), owner);
+        assert_eq!(editor.felix_active_selection(), selection.as_ref());
+        assert_eq!(editor.current_buffer().contents(), "😀F F\n");
+        editor
+            .execute_felix(
+                Input::Key("<left>"),
+                owner.unwrap(),
+                &mut frame,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        let window = editor.window_manager.active_window().unwrap();
+        assert!(editor.felix_preview(window).is_none());
+        let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            editor.felix_completion_key(&enter),
+            Some(KeyAction::Single(Action::CloseDialog))
+        ));
     }
 
     #[tokio::test]

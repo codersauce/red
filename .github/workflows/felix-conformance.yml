@@ -55,6 +55,7 @@ jobs:
           grep -F -- '--features helix' "$RUNNER_TEMP/config-error"
           cargo tree --locked -p red --edges normal > "$RUNNER_TEMP/red-tree"
           if grep -Fq felix-core "$RUNNER_TEMP/red-tree"; then exit 1; fi
+          cargo test --locked -p red --test completion
       - name: Fetch release and build candidate
         env:
           GH_TOKEN: ${{ github.token }}
@@ -83,6 +84,7 @@ jobs:
           if [ "$EXTENDED" != true ]; then cmp scripts/felix/fixtures/motions.json "$FELIX_SCENARIOS"; fi
           cargo test --locked -p felix-core
           cargo test --locked -p red --features helix --lib editor::felix
+          cargo test --locked -p red --features helix --test completion
       - uses: actions/upload-artifact@v4
         if: always()
         with:

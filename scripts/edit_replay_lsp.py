@@ -58,7 +58,7 @@ def main():
             if method == "initialize":
                 capabilities = {"textDocumentSync": 1 if args.mode == "full" else 2}
                 if args.completion:
-                    capabilities["completionProvider"] = {}
+                    capabilities["completionProvider"] = {"resolveProvider": True}
                 reply(message, {"capabilities": capabilities})
             elif method == "textDocument/completion" and args.completion:
                 cursor = offset(document, params["position"])
@@ -66,7 +66,12 @@ def main():
                 if document[:cursor].endswith("S"):
                     item = {"label": "SnippetCandidate", "kind": 15, "insertTextFormat": 2,
                             "insertText": "${1:one}=${2:two}$0"}
-                reply(message, [item])
+                items = [item]
+                if document[:cursor].endswith("F"):
+                    items.append({"label": "FelixOther", "kind": 6, "data": {"id": "other"}})
+                reply(message, items)
+            elif method == "completionItem/resolve" and args.completion:
+                reply(message, params)
             elif method == "textDocument/didOpen":
                 document = params["textDocument"]["text"]
                 version = params["textDocument"]["version"]

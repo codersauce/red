@@ -65,6 +65,8 @@ pub struct CompletionUI {
     filtered_history: VecDeque<(String, Vec<usize>)>,
     viewport: SelectionViewport,
     selection_manually_changed: bool,
+    #[cfg(feature = "helix")]
+    explicit_selection: bool,
     visible: bool,
     anchor_x: usize,
     anchor_y: usize,
@@ -194,7 +196,23 @@ impl CompletionUI {
         self.visible
     }
 
+    #[cfg(feature = "helix")]
+    pub(crate) fn require_explicit_selection(&mut self) {
+        self.explicit_selection = true;
+    }
+
+    fn has_selection(&self) -> bool {
+        #[cfg(feature = "helix")]
+        if self.explicit_selection {
+            return self.selection_manually_changed;
+        }
+        true
+    }
+
     pub fn selected_item(&self) -> Option<&CompletionResponseItem> {
+        if !self.has_selection() {
+            return None;
+        }
         self.items
             .get(self.viewport.selected())
             .and_then(|index| self.all_items.get(*index))
@@ -592,7 +610,7 @@ impl CompletionUI {
                 continue;
             };
             let y = self.y + visible_index + 1;
-            let selected = item_position == self.viewport.selected();
+            let selected = self.has_selection() && item_position == self.viewport.selected();
             let base_style = self.row_style(selected, item.deprecated.unwrap_or(false));
             let inner_width = self.width.saturating_sub(2);
             output.push((self.x, y, "│".to_string(), self.styles.popup_border.clone()));
@@ -697,7 +715,7 @@ impl Component for CompletionUI {
     }
 
     fn is_empty_completion(&self) -> bool {
-        self.selected_item().is_none()
+        self.items.is_empty()
     }
 
     fn completion_popup_bounds(&self) -> Option<(usize, usize, usize, usize)> {
@@ -746,6 +764,30 @@ impl Component for CompletionUI {
     }
 
     fn handle_event(&mut self, ev: &Event) -> Option<KeyAction> {
+        #[cfg(feature = "helix")]
+        if self.explicit_selection && !self.items.is_empty() {
+            let Event::Key(key) = ev else { return None };
+            let backwards = match (key.code, key.modifiers) {
+                (KeyCode::BackTab, _)
+                | (KeyCode::Up, KeyModifiers::NONE)
+                | (KeyCode::Char('p'), KeyModifiers::CONTROL) => Some(true),
+                (KeyCode::Tab | KeyCode::Down, KeyModifiers::NONE)
+                | (KeyCode::Char('n'), KeyModifiers::CONTROL) => Some(false),
+                _ => None,
+            };
+            if let Some(backwards) = backwards {
+                let len = self.items.len();
+                let index = match (self.has_selection(), backwards) {
+                    (false, false) => 0,
+                    (false, true) => len - 1,
+                    (true, true) => (self.viewport.selected() + len - 1) % len,
+                    (true, false) => (self.viewport.selected() + 1) % len,
+                };
+                self.viewport.select(index);
+                self.selection_manually_changed = true;
+                return Some(KeyAction::Single(Action::FelixPreviewCompletion));
+            }
+        }
         match ev {
             Event::Key(KeyEvent {
                 code: KeyCode::Up, ..

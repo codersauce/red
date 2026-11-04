@@ -2660,6 +2660,17 @@ pub enum Action {
         owner: (BufferId, WindowId, u64, u64),
     },
     #[cfg(feature = "helix")]
+    #[serde(skip)]
+    FelixPreviewCompletion,
+    #[cfg(feature = "helix")]
+    #[serde(skip)]
+    FelixCompletionKey {
+        item: Box<CompletionResponseItem>,
+        key: KeyEvent,
+        owner: (BufferId, WindowId, u64, u64),
+        resolve: bool,
+    },
+    #[cfg(feature = "helix")]
     FelixDocumentDiagnostics,
     #[cfg(feature = "helix")]
     FelixSwapWindow(crate::window::Direction),
@@ -17540,7 +17551,7 @@ impl Editor {
         }
 
         #[cfg(feature = "helix")]
-        if let Some(action) = self.felix_completion_dismissal(ev) {
+        if let Some(action) = self.felix_completion_key(ev) {
             return Ok(Some(action));
         }
 
@@ -22320,6 +22331,51 @@ impl Editor {
                 return Ok(Some((true, false)));
             }
             #[cfg(feature = "helix")]
+            Action::FelixCompletionKey {
+                item,
+                key,
+                owner,
+                resolve,
+            } => {
+                if self.felix_owner() != Some(*owner) {
+                    return Ok(Some((true, false)));
+                }
+                if *resolve
+                    && self
+                        .resolve_completion_item(item, None, Some((*owner, *key)))
+                        .await?
+                {
+                    self.close_completion_popup();
+                    self.completion_snapshot = None;
+                } else {
+                    self.apply_completion(item, None, runtime).await?;
+                    if self.is_insert()
+                        && self
+                            .felix_owner()
+                            .is_some_and(|now| (now.0, now.1) == (owner.0, owner.1))
+                    {
+                        if let Some(action) = self.felix_input_action(key) {
+                            let quit = Box::pin(self.handle_key_action(
+                                &Event::Key(*key),
+                                &action,
+                                buffer,
+                                runtime,
+                            ))
+                            .await?;
+                            return Ok(Some((true, quit)));
+                        }
+                    }
+                }
+                self.render(buffer)?;
+                return Ok(Some((true, false)));
+            }
+            #[cfg(feature = "helix")]
+            Action::FelixPreviewCompletion => {
+                self.refresh_felix_preview();
+                self.render(buffer)?;
+                return Ok(Some((true, false)));
+            }
+            #[cfg(feature = "helix")]
             Action::FelixDocumentDiagnostics => {
                 self.open_document_diagnostics_picker();
                 self.render(buffer)?;
@@ -25425,6 +25481,10 @@ impl Editor {
                     }
                     self.release_current_dialog_callbacks(runtime);
                     self.current_dialog = None;
+                    #[cfg(feature = "helix")]
+                    {
+                        self.felix.preview = None;
+                    }
                     self.completion_snapshot = None;
                     self.render(buffer)?;
                 }
@@ -25976,7 +26036,12 @@ impl Editor {
                     commit_character,
                 } => {
                     if !self
-                        .resolve_completion_item(item, *commit_character)
+                        .resolve_completion_item(
+                            item,
+                            *commit_character,
+                            #[cfg(feature = "helix")]
+                            None,
+                        )
                         .await?
                     {
                         self.apply_completion(item, *commit_character, runtime)
@@ -32627,12 +32692,22 @@ impl Editor {
             } else {
                 self.activate_completion_snapshot(snapshot)
             });
+            #[cfg(feature = "helix")]
+            if self.config.editing_model == crate::config::EditingModel::Helix {
+                self.refresh_felix_preview();
+            }
             return true;
         }
 
         let (completion_x, completion_y) =
             self.render_cursor_position().unwrap_or((self.cx, self.cy));
         let mut completion = CompletionUI::with_theme(&self.theme);
+        #[cfg(feature = "helix")]
+        if self.panel_manager.focused_panel_id().is_none()
+            && self.config.editing_model == crate::config::EditingModel::Helix
+        {
+            completion.require_explicit_selection();
+        }
         completion.show_filtered_with_bounds(
             items,
             &filter,

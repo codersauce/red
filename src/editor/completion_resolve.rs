@@ -9,10 +9,57 @@ use super::{
 pub(super) struct PendingCompletionResolution {
     item: CompletionResponseItem,
     commit_character: Option<char>,
+    #[cfg(feature = "helix")]
+    next_key: Option<(super::felix::Owner, crossterm::event::KeyEvent)>,
     snapshot: CompletionSnapshot,
 }
 
 pub(super) type PendingCompletionRefresh = PendingCompletionResolution;
+
+impl PendingCompletionResolution {
+    fn has_pending_input(&self) -> bool {
+        #[cfg(feature = "helix")]
+        if self.next_key.is_some() {
+            return true;
+        }
+        self.commit_character.is_some()
+    }
+
+    fn is_current(&self, editor: &Editor) -> bool {
+        #[cfg(feature = "helix")]
+        if self
+            .next_key
+            .is_some_and(|(owner, _)| editor.felix_owner() != Some(owner))
+        {
+            return false;
+        }
+        editor.is_insert() && editor.completion_snapshot_is_current(&self.snapshot)
+    }
+
+    fn action(&self, item: CompletionResponseItem, resolve: bool) -> Action {
+        let item = Box::new(item);
+        #[cfg(feature = "helix")]
+        if let Some((owner, key)) = self.next_key {
+            return Action::FelixCompletionKey {
+                item,
+                key,
+                owner,
+                resolve,
+            };
+        }
+        if resolve {
+            Action::ApplyCompletion {
+                item,
+                commit_character: self.commit_character,
+            }
+        } else {
+            Action::ApplyResolvedCompletion {
+                item,
+                commit_character: self.commit_character,
+            }
+        }
+    }
+}
 
 fn completion_candidate_matches(
     selected: &CompletionResponseItem,
@@ -49,7 +96,7 @@ impl Editor {
         let refresh_id = self
             .pending_completion_refreshes
             .iter()
-            .find_map(|(id, pending)| pending.commit_character.map(|_| *id));
+            .find_map(|(id, pending)| pending.has_pending_input().then_some(*id));
         let pending = if let Some(id) = refresh_id {
             let pending = self.pending_completion_refreshes.remove(&id)?;
             // A late refresh must not become a new popup for the current buffer.
@@ -67,7 +114,7 @@ impl Editor {
             let id = self
                 .pending_completion_resolutions
                 .iter()
-                .find_map(|(id, pending)| pending.commit_character.map(|_| *id))?;
+                .find_map(|(id, pending)| pending.has_pending_input().then_some(*id))?;
             self.pending_completion_resolutions.remove(&id)?
         };
         let item = pending.item.clone();
@@ -81,6 +128,10 @@ impl Editor {
             .is_some_and(|dialog| dialog.accepts_completion_updates())
         {
             self.current_dialog = None;
+            #[cfg(feature = "helix")]
+            {
+                self.felix.preview = None;
+            }
         }
     }
 
@@ -89,6 +140,10 @@ impl Editor {
         &mut self,
         item: &CompletionResponseItem,
         commit_character: Option<char>,
+        #[cfg(feature = "helix")] next_key: Option<(
+            super::felix::Owner,
+            crossterm::event::KeyEvent,
+        )>,
     ) -> anyhow::Result<bool> {
         if item.data.is_none()
             || item
@@ -166,6 +221,8 @@ impl Editor {
                             PendingCompletionRefresh {
                                 item: item.clone(),
                                 commit_character,
+                                #[cfg(feature = "helix")]
+                                next_key,
                                 snapshot,
                             },
                         );
@@ -216,6 +273,8 @@ impl Editor {
             PendingCompletionResolution {
                 item: item.clone(),
                 commit_character,
+                #[cfg(feature = "helix")]
+                next_key,
                 snapshot,
             },
         );
@@ -259,18 +318,16 @@ impl Editor {
         pending: PendingCompletionResolution,
         item: CompletionResponseItem,
     ) -> Option<Action> {
-        if !self.is_insert() || !self.completion_snapshot_is_current(&pending.snapshot) {
+        if !pending.is_current(self) {
             self.set_legacy_message(Some(
                 "completion resolve response is stale; buffer or cursor changed".to_string(),
             ));
             return None;
         }
 
+        let action = pending.action(item, false);
         self.completion_snapshot = Some(pending.snapshot);
-        Some(Action::ApplyResolvedCompletion {
-            item: Box::new(item),
-            commit_character: pending.commit_character,
-        })
+        Some(action)
     }
 
     pub(super) fn refreshed_completion_action(
@@ -278,7 +335,7 @@ impl Editor {
         response: &ResponseMessage,
     ) -> Option<Action> {
         let pending = self.pending_completion_refreshes.remove(&response.id)?;
-        if !self.is_insert() || !self.completion_snapshot_is_current(&pending.snapshot) {
+        if !pending.is_current(self) {
             self.set_legacy_message(Some(
                 "completion refresh response is stale; buffer or cursor changed".to_string(),
             ));
@@ -314,19 +371,13 @@ impl Editor {
         let action = if let Some(item) = refreshed {
             pending.snapshot.initial_revision = pending.snapshot.revision;
             pending.snapshot.original_range = pending.snapshot.current_range.clone();
-            Action::ApplyCompletion {
-                item: Box::new(item),
-                commit_character: pending.commit_character,
-            }
+            pending.action(item, true)
         } else {
             self.set_legacy_message(Some(
                 "completion refresh did not return the selected item; inserting without deferred edits"
                     .to_string(),
             ));
-            Action::ApplyResolvedCompletion {
-                item: Box::new(pending.item),
-                commit_character: pending.commit_character,
-            }
+            pending.action(pending.item.clone(), false)
         };
         self.completion_snapshot = Some(pending.snapshot);
         Some(action)
@@ -417,6 +468,8 @@ mod tests {
             PendingCompletionResolution {
                 item: completion(),
                 commit_character: None,
+                #[cfg(feature = "helix")]
+                next_key: None,
                 snapshot,
             },
         );
@@ -441,6 +494,8 @@ mod tests {
             PendingCompletionResolution {
                 item: selected.clone(),
                 commit_character: None,
+                #[cfg(feature = "helix")]
+                next_key: None,
                 snapshot,
             },
         );
@@ -464,6 +519,8 @@ mod tests {
             PendingCompletionRefresh {
                 item: selected,
                 commit_character: None,
+                #[cfg(feature = "helix")]
+                next_key: None,
                 snapshot,
             },
         );
@@ -557,6 +614,8 @@ mod tests {
             PendingCompletionRefresh {
                 item: deferred_completion(3),
                 commit_character: None,
+                #[cfg(feature = "helix")]
+                next_key: None,
                 snapshot,
             },
         );
