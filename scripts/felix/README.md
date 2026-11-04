@@ -91,4 +91,13 @@ python3 scripts/felix/input_bench.py --binary target/release/red --model helix \
   --scenario horizontal --events 40 --warmup 4 --burst --burst-ms 10
 ```
 
+To reproduce the image-rendering regression, copy the README screenshot alongside the disposable document. This check requires a Kitty pixel upload before the measured keys, then fails if an unchanged image is encoded again. A PTY is sufficient. Run it with either `--scenario typing` or `--scenario vertical`.
+
+```sh
+python3 scripts/felix/input_bench.py --binary target/debug/red --model helix \
+  --source README.md --source-asset docs/images/editor-overview.jpg \
+  --line 4 --scenario typing --cols 152 --rows 94 --events 12 --warmup 4 \
+  --perf-mode trace --config-override markdown_images=kitty --verify-image-reuse
+```
+
 The paced burst reports time through the last expected frame and time from the last write until that frame. Motion reverses direction and ends on a distinct row and column. The document marker verifies the destination. On macOS, add `--sample FILE` to a longer diagnostic run to collect a separate process sample. Compare gating runs with instrumentation disabled.

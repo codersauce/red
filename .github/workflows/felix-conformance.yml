@@ -69,6 +69,17 @@ jobs:
         run: |
           mkdir -p evidence
           python3 scripts/felix/reference_smoke.py "$ARCHIVE" --observer reference/target/debug/hx --candidate target/debug/red > evidence/terminal.json
+      - name: Verify ordinary keys reuse the visible README image
+        run: |
+          image_line=$(grep -nF '](docs/images/editor-overview.jpg)' README.md | cut -d: -f1)
+          for scenario in typing vertical; do
+            line=4
+            if [ "$scenario" = vertical ]; then line=$((image_line - 1)); fi
+            python3 scripts/felix/input_bench.py --binary target/debug/red --model helix \
+              --scenario "$scenario" --source README.md --source-asset docs/images/editor-overview.jpg \
+              --line "$line" --rows 94 --cols 152 --events 12 --warmup 4 --perf-mode trace \
+              --config-override markdown_images=kitty --verify-image-reuse > "evidence/image-$scenario.json"
+          done
       - name: Verify multi-selection edits reach the language server
         run: |
           python3 scripts/edit_replay_bench.py --binary target/debug/red --scenario felix-change \

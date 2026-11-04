@@ -1,6 +1,6 @@
 # Helix typing and movement performance
 
-Measured on November 4, 2026. The baseline was `81083077`. The editor changes end at `9ff7afd5`. The runs used an Apple M4 Max with 128 GiB RAM, macOS 26.7.2 arm64 and rustc 1.98.1. Both revisions used the same local Cargo lockfile, SHA-256 `2b9e8afc117389f96a2499f14266f6ef9e14b4b715b8538ead281dca90bd90a9`. That lockfile resolves pulldown-cmark 0.13.5 and wasmtime 48.0.7. Development used the normal unoptimized profile with debug info disabled. Release used Cargo's optimized profile. Incremental compilation was disabled.
+Measured on November 4, 2026. The initial series compared `81083077` with the editor changes through `9ff7afd5`. The [illustrated README follow-up](#follow-up-with-the-readme-images-present) measures the development-build issue reported afterward. The runs used an Apple M4 Max with 128 GiB RAM, macOS 26.7.2 arm64 and rustc 1.98.1. Both revisions used the same local Cargo lockfile, SHA-256 `2b9e8afc117389f96a2499f14266f6ef9e14b4b715b8538ead281dca90bd90a9`. That lockfile resolves pulldown-cmark 0.13.5 and wasmtime 48.0.7. Development used the normal unoptimized profile with debug info disabled. Release used Cargo's optimized profile. Incremental compilation was disabled.
 
 ## Ordinary input
 
@@ -23,7 +23,7 @@ The pass condition was frozen in `a9844918` before the editor changes. For each 
 
 ## Real files
 
-The 200 × 60 terminal opened disposable copies from the baseline revision. The README has 405 lines and a maximum line length of 174 bytes. The 2.12 MB editor source has 55,268 lines and a maximum line length of 406 bytes. Typing started at README line 4 and source line 35,307. Development diagnostics used 40 measured inputs with tracing enabled. Release used 200 measured inputs with tracing disabled. These p95s describe the two files and positions.
+The 200 × 60 terminal opened disposable copies from the baseline revision. The README has 405 lines and a maximum line length of 174 bytes. The 2.12 MB editor source has 55,268 lines and a maximum line length of 406 bytes. The disposable README had no sibling image assets, so those runs measured Markdown with image placeholders. Typing started at README line 4 and source line 35,307. Development diagnostics used 40 measured inputs with tracing enabled. Release used 200 measured inputs with tracing disabled. These p95s describe the two files and positions.
 
 | File | Profile | Typing p95 | Horizontal p95 | Vertical p95 |
 | --- | --- | ---: | ---: | ---: |
@@ -74,7 +74,7 @@ The Unicode/CRLF fixtures verified split views, newline/backspace, arrows, selec
 
 ### tmux replay
 
-In tmux 3.7c at 200 × 60, Red opened a disposable copy of the README inside this worktree using a temporary copy of the user's Red configuration. First-launch release notes were disabled. Each replay verified entry into Insert mode on line 4, sent 32 letter/backspace pairs and a five-letter marker, and checked the complete saved file. The table shows time from sending the 69-key burst to seeing its final marker via `tmux capture-pane`.
+In tmux 3.7c at 200 × 60, Red opened a disposable copy of the README inside this worktree using a temporary copy of the user's `config.toml`. The replay omitted `preferences.json`, installed plugins and the README's local images. First-launch release notes were disabled. Each replay verified entry into Insert mode on line 4, sent 32 letter/backspace pairs and a five-letter marker, and checked the complete saved file. The table shows time from sending the 69-key burst to seeing its final marker via `tmux capture-pane`.
 
 | Build | Median of five, ms | Range, ms |
 | --- | ---: | ---: |
@@ -101,3 +101,24 @@ The raw evidence archive is `target/felix-perf/evidence.tar.gz`. The local run d
 The numeric Red command used during fixture setup revealed a separate bug. After `:1000`, the next Felix edit could return to the previous selection. The fix makes host jumps update the active document selection. Both a native jump and a position with a nonzero Unicode column have a regression test. Timed runs use the same counted `G` setup on both revisions.
 
 The separate signature-help fixture finds that an automatic LSP signature request is missing on a typed trigger in Helix mode on both the baseline and the candidate. Vim opens it in the control run. The ordinary-input comparison uses LSP disabled in both models. The controlled language-server and completion replays exercise their own paths.
+
+## Follow-up with the README images present
+
+The reported development command ran in a 152 × 94 pane. A new replay copied the three local screenshots along with the README and ran under copies of the user's configuration, preferences and plugins. It selected Kitty graphics explicitly to reproduce the negotiated graphics path in a PTY. Each sample waited for the expected cursor position in a completed terminal frame. A saved marker verified the final document.
+
+| Development workload | Before, median per key | After, median per key |
+| --- | ---: | ---: |
+| Helix typing, screenshot visible | 734 ms | 10.8 ms |
+| Helix alternating `j` and `k`, screenshot visible | 385 ms | 3.0 ms |
+| Helix typing, two screenshots shown as text blocks | 626 ms | 6.2 ms |
+| Vim typing on remote main `c42adfff`, screenshot visible | 766 ms | 23.6 ms |
+
+Each Kitty comparison used 12 measured inputs with tracing off. The text-block comparison used eight inputs after four warmups in a nine-line document containing two README screenshots. These are individual workstation runs. In a separate private tmux replay, 13 inputs spaced 10 ms apart took 12.95 s from the first send to the visible final marker before the fix and 0.17 s afterward. Both runs saved the expected bytes.
+
+The graphics renderer now encodes pixels when it sends them. Kitty keeps the pixels when a placement moves, disappears, or returns. The text fallback caches resized grids for multiple immutable images and sizes. The viewport also scrolls toward a visible cursor in the top margin. Previously it could scroll in the opposite direction for an entire screen before repositioning.
+
+In a 220-key `j`/`k` traversal of the illustrated README, the fixed development build took 6.6 ms at p95 and 17.1 ms at p99. The slowest key took 654 ms when the second screenshot appeared for the first time. The trace recorded one image encode during the traversal. First-time image preparation and transfer still run on the input thread.
+
+The development and release builds passed all 24 frozen input-latency checks and all five historical replay budgets. On the standalone Vim backport, all 36 Markdown image tests and 17 navigation tests passed.
+
+Commit `7733e37c` contains the shared Rust fix and its regression tests. It applies cleanly to `c42adfff` and builds with the default Vim editing model. The worktree development binary for the follow-up has SHA-256 `d58b037498ac55d191c74c5d6c0074748ec4e48d007962c7ae9e5cccbc51ade1`. The patched main binary has SHA-256 `8cfca38c3a83d220d22b584d37b62bde0dc1bcec402c350a3a160955a0cfa7d0`. The [replay instructions](../scripts/felix/README.md#ordinary-typing-and-cursor-latency) exercise unchanged-image reuse in the development build.

@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -31,6 +32,7 @@ class InputDriver(Driver):
         self.launched = time.monotonic_ns()
         self.changed = threading.Condition()
         self.frames = []
+        self.last_normal_frame = 0
         super().__init__(args)
 
     def drain(self):
@@ -65,6 +67,8 @@ class InputDriver(Driver):
                 pos = POSITION.search(status)
                 if pos:
                     with self.changed:
+                        if b"NORMAL" in status:
+                            self.last_normal_frame = observed
                         self.frames.append((observed, (int(pos[1]), int(pos[2]))))
                         self.changed.notify_all()
 
@@ -97,6 +101,10 @@ def workload(args):
             source = args.source.read_bytes()
             file = root / args.source.name
         file.write_bytes(source)
+        for asset in args.source_asset:
+            destination = root / asset
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(args.source.parent / asset, destination)
         args.root = args.project_root.resolve() if args.project_root else root
         args.file, args.split_file = file, file
         args.output = root / "capture"
@@ -153,6 +161,11 @@ def workload(args):
                         sampler = subprocess.Popen(["sample", str(driver.process.pid), "3", "1",
                                                     "-file", str(args.sample.resolve())],
                                                    stdout=subprocess.DEVNULL)
+                    if args.verify_image_reuse:
+                        initial_encode = any(match[1] == "markdown_images:encode"
+                                             for match in TIMING.finditer(driver.read_log()))
+                        if not initial_encode or b"a=t,f=32" not in driver.capture:
+                            raise ValueError("expected a traced image encode and Kitty upload before measurement")
                     frame_start = len(driver.frames)
                     bytes_before = driver.bytes
                     offset = driver.log.stat().st_size if driver.log.exists() else 0
@@ -178,6 +191,8 @@ def workload(args):
                         spans.setdefault(match[1], []).append(int(match[3]))
                 if len(spans.get("event", [])) != args.events:
                     raise ValueError(f"unaccounted inputs: {len(spans.get('event', []))}/{args.events}")
+            if args.verify_image_reuse and spans.get("markdown_images:encode"):
+                raise ValueError("redrawing the unchanged image encoded its pixels again")
             burst = None
             inserted = b""
             if args.burst:
@@ -210,8 +225,13 @@ def workload(args):
                 time.sleep(0.1)
             if not typing:
                 driver.send(b"i")
-            driver.send(b"Z\x1b")
-            time.sleep(0.1)
+            sent = time.monotonic_ns()
+            driver.send(b"Z")
+            driver.wait_position((row, col + 1), sent)
+            marker_frame = time.monotonic_ns()
+            driver.send(b"\x1b")
+            # Wait for the mode-change frame before sending the command prefix.
+            driver.wait_for(lambda: driver.last_normal_frame >= marker_frame, 12, "leaving Insert")
             driver.command("w")
             expected = source.splitlines(keepends=True)
             # Insert sessions finish their measured cycle at the original column.
@@ -229,7 +249,8 @@ def workload(args):
                         binary_sha256=binary_hash, config_overrides=args.config_override,
                         frames_with_position=frame_count,
                         launch_to_first_status_us=(driver.frames[0][0] - driver.launched) // 1000,
-                        source_file=file.name, source_sha256=hashlib.sha256(source).hexdigest(),
+                        source_file=file.name, source_assets=[str(p) for p in args.source_asset],
+                        source_sha256=hashlib.sha256(source).hexdigest(),
                         output_bytes=output_bytes, burst=burst, latency=stats(latencies), latency_us=latencies,
                         spans={key: stats(values) for key, values in spans.items()})
         finally:
@@ -247,6 +268,10 @@ if __name__ == "__main__":
     parser.add_argument("--scenario", choices=("typing", "horizontal", "vertical", "arrows", "select", "newline", "word"), required=True)
     parser.add_argument("--project-root", type=Path, help="use this workspace and put scratch files under its target directory")
     parser.add_argument("--source", type=Path, help="copy a real fixture into the isolated workspace")
+    parser.add_argument("--source-asset", action="append", type=Path, default=[],
+                        help="also copy this file relative to the source file's directory (repeatable)")
+    parser.add_argument("--verify-image-reuse", action="store_true",
+                        help="require an initial Kitty image upload and zero encodes during traced inputs")
     parser.add_argument("--sample", type=Path, help="write a three-second macOS process sample during measurement")
     parser.add_argument("--command-jump", action="store_true", help="position using Red's numeric colon command")
     parser.add_argument("--line", type=int, help="one-based unindented starting line")
@@ -266,6 +291,11 @@ if __name__ == "__main__":
     parser.add_argument("--burst", action="store_true")
     parser.add_argument("--burst-ms", type=float, default=0)
     args = parser.parse_args()
+    if args.source_asset and (not args.source or any(
+            p.is_absolute() or ".." in p.parts or p == Path(args.source.name) for p in args.source_asset)):
+        parser.error("source assets must be relative to --source and distinct from the edited file")
+    if args.verify_image_reuse and (args.perf_mode != "trace" or not args.source_asset):
+        parser.error("--verify-image-reuse requires a --source-asset and --perf-mode trace")
     if (args.lines < 4 or args.events < 4 or args.warmup < 0 or args.warmup % 4
             or args.events % 4 or args.padding < 0 or min(args.interval_ms, args.burst_ms) < 0):
         parser.error("use at least four lines and whole four-input cycles")
