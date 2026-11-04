@@ -35,7 +35,7 @@ impl WindowId {
 }
 
 /// Spatial direction used for window navigation, movement, and split resizing.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Direction {
     /// Toward smaller terminal rows.
     Up,
@@ -1880,6 +1880,22 @@ impl WindowManager {
     /// Moves the active window to the requested full-height or full-width outer edge.
     ///
     /// Returns `None` when there is only one window or the active window already
+    /// Exchange neighboring leaf views while preserving the split tree and its geometry.
+    #[cfg(feature = "helix")]
+    pub fn swap_adjacent(&mut self, direction: Direction) -> Option<()> {
+        let target = self.find_window_in_direction(direction)?;
+        let active = self.active_window_id();
+        let mut windows = self.windows_mut();
+        let (first, rest) = windows.split_at_mut(active.max(target));
+        let a = &mut first[active.min(target)];
+        let b = &mut rest[0];
+        std::mem::swap(&mut **a, &mut **b);
+        std::mem::swap(&mut a.size, &mut b.size);
+        std::mem::swap(&mut a.position, &mut b.position);
+        self.set_active(target);
+        Some(())
+    }
+
     /// occupies the requested edge.
     pub fn move_window_to_edge(&mut self, direction: Direction) -> Option<()> {
         let active_window = self.active_window()?;

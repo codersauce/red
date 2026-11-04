@@ -1331,6 +1331,13 @@ impl Editor {
     }
 
     pub(super) fn multi_cursor_status_label(&self) -> Option<String> {
+        #[cfg(feature = "helix")]
+        if self.config.editing_model == crate::config::EditingModel::Helix
+            && self.panel_manager.focused_panel_id().is_none()
+            && matches!(self.mode, Mode::Insert | Mode::Normal)
+        {
+            return self.felix_status();
+        }
         let session = self
             .multi_cursor
             .as_ref()

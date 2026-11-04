@@ -3101,6 +3101,9 @@ impl Editor {
         self.render_search_highlights_in_window(buffer, window)?;
         self.render_matching_brackets_in_window(buffer, window, None);
 
+        #[cfg(feature = "helix")]
+        self.render_felix_selections(buffer, window);
+
         let multi_cursor_ranges = self
             .multi_cursor_render_ranges(self.buffer_manager[window.buffer_index].id(), window.id);
         for (range, collapsed) in multi_cursor_ranges {
@@ -3498,7 +3501,7 @@ impl Editor {
         Ok(())
     }
 
-    fn display_col_range_points_in_window(
+    pub(super) fn display_col_range_points_in_window(
         &self,
         window: &crate::window::Window,
         line_index: usize,

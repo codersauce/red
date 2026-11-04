@@ -347,6 +347,28 @@ impl Editor {
             {
                 return Ok(());
             }
+            #[cfg(feature = "helix")]
+            if self.config.editing_model == crate::config::EditingModel::Helix {
+                self.felix_pointer(point, modifiers == KeyModifiers::ALT, false);
+                self.mouse_selection.gesture = Some(MouseGesture {
+                    owner: MouseSelectionOwner {
+                        window: window.id,
+                        buffer: self.current_buffer().id(),
+                    },
+                    revision: self.current_buffer().revision(),
+                    anchor: point,
+                    anchor_end: point,
+                    pointer,
+                    started: false,
+                    activate_on_press: false,
+                    press_pointer: pointer,
+                    reverse_initial: false,
+                    from_insert: self.is_insert(),
+                    unit: SelectionUnit::Character,
+                    last_scroll: Instant::now() - AUTOSCROLL_INTERVAL,
+                });
+                return self.render(buffer);
+            }
             self.clear_multi_cursor();
             self.execute(&Action::SetCursor(point.x, point.y), buffer, runtime)
                 .await?;
@@ -465,6 +487,21 @@ impl Editor {
                     self.mouse_selection.gesture = None;
                 }
                 return Ok(());
+            }
+            #[cfg(feature = "helix")]
+            if self.config.editing_model == crate::config::EditingModel::Helix {
+                if !finish && gesture.last_scroll.elapsed() >= AUTOSCROLL_INTERVAL {
+                    self.scroll_mouse_selection(pointer);
+                    gesture.last_scroll = Instant::now();
+                }
+                if let Some(window) = self.active_window_with_editor_view() {
+                    let point = self.mouse_buffer_point(&window, pointer);
+                    self.felix_pointer(point, false, true);
+                }
+                gesture.started = true;
+                gesture.pointer = pointer;
+                self.mouse_selection.gesture = (!finish).then_some(gesture);
+                return self.render(buffer);
             }
             // Entering Visual mode reveals a Markdown table. Resolve the first
             // drag against the grid that was actually under the pointer.

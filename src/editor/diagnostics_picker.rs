@@ -73,10 +73,37 @@ struct DiagnosticPickerModel {
 
 impl Editor {
     pub(super) fn open_diagnostics_picker(&mut self, filter: DiagnosticFilter) {
-        let diagnostic_paths = filtered_diagnostic_paths(&self.diagnostics, filter);
+        self.show_filtered_diagnostics(filter, None);
+    }
+
+    #[cfg(feature = "helix")]
+    pub(super) fn open_document_diagnostics_picker(&mut self) {
+        let uri = self
+            .current_buffer()
+            .uri()
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        self.show_filtered_diagnostics(DiagnosticFilter::All, Some(&uri));
+    }
+
+    fn show_filtered_diagnostics(&mut self, filter: DiagnosticFilter, uri: Option<&str>) {
+        let scoped;
+        let diagnostics = if let Some(uri) = uri {
+            scoped = self
+                .diagnostics
+                .get_key_value(uri)
+                .map(|(key, values)| (key.clone(), values.clone()))
+                .into_iter()
+                .collect();
+            &scoped
+        } else {
+            &self.diagnostics
+        };
+        let diagnostic_paths = filtered_diagnostic_paths(diagnostics, filter);
         let preview_contents = diagnostic_preview_contents(&self.buffer_manager, &diagnostic_paths);
         let model = diagnostic_picker_model(
-            &self.diagnostics,
+            diagnostics,
             filter,
             &get_workspace_path(),
             &preview_contents,

@@ -1,0 +1,80 @@
+name: Felix conformance
+
+on:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '37 4 * * *'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  CARGO_INCREMENTAL: 0
+  HX_PIN: a05c151bb6e8e9c65ec390b0ae2afe7a5efd619b
+  ARCHIVE: helix-25.07.1-x86_64-linux.tar.xz
+
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check out pinned Helix
+        uses: actions/checkout@v4
+        with:
+          repository: helix-editor/helix
+          ref: ${{ env.HX_PIN }}
+          path: reference
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            reference
+      - name: Build reference observer
+        working-directory: reference
+        env:
+          HELIX_DISABLE_AUTO_GRAMMAR_BUILD: 1
+          RUSTUP_TOOLCHAIN: stable
+        run: |
+          test "$(git rev-parse HEAD)" = "$HX_PIN"
+          git apply ../scripts/felix/helix-observer.patch
+          cargo build --locked -p helix-term --bin hx
+      - name: Verify ordinary Red build and configuration
+        run: |
+          cargo build --locked --bin red
+          target/debug/red --check-config
+          if target/debug/red --check-config -c editing_model=helix > "$RUNNER_TEMP/config-error" 2>&1; then exit 1; fi
+          grep -F -- '--features helix' "$RUNNER_TEMP/config-error"
+          cargo tree --locked -p red --edges normal > "$RUNNER_TEMP/red-tree"
+          if grep -Fq felix-core "$RUNNER_TEMP/red-tree"; then exit 1; fi
+      - name: Fetch release and build candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download 25.07.1 --repo helix-editor/helix --pattern "$ARCHIVE"
+          cargo build --locked --features helix --bin red
+      - name: Compare terminals and check reference fixture
+        run: |
+          mkdir -p evidence
+          python3 scripts/felix/reference_smoke.py "$ARCHIVE" --observer reference/target/debug/hx --candidate target/debug/red > evidence/terminal.json
+      - name: Compare live reference events with Red
+        env:
+          EXTENDED: ${{ github.event_name == 'schedule' }}
+        run: |
+          tar -xJf "$ARCHIVE" helix-25.07.1-x86_64-linux/runtime
+          steps=48
+          seed=250701
+          if [ "$EXTENDED" = true ]; then steps=512; seed="$GITHUB_RUN_ID"; fi
+          export FELIX_SCENARIOS="$PWD/evidence/scenarios.json"
+          python3 scripts/felix/scenarios.py --observer reference/target/debug/hx --runtime helix-25.07.1-x86_64-linux/runtime --steps "$steps" --seed "$seed" > "$FELIX_SCENARIOS"
+          cargo test --locked -p felix-core
+          cargo test --locked -p red --features helix --lib editor::felix
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: felix-conformance
+          path: evidence/

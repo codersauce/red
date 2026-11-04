@@ -929,6 +929,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "felix-core"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "regex-automata",
+ "ropey",
+ "serde_json",
+ "unicode-segmentation",
+ "unicode-width 0.2.1",
+]
+
+[[package]]
 name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2472,6 +2484,7 @@ dependencies = [
  "core-foundation",
  "crossterm",
  "ed25519-dalek",
+ "felix-core",
  "flate2",
  "futures",
  "fuzzy-matcher",

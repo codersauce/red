@@ -1,3 +1,5 @@
+editing_model = "vim"
+
 # This is a sample configuration file for red.
 #
 # The configuration file is a TOML file. The configuration file is read from

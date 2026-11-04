@@ -19,6 +19,7 @@ harness = false
 [workspace]
 members = [
     ".",
+    "crates/felix-core",
     "crates/husk",
     "crates/husk-analysis",
     "crates/husk-ast",
@@ -68,7 +69,11 @@ husk-types = { version = "0.1.0", path = "crates/husk-types" }
 husk-value = { version = "0.1.0", path = "crates/husk-value" }
 husk-wasm = { version = "0.1.0", path = "crates/husk-wasm" }
 
+[features]
+helix = ["dep:felix-core"]
+
 [dependencies]
+felix-core = { path = "crates/felix-core", optional = true }
 anyhow = "1.0.79"
 arboard = "3.4.1"
 base64 = "0.22.1"

@@ -1319,6 +1319,8 @@ fn finalize_runtime_config(
     mut loaded: LoadedConfig,
 ) -> anyhow::Result<(LoadedConfig, Theme, Option<Logger>)> {
     let config_dir = Config::config_dir();
+    anyhow::ensure!(cfg!(feature = "helix") || loaded.config.editing_model != red::config::EditingModel::Helix,
+        "Helix editing requires a Red build with the helix feature. Select vim or rebuild with --features helix.");
     let package_manager = red::plugin::package::PluginPackageManager::new(&config_dir);
     for installed in package_manager
         .list()?

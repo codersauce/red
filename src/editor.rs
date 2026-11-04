@@ -37,6 +37,8 @@ mod display_layout;
 mod edit_batch;
 mod edit_history;
 mod explore_ui;
+#[cfg(feature = "helix")]
+mod felix;
 mod file_watch;
 mod inline_actions;
 mod inline_agent_outcomes;
@@ -2645,6 +2647,26 @@ impl PickerCallback {
 /// serializes their execution through its event loop and canonical edit
 /// transaction boundary.
 pub enum Action {
+    #[cfg(feature = "helix")]
+    #[serde(skip)]
+    FelixInput {
+        key: String,
+        owner: (BufferId, WindowId, u64, u64),
+    },
+    #[cfg(feature = "helix")]
+    #[serde(skip)]
+    FelixPaste {
+        text: String,
+        owner: (BufferId, WindowId, u64, u64),
+    },
+    #[cfg(feature = "helix")]
+    FelixDocumentDiagnostics,
+    #[cfg(feature = "helix")]
+    FelixSwapWindow(crate::window::Direction),
+    #[cfg(feature = "helix")]
+    FelixClipboardBefore,
+    #[cfg(feature = "helix")]
+    FelixClipboardAfter,
     /// Starts an editor-owned pointer gesture in terminal-cell coordinates.
     MousePress {
         column: u16,
@@ -3679,6 +3701,8 @@ impl Drop for PendingGitStatus {
 /// persistence, and live agent edits. External tasks communicate through
 /// messages; they do not mutate this state directly.
 pub struct Editor {
+    #[cfg(feature = "helix")]
+    felix: felix::FelixHost,
     /// Domain sub-controller managing open buffers and tab selection.
     buffer_manager: buffer_manager::BufferManager,
 
@@ -5910,6 +5934,8 @@ impl Editor {
 
         Ok(Editor {
             buffer_manager,
+            #[cfg(feature = "helix")]
+            felix: Default::default(),
             scratch_buffers: HashMap::new(),
             open_file_watcher: Box::default(),
             file_picker_cache: Arc::default(),
@@ -7197,8 +7223,12 @@ impl Editor {
             .collect::<HashSet<_>>();
         let previous_buffer = self.current_buffer().id();
         let previous_inline = self.active_inline_comment();
+        #[cfg(feature = "helix")]
+        let previous_selection = self.felix_active_selection().cloned();
         if update(&mut self.window_manager).is_some() {
             self.sync_with_window();
+            #[cfg(feature = "helix")]
+            self.felix_prune_views();
             self.inline_comment_selections
                 .retain(|(window, buffer), _| {
                     self.window_manager.window(*window).is_some()
@@ -7214,6 +7244,10 @@ impl Editor {
                     .is_some_and(|window| !previous_windows.contains(&window))
             {
                 self.set_active_inline_comment(previous_inline);
+                #[cfg(feature = "helix")]
+                if let Some(selection) = previous_selection {
+                    self.set_felix_active_selection(selection);
+                }
             }
             true
         } else {
@@ -9705,6 +9739,10 @@ impl Editor {
     }
 
     fn last_navigable_line(&self) -> usize {
+        #[cfg(feature = "helix")]
+        if self.config.editing_model == crate::config::EditingModel::Helix {
+            return self.current_buffer().len();
+        }
         self.current_buffer().last_navigable_line()
     }
 
@@ -17506,6 +17544,23 @@ impl Editor {
             }
         }
 
+        #[cfg(feature = "helix")]
+        if self.config.editing_model == crate::config::EditingModel::Helix
+            && self.panel_manager.focused_panel_id().is_none()
+        {
+            if let Event::Key(key) = ev {
+                return Ok(self.felix_input_action(key));
+            }
+            if let Event::Paste(text) = ev {
+                return Ok(self.felix_owner().map(|owner| {
+                    KeyAction::Single(Action::FelixPaste {
+                        text: normalize_terminal_paste(text),
+                        owner,
+                    })
+                }));
+            }
+        }
+
         Ok(match self.mode {
             Mode::Normal => self.handle_normal_event(ev),
             Mode::Insert => self.handle_insert_event(ev)?,
@@ -22184,6 +22239,43 @@ impl Editor {
         add_to_history: &mut bool,
     ) -> anyhow::Result<Option<(bool, bool)>> {
         match action {
+            #[cfg(feature = "helix")]
+            Action::FelixInput { key, owner } => {
+                self.execute_felix(felix::Input::Key(key), *owner, buffer, runtime)
+                    .await?;
+                return Ok(Some((true, false)));
+            }
+            #[cfg(feature = "helix")]
+            Action::FelixDocumentDiagnostics => {
+                self.open_document_diagnostics_picker();
+                self.render(buffer)?;
+                return Ok(Some((true, false)));
+            }
+            #[cfg(feature = "helix")]
+            Action::FelixSwapWindow(direction) => {
+                self.update_window_layout(|windows| windows.swap_adjacent(*direction));
+                self.render(buffer)?;
+                return Ok(Some((true, false)));
+            }
+            #[cfg(feature = "helix")]
+            Action::FelixPaste { text, owner } => {
+                self.execute_felix(felix::Input::Bracketed(text), *owner, buffer, runtime)
+                    .await?;
+                return Ok(Some((true, false)));
+            }
+            #[cfg(feature = "helix")]
+            Action::FelixClipboardBefore | Action::FelixClipboardAfter => {
+                if let Some(owner) = self.felix_owner() {
+                    let placement = if matches!(action, Action::FelixClipboardBefore) {
+                        felix_core::Paste::Before
+                    } else {
+                        felix_core::Paste::After
+                    };
+                    self.execute_felix(felix::Input::Clipboard(placement), owner, buffer, runtime)
+                        .await?;
+                }
+                return Ok(Some((true, false)));
+            }
             Action::MousePress {
                 column,
                 row,
@@ -23956,6 +24048,8 @@ impl Editor {
                             start: position,
                             end: position,
                         };
+                        #[cfg(feature = "helix")]
+                        let range = self.felix_code_action_range().unwrap_or(range);
                         let pending = PendingLspEdit {
                             buffer_id: self.current_buffer().id(),
                             revision: self.current_buffer().revision(),
@@ -27584,6 +27678,10 @@ impl Editor {
 
         self.prev_highlight_y = None;
 
+        #[cfg(feature = "helix")]
+        if self.config.editing_model == crate::config::EditingModel::Helix {
+            self.restore_felix_view();
+        }
         self.request_diagnostics().await?;
         self.render(render_buffer)
     }
@@ -27630,6 +27728,8 @@ impl Editor {
                 self.mark_diagnostic_cache_dirty();
             }
         }
+        #[cfg(feature = "helix")]
+        self.felix_forget_document(removed_id);
         self.lsp_coordinator.forget_buffer(removed_id);
         self.plugin_registry
             .queue_rpc_document_closed(removed_id.as_u64());
@@ -29823,6 +29923,10 @@ impl Editor {
     }
 
     fn update_anchors_for_edit(&mut self, edit: AppliedTextEdit) {
+        #[cfg(feature = "helix")]
+        if self.config.editing_model == crate::config::EditingModel::Helix {
+            self.rebase_felix_views(edit);
+        }
         if !self.inline_history.conversations.is_empty()
             || !self.inline_jobs.is_empty()
             || self.inline_history_browser.is_some()

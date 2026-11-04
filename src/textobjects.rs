@@ -297,19 +297,13 @@ impl SyntaxTextObjectService {
         Ok(adjacent.map(|capture| (current.range, capture.range)))
     }
 
-    fn document(
+    fn ensure_tree(
         &mut self,
         buffer: &Buffer,
         language_id: &str,
-        kind: SyntaxObjectKind,
-        position: TextPosition,
-        goal: SearchGoal,
-    ) -> anyhow::Result<Option<&DocumentCaptures>> {
+        language: &tree_sitter::Language,
+    ) -> anyhow::Result<()> {
         let id = buffer.id();
-        let Some((language, source)) = self.registry.textobject_language(language_id) else {
-            self.documents.remove(&id);
-            return Ok(None);
-        };
         let current = self.documents.get(&id).is_some_and(|document| {
             document.revision == buffer.revision() && document.language_id == language_id
         });
@@ -323,7 +317,7 @@ impl SyntaxTextObjectService {
             }
             let mut parser = Parser::new();
             parser
-                .set_language(&language)
+                .set_language(language)
                 .with_context(|| format!("incompatible structural grammar for {language_id}"))?;
             let started = Instant::now();
             let bytes = contents.as_bytes();
@@ -351,6 +345,62 @@ impl SyntaxTextObjectService {
                 },
             );
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "helix")]
+    pub(crate) fn parent_ends(
+        &mut self,
+        buffer: &Buffer,
+        language_id: &str,
+        selections: &felix_core::Selections,
+    ) -> anyhow::Result<Option<felix_core::Selections>> {
+        let Some((language, _)) = self.registry.textobject_language(language_id) else {
+            return Ok(None);
+        };
+        self.ensure_tree(buffer, language_id, &language)?;
+        let tree = &self.documents[&buffer.id()].tree;
+        let rope = buffer.contents_snapshot();
+        let text = rope.slice(..);
+        let points = selections
+            .ranges()
+            .iter()
+            .map(|&r| {
+                let node = tree.root_node().named_descendant_for_byte_range(
+                    text.char_to_byte(r.start()),
+                    text.char_to_byte(r.end()),
+                );
+                node.map_or(r, |node| {
+                    let pos = text.byte_to_char(node.end_byte());
+                    let mut moved = felix_core::Range::at(text, pos);
+                    if r.anchor > r.head {
+                        std::mem::swap(&mut moved.anchor, &mut moved.head);
+                    }
+                    moved
+                })
+            })
+            .collect();
+        Ok(felix_core::Selections::new(
+            text,
+            points,
+            selections.primary_index(),
+        ))
+    }
+
+    fn document(
+        &mut self,
+        buffer: &Buffer,
+        language_id: &str,
+        kind: SyntaxObjectKind,
+        position: TextPosition,
+        goal: SearchGoal,
+    ) -> anyhow::Result<Option<&DocumentCaptures>> {
+        let id = buffer.id();
+        let Some((language, source)) = self.registry.textobject_language(language_id) else {
+            self.documents.remove(&id);
+            return Ok(None);
+        };
+        self.ensure_tree(buffer, language_id, &language)?;
 
         let query_key = (language_id.to_string(), kind);
         let query = if let Some(query) = self.queries.get(&query_key) {

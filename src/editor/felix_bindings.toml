@@ -1,0 +1,63 @@
+# Native document-window actions. Editing commands are resolved by felix-core.
+[normal]
+"Alt-m" = { PluginCommand = "AgentModel" }
+"Alt-w" = { PluginCommand = "AgentClose" }
+"Alt-y" = "ScrollDown"
+"Ctrl-y" = "ScrollUp"
+"Ctrl-Shift-p" = "CommandPalette"
+
+[normal." "]
+p = "FelixClipboardAfter"
+P = "FelixClipboardBefore"
+f = "FilePicker"
+a = "CodeAction"
+e = { PluginCommand = "NeoTree" }
+"=" = "FormatDocument"
+b = { PluginCommand = "BufferPicker" }
+"/" = { PluginCommand = "ProjectSearch" }
+s = { PluginCommand = "LspDocumentSymbols" }
+S = { PluginCommand = "LspWorkspaceSymbols" }
+k = "Hover"
+r = "StartRename"
+d = "FelixDocumentDiagnostics"
+D = "OpenDiagnosticsPicker"
+"?" = "CommandPalette"
+G = { PluginCommand = "GitDashboard" }
+l = "OpenStatuslineManager"
+L = "ListPlugins"
+A = { PluginCommand = "Agent" }
+m = "OpenMessages"
+i = "InlineAssist"
+V = "AddSampleInlineComment"
+H = "OpenInlineHistory"
+N = "OpenLatestInlineCompletion"
+X = "ClearInlineComments"
+v = "ShowInlineComment"
+x = "DismissInlineComment"
+t = { PluginCommand = "ThemeBrowser" }
+z = { s = { PluginCommand = "GitHunkStage" }, u = { PluginCommand = "GitHunkUnstage" }, r = { PluginCommand = "GitHunkReset" }, c = { PluginCommand = "GitSubmitMessage" }, q = { PluginCommand = "GitCancelMessage" } }
+B = { t = { PluginCommand = "AgentToggle" }, n = { PluginCommand = "AgentNew" }, s = { PluginCommand = "AgentSessions" }, c = { PluginCommand = "AgentClear" } }
+o = { e = { ExploreCommand = "toggle" }, f = { ExploreCommand = "follow" }, "*" = { ExploreCommand = "follow" }, s = { ExploreCommand = "skeleton" }, d = { ExploreCommand = "definition" }, t = { ExploreCommand = "type" }, j = { ExploreCommand = "next" }, k = { ExploreCommand = "prev" }, b = { ExploreCommand = "back" }, n = { ExploreCommand = "forward" }, r = { ExploreCommand = "refresh" }, R = { ExploreCommand = "index" }, p = { ExploreCommand = "pr" }, "?" = { ExploreCommand = "help" }, q = { ExploreCommand = "close" } }
+
+[normal.Ctrl-w]
+H = { FelixSwapWindow = "Left" }
+J = { FelixSwapWindow = "Down" }
+K = { FelixSwapWindow = "Up" }
+L = { FelixSwapWindow = "Right" }
+h = "MoveWindowLeft"
+j = "MoveWindowDown"
+k = "MoveWindowUp"
+l = "MoveWindowRight"
+w = "NextWindow"
+"Ctrl-w" = "NextWindow"
+s = "SplitHorizontal"
+v = "SplitVertical"
+q = "CloseWindow"
+o = "OnlyWindow"
+n = { s = "SplitHorizontalNewBuffer", v = "SplitVerticalNewBuffer" }
+e = { h = "MoveWindowToLeft", j = "MoveWindowToBottom", k = "MoveWindowToTop", l = "MoveWindowToRight" }
+
+[insert]
+"Alt-k" = "SignatureHelp"
+"Ctrl-x" = "RequestCompletion"
+"Ctrl-Space" = "RequestCompletion"

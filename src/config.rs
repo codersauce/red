@@ -247,6 +247,15 @@ pub struct UpdateConfig {
     pub mode: UpdateMode,
 }
 
+/// Document editing grammar selected at startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum EditingModel {
+    #[default]
+    Vim,
+    Helix,
+}
+
 #[derive(Debug, Serialize, Deserialize, Default)]
 /// Complete effective editor configuration.
 ///
@@ -254,6 +263,9 @@ pub struct UpdateConfig {
 /// access sites apply embedded defaults. Collections use Serde defaults so
 /// older user files remain compatible.
 pub struct Config {
+    /// Editing grammar used for document windows.
+    #[serde(default)]
+    pub editing_model: EditingModel,
     /// Per-mode key mappings.
     pub keys: Keys,
     /// Runtime theme name.
@@ -2206,6 +2218,7 @@ fn known_top_level_field(field: &str) -> bool {
             | "languages"
             | "commenting"
             | "matchit"
+            | "editing_model"
             | "disable_ai"
             | "agent"
             | "diagnostics"
