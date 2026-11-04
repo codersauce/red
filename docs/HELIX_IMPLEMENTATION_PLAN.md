@@ -284,6 +284,8 @@ The observer remains an early feasibility risk until stage 1 proves it. If requi
 
 ### Remaining M1 work before the next push
 
+The reported ordinary typing and cursor-movement slowdown takes priority in the performance work. Follow the [Helix performance plan](HELIX_PERFORMANCE_PLAN.md) to establish input-to-frame measurements and improve single-selection editing before completing scaling and acceptance checks.
+
 Starting from `e91d6017`, keep the remaining changes on the local Felix branch in small, tested commits. The next planned push is the M1 acceptance candidate. Use the following order for the remaining work.
 
 1. **Audit the acceptance evidence.** Map the agreed command and host workflows to executable cases and identify missing observations. Reconcile the coverage inventory with all eight gates above. Locate the original performance baselines, workloads and budgets before measuring the candidate. Record any missing baseline evidence explicitly.
