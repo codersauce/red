@@ -55,7 +55,8 @@ jobs:
           grep -F -- '--features helix' "$RUNNER_TEMP/config-error"
           cargo tree --locked -p red --edges normal > "$RUNNER_TEMP/red-tree"
           if grep -Fq felix-core "$RUNNER_TEMP/red-tree"; then exit 1; fi
-          cargo test --locked -p red --test completion
+          cargo clippy --locked -p red --all-targets -- -D warnings
+          cargo test --locked -p red --lib --test completion -- --test-threads=1
       - name: Fetch release and build candidate
         env:
           GH_TOKEN: ${{ github.token }}
@@ -70,21 +71,26 @@ jobs:
         run: |
           python3 scripts/edit_replay_bench.py --binary target/debug/red --scenario felix-change \
             --lines 300 --block-rows 8 --lsp incremental --split --unicode > evidence/lsp.json
-      - name: Compare live reference events with Red
+      - name: Compare deterministic reference events and run Red regressions
         env:
-          EXTENDED: ${{ github.event_name == 'schedule' }}
+          FELIX_SCENARIOS: ${{ github.workspace }}/evidence/scenarios.json
         run: |
           tar -xJf "$ARCHIVE" helix-25.07.1-x86_64-linux/runtime
-          steps=48
-          seed=250701
-          if [ "$EXTENDED" = true ]; then steps=512; seed="$GITHUB_RUN_ID"; fi
-          export FELIX_SCENARIOS="$PWD/evidence/scenarios.json"
-          python3 scripts/felix/scenarios.py --observer reference/target/debug/hx --runtime helix-25.07.1-x86_64-linux/runtime --steps "$steps" --seed "$seed" > "$FELIX_SCENARIOS"
+          python3 scripts/felix/scenarios.py --observer reference/target/debug/hx --runtime helix-25.07.1-x86_64-linux/runtime --steps 48 --seed 250701 > "$FELIX_SCENARIOS"
           python3 scripts/felix/check_coverage.py "$FELIX_SCENARIOS" >> "$GITHUB_STEP_SUMMARY"
-          if [ "$EXTENDED" != true ]; then cmp scripts/felix/fixtures/motions.json "$FELIX_SCENARIOS"; fi
+          cmp scripts/felix/fixtures/motions.json "$FELIX_SCENARIOS"
+          cargo clippy --locked --all-targets --all-features -- -D warnings
           cargo test --locked -p felix-core
-          cargo test --locked -p red --features helix --lib editor::felix
-          cargo test --locked -p red --features helix --test completion
+          cargo test --locked -p red --features helix --lib --test completion -- --test-threads=1
+      - name: Replay the extended seed against the same revision
+        if: github.event_name != 'pull_request'
+        env:
+          FELIX_SCENARIOS: ${{ github.workspace }}/evidence/extended.json
+        run: |
+          python3 scripts/felix/scenarios.py --observer reference/target/debug/hx --runtime helix-25.07.1-x86_64-linux/runtime --steps 512 --seed "$GITHUB_RUN_ID" > "$FELIX_SCENARIOS"
+          python3 scripts/felix/check_coverage.py "$FELIX_SCENARIOS" >> "$GITHUB_STEP_SUMMARY"
+          cargo test --locked -p felix-core --test reference
+          cargo test --locked -p red --features helix --lib editor::felix::tests::motions_match_reference_at_every_key
       - uses: actions/upload-artifact@v4
         if: always()
         with:
