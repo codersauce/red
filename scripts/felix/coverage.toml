@@ -11,7 +11,7 @@ remaining = ["Complete mode/count/argument/cancellation matrix"]
 [[area]]
 name = "Movement and navigation"
 cases = ["word-boundaries", "character-arguments", "vertical-goal", "wrapped-motion", "page-movement", "page-multiple", "page-edges", "page-through-eof", "page-wrapped-continuations", "selection-jumplist", "jump-follows-edit", "motion-seed-{seed}"]
-remaining = ["Wrapping with tabs, wide glyphs and inline decorations", "All aliases and repeated motions"]
+remaining = ["Wrapping with tabs, wide glyphs and inline decorations", "Other logical and visual line motions at non-LF separators", "All aliases and repeated motions"]
 
 [[area]]
 name = "Selections"
@@ -25,8 +25,8 @@ remaining = ["Search viewport with inline decorations"]
 
 [[area]]
 name = "Text objects"
-cases = ["explicit-objects", "quoted-objects"]
-remaining = ["Delimiters, nesting, counts and failure on unmatched objects"]
+cases = ["explicit-objects", "quoted-objects", "nested-delimiters", "quote-boundaries", "bracket-matches", "unicode-delimiters", "multiple-pair-objects", "word-object-boundaries", "word-object-spaces", "paragraph-boundaries", "empty-paragraphs"]
+remaining = []
 
 [[area]]
 name = "Editing and clipboard"

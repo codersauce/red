@@ -161,7 +161,15 @@ pub(crate) fn goto(
     };
     let pos = match key {
         "g" => text.line_to_char(count.unwrap_or(1).saturating_sub(1).min(last_non_eof)),
-        "e" => text.line_to_char(last_non_eof),
+        "e" => {
+            // Red's rope indexes additional Unicode separators; the pinned Helix
+            // release counts LF (including CRLF) when jumping to the last line.
+            let mut last_line = last_non_eof;
+            while last_line > 0 && text.char(text.line_to_char(last_line) - 1) != '\n' {
+                last_line -= 1;
+            }
+            text.line_to_char(last_line)
+        }
         "h" => text.line_to_char(line),
         "l" => boundary(text, line_end(text, line), false).max(text.line_to_char(line)),
         "s" => match text.line(line).chars().position(|c| !c.is_whitespace()) {
@@ -241,7 +249,14 @@ pub(crate) fn word_object(text: RopeSlice<'_>, r: Range, long: bool, around: boo
         end += 1;
     }
     if around && start != end {
-        let spaces = |c: char| c != '\n' && c != '\r' && c.is_whitespace();
+        // Helix around-word objects include zero-width spaces but exclude line breaks.
+        let spaces = |c| {
+            matches!(
+                c,
+                ' ' | '\t' | '\u{a0}' | '\u{180e}' | '\u{2000}'
+                    ..='\u{200b}' | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}'
+            )
+        };
         let trailing = text.chars_at(end).take_while(|&c| spaces(c)).count();
         if trailing == 0 {
             while start > 0 && spaces(text.char(start - 1)) {
@@ -257,6 +272,61 @@ pub(crate) fn word_object(text: RopeSlice<'_>, r: Range, long: bool, around: boo
     }
 }
 
+fn brackets(ch: char) -> Option<(char, char)> {
+    [
+        ('(', ')'),
+        ('[', ']'),
+        ('{', '}'),
+        ('<', '>'),
+        ('‘', '’'),
+        ('“', '”'),
+        ('«', '»'),
+        ('「', '」'),
+        ('（', '）'),
+    ]
+    .into_iter()
+    .find(|&(open, close)| ch == open || ch == close)
+}
+
+/// Find the requested enclosing delimiter, skipping balanced inner pairs.
+fn delimiter_offset(
+    chars: impl Iterator<Item = char>,
+    wanted: char,
+    opposite: char,
+    count: usize,
+) -> Option<usize> {
+    let mut depth = 0;
+    let mut remaining = count;
+    for (index, ch) in chars.enumerate() {
+        if ch == wanted {
+            if depth == 0 {
+                remaining -= 1;
+                if remaining == 0 {
+                    return Some(index + 1);
+                }
+            } else {
+                depth -= 1;
+            }
+        } else if ch == opposite {
+            depth += 1;
+        }
+    }
+    None
+}
+
+pub(crate) fn match_bracket(text: RopeSlice<'_>, pos: usize) -> Option<usize> {
+    const SCAN_LIMIT: usize = 10_000;
+    let ch = text.get_char(pos)?;
+    let (open, close) = brackets(ch)?;
+    if ch == open {
+        let chars = text.chars_at(pos + 1).take(SCAN_LIMIT);
+        delimiter_offset(chars, close, open, 1).map(|offset| pos + offset)
+    } else {
+        let chars = text.chars_at(pos).reversed().take(SCAN_LIMIT);
+        delimiter_offset(chars, open, close, 1).map(|offset| pos - offset)
+    }
+}
+
 pub(crate) fn pair_object(
     text: RopeSlice<'_>,
     r: Range,
@@ -264,32 +334,35 @@ pub(crate) fn pair_object(
     around: bool,
     count: usize,
 ) -> Range {
-    let (open, close) = match delimiter {
-        '(' | ')' => ('(', ')'),
-        '[' | ']' => ('[', ']'),
-        '{' | '}' => ('{', '}'),
-        '<' | '>' => ('<', '>'),
-        '"' | '\'' | '`' => (delimiter, delimiter),
-        _ => return r,
-    };
-    let pos = r.cursor(text);
-    let mut stack = Vec::new();
-    let mut pairs = Vec::new();
-    for (i, c) in text.chars().enumerate() {
-        if c == open && (open != close || stack.is_empty()) {
-            stack.push(i);
-        } else if c == close
-            && let Some(start) = stack.pop()
-            && start <= pos
-            && pos <= i
-        {
-            pairs.push((start, i));
-        }
+    if delimiter.is_ascii_alphanumeric() || r.end() >= text.len_chars() || count == 0 {
+        return r;
     }
-    pairs.get(count - 1).map_or(r, |&(start, end)| Range {
-        anchor: start + usize::from(!around),
-        head: end + usize::from(around),
-    })
+    let (open, close) = brackets(delimiter).unwrap_or((delimiter, delimiter));
+    let pos = r.cursor(text);
+    let ch = text.char(pos);
+    // A quote under the cursor could belong to either side of the object.
+    if open == close && ch == open {
+        return r;
+    }
+    let start = if ch == open {
+        Some(pos)
+    } else {
+        delimiter_offset(text.chars_at(pos).reversed(), open, close, count)
+            .map(|offset| pos - offset)
+    };
+    let end = if ch == close {
+        Some(pos)
+    } else {
+        delimiter_offset(text.chars_at(pos + 1), close, open, count).map(|offset| pos + offset)
+    };
+    let (Some(start), Some(end)) = (start, end) else {
+        return r;
+    };
+    if around {
+        r.with_bounds(start, boundary(text, end, true))
+    } else {
+        r.with_bounds(boundary(text, start, true), end)
+    }
 }
 
 pub(crate) fn vertical(
@@ -350,21 +423,24 @@ pub(crate) fn paragraph(text: RopeSlice<'_>, r: Range, count: usize, around: boo
         let line = text.line(i);
         line.len_chars() == 0 || line == "\n" || line == "\r\n"
     };
-    let mut start = row;
-    let mut end = row;
-    let before_blank = blank(row.saturating_sub(1));
-    if !blank(row) && before_blank && cursor == boundary(text, text.line_to_char(row + 1), false) {
-        start += 1;
-    } else if start > 0 {
-        while start > 0 && blank(start - 1) {
-            start -= 1;
+    let current_blank = blank(row);
+    let previous_blank = blank(row.saturating_sub(1));
+    let at_separator = current_blank
+        && !previous_blank
+        && cursor == boundary(text, text.line_to_char(row + 1), false);
+    let mut start = row + usize::from(current_blank != previous_blank);
+    let mut end = row + usize::from(at_separator);
+    let previous_paragraph = |mut line: usize| {
+        while line > 0 && blank(line - 1) {
+            line -= 1;
         }
-        while start > 0 && !blank(start - 1) {
-            start -= 1;
+        while line > 0 && !blank(line - 1) {
+            line -= 1;
         }
-    }
-    if blank(row) && !before_blank && cursor == boundary(text, text.line_to_char(row + 1), false) {
-        end += 1;
+        line
+    };
+    if !at_separator {
+        start = previous_paragraph(start);
     }
     let mut found = 0;
     for _ in 0..count {
@@ -383,12 +459,7 @@ pub(crate) fn paragraph(text: RopeSlice<'_>, r: Range, count: usize, around: boo
         }
     }
     if found < count && end == text.len_lines() {
-        while start > 0 && blank(start - 1) {
-            start -= 1;
-        }
-        while start > 0 && !blank(start - 1) {
-            start -= 1;
-        }
+        start = previous_paragraph(start);
     }
     if !around {
         while end > 0 && blank(end - 1) {

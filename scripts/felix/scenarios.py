@@ -44,6 +44,22 @@ def scenarios(seed, steps):
         + ["?", {"paste": "fox"}, "<enter>"])
     yield "search-identical-selections", "foo foo BAR foo\n", list("%sfoo") + enter + ["*", "n", "N", "<a-*>"]
     yield "quoted-objects", '(one (two)) "foo" bar\n', list('5lmi(2ma(gg13lmi"ma"ggmm')
+    yield "nested-delimiters", "A {(b[c]d)e} and (f(g)h) unmatched {\n", (
+        list("5lmi[ma]") + ["<a-;>"] + list("mi{gg3l2ma(gg20l2mi)gg34lmi{"))
+    yield "quote-boundaries", 'a "one" mid "two" end\n', list('2lmi"lmi"ma"gg8lmi"gg8l2ma"gg12lmm')
+    yield "bracket-matches", "[x(y)] 'aa' ()\n", (
+        list("mmvmm") + ["<esc>"] + list("gg2lmmgg7lmmgg12lmm"))
+    yield "unicode-delimiters", "「a（b）c」 «z» |hi| |ok|\n", list("mmlmi」gg3lma（gg13lmi|")
+
+    yield "multiple-pair-objects", "[x] no x (x) [éx] x\n", (
+        list("%sx") + enter + ["<a-;>"] + list("mi[duUma[u"))
+    yield "word-object-boundaries", "aa  !! bb_cc. Z\r\nend", (
+        list("2miwgg2lmiwmaWgg5l3maw") + ["<a-;>"] + list("miWge2miw"))
+    yield "word-object-spaces", "ab\u200bcd\u1680ef\u3000gh\ufeffij\u180ekl\x0bmn", (
+        list("mawgg3lmawgg6lmawgg9lmawgg12lmawgg15lmawge2miw"))
+    yield "paragraph-boundaries", "aa\r\nbb\r\n\r\ncc\r\n\r\n\r\ndd\r\n", (
+        list("2mapgg2jmipgg2j2mipgg3jmapge2mipgg4jmap"))
+    yield "empty-paragraphs", "\n\n", list("mipmapge2map")
     yield "regex-select-split-keep", "red blue red\n", list("%S ") + enter + list("Kred") + enter + list(")") + [",", "<a-;>"]
     yield "yank-paste-replace", "one two\n", list("eywpP;Rl") + ["<a-;>"] + list("rX")
     yield "counted-register-edits", "a bb ccc\r\nend\r\n", list("%s[a-z]+") + enter + list("y,2R3pPuU")

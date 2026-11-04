@@ -700,19 +700,8 @@ impl Session {
                 if key == "m" {
                     p.set(selections.transform(text, |r| {
                         let pos = r.cursor(text);
-                        let Some(c) = text.get_char(pos) else {
-                            return r;
-                        };
-                        let pair = crate::motion::pair_object(text, r, c, true, 1);
-                        if pair == r || pair.head == 0 {
-                            return r;
-                        }
-                        let target = if pair.anchor == pos {
-                            pair.head - 1
-                        } else {
-                            pair.anchor
-                        };
-                        r.move_to(text, target, extend)
+                        crate::motion::match_bracket(text, pos)
+                            .map_or(r, |target| r.move_to(text, target, extend))
                     }));
                 }
                 return p;

@@ -386,6 +386,17 @@ mod tests {
     }
 
     #[test]
+    fn matching_brackets_scans_at_most_ten_thousand_characters_in_either_direction() {
+        for distance in [10_000, 10_001] {
+            let rope = Rope::from_str(&format!("「{}」", "é".repeat(distance - 1)));
+            let text = rope.slice(..);
+            let in_range = distance == 10_000;
+            assert_eq!(motion::match_bracket(text, 0), in_range.then_some(distance));
+            assert_eq!(motion::match_bracket(text, distance), in_range.then_some(0));
+        }
+    }
+
+    #[test]
     fn graphemes_across_rope_chunks_and_line_endings() {
         use unicode_segmentation::UnicodeSegmentation;
         let source = "🇧🇷e\u{301}👩‍💻\r\n".repeat(600);

@@ -59,7 +59,8 @@ def main():
     print(f"Compared inventory with {len(suite['cases'])} cases and "
           f"{sum(len(case['events']) for case in suite['cases'])} recorded inputs.")
     for area in inventory["area"]:
-        print(f"- {area['name']}: " + ", ".join(area["remaining"]))
+        if area["remaining"]:
+            print(f"- {area['name']}: " + ", ".join(area["remaining"]))
 
 
 if __name__ == "__main__":
