@@ -61,7 +61,12 @@ def main():
                     capabilities["completionProvider"] = {}
                 reply(message, {"capabilities": capabilities})
             elif method == "textDocument/completion" and args.completion:
-                reply(message, [{"label": "FelixCandidate", "kind": 6}])
+                cursor = offset(document, params["position"])
+                item = {"label": "FelixCandidate", "kind": 6}
+                if document[:cursor].endswith("S"):
+                    item = {"label": "SnippetCandidate", "kind": 15, "insertTextFormat": 2,
+                            "insertText": "${1:one}=${2:two}$0"}
+                reply(message, [item])
             elif method == "textDocument/didOpen":
                 document = params["textDocument"]["text"]
                 version = params["textDocument"]["version"]

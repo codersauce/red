@@ -36,7 +36,7 @@ remaining = ["Clipboard transport interoperability", "Language-specific indentat
 [[area]]
 name = "Insert behavior"
 cases = ["open-line", "auto-pairs", "insert-controls"]
-remaining = ["Snippet and completion precedence with multiple selections", "Language-specific smart Tab"]
+remaining = ["Completion preview, cancellation, and nested or mirrored snippet stops with multiple selections", "Language-specific smart Tab"]
 
 [[area]]
 name = "Undo and repeat"

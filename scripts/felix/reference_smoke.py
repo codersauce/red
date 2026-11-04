@@ -106,7 +106,7 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
             if copies > 1:
                 matches &= sum(row.strip() == (f"1 {line}" if red else f"1  {line}") for row in rows) == copies
             if menu is not None:
-                menu_visible = any("FelixCandidate" in row and not re.match(r"^\s*1\s", row) for row in rows)
+                menu_visible = any(("FelixCandidate" in row or "SnippetCandidate" in row) and not re.match(r"^\s*1\s", row) for row in rows)
                 matches &= menu_visible == menu
             if matches:
                 checkpoints.append({"step": label, "frame": rows})
@@ -173,6 +173,24 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
             observe("undo completion and typing", "F F", "NOR")
             tmux("send-keys", "u")
             observe("undo initial change", "foo foo", "NOR")
+            observe_server("foo foo\n")
+            tmux("send-keys", "c", "S", "C-x")
+            observe("request snippet", "S S", "INS", menu=True)
+            tmux("send-keys", "C-n", "Enter")
+            observe("expand snippet twice", "one=two one=two", "INS", menu=False)
+            tmux("send-keys", "X")
+            observe("replace first defaults", "X=two X=two", "INS")
+            tmux("send-keys", "Tab", "Y")
+            observe("replace second defaults", "X=Y X=Y", "INS")
+            observe_server("X=Y X=Y\n")
+            # Helix 25.07.1 panics on another Tab here. Red covers the final
+            # stop in snippet_final_stop_preserves_both_insert_cursors_and_undo.
+            tmux("send-keys", "Escape")
+            observe("leave snippet", "X=Y X=Y", "NOR")
+            tmux("send-keys", "u")
+            observe("undo snippet edits", "S S", "NOR")
+            tmux("send-keys", "u")
+            observe("undo snippet prefix", "foo foo", "NOR")
             observe_server("foo foo\n")
             return checkpoints
         if scenario == "paging":

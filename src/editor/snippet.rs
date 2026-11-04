@@ -28,6 +28,30 @@ pub(super) struct ParsedSnippet {
     pub(super) final_cursor: Option<usize>,
 }
 
+#[cfg(feature = "helix")]
+impl ParsedSnippet {
+    pub(super) fn insert_commit_character(&mut self, ch: char) {
+        let offset = self
+            .final_cursor
+            .unwrap_or_else(|| self.text.chars().count());
+        let byte = self
+            .text
+            .char_indices()
+            .nth(offset)
+            .map_or(self.text.len(), |(i, _)| i);
+        self.text.insert(byte, ch);
+        for stop in &mut self.placeholders {
+            if stop.start >= offset {
+                stop.start += 1;
+                stop.end += 1;
+            } else if stop.end > offset {
+                stop.end += 1;
+            }
+        }
+        self.final_cursor = Some(offset + 1);
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SnippetStop {
     index: usize,
@@ -36,11 +60,17 @@ struct SnippetStop {
 }
 
 #[derive(Debug, Clone)]
+struct SnippetInstance {
+    stops: Vec<SnippetStop>,
+    final_cursor: EditAnchor,
+}
+
+#[derive(Debug, Clone)]
 pub(super) struct SnippetSession {
     buffer_id: BufferId,
-    stops: Vec<SnippetStop>,
+    instances: Vec<SnippetInstance>,
+    primary: usize,
     active: usize,
-    final_cursor: EditAnchor,
     region_start: EditAnchor,
     region_end: EditAnchor,
     selected: bool,
@@ -224,34 +254,50 @@ fn record_placeholder(parsed: &mut ParsedSnippet, index: usize, start: usize, en
 
 impl Editor {
     pub(super) fn activate_snippet_session(&mut self, start: TextPosition, parsed: &ParsedSnippet) {
+        let base = self.current_buffer().position_to_char_idx(start);
+        self.activate_snippet_instances(&[base], 0, parsed);
+    }
+
+    pub(super) fn activate_snippet_instances(
+        &mut self,
+        bases: &[usize],
+        primary: usize,
+        parsed: &ParsedSnippet,
+    ) {
+        self.snippet_session = None;
         if parsed.placeholders.is_empty() {
             return;
         }
-
-        let base = self.current_buffer().position_to_char_idx(start);
-        let mut stops = parsed
-            .placeholders
-            .iter()
-            .map(|placeholder| SnippetStop {
-                index: placeholder.index,
-                start: self.anchor_at_char(base + placeholder.start, AnchorAffinity::Left),
-                end: self.anchor_at_char(base + placeholder.end, AnchorAffinity::Right),
-            })
-            .collect::<Vec<_>>();
-        stops.sort_by_key(|stop| stop.index);
-        stops.dedup_by_key(|stop| stop.index);
-
         let length = parsed.text.chars().count();
+        let instances = bases
+            .iter()
+            .map(|&base| {
+                let mut stops: Vec<_> = parsed
+                    .placeholders
+                    .iter()
+                    .map(|placeholder| SnippetStop {
+                        index: placeholder.index,
+                        start: self.anchor_at_char(base + placeholder.start, AnchorAffinity::Left),
+                        end: self.anchor_at_char(base + placeholder.end, AnchorAffinity::Right),
+                    })
+                    .collect();
+                stops.dedup_by_key(|stop| stop.index);
+                SnippetInstance {
+                    stops,
+                    final_cursor: self.anchor_at_char(
+                        base + parsed.final_cursor.unwrap_or(length),
+                        AnchorAffinity::Right,
+                    ),
+                }
+            })
+            .collect();
         self.snippet_session = Some(SnippetSession {
             buffer_id: self.current_buffer().id(),
-            stops,
+            instances,
+            primary,
             active: 0,
-            final_cursor: self.anchor_at_char(
-                base + parsed.final_cursor.unwrap_or(length),
-                AnchorAffinity::Right,
-            ),
-            region_start: self.anchor_at_char(base, AnchorAffinity::Left),
-            region_end: self.anchor_at_char(base + length, AnchorAffinity::Right),
+            region_start: self.anchor_at_char(bases[primary], AnchorAffinity::Left),
+            region_end: self.anchor_at_char(bases[primary] + length, AnchorAffinity::Right),
             selected: true,
         });
     }
@@ -263,7 +309,9 @@ impl Editor {
             return None;
         }
 
-        let stop = session.stops.get(session.active)?;
+        let stop = session.instances[session.primary]
+            .stops
+            .get(session.active)?;
         Some(TextRange::new(
             self.current_buffer()
                 .char_idx_to_position(stop.start.char_index),
@@ -282,7 +330,7 @@ impl Editor {
         let session = self.snippet_session.as_ref()?;
         (session.buffer_id == self.current_buffer().id()).then(|| {
             self.current_buffer()
-                .char_idx_to_position(session.final_cursor.char_index)
+                .char_idx_to_position(session.instances[session.primary].final_cursor.char_index)
         })
     }
 
@@ -303,11 +351,13 @@ impl Editor {
                 edit.new_char_len,
             );
         };
-        for stop in &mut session.stops {
-            transform(&mut stop.start);
-            transform(&mut stop.end);
+        for instance in &mut session.instances {
+            for stop in &mut instance.stops {
+                transform(&mut stop.start);
+                transform(&mut stop.end);
+            }
+            transform(&mut instance.final_cursor);
         }
-        transform(&mut session.final_cursor);
         transform(&mut session.region_start);
         transform(&mut session.region_end);
     }
@@ -323,6 +373,10 @@ impl Editor {
             return None;
         }
 
+        #[cfg(feature = "helix")]
+        if self.felix_active_selection().is_some() {
+            return None;
+        }
         let action = match event {
             Event::Key(KeyEvent {
                 code: KeyCode::Tab,
@@ -365,8 +419,14 @@ impl Editor {
 
         if backwards {
             session.active = session.active.saturating_sub(1);
-        } else if session.active + 1 == session.stops.len() {
-            let final_cursor = session.final_cursor.char_index;
+        } else if session.active + 1 == session.instances[session.primary].stops.len() {
+            let final_cursor = session.instances[session.primary].final_cursor.char_index;
+            #[cfg(feature = "helix")]
+            if self.felix_active_selection().is_some() {
+                self.select_felix_snippet_stop(true);
+                self.snippet_session = None;
+                return;
+            }
             self.snippet_session = None;
             let position = self.current_buffer().char_idx_to_position(final_cursor);
             self.move_to_insert_text_position(position);
@@ -376,9 +436,115 @@ impl Editor {
         }
 
         session.selected = true;
-        let char_index = session.stops[session.active].start.char_index;
+        let char_index = session.instances[session.primary].stops[session.active]
+            .start
+            .char_index;
+        #[cfg(feature = "helix")]
+        if self.felix_active_selection().is_some() {
+            self.select_felix_snippet_stop(false);
+            return;
+        }
         let position = self.current_buffer().char_idx_to_position(char_index);
         self.move_to_insert_text_position(position);
+    }
+
+    #[cfg(feature = "helix")]
+    pub(super) fn select_felix_snippet_stop(&mut self, final_stop: bool) {
+        let Some(session) = &mut self.snippet_session else {
+            return;
+        };
+        // While typing into a stop, an adjacent stop on either side must
+        // stay outside the inserted text even when a deletion joins them.
+        for instance in &mut session.instances {
+            let target = &instance.stops[session.active];
+            let start = target.start.char_index;
+            let end = target.end.char_index;
+            for (i, stop) in instance.stops.iter_mut().enumerate() {
+                stop.start.affinity = if i != session.active && stop.start.char_index >= end {
+                    AnchorAffinity::Right
+                } else {
+                    AnchorAffinity::Left
+                };
+                stop.end.affinity = if i != session.active && stop.end.char_index <= start {
+                    AnchorAffinity::Left
+                } else {
+                    AnchorAffinity::Right
+                };
+            }
+        }
+        let primary = session.primary;
+        let ranges: Vec<_> = session
+            .instances
+            .iter()
+            .map(|instance| {
+                if final_stop {
+                    let pos = instance.final_cursor.char_index;
+                    felix_core::Range {
+                        anchor: pos,
+                        head: pos,
+                    }
+                } else {
+                    let stop = &instance.stops[session.active];
+                    felix_core::Range {
+                        anchor: stop.start.char_index,
+                        head: stop.end.char_index,
+                    }
+                }
+            })
+            .collect();
+        let text = self.current_buffer().contents_snapshot();
+        if let Some(state) = felix_core::Selections::new(text.slice(..), ranges, primary) {
+            self.set_felix_active_selection(state);
+        }
+    }
+
+    #[cfg(feature = "helix")]
+    pub(super) fn prepare_felix_snippet_input(&mut self, key: &str) -> bool {
+        if !self.is_insert() || self.current_buffer().directory.is_some() {
+            return false;
+        }
+        let buffer_id = self.current_buffer().id();
+        let Some(session) = self.snippet_session.as_mut() else {
+            return false;
+        };
+        if session.buffer_id != buffer_id {
+            self.snippet_session = None;
+            return false;
+        }
+        if !session.selected || key == "<tab>" {
+            return false;
+        }
+        session.selected = false;
+        if key.chars().count() != 1 {
+            return false;
+        }
+        let ranges: Vec<_> = session
+            .instances
+            .iter()
+            .map(|instance| {
+                let stop = &instance.stops[session.active];
+                stop.start.char_index..stop.end.char_index
+            })
+            .filter(|r| !r.is_empty())
+            .collect();
+        // An intervening edit can collapse originally disjoint placeholders.
+        // Applying overlapping deletions in sequence would delete unrelated text.
+        if ranges.windows(2).any(|pair| pair[0].end > pair[1].start) {
+            self.snippet_session = None;
+            return false;
+        }
+        for range in ranges.iter().rev() {
+            let buffer = self.current_buffer();
+            self.replace_range(
+                TextRange::new(
+                    buffer.char_idx_to_position(range.start),
+                    buffer.char_idx_to_position(range.end),
+                ),
+                "",
+            );
+        }
+        self.select_felix_snippet_stop(false);
+        !ranges.is_empty()
     }
 
     pub(super) fn finish_snippet_after_action(&mut self, action: &Action) {
@@ -442,6 +608,17 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 2, 3, 10]
         );
+    }
+
+    #[cfg(feature = "helix")]
+    #[test]
+    fn commit_character_moves_following_stops_in_character_coordinates() {
+        let mut parsed = parse_snippet("${1:λ}$0${2:位置}$3");
+        parsed.insert_commit_character('🚀');
+        assert_eq!(parsed.text, "λ🚀位置");
+        assert_eq!(parsed.final_cursor, Some(2));
+        let ranges: Vec<_> = parsed.placeholders.iter().map(|p| p.start..p.end).collect();
+        assert_eq!(ranges, [0..1, 2..4, 4..4]);
     }
 
     #[test]

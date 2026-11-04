@@ -32860,13 +32860,13 @@ impl Editor {
         if self.config.editing_model == crate::config::EditingModel::Helix
             && self.is_insert()
             && self.felix_active_selection().is_some()
-            && !matches!(item.insert_text_format, Some(InsertTextFormat::Snippet))
         {
             return self
                 .apply_felix_completion(
                     contents,
                     main_text_edit,
                     additional_text_edits,
+                    item.insert_text_format.as_ref(),
                     commit_character,
                     runtime,
                 )

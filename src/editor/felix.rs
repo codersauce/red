@@ -72,6 +72,7 @@ impl Editor {
     }
 
     pub(super) fn restore_felix_view(&mut self) {
+        self.snippet_session = None;
         let text = self.current_buffer().contents_snapshot();
         let state = self.felix_active_selection().cloned().unwrap_or_else(|| {
             let offset = self
@@ -126,6 +127,7 @@ impl Editor {
             add,
             drag,
         );
+        self.snippet_session = None;
         self.place_felix_cursor(&next);
         self.felix.selections.insert((doc, view), next);
         self.felix.session.cancel_pending();
@@ -389,6 +391,10 @@ impl Editor {
             "document or selection changed before Helix input"
         );
         let id = (owner.0, owner.1);
+        let removed_placeholders = match input {
+            Input::Key(key) => self.prepare_felix_snippet_input(key),
+            _ => false,
+        };
         let rope = self.current_buffer().contents_snapshot();
         let text = rope.slice(..);
         let initial = self.felix.selections.get(&id).cloned().unwrap_or_else(|| {
@@ -615,7 +621,9 @@ impl Editor {
                     }
                 }
                 HostAction::SyntaxParentEnd => {
-                    if let Some(lang) = self
+                    if self.snippet_session.is_some() {
+                        self.navigate_snippet_placeholder(false);
+                    } else if let Some(lang) = self
                         .highlight_language_id_for_buffer_index(self.buffer_manager.active_index())
                     {
                         let buffer = self
@@ -647,7 +655,7 @@ impl Editor {
         if plan.host.is_none() || plan.message.is_some() {
             self.set_legacy_message(plan.message);
         }
-        if !plan.edits.is_empty() {
+        if removed_placeholders || !plan.edits.is_empty() {
             self.notify_change(runtime).await?;
         }
         if matches!(input, Input::Replay(_)) {
@@ -664,6 +672,7 @@ impl Editor {
         contents: &str,
         main: &LspTextEdit,
         additional: &[LspTextEdit],
+        format: Option<&InsertTextFormat>,
         commit_character: Option<char>,
         runtime: &mut Runtime,
     ) -> anyhow::Result<bool> {
@@ -682,26 +691,35 @@ impl Editor {
             }
         };
         let (ranges, selection) = before.completion_ranges(rope.slice(..), start..end);
-        let mut replacement = main.new_text.clone();
-        if let Some(ch) = commit_character {
-            replacement.push(ch);
+        let mut snippet = matches!(format, Some(InsertTextFormat::Snippet))
+            .then(|| snippet::parse_snippet(&main.new_text));
+        if let (Some(snippet), Some(ch)) = (&mut snippet, commit_character) {
+            snippet.insert_commit_character(ch);
+        }
+        let mut replacement = std::borrow::Cow::Borrowed(
+            snippet
+                .as_ref()
+                .map_or(main.new_text.as_str(), |parsed| parsed.text.as_str()),
+        );
+        if let (None, Some(ch)) = (&snippet, commit_character) {
+            replacement.to_mut().push(ch);
         }
         // Keep projected ranges in original character coordinates. Only edits
         // received from the server require UTF-16 conversion.
         let mut edits: Vec<_> = ranges
             .into_iter()
-            .map(|range| (range, replacement.as_str()))
+            .map(|range| (range, replacement.as_ref(), true))
             .collect();
         for edit in additional {
             match text_edit_char_range(contents, &edit.range) {
-                Ok((start, end)) => edits.push((start..end, &edit.new_text)),
+                Ok((start, end)) => edits.push((start..end, &edit.new_text, false)),
                 Err(err) => {
                     self.set_legacy_message(Some(format!("invalid LSP completion edit: {err}")));
                     return Ok(false);
                 }
             }
         }
-        edits.sort_by_key(|(range, _)| (range.start, range.end));
+        edits.sort_by_key(|(range, _, _)| (range.start, range.end));
         if edits.windows(2).any(|pair| pair[0].0.end > pair[1].0.start) {
             self.set_legacy_message(Some(
                 "invalid LSP completion edit: overlapping ranges".into(),
@@ -711,8 +729,20 @@ impl Editor {
         self.commit_felix_transaction(doc, &before);
         self.begin_transaction("Helix completion");
         self.felix.before = Some(before);
+        let primary = selection.primary_index();
         self.set_felix_active_selection(selection);
-        for (range, value) in edits.into_iter().rev() {
+        let mut bases = Vec::new();
+        if snippet.is_some() {
+            let (mut removed, mut inserted) = (0, 0);
+            for (range, value, is_main) in &edits {
+                if *is_main {
+                    bases.push(range.start - removed + inserted);
+                }
+                removed += range.len();
+                inserted += value.chars().count();
+            }
+        }
+        for (range, value, _) in edits.into_iter().rev() {
             let buffer = self.current_buffer();
             let range = TextRange::new(
                 buffer.char_idx_to_position(range.start),
@@ -720,7 +750,24 @@ impl Editor {
             );
             self.replace_range(range, value);
         }
-        if let Some(selection) = self.felix_active_selection().cloned() {
+        if let Some(snippet) = snippet {
+            self.activate_snippet_instances(&bases, primary, &snippet);
+            if snippet.placeholders.is_empty() {
+                let text = self.current_buffer().contents_snapshot();
+                let final_offset = snippet
+                    .final_cursor
+                    .unwrap_or_else(|| snippet.text.chars().count());
+                let cursors = bases
+                    .iter()
+                    .map(|base| FelixRange::at(text.slice(..), base + final_offset))
+                    .collect();
+                if let Some(state) = Selections::new(text.slice(..), cursors, primary) {
+                    self.set_felix_active_selection(state);
+                }
+            } else {
+                self.select_felix_snippet_stop(false);
+            }
+        } else if let Some(selection) = self.felix_active_selection().cloned() {
             self.place_felix_cursor(&selection);
         }
         self.notify_change(runtime).await?;
@@ -1061,7 +1108,7 @@ mod tests {
         let primary = edit(1, 0, 1, "Filled");
         let overlap = edit(1, 2, 3, "conflict");
         assert!(!editor
-            .apply_felix_completion(&original, &primary, &[overlap], None, &mut runtime)
+            .apply_felix_completion(&original, &primary, &[overlap], None, None, &mut runtime)
             .await
             .unwrap());
         assert_eq!(editor.felix_owner(), owner);
@@ -1069,7 +1116,7 @@ mod tests {
         assert_eq!(editor.current_buffer().contents(), original);
         let extra = edit(0, 0, 2, "λ");
         assert!(editor
-            .apply_felix_completion(&original, &primary, &[extra], None, &mut runtime)
+            .apply_felix_completion(&original, &primary, &[extra], None, None, &mut runtime)
             .await
             .unwrap());
         assert_eq!(editor.current_buffer().contents(), "λ\nFilled Filled\n");
@@ -1082,6 +1129,67 @@ mod tests {
         }
         assert_eq!(editor.current_buffer().contents(), original);
         assert_eq!(editor.felix_active_selection(), Some(&state));
+    }
+
+    #[tokio::test]
+    async fn snippet_final_stop_preserves_both_insert_cursors_and_undo() {
+        for separator in ["=", ""] {
+            let (mut editor, mut frame, mut runtime) = fixture_editor("foo foo\n");
+            for key in ["%", "s", "f", "o", "o", "<enter>", "c", "S"] {
+                let owner = editor.felix_owner().unwrap();
+                editor
+                    .execute_felix(Input::Key(key), owner, &mut frame, &mut runtime)
+                    .await
+                    .unwrap();
+            }
+            let original = editor.current_buffer().contents();
+            let edit = LspTextEdit {
+                range: Range {
+                    start: LspPosition {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: LspPosition {
+                        line: 0,
+                        character: 1,
+                    },
+                },
+                new_text: format!("${{1:one}}{separator}${{2:two}}$0"),
+            };
+            assert!(editor
+                .apply_felix_completion(
+                    &original,
+                    &edit,
+                    &[],
+                    Some(&InsertTextFormat::Snippet),
+                    None,
+                    &mut runtime
+                )
+                .await
+                .unwrap());
+            for (key, expected) in [
+                ("X", "X=two X=two"),
+                ("<tab>", "X=two X=two"),
+                ("Y", "X=Y X=Y"),
+                ("<tab>", "X=Y X=Y"),
+                ("!", "X=Y! X=Y!"),
+                ("<esc>", "X=Y! X=Y!"),
+                ("u", "S S"),
+                ("u", "foo foo"),
+            ] {
+                let owner = editor.felix_owner().unwrap();
+                editor
+                    .execute_felix(Input::Key(key), owner, &mut frame, &mut runtime)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    editor.current_buffer().contents().trim_end(),
+                    expected.replace('=', separator),
+                    "{key}"
+                );
+                assert_eq!(editor.felix_active_selection().unwrap().ranges().len(), 2);
+            }
+        }
     }
 
     #[tokio::test]
