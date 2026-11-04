@@ -1,6 +1,8 @@
 name: Felix conformance
 
 on:
+  push:
+    branches: [fcoury/felix-core]
   pull_request:
   workflow_dispatch:
   schedule:
