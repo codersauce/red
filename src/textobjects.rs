@@ -808,19 +808,128 @@ fn synthesize_fish_function_interiors(buffer: &Buffer, source: &str, captures: &
     captures.extend(additions);
 }
 
+/// Which way a Helix syntax-node motion walks the tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyntaxWalk {
+    Expand,
+    Shrink,
+    NextSibling,
+    PrevSibling,
+}
+
+impl SyntaxTextObjectService {
+    /// Returns the byte range of the syntax node reached by `walk`.
+    pub(crate) fn walk_syntax_node(
+        &self,
+        contents: &str,
+        language_id: &str,
+        start_byte: usize,
+        end_byte: usize,
+        walk: SyntaxWalk,
+    ) -> anyhow::Result<Option<(usize, usize)>> {
+        let Some((language, _)) = self.registry.textobject_language(language_id) else {
+            return Ok(None);
+        };
+        if contents.len() > MAX_STRUCTURAL_DOCUMENT_BYTES {
+            return Ok(None);
+        }
+        let mut parser = Parser::new();
+        parser
+            .set_language(&language)
+            .with_context(|| format!("incompatible structural grammar for {language_id}"))?;
+        let bytes = contents.as_bytes();
+        let tree = parser
+            .parse_with_options(
+                &mut |offset, _| bytes.get(offset..).unwrap_or_default(),
+                None,
+                None,
+            )
+            .ok_or_else(|| anyhow!("syntax tree could not be parsed"))?;
+        let root = tree.root_node();
+        let end_byte = end_byte.max(start_byte);
+        let Some(node) = tightest_node(root, start_byte, end_byte) else {
+            return Ok(None);
+        };
+        let chosen = match walk {
+            SyntaxWalk::Expand => {
+                if node.start_byte() == start_byte && node.end_byte() == end_byte {
+                    node.parent()
+                } else {
+                    Some(node)
+                }
+            }
+            SyntaxWalk::Shrink => largest_inner_child(node, start_byte, end_byte),
+            SyntaxWalk::NextSibling => node.next_sibling().or_else(|| node.next_named_sibling()),
+            SyntaxWalk::PrevSibling => node.prev_sibling().or_else(|| node.prev_named_sibling()),
+        };
+        Ok(chosen.map(|node| (node.start_byte(), node.end_byte())))
+    }
+}
+
+fn tightest_node(root: Node<'_>, start: usize, end: usize) -> Option<Node<'_>> {
+    if root.start_byte() > start || root.end_byte() < end {
+        return None;
+    }
+    let mut best = root;
+    let mut index = 0;
+    while index < best.child_count() {
+        let Some(child) = best.child(index) else {
+            break;
+        };
+        if child.start_byte() <= start && child.end_byte() >= end {
+            best = child;
+            index = 0;
+            continue;
+        }
+        index += 1;
+    }
+    Some(best)
+}
+
+fn largest_inner_child<'tree>(node: Node<'tree>, start: usize, end: usize) -> Option<Node<'tree>> {
+    let mut best: Option<Node<'tree>> = None;
+    let mut best_len = 0;
+    for index in 0..node.named_child_count() {
+        let Some(child) = node.named_child(index) else {
+            continue;
+        };
+        let contains_cursor = child.start_byte() <= start && child.end_byte() >= start.min(end);
+        let smaller = child.start_byte() > start || child.end_byte() < end;
+        let length = child.end_byte().saturating_sub(child.start_byte());
+        if contains_cursor && smaller && length >= best_len && child.end_byte() <= end {
+            best = Some(child);
+            best_len = length;
+        }
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use tree_sitter::Query;
 
-    use super::{structural_query_patterns, SyntaxObjectKind, SyntaxTextObjectService};
+    use super::{structural_query_patterns, SyntaxObjectKind, SyntaxTextObjectService, SyntaxWalk};
     use crate::{
         buffer::Buffer,
         editing::TextObjectScope,
         highlighter::LanguageRegistry,
         undo::{TextPosition, TextRange},
     };
+
+    #[test]
+    fn expanding_a_rust_binding_reaches_a_larger_node() {
+        let source = "fn demo() {\n    let value = 1;\n}\n";
+        let buffer = Buffer::new(Some("demo.rs".to_string()), source.to_string());
+        let service = SyntaxTextObjectService::new(Arc::new(LanguageRegistry::bundled()));
+        let start = buffer.position_to_byte_idx(TextPosition::new(1, 8));
+        let expanded = service
+            .walk_syntax_node(source, "rust", start, start + 5, SyntaxWalk::Expand)
+            .unwrap()
+            .expect("the binding sits inside a function");
+        assert!(expanded.1 - expanded.0 > 5);
+    }
 
     #[test]
     fn every_bundled_structural_query_compiles_against_its_grammar() {

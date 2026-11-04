@@ -392,6 +392,38 @@ pub struct Config {
     /// Whether startup already restored a core-owned recovery snapshot.
     #[serde(default, skip_serializing)]
     pub startup_session_resumed: bool,
+    /// Key grammar. `helix` is experimental and read when the editor starts.
+    #[serde(default)]
+    pub editing_model: EditingModel,
+    /// Helix keymap overrides. Empty means the built-in felix defaults.
+    /// Vim `[keys.*]` tables are not consulted while Helix is active.
+    #[serde(default)]
+    pub helix_keys: HelixKeys,
+}
+
+/// Which key grammar the editor uses. The Vim grammar stays the default.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EditingModel {
+    #[default]
+    Vim,
+    /// Experimental selection-first grammar implemented by the `felix` module.
+    Helix,
+}
+
+/// Optional overrides for the experimental Helix keymap.
+///
+/// Leaves replace built-in bindings. Nested tables merge the same way as
+/// `[keys.*]`. A string that names a felix command, such as
+/// `"move_next_word_start"`, is accepted alongside a Red action name.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+pub struct HelixKeys {
+    #[serde(default)]
+    pub normal: HashMap<String, KeyAction>,
+    #[serde(default)]
+    pub select: HashMap<String, KeyAction>,
+    #[serde(default)]
+    pub insert: HashMap<String, KeyAction>,
 }
 
 /// Optional Codex extension categories that Red may expose to Agent sessions.
@@ -2091,7 +2123,13 @@ fn embedded_config_value() -> anyhow::Result<toml::Value> {
     Ok(value)
 }
 
-fn deserialize_config(value: toml::Value) -> anyhow::Result<Config> {
+fn deserialize_config(mut value: toml::Value) -> anyhow::Result<Config> {
+    if let Some(helix_keys) = value
+        .as_table_mut()
+        .and_then(|table| table.get_mut("helix_keys"))
+    {
+        normalize_felix_command_names(helix_keys);
+    }
     let mut config: Config = value
         .try_into()
         .map_err(|error| anyhow::anyhow!("failed to deserialize merged config: {error}"))?;
@@ -2211,6 +2249,8 @@ fn known_top_level_field(field: &str) -> bool {
             | "diagnostics"
             | "show_diagnostics"
             | "window_borders_ascii"
+            | "editing_model"
+            | "helix_keys"
     )
 }
 
@@ -2242,6 +2282,13 @@ fn apply_user_value(
     }
 
     if path.first().is_some_and(|part| part == "keys") {
+        apply_keymap_value(base, value, path, contents, source, diagnostics);
+        return;
+    }
+
+    if path.first().is_some_and(|part| part == "helix_keys") {
+        let mut value = value;
+        normalize_felix_command_names(&mut value);
         apply_keymap_value(base, value, path, contents, source, diagnostics);
         return;
     }
@@ -2324,11 +2371,43 @@ fn apply_user_value(
     }
 }
 
+/// Rewrites a felix command name into `{ Felix = "name" }` so the keymap
+/// deserializer can store it beside ordinary Red actions.
+fn normalize_felix_command_names(value: &mut toml::Value) {
+    match value {
+        toml::Value::String(text) if crate::felix::Command::from_name(text).is_some() => {
+            let mut table = toml::map::Map::new();
+            table.insert(
+                "Felix".to_string(),
+                toml::Value::String(std::mem::take(text)),
+            );
+            *value = toml::Value::Table(table);
+        }
+        toml::Value::Array(items) => {
+            for item in items {
+                normalize_felix_command_names(item);
+            }
+        }
+        toml::Value::Table(table) => {
+            if table.contains_key("Felix") {
+                return;
+            }
+            let keys = table.keys().cloned().collect::<Vec<_>>();
+            for key in keys {
+                if let Some(child) = table.get_mut(&key) {
+                    normalize_felix_command_names(child);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn known_schema_path(path: &[String]) -> bool {
     let parts = path.iter().map(String::as_str).collect::<Vec<_>>();
     match parts.as_slice() {
         [field] => known_top_level_field(field),
-        ["keys", ..] | ["plugin_config", ..] => true,
+        ["keys", ..] | ["plugin_config", ..] | ["helix_keys", ..] => true,
         ["plugins", _] => true,
         ["plugin_permissions", _] | ["plugin_permissions", _, "process" | "inherit_env"] => true,
         ["agent", field] => matches!(

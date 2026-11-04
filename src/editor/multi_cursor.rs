@@ -128,7 +128,7 @@ impl Editor {
                         }
                     }
                     Mode::VisualLine | Mode::VisualBlock => {}
-                    Mode::Normal | Mode::Insert | Mode::Command | Mode::Search => {
+                    Mode::Normal | Mode::Insert | Mode::Command | Mode::Search | Mode::Select => {
                         self.select_next_occurrence();
                     }
                 },

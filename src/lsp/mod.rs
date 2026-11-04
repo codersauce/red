@@ -413,6 +413,46 @@ pub trait LspClient: std::any::Any + Send {
         )
         .await
     }
+    /// Requests declaration locations at an editor position.
+    async fn goto_declaration(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError> {
+        self.send_request_for_file(
+            file,
+            "textDocument/declaration",
+            document_position_params(file, x, y)?,
+            false,
+        )
+        .await
+    }
+    /// Requests type-definition locations at an editor position.
+    async fn goto_type_definition(
+        &mut self,
+        file: &str,
+        x: usize,
+        y: usize,
+    ) -> Result<i64, LspError> {
+        self.send_request_for_file(
+            file,
+            "textDocument/typeDefinition",
+            document_position_params(file, x, y)?,
+            false,
+        )
+        .await
+    }
+    /// Requests implementation locations at an editor position.
+    async fn goto_implementation(
+        &mut self,
+        file: &str,
+        x: usize,
+        y: usize,
+    ) -> Result<i64, LspError> {
+        self.send_request_for_file(
+            file,
+            "textDocument/implementation",
+            document_position_params(file, x, y)?,
+            false,
+        )
+        .await
+    }
     /// Requests completion candidates at an editor position.
     async fn completion(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError> {
         let mut params = document_position_params(file, x, y)?;

@@ -339,6 +339,34 @@ impl Editor {
             }
             let point =
                 visual_table_point.unwrap_or_else(|| self.mouse_buffer_point(&window, pointer));
+            if self.is_helix() {
+                self.place_cursor_for_pointer(point.x, point.y);
+                self.helix_mouse_click(modifiers.contains(KeyModifiers::ALT));
+                let owner = MouseSelectionOwner {
+                    window: window.id,
+                    buffer: self.current_buffer().id(),
+                };
+                let pressed = Point::new(self.cx, self.buffer_line());
+                self.mouse_selection.gesture = Some(MouseGesture {
+                    owner,
+                    revision: self.current_buffer().revision(),
+                    anchor: pressed,
+                    anchor_end: pressed,
+                    pointer,
+                    // `started` would make the vim gesture validator drop the
+                    // press, because Helix drag does not enter Visual mode.
+                    started: false,
+                    activate_on_press: false,
+                    press_pointer: pointer,
+                    reverse_initial: false,
+                    from_insert: false,
+                    unit: SelectionUnit::Character,
+                    last_scroll: Instant::now(),
+                });
+                self.sync_to_window();
+                self.render(buffer)?;
+                return Ok(());
+            }
             if self.explore.enabled
                 && window.active
                 && self
@@ -456,6 +484,26 @@ impl Editor {
     ) -> BoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async move {
             self.validate_mouse_selection_owner();
+            if self.is_helix() {
+                if !self.helix_mouse_is_dragging() {
+                    return Ok(());
+                }
+                let pointer = Point::new(usize::from(column), usize::from(row));
+                let Some(window) = self.active_window_with_editor_view() else {
+                    self.clear_helix_mouse_anchor();
+                    return Ok(());
+                };
+                let point = self.mouse_buffer_point(&window, pointer);
+                self.place_cursor_for_pointer(point.x, point.y);
+                self.helix_mouse_drag();
+                if finish {
+                    self.clear_helix_mouse_anchor();
+                    self.mouse_selection.gesture = None;
+                }
+                self.sync_to_window();
+                self.render(buffer)?;
+                return Ok(());
+            }
             let Some(mut gesture) = self.mouse_selection.gesture.clone() else {
                 return Ok(());
             };

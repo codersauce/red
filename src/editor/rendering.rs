@@ -1413,6 +1413,23 @@ fn render_source_segment(
 
 impl Editor {
     pub(crate) fn terminal_cursor_state(&self) -> crate::terminal_output::CursorState {
+        // Helix's block cursor is drawn on the head cell. While the terminal
+        // is focused the hardware cursor is hidden. Unfocused, Helix shows
+        // that cursor as an underscore and does not paint the head cell.
+        if self.helix_unfocused_block_cursor() {
+            let position = self
+                .render_cursor_position()
+                .filter(|&(x, y)| x < usize::from(self.size.0) && y < usize::from(self.size.1));
+            let surface = self
+                .last_rendered_cursor_surface
+                .as_ref()
+                .unwrap_or(&self.theme.style);
+            return crate::terminal_output::CursorState {
+                position,
+                shape: CursorShape::SteadyUnderscore,
+                color: Some(self.theme.terminal_cursor_color(surface)),
+            };
+        }
         let position = (self.is_focused && !self.uses_synthetic_block_cursor())
             .then(|| self.render_cursor_position())
             .flatten()
@@ -1634,6 +1651,17 @@ impl Editor {
         Ok(())
     }
 
+    /// Helix paints a block for normal and select. A focused block is the
+    /// head cell and the terminal cursor stays hidden. Insert keeps a bar
+    /// between characters and does not paint a one-cell selection.
+    fn helix_block_cursor_mode(&self) -> bool {
+        self.is_helix() && matches!(self.mode, Mode::Normal | Mode::Select)
+    }
+
+    fn helix_unfocused_block_cursor(&self) -> bool {
+        self.helix_block_cursor_mode() && !self.is_focused && !self.has_term()
+    }
+
     pub(crate) fn uses_synthetic_block_cursor(&self) -> bool {
         let dialog_allows_editor_cursor = self
             .current_dialog
@@ -1641,15 +1669,21 @@ impl Editor {
             .map(|dialog| dialog.allows_event_passthrough())
             .unwrap_or(true);
 
-        self.is_focused
+        let surface_allows_block = self.is_focused
             && dialog_allows_editor_cursor
             && !self.has_term()
             && !self.panel_manager.has_focused_panel()
-            && !self.is_waiting_for_key_sequence()
-            && matches!(
-                self.mode,
-                Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock
-            )
+            && !self.is_waiting_for_key_sequence();
+        if !surface_allows_block {
+            return false;
+        }
+        if self.helix_block_cursor_mode() {
+            return true;
+        }
+        matches!(
+            self.mode,
+            Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+        )
     }
 
     fn render_cursor_cell(
@@ -3176,6 +3210,10 @@ impl Editor {
         }
 
         // Render selection last so its contrast guarantee is not overwritten by search highlights.
+        if self.is_helix() && window.active {
+            self.draw_felix_ranges(buffer, window);
+        }
+
         if self.is_visual() && window.active {
             self.update_selection();
 
@@ -3498,7 +3536,7 @@ impl Editor {
         Ok(())
     }
 
-    fn display_col_range_points_in_window(
+    pub(super) fn display_col_range_points_in_window(
         &self,
         window: &crate::window::Window,
         line_index: usize,
@@ -4605,6 +4643,9 @@ impl Editor {
         if self.is_waiting_for_key_sequence() {
             return self.config.cursor.waiting;
         }
+        if self.helix_unfocused_block_cursor() {
+            return CursorShape::SteadyUnderscore;
+        }
 
         let mode = if let Some(dialog) = self.current_dialog.as_ref() {
             dialog.cursor_mode().unwrap_or(self.mode)
@@ -4618,7 +4659,7 @@ impl Editor {
             Mode::Command => self.config.cursor.command,
             Mode::Insert => self.config.cursor.insert,
             Mode::Search => self.config.cursor.search,
-            Mode::Visual => self.config.cursor.visual,
+            Mode::Visual | Mode::Select => self.config.cursor.visual,
             Mode::VisualLine => self.config.cursor.visual_line,
             Mode::VisualBlock => self.config.cursor.visual_block,
         }
@@ -4638,6 +4679,7 @@ fn format_mode_name(mode: &Mode) -> String {
         Mode::Visual => "VISUAL".to_string(),
         Mode::VisualLine => "V-LINE".to_string(),
         Mode::VisualBlock => "V-BLOCK".to_string(),
+        Mode::Select => "SELECT".to_string(),
     }
 }
 
@@ -4906,6 +4948,170 @@ mod tests {
             .map(|cell| cell.text.as_str())
             .collect::<String>();
         assert!(actionline.contains("s stage"), "{actionline}");
+    }
+
+    #[test]
+    fn helix_block_cursor_is_painted_while_focused_and_an_underscore_when_not() {
+        use crate::config::EditingModel;
+
+        let mut editor = rendering_test_editor(Buffer::new(None, "hello\n".to_string()));
+        editor.config.editing_model = EditingModel::Helix;
+        for mode in [Mode::Normal, Mode::Select] {
+            editor.mode = mode;
+            editor.is_focused = true;
+            assert!(
+                editor.uses_synthetic_block_cursor(),
+                "focused {mode:?} paints the head cell"
+            );
+            assert!(editor.terminal_cursor_state().position.is_none());
+            editor.is_focused = false;
+            assert!(!editor.uses_synthetic_block_cursor());
+            assert_eq!(editor.active_cursor_shape(), CursorShape::SteadyUnderscore);
+            let state = editor.terminal_cursor_state();
+            assert_eq!(state.shape, CursorShape::SteadyUnderscore);
+            assert!(state.position.is_some());
+        }
+        editor.mode = Mode::Insert;
+        editor.is_focused = true;
+        assert!(!editor.uses_synthetic_block_cursor());
+        assert_eq!(editor.active_cursor_shape(), CursorShape::SteadyBar);
+    }
+
+    #[tokio::test]
+    async fn helix_insert_uses_a_bar_and_o_does_not_keep_the_old_highlight() {
+        use crate::config::EditingModel;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+        let mut editor = rendering_test_editor(Buffer::new(None, "hello world\n".to_string()));
+        editor.config.editing_model = EditingModel::Helix;
+        let key =
+            |character| Event::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        editor.test_execute_event(key('i')).await.unwrap();
+        assert_eq!(editor.mode, Mode::Insert);
+        assert_eq!(editor.active_cursor_shape(), CursorShape::SteadyBar);
+        assert!(editor.terminal_cursor_state().position.is_some());
+        let mut frame = RenderBuffer::new(60, 12, &editor.theme.style);
+        editor.render(&mut frame).unwrap();
+        let window = editor.active_window_with_editor_view().unwrap();
+        let start = editor.gutter_width_for_window(&window) + 1;
+        assert_eq!(
+            frame.cells[start].style.bg,
+            frame.cells[start + 1].style.bg,
+            "insert does not paint a one-wide selection on the cursor"
+        );
+
+        let mut editor = rendering_test_editor(Buffer::new(None, "hello world\n".to_string()));
+        editor.config.editing_model = EditingModel::Helix;
+        editor.test_execute_event(key('w')).await.unwrap();
+        editor.test_execute_event(key('o')).await.unwrap();
+        assert_eq!(editor.test_buffer_line(), 1);
+        let mut frame = RenderBuffer::new(60, 12, &editor.theme.style);
+        editor.render(&mut frame).unwrap();
+        let window = editor.active_window_with_editor_view().unwrap();
+        let start = editor.gutter_width_for_window(&window) + 1;
+        assert_eq!(
+            frame.cells[start].style.bg,
+            frame.cells[start + 1].style.bg,
+            "o must not leave the word selection painted on the original line"
+        );
+    }
+
+    #[tokio::test]
+    async fn helix_counted_word_motion_paints_the_final_selection_once() {
+        use crate::config::EditingModel;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+        let mut editor =
+            rendering_test_editor(Buffer::new(None, "this is just a line\n".to_string()));
+        editor.config.editing_model = EditingModel::Helix;
+        let key =
+            |character| Event::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        editor.test_execute_event(key('2')).await.unwrap();
+        let renders = editor.full_render_count;
+        editor.test_execute_event(key('w')).await.unwrap();
+        assert_eq!(
+            editor.full_render_count,
+            renders + 1,
+            "2w should paint the final selection once, markup {}",
+            editor.test_felix_markup()
+        );
+        let markup = editor.test_felix_markup();
+        assert!(
+            markup.contains("#[is| ") || markup.contains("is| "),
+            "2w lands on the second word, markup {markup}"
+        );
+        assert!(
+            !markup.starts_with("#[this| "),
+            "2w must not stop on the first word, markup {markup}"
+        );
+
+        let mut editor =
+            rendering_test_editor(Buffer::new(None, "one\ntwo\nthree\nfour\n".to_string()));
+        editor.config.editing_model = EditingModel::Helix;
+        editor.test_execute_event(key('3')).await.unwrap();
+        let renders = editor.full_render_count;
+        editor.test_execute_event(key('j')).await.unwrap();
+        assert_eq!(editor.full_render_count, renders + 1);
+        assert_eq!(editor.test_buffer_line(), 3);
+
+        let mut editor = rendering_test_editor(Buffer::new(None, "abxcdx\n".to_string()));
+        editor.config.editing_model = EditingModel::Helix;
+        editor.test_execute_event(key('2')).await.unwrap();
+        editor.test_execute_event(key('f')).await.unwrap();
+        let renders = editor.full_render_count;
+        editor.test_execute_event(key('x')).await.unwrap();
+        assert_eq!(
+            editor.full_render_count,
+            renders + 1,
+            "2fx paints the final match once, markup {}",
+            editor.test_felix_markup()
+        );
+        assert!(editor.test_felix_markup().contains("|x"));
+    }
+
+    #[tokio::test]
+    async fn helix_unfocused_selection_leaves_the_head_cell_unpainted() {
+        use crate::config::EditingModel;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+        let mut editor =
+            rendering_test_editor(Buffer::new(None, "this is just a line\n".to_string()));
+        editor.config.editing_model = EditingModel::Helix;
+        editor
+            .test_execute_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('w'),
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+        editor.is_focused = false;
+        let mut frame = RenderBuffer::new(60, 12, &editor.theme.style);
+        editor.render(&mut frame).unwrap();
+        let window = editor.active_window_with_editor_view().unwrap();
+        let start = editor.gutter_width_for_window(&window) + 1;
+        let selection_bg = frame.cells[start].style.bg;
+        let head_bg = frame.cells[start + 4].style.bg;
+        let plain_bg = frame.cells[start + 5].style.bg;
+        assert_ne!(
+            selection_bg, plain_bg,
+            "the word before the head is selected"
+        );
+        assert_eq!(
+            head_bg,
+            plain_bg,
+            "an unfocused head cell is not drawn as a selection, markup {}",
+            editor.test_felix_markup()
+        );
+    }
+
+    #[test]
+    fn vim_insert_keeps_a_bar_cursor() {
+        let mut editor = rendering_test_editor(Buffer::new(None, "hello\n".to_string()));
+        editor.mode = Mode::Insert;
+        editor.is_focused = true;
+        assert!(!editor.uses_synthetic_block_cursor());
+        assert_eq!(editor.active_cursor_shape(), CursorShape::SteadyBar);
+        assert_eq!(editor.terminal_cursor_state().shape, CursorShape::SteadyBar);
     }
 
     #[test]

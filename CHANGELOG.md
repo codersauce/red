@@ -2,6 +2,12 @@
 
 All notable changes to Red are documented in this file.
 
+## Unreleased
+
+### Features
+
+- **editor:** Add an experimental Helix editing model (`editing_model = "helix"`), with selection-first motions, multiple selections, and a compatibility matrix. The Vim grammar is unchanged. The headless core is the future `felix` crate.
+
 ## [0.11.0](https://github.com/codersauce/red/compare/v0.10.0...v0.11.0)
 
 ### Features

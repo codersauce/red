@@ -450,6 +450,11 @@ impl UndoHistory {
     ///
     /// Returns `true` only when history advanced. Empty transactions are discarded and
     /// sibling branches remain available.
+    /// Revision restored by undo and redo. Felix stores selections against it.
+    pub(crate) fn history_revision(&self) -> u64 {
+        self.current_revision
+    }
+
     pub fn commit_transaction(&mut self, after_cursor: CursorSnapshot) -> bool {
         self.active_insert_end = None;
         let Some(mut transaction) = self.active_transaction.take() else {

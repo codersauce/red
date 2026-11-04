@@ -528,6 +528,22 @@ interaction model, commands, path boundaries, and failure behavior.
 
 Red layers your configuration over embedded defaults:
 
+The experimental Helix grammar is off unless you opt in. It does not change
+Vim keys. Agent and panel text areas stay on the Vim engine. The future
+headless library for this grammar is named `felix`; it is not a separate crate
+yet. The key list and the intentional differences are in
+[HELIX_COMPATIBILITY.md](HELIX_COMPATIBILITY.md).
+
+```toml
+editing_model = "helix"
+
+[helix_keys.normal]
+w = "move_next_word_start"
+```
+
+`Space e` remains Explore and `Space f` remains format. Other Helix defaults
+apply. Restart Red after changing `editing_model`.
+
 ```toml
 # ~/.config/red/config.toml
 theme = "red.json"

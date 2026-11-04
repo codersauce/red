@@ -37,6 +37,7 @@ mod display_layout;
 mod edit_batch;
 mod edit_history;
 mod explore_ui;
+mod felix;
 mod file_watch;
 mod inline_actions;
 mod inline_agent_outcomes;
@@ -2670,6 +2671,21 @@ pub enum Action {
     /// Shows the backing file beside the current buffer as a unified conflict diff.
     CompareFileOnDisk,
     EnterMode(Mode),
+    /// Experimental Helix command. The Vim grammar never produces this.
+    Felix(crate::felix::Command),
+    /// Helix command plus the character argument it was waiting for.
+    FelixChar {
+        command: crate::felix::Command,
+        character: char,
+        extra: Option<char>,
+    },
+    /// Confirmed Helix prompt, such as a regex selection.
+    FelixPrompt {
+        command: crate::felix::Command,
+        text: String,
+    },
+    /// LSP location request issued by a Helix goto binding.
+    FelixGoto(String),
     RestoreLastVisualSelection,
     /// Opens a bounded inline edit for the enclosing function or exact selection.
     InlineAssist,
@@ -3379,6 +3395,8 @@ pub enum Mode {
     VisualLine,
     /// Rectangular selection.
     VisualBlock,
+    /// Helix select mode. Motions extend the current selection.
+    Select,
 }
 
 #[derive(Debug, Clone)]
@@ -3969,6 +3987,9 @@ pub struct Editor {
 
     /// Whether Normal-mode `r` is waiting for its replacement character.
     pending_replace: bool,
+
+    /// Runtime state for the experimental Helix grammar.
+    felix: felix::State,
 
     /// Executed actions
     actions: Vec<Action>,
@@ -6025,6 +6046,7 @@ impl Editor {
             pending_character_motion: None,
             last_character_motion: None,
             pending_replace: false,
+            felix: felix::State::default(),
             actions: vec![],
             last_semantic_change: None,
             pending_semantic_change: None,
@@ -6460,6 +6482,10 @@ impl Editor {
 
     /// Synchronizes the active window with the editor's state
     fn sync_to_window(&mut self) {
+        // The Vim model keeps a 1-width selection beside the cursor. The
+        // Helix model owns the selection and updates the cursor from it.
+        let vim_selection = (self.config.editing_model != crate::config::EditingModel::Helix)
+            .then(|| crate::felix::Selection::cursor(self.cursor_char_index()));
         if let Some(window) = self.window_manager.active_window_mut() {
             window.buffer_index = self.buffer_manager.active_index();
             window.vtop = self.vtop;
@@ -6470,6 +6496,9 @@ impl Editor {
             window.cy = self.cy;
             window.cursor_goal = self.cursor_goal;
             window.vx = self.vx;
+            if let Some(selection) = vim_selection {
+                window.selection = selection;
+            }
         }
         self.reconcile_markdown_link_destinations();
     }
@@ -12607,16 +12636,23 @@ impl Editor {
                         &msg,
                         InboundMessage::Notification(ParsedNotification::Progress(_))
                     );
-                    let completed_definition =
-                        if method.as_deref() == Some("textDocument/definition") {
-                            match &msg {
-                                InboundMessage::Message(response) => Some(response.id),
-                                InboundMessage::RequestError { id, .. } => Some(*id),
-                                _ => None,
-                            }
-                        } else {
-                            None
-                        };
+                    let completed_definition = if matches!(
+                        method.as_deref(),
+                        Some(
+                            "textDocument/definition"
+                                | "textDocument/declaration"
+                                | "textDocument/typeDefinition"
+                                | "textDocument/implementation"
+                        )
+                    ) {
+                        match &msg {
+                            InboundMessage::Message(response) => Some(response.id),
+                            InboundMessage::RequestError { id, .. } => Some(*id),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
                     if let Some(action) = self.handle_lsp_message(&msg, method) {
                         // TODO: handle quit
                         let generation_before = self.render_generation;
@@ -15423,7 +15459,12 @@ impl Editor {
             Mode::VisualBlock => {
                 Self::merge_key_mappings(&mut mappings, &self.config.keys.visual_block)
             }
-            Mode::Visual | Mode::Normal | Mode::Insert | Mode::Command | Mode::Search => {}
+            Mode::Visual
+            | Mode::Normal
+            | Mode::Insert
+            | Mode::Command
+            | Mode::Search
+            | Mode::Select => {}
         }
         mappings
     }
@@ -17036,7 +17077,25 @@ impl Editor {
                         return self.resolved_completion_action(msg);
                     }
 
-                    if method == "textDocument/definition" {
+                    if self.felix.reference_requests.remove(&msg.id) {
+                        let locations = match &msg.result {
+                            serde_json::Value::Array(locations) => locations.clone(),
+                            serde_json::Value::Object(location) => {
+                                vec![serde_json::Value::Object(location.clone())]
+                            }
+                            _ => Vec::new(),
+                        };
+                        self.felix_references_from_locations(&locations);
+                        return Some(Action::Refresh);
+                    }
+
+                    if matches!(
+                        method.as_str(),
+                        "textDocument/definition"
+                            | "textDocument/declaration"
+                            | "textDocument/typeDefinition"
+                            | "textDocument/implementation"
+                    ) {
                         let definition = match msg.result {
                             serde_json::Value::Array(ref arr) => {
                                 arr.first().and_then(|value| value.as_object())
@@ -17421,6 +17480,14 @@ impl Editor {
             return Ok(None);
         }
 
+        // Select mode must not swallow Esc or `v` inside a keymap menu. A
+        // dialog still owns Esc so a picker can close.
+        if self.current_dialog.is_none() {
+            if let Some(action) = self.helix_select_exit_action(ev) {
+                return Ok(Some(action));
+            }
+        }
+
         if let Some(ka) = self.waiting_key_action.take() {
             self.waiting_command = None;
             self.keymap_hint_deadline = None;
@@ -17513,7 +17580,12 @@ impl Editor {
         }
 
         Ok(match self.mode {
+            Mode::Normal if self.is_helix() => self.handle_felix_event(ev),
+            Mode::Select => self.handle_felix_event(ev),
             Mode::Normal => self.handle_normal_event(ev),
+            Mode::Insert if self.is_helix() && self.felix.insert_cursors.len() > 1 => {
+                self.handle_felix_multi_insert(ev)
+            }
             Mode::Insert => self.handle_insert_event(ev)?,
             Mode::Command => self.handle_command_event(ev, runtime),
             Mode::Search => self.handle_search_event(ev),
@@ -18275,6 +18347,10 @@ impl Editor {
     }
 
     fn key_string_for_event(ev: &Event) -> Option<String> {
+        Self::key_string_for_event_with(ev, false)
+    }
+
+    fn key_string_for_event_with(ev: &Event, preserve_case: bool) -> Option<String> {
         let Event::Key(KeyEvent {
             code, modifiers, ..
         }) = ev
@@ -18291,7 +18367,11 @@ impl Editor {
         );
         let key = match code {
             KeyCode::Char(' ') => "Space".to_string(),
-            KeyCode::Char(c) if has_modifier => c.to_ascii_lowercase().to_string(),
+            // Helix chords distinguish `Alt-c` from `Alt-C`. Vim chords do not.
+            KeyCode::Char(c) if has_modifier && !preserve_case => {
+                c.to_ascii_lowercase().to_string()
+            }
+            KeyCode::Char(c) if has_modifier => c.to_string(),
             KeyCode::Char(c) => c.to_string(),
             KeyCode::F(number) => format!("F{number}"),
             _ => format!("{code:?}"),
@@ -18358,7 +18438,9 @@ impl Editor {
             ..
         }) = ev
         {
-            if (!self.is_normal() && !self.is_visual()) || !c.is_numeric() {
+            if (!self.is_normal() && !self.is_visual() && self.mode != Mode::Select)
+                || !c.is_numeric()
+            {
                 return false;
             }
 
@@ -19443,6 +19525,10 @@ impl Editor {
         self.check_bounds();
         self.refresh_cursor_goal();
         self.sync_to_window();
+        self.felix_select_search_match(
+            TextPosition::new(match_.start_y, match_.start_x),
+            TextPosition::new(match_.end_y, match_.end_x),
+        );
     }
 
     fn restore_search_origin(&mut self, origin: &HistoryEntry, vtop: usize) {
@@ -21064,6 +21150,11 @@ impl Editor {
         TextPosition::new(line, self.grapheme_to_char_on_line(self.cx, line))
     }
 
+    fn cursor_char_index(&self) -> usize {
+        self.current_buffer()
+            .position_to_char_idx(self.cursor_text_position())
+    }
+
     fn cursor_lsp_position(&self) -> crate::lsp::Position {
         let position = self.cursor_text_position();
         let buffer = self.current_buffer();
@@ -22060,18 +22151,27 @@ impl Editor {
 
             if matches!(old_mode, Mode::Insert) && matches!(new_mode, Mode::Normal) {
                 let cleaned_generated_indent = self.cleanup_generated_indent();
-                if self.insert_entry_cursor.is_some_and(|entry| {
-                    let y = self.buffer_line();
-                    y > entry.y || (y == entry.y && self.cx > entry.x)
-                }) {
+                // Vim moves back onto the last inserted scalar. Helix stays
+                // where the insert cursor was.
+                if !self.is_helix()
+                    && self.insert_entry_cursor.is_some_and(|entry| {
+                        let y = self.buffer_line();
+                        y > entry.y || (y == entry.y && self.cx > entry.x)
+                    })
+                {
                     self.cx = self.cx.saturating_sub(1);
                 }
-                self.cx = self.cx.min(self.line_length().saturating_sub(1));
+                if !self.is_helix() {
+                    self.cx = self.cx.min(self.line_length().saturating_sub(1));
+                }
                 // EnterMode renders before the generic post-action cursor-goal refresh.
                 self.refresh_cursor_goal();
                 self.insert_entry_cursor = None;
                 let after_cursor = self.cursor_snapshot();
                 self.commit_transaction(after_cursor);
+                if self.is_helix() {
+                    self.finish_helix_insert();
+                }
                 self.cancel_transaction_if_empty();
                 if cleaned_generated_indent {
                     self.notify_change(runtime).await?;
@@ -22097,6 +22197,7 @@ impl Editor {
 
             self.flush_edit_batch_events(runtime).await?;
             self.mode = new_mode;
+            self.finish_felix_mode_transition(old_mode, new_mode);
 
             if matches!(
                 new_mode,
@@ -22551,6 +22652,9 @@ impl Editor {
 
                 // Move cursor by one character position (not display width)
                 self.cx += grapheme_len(&c.to_string());
+                if self.is_helix() {
+                    self.sync_helix_insert_selection();
+                }
                 let language =
                     self.highlight_language_id_for_buffer_index(self.buffer_manager.active_index());
                 let should_reindent = self.current_line_contents().is_some_and(|contents| {
@@ -23680,6 +23784,31 @@ impl Editor {
                     self.set_legacy_message(Some("No log file configured".to_string()));
                 }
             }
+            Action::Felix(command) => {
+                self.execute_felix(*command, buffer, runtime).await?;
+            }
+            Action::FelixChar {
+                command,
+                character,
+                extra,
+            } => {
+                self.execute_felix_argument(*command, *character, *extra, None, buffer, runtime)
+                    .await?;
+            }
+            Action::FelixPrompt { command, text } => {
+                self.execute_felix_argument(
+                    *command,
+                    '\0',
+                    None,
+                    Some(text.clone()),
+                    buffer,
+                    runtime,
+                )
+                .await?;
+            }
+            Action::FelixGoto(method) => {
+                self.felix_lsp_goto(method, runtime).await?;
+            }
             Action::ListPlugins
             | Action::PluginManagerCatalogLoaded { .. }
             | Action::PluginManagerSelect(..)
@@ -24312,18 +24441,8 @@ impl Editor {
                     .await?;
                 }
                 Action::SetCursor(x, y) => {
-                    let target_y = (*y).min(self.last_navigable_line());
-
-                    if target_y < self.vtop {
-                        self.vtop = target_y;
-                    } else if target_y >= self.vtop + self.vheight().max(1) {
-                        self.vtop = target_y.saturating_sub(self.vheight().saturating_sub(1));
-                    }
-
-                    self.cy = target_y.saturating_sub(self.vtop);
-                    self.cx = *x;
-                    self.check_bounds();
-                    self.refresh_cursor_goal();
+                    self.place_cursor_for_pointer(*x, *y);
+                    self.follow_helix_cursor();
                     self.sync_to_window();
                     self.ensure_current_buffer_lsp_opened().await?;
                     self.render(buffer)?;
@@ -24350,6 +24469,7 @@ impl Editor {
                             self.cy = self.cy.saturating_add(scrolled_lines).min(max_cy);
                             self.skipcol = 0;
                             self.clamp_cursor_to_scrolled_viewport();
+                            self.follow_helix_cursor();
                             self.sync_to_window();
                             self.render_motion_frame(buffer)?;
                         }
@@ -24383,6 +24503,7 @@ impl Editor {
                             self.cy = self.cy.saturating_sub(scrolled_lines).max(scrolloff);
                             self.skipcol = 0;
                             self.clamp_cursor_to_scrolled_viewport();
+                            self.follow_helix_cursor();
                             self.sync_to_window();
                             self.render_motion_frame(buffer)?;
                         }
@@ -28668,7 +28789,7 @@ impl Editor {
                 -32003,
                 "red/DocumentSnapshot does not support block selections",
             )),
-            Mode::Normal | Mode::Insert | Mode::Command | Mode::Search => {
+            Mode::Normal | Mode::Insert | Mode::Command | Mode::Search | Mode::Select => {
                 unreachable!("stored visual selections retain a visual mode")
             }
         }
@@ -29465,7 +29586,7 @@ impl Editor {
             event::Event::Key(KeyEvent {
                 code, modifiers, ..
             }) => {
-                let key = Self::key_string_for_event(ev)?;
+                let key = Self::key_string_for_event_with(ev, self.is_helix())?;
 
                 mappings
                     .get(&key)
@@ -29608,6 +29729,37 @@ impl Editor {
                     }
                     KeyAction::Single(Action::UnindentSelection(_)) => {
                         KeyAction::Single(Action::UnindentSelection(count))
+                    }
+                    // Helix counts on goto are line numbers, not repeats.
+                    // Other Helix commands still repeat once per count.
+                    // These commands take the count themselves. Repeating them
+                    // once per count paints a different selection than Helix,
+                    // which applies the count inside one motion.
+                    KeyAction::Single(Action::Felix(
+                        crate::felix::Command::GotoFileStart
+                        | crate::felix::Command::GotoLine
+                        | crate::felix::Command::GotoLastLine
+                        | crate::felix::Command::GotoLineStart
+                        | crate::felix::Command::GotoLineEnd
+                        | crate::felix::Command::GotoFirstNonwhitespace
+                        | crate::felix::Command::MoveCharLeft
+                        | crate::felix::Command::MoveCharRight
+                        | crate::felix::Command::MoveLineUp
+                        | crate::felix::Command::MoveLineDown
+                        | crate::felix::Command::MoveNextWordStart
+                        | crate::felix::Command::MovePrevWordStart
+                        | crate::felix::Command::MoveNextWordEnd
+                        | crate::felix::Command::MovePrevWordEnd
+                        | crate::felix::Command::MoveNextLongWordStart
+                        | crate::felix::Command::MovePrevLongWordStart
+                        | crate::felix::Command::MoveNextLongWordEnd
+                        | crate::felix::Command::MovePrevLongWordEnd
+                        | crate::felix::Command::FindNextChar
+                        | crate::felix::Command::FindPrevChar
+                        | crate::felix::Command::TillNextChar
+                        | crate::felix::Command::TillPrevChar,
+                    )) => {
+                        return key_action;
                     }
                     KeyAction::Single(Action::StartUppercaseOperator(_)) => {
                         KeyAction::Single(Action::StartUppercaseOperator(count))
@@ -30128,12 +30280,18 @@ impl Editor {
 
     fn comment_syntax(&mut self) -> Option<CommentSyntax> {
         let Some(language) = self.current_language_id() else {
+            if self.is_helix() {
+                return CommentSyntax::parse("# %s");
+            }
             self.set_legacy_message(Some(
                 "no comment syntax configured for unnamed buffer".to_string(),
             ));
             return None;
         };
         let Some(template) = self.comment_template_for_language(&language) else {
+            if self.is_helix() {
+                return CommentSyntax::parse("# %s");
+            }
             self.set_legacy_message(Some(format!("no comment syntax configured for {language}")));
             return None;
         };
@@ -30415,7 +30573,9 @@ impl Editor {
                     vec![TextRange::new(start, end)]
                 }
             }
-            Mode::Normal | Mode::Insert | Mode::Command | Mode::Search => return false,
+            Mode::Normal | Mode::Insert | Mode::Command | Mode::Search | Mode::Select => {
+                return false
+            }
         };
 
         let edits = ranges
@@ -30553,6 +30713,19 @@ impl Editor {
         self.replace_range(range, "");
         self.move_to_text_position(range.start);
         true
+    }
+
+    fn place_cursor_for_pointer(&mut self, x: usize, y: usize) {
+        let target_y = y.min(self.last_navigable_line());
+        if target_y < self.vtop {
+            self.vtop = target_y;
+        } else if target_y >= self.vtop + self.vheight().max(1) {
+            self.vtop = target_y.saturating_sub(self.vheight().saturating_sub(1));
+        }
+        self.cy = target_y.saturating_sub(self.vtop);
+        self.cx = x;
+        self.check_bounds();
+        self.refresh_cursor_goal();
     }
 
     fn move_to_text_position(&mut self, position: TextPosition) {
@@ -30734,6 +30907,7 @@ impl Editor {
             self.set_special_mark_at_char('.', edit.start_char, AnchorAffinity::Left);
         }
         self.restore_cursor_snapshot(cursor);
+        self.restore_felix_selection();
         self.restore_inline_history_comments();
         self.notify_change(runtime).await?;
         self.render(render_buffer)?;
@@ -30771,6 +30945,7 @@ impl Editor {
             self.set_special_mark_at_char('.', edit.start_char, AnchorAffinity::Left);
         }
         self.restore_cursor_snapshot(cursor);
+        self.restore_felix_selection();
         self.restore_inline_history_comments();
         self.notify_change(runtime).await?;
         self.render(render_buffer)?;
@@ -31460,7 +31635,9 @@ impl Editor {
                     Mode::Visual => SessionVisualMode::Character,
                     Mode::VisualLine => SessionVisualMode::Line,
                     Mode::VisualBlock => SessionVisualMode::Block,
-                    Mode::Normal | Mode::Insert | Mode::Command | Mode::Search => return None,
+                    Mode::Normal | Mode::Insert | Mode::Command | Mode::Search | Mode::Select => {
+                        return None
+                    }
                 };
                 Some(SessionVisualSelection {
                     buffer_index,
@@ -35671,6 +35848,36 @@ impl Editor {
     #[doc(hidden)]
     pub fn test_is_waiting_for_key_sequence(&self) -> bool {
         self.is_waiting_for_key_sequence()
+    }
+
+    #[doc(hidden)]
+    pub fn test_felix_selection(&self) -> (usize, usize, usize) {
+        let selection = self
+            .window_manager
+            .active_window()
+            .map(|window| window.selection.clone())
+            .unwrap_or_default();
+        (
+            selection.primary().anchor,
+            selection.primary().head,
+            selection.len(),
+        )
+    }
+
+    /// Every range as `(anchor, head)` plus the primary index.
+    #[doc(hidden)]
+    pub fn test_felix_ranges(&self) -> (usize, Vec<(usize, usize)>) {
+        let selection = self
+            .window_manager
+            .active_window()
+            .map(|window| window.selection.clone())
+            .unwrap_or_default();
+        let ranges = selection
+            .ranges()
+            .iter()
+            .map(|range| (range.anchor, range.head))
+            .collect();
+        (selection.primary_index(), ranges)
     }
 
     #[doc(hidden)]

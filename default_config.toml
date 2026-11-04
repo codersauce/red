@@ -9,6 +9,12 @@
 # Precedence is embedded defaults, then this file, then repeatable
 # `-c`/`--config key=value` flags. A value that is not valid TOML is a plain
 # string. `red --print-config` prints the merged configuration.
+#
+# editing_model = "vim"
+# Set editing_model = "helix" to use the experimental selection-first grammar.
+# It is read at startup. Overrides go in [helix_keys.normal], [helix_keys.select],
+# and [helix_keys.insert]. See docs/HELIX_COMPATIBILITY.md. The Vim [keys.*]
+# tables stay in effect for editing_model = "vim".
 # 
 
 # Name of the VSCode theme to use. The theme file should be present in the

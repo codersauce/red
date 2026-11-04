@@ -290,7 +290,7 @@ impl Component for AgentComposer {
             let actions = self.surface_actions();
             ActionBar::new(&actions)
                 .with_mode(match prompt_mode {
-                    Mode::Normal => ActionMode::Normal,
+                    Mode::Normal | Mode::Select => ActionMode::Normal,
                     Mode::Visual | Mode::VisualLine | Mode::VisualBlock => ActionMode::Visual,
                     Mode::Search => ActionMode::Read,
                     Mode::Insert | Mode::Command => ActionMode::Insert,
