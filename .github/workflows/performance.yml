@@ -9,8 +9,11 @@ on:
       - 'Cargo.toml'
       - 'crates/husk*/**'
       - 'examples/husk_cursor_bench.rs'
-      - 'plugins/indent_guides.hk'
-      - 'src/plugin/**'
+      - 'plugins/**'
+      - 'src/**'
+      - 'default_config.toml'
+      - 'vendor/crossterm/**'
+      - 'tools/navigation-bench/**'
   pull_request:
     branches: [main, develop]
     paths:
@@ -19,8 +22,11 @@ on:
       - 'Cargo.toml'
       - 'crates/husk*/**'
       - 'examples/husk_cursor_bench.rs'
-      - 'plugins/indent_guides.hk'
-      - 'src/plugin/**'
+      - 'plugins/**'
+      - 'src/**'
+      - 'default_config.toml'
+      - 'vendor/crossterm/**'
+      - 'tools/navigation-bench/**'
   schedule:
     - cron: '47 6 * * 1'
   workflow_dispatch:
@@ -56,3 +62,32 @@ jobs:
 
       - name: Check bundled Husk callback budget
         run: cargo run --locked --release --example husk_cursor_bench -- --assert
+
+  navigation:
+    name: Native navigation replay (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: navigation-release
+      - name: Build Red and the native terminal driver
+        run: |
+          cargo build --locked --release --bin red
+          cargo build --locked --release --manifest-path tools/navigation-bench/Cargo.toml --target-dir target
+      - name: Compare incremental navigation with full rendered frames
+        run: cargo test --locked --release --lib editor::navigation_perf_tests::
+      - name: Check every displayed position and saved document
+        shell: bash
+        run: |
+          suffix=""
+          if [[ "$RUNNER_OS" == Windows ]]; then suffix=.exe; fi
+          for scenario in inside scroll reverse window buffer; do
+            target/release/red-navigation-bench"$suffix" --binary target/release/red"$suffix" \
+              --scenario "$scenario" --presses 64 --interval-ms 5
+          done

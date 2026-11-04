@@ -13899,6 +13899,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn indent_guides_reuses_a_scope_until_the_cursor_crosses_a_level() {
+        drain_requests();
+        let mut layout = sample_indent_layout();
+        layout["rows"][1]["text"] = serde_json::json!("        first();");
+        let mut runtime = Runtime::new();
+        runtime.set_snapshot(
+            "editor_info",
+            sample_indent_editor_info(
+                Color::Rgb {
+                    r: 40,
+                    g: 41,
+                    b: 42,
+                },
+                Color::Rgb {
+                    r: 80,
+                    g: 81,
+                    b: 82,
+                },
+            ),
+        );
+        runtime.set_snapshot("viewport_layout", layout.clone());
+        runtime
+            .load_plugin(
+                "indent_guides",
+                include_str!("../../plugins/indent_guides.hk"),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.try_recv_request(),
+            Some(PluginRequest::SetDecorations { .. })
+        ));
+        for (line, changed) in [(1, false), (2, false), (3, true), (2, true)] {
+            layout["cursor"]["y"] = serde_json::json!(line);
+            runtime.set_snapshot("viewport_layout", layout.clone());
+            runtime
+                .notify("cursor:moved", serde_json::json!({}))
+                .await
+                .unwrap();
+            assert_eq!(
+                matches!(
+                    ACTION_DISPATCHER.try_recv_request(),
+                    Some(PluginRequest::SetDecorations { .. })
+                ),
+                changed
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn indent_guides_skip_same_line_edits_without_indentation_changes() {
         drain_requests();
 

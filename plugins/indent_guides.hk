@@ -33,12 +33,6 @@ struct IndentViewportLayout {
     rows: [ViewportRow],
 }
 
-struct SourceRow {
-    line: i32,
-    text: String,
-    indent_width: i32,
-}
-
 struct MeasuredRow {
     line: i32,
     width: i32,
@@ -81,11 +75,13 @@ struct IndentEditorInfo {
 
 struct IndentGuidesState {
     layout_key: String,
+    first_line: i32,
+    last_line: i32,
 }
 
 #[red::state]
 fn initial_state() -> IndentGuidesState {
-    return IndentGuidesState { layout_key: "" };
+    return IndentGuidesState { layout_key: "", first_line: -1, last_line: -1 };
 }
 
 fn state() -> IndentGuidesState {
@@ -112,16 +108,16 @@ fn refresh(event: EmptyEvent) {
     let key = red::int(layout.buffer_index, -1)
         + ":" + indentation_key
         + ":" + red::int(layout.vtop, -1)
-        + ":" + red::int(layout.cursor.y, -1)
         + ":" + red::int(layout.width, -1)
         + ":" + red::int(layout.height, -1)
         + ":" + red::int(layout.indentation.shift_width, -1)
         + ":" + red::int(layout.indentation.tab_width, -1);
-    if key == state().layout_key {
+    let cached = state();
+    let line = red::int(layout.cursor.y, 0);
+    if key == cached.layout_key && line >= cached.first_line && line <= cached.last_line {
         return;
     }
-    red::state_patch(IndentGuidesState { layout_key: key });
-    render(layout, red::editor_info());
+    render(layout, red::editor_info(), key);
 }
 
 #[red::on("theme:changed")]
@@ -130,21 +126,40 @@ fn refresh_theme(event: EmptyEvent) {
     refresh(event);
 }
 
-fn render(layout: IndentViewportLayout, info: IndentEditorInfo) {
-    red::execute("SetDecorations", "indent-guides", build_decorations(layout, info));
-}
-
 #[red::lifecycle("deactivate")]
 fn deactivate() {
     red::execute("ClearDecorations", "indent-guides");
 }
 
-fn build_decorations(layout: IndentViewportLayout, info: IndentEditorInfo) -> [IndentDecoration] {
+fn render(layout: IndentViewportLayout, info: IndentEditorInfo, key: String) {
     let shift_width = positive_or(red::int(layout.indentation.shift_width, 4), 4);
     let tab_width = positive_or(red::int(layout.indentation.tab_width, shift_width), shift_width);
     let buffer_index = red::int(layout.buffer_index, 0);
-    let rows = measured_rows(unique_first_segment_rows(layout.rows), tab_width);
-    let scope = active_scope(layout, rows, shift_width);
+    let rows = measured_rows(layout.rows, tab_width);
+    let cursor_line = red::int(layout.cursor.y, 0);
+    let index = 0;
+    while index < red::len(rows) && rows[index].line != cursor_line {
+        index = index + 1;
+    }
+    let scope = active_scope(cursor_line, index, rows, shift_width);
+    // Adjacent rows at the same indentation level have the same active scope.
+    // A gap or a nested level must still trigger a fresh decoration set.
+    let first = index;
+    let last = index;
+    if index < red::len(rows) {
+        let level = rows[index].width / shift_width;
+        while first > 0 && rows[first - 1].line == rows[first].line - 1 && rows[first - 1].width / shift_width == level {
+            first = first - 1;
+        }
+        while last + 1 < red::len(rows) && rows[last + 1].line == rows[last].line + 1 && rows[last + 1].width / shift_width == level {
+            last = last + 1;
+        }
+    }
+    red::state_patch(IndentGuidesState {
+        layout_key: key,
+        first_line: cursor_line - (index - first),
+        last_line: cursor_line + (last - index),
+    });
     let decorations: [IndentDecoration] = [];
     let guide = red::char(9474);
     let guide_style = indent_style(info);
@@ -174,83 +189,66 @@ fn build_decorations(layout: IndentViewportLayout, info: IndentEditorInfo) -> [I
         i = i + 1;
     }
 
-    return decorations;
+    red::execute("SetDecorations", "indent-guides", decorations);
 }
 
-fn unique_first_segment_rows(source_rows: [ViewportRow]) -> [SourceRow] {
-    let rows: [SourceRow] = [];
+// Hold blank line numbers until the next nonblank row supplies their right
+// boundary. Wrapped continuations consume neither the row budget nor a guide.
+fn measured_rows(source: [ViewportRow], tab_width: i32) -> [MeasuredRow] {
+    let rows: [MeasuredRow] = [];
+    let blanks: [i32] = [];
+    let previous = -1;
+    let count = 0;
     let i = 0;
-
-    while i < red::len(source_rows) && red::len(rows) < 500 {
-        let row = source_rows[i];
-        let line = red::int(row.line, 0);
-        if red::bool(row.first_segment, true) {
-            rows = red::push(rows, SourceRow {
-                line: line,
-                text: red::string(row.text, ""),
-                indent_width: red::int(row.indent_width, -1),
-            });
-        }
+    while i < red::len(source) && count < 500 {
+        let row = source[i];
         i = i + 1;
+        if !red::bool(row.first_segment, true) {
+            continue;
+        }
+        count = count + 1;
+        let line = red::int(row.line, 0);
+        let text = red::string(row.text, "");
+        if is_blank(text) {
+            blanks = red::push(blanks, line);
+            continue;
+        }
+        let width = red::int(row.indent_width, -1);
+        if width < 0 {
+            width = leading_indent_width(text, tab_width);
+        }
+        if red::len(blanks) > 0 {
+            let inferred = width;
+            if previous >= 0 {
+                inferred = min_int(previous, width);
+            }
+            rows = append_blank_rows(rows, blanks, inferred);
+            blanks = [];
+        }
+        rows = red::push(rows, MeasuredRow { line: line, width: width });
+        previous = width;
     }
-
+    if red::len(blanks) > 0 {
+        let trailing = previous;
+        if trailing < 0 {
+            trailing = 0;
+        }
+        rows = append_blank_rows(rows, blanks, trailing);
+    }
     return rows;
 }
 
-fn measured_rows(rows: [SourceRow], tab_width: i32) -> [MeasuredRow] {
-    let measured: [MeasuredRow] = [];
+fn append_blank_rows(rows: [MeasuredRow], blanks: [i32], width: i32) -> [MeasuredRow] {
+    let result = rows;
     let i = 0;
-    let previous = -1;
-
-    while i < red::len(rows) {
-        let row = rows[i];
-        if !is_blank(row.text) {
-            let width = non_blank_indent(row, tab_width);
-            measured = red::push(measured, MeasuredRow { line: row.line, width: width });
-            previous = width;
-            i = i + 1;
-            continue;
-        }
-
-        let end = i + 1;
-        while end < red::len(rows) && is_blank(rows[end].text) {
-            end = end + 1;
-        }
-        let after = -1;
-        if end < red::len(rows) {
-            after = non_blank_indent(rows[end], tab_width);
-        }
-        let width = 0;
-        if previous >= 0 && after >= 0 {
-            width = min_int(previous, after);
-        } else if previous >= 0 {
-            width = previous;
-        } else if after >= 0 {
-            width = after;
-        }
-        while i < end {
-            measured = red::push(measured, MeasuredRow { line: rows[i].line, width: width });
-            i = i + 1;
-        }
+    while i < red::len(blanks) {
+        result = red::push(result, MeasuredRow { line: blanks[i], width: width });
+        i = i + 1;
     }
-
-    return measured;
+    return result;
 }
 
-fn non_blank_indent(row: SourceRow, tab_width: i32) -> i32 {
-    let width = red::int(row.indent_width, -1);
-    if width >= 0 {
-        return width;
-    }
-    return leading_indent_width(row.text, tab_width);
-}
-
-fn active_scope(layout: IndentViewportLayout, rows: [MeasuredRow], shift_width: i32) -> IndentScope {
-    let cursor_line = red::int(layout.cursor.y, 0);
-    let cursor_index = 0;
-    while cursor_index < red::len(rows) && rows[cursor_index].line != cursor_line {
-        cursor_index = cursor_index + 1;
-    }
+fn active_scope(cursor_line: i32, cursor_index: i32, rows: [MeasuredRow], shift_width: i32) -> IndentScope {
     if cursor_index >= red::len(rows) {
         return IndentScope { active: false, column: 0, start: 0, end: 0 };
     }

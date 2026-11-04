@@ -512,6 +512,16 @@ impl RenderBuffer {
         }
     }
 
+    pub(super) fn diff_rows<'a>(&'a self, previous: &Self, rows: &[usize]) -> Vec<Change<'a>> {
+        let _span = super::perf::PerfSpan::start("render:compare_rows");
+        let mut changes = Vec::new();
+        for &y in rows.iter().filter(|&&y| y < self.height) {
+            let start = y * self.width;
+            self.diff_row(y, &previous.cells[start..start + self.width], &mut changes);
+        }
+        changes
+    }
+
     pub fn snapshot_rows(&self, rows: &[usize]) -> Vec<(usize, Vec<Cell>)> {
         let mut snapshots = Vec::with_capacity(rows.len());
         let mut seen = Vec::with_capacity(rows.len());
@@ -661,6 +671,7 @@ mod tests {
             for changes in [
                 restored.diff(&overlay),
                 restored.diff_row_snapshots(&snapshots),
+                restored.diff_rows(&overlay, &[0]),
             ] {
                 assert_eq!(changes.len(), 2);
                 assert_eq!((changes[0].x, changes[0].y), (1, 0));
