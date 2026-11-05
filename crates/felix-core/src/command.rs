@@ -1,6 +1,7 @@
 //! Document commands produce edits in original document coordinates. The host
 //! commits them in reverse order, then resolves the new selection against its Rope.
 mod comments;
+mod increment;
 mod insert;
 pub use comments::CommentMode;
 mod lines;
@@ -1455,6 +1456,19 @@ impl Session {
             }
             "<a-(>" | "<a-)>" => p.rotate_contents(text, selections, key == "<a-)>", self.count),
             "&" => p.align(text, selections, context.tab_width),
+            "<c-a>" | "<c-x>" => {
+                let step = if key == "<c-a>" { 1 } else { -1 };
+                p.increment(
+                    text,
+                    selections,
+                    step * count as i64,
+                    if self.selected_register == Some('#') {
+                        step
+                    } else {
+                        0
+                    },
+                );
+            }
             "<c-s>" => p.save_jump = Some(selections.clone()),
             "<c-o>" | "<c-i>" | "<tab>" => {
                 p.host = Some(HostAction::Jump {

@@ -932,6 +932,7 @@ dependencies = [
 name = "felix-core"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "regex",
  "regex-automata",
  "ropey",

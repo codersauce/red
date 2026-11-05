@@ -23,6 +23,7 @@ BEGIN = b"\x1b[?2026h"
 END = b"\x1b[?2026l"
 TOKEN = re.compile(rb"\x1b\[(\d+);(\d+)H|\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x1b\x07]*(?:\x07|\x1b\\)|[^\x1b]+")
 POSITION = re.compile(rb"\b(\d+):(\d+)\b")
+NORMAL_MODE = re.compile(rb"\b(?:NOR|NORMAL)\b")
 
 
 class InputDriver(Driver):
@@ -67,7 +68,7 @@ class InputDriver(Driver):
                 pos = POSITION.search(status)
                 if pos:
                     with self.changed:
-                        if b"NORMAL" in status:
+                        if NORMAL_MODE.search(status):
                             self.last_normal_frame = observed
                         self.frames.append((observed, (int(pos[1]), int(pos[2]))))
                         self.changed.notify_all()

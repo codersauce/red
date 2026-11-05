@@ -1899,9 +1899,9 @@ impl Editor {
         Some(format!(
             "{} {primary}/{total}{recording}",
             match self.felix.session.mode {
-                felix_core::Mode::Insert => "INSERT",
-                felix_core::Mode::Select => "SELECT",
-                felix_core::Mode::Normal => "NORMAL",
+                felix_core::Mode::Insert => "INS",
+                felix_core::Mode::Select => "SEL",
+                felix_core::Mode::Normal => "NOR",
             }
         ))
     }
@@ -3810,6 +3810,11 @@ mod tests {
             "a.rs"
         );
         assert_eq!(editor.cursor_text_position(), TextPosition::new(0, 1));
+    }
+
+    #[tokio::test]
+    async fn increments_match_helix() {
+        replay_suite(include_str!("../../scripts/felix/fixtures/increments.json")).await;
     }
 
     #[tokio::test]

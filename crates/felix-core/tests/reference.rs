@@ -78,6 +78,13 @@ fn reference_registers() {
 }
 
 #[test]
+fn reference_increments() {
+    replay_suite(include_str!(
+        "../../../scripts/felix/fixtures/increments.json"
+    ));
+}
+
+#[test]
 fn reference_macros() {
     replay_suite(include_str!("../../../scripts/felix/fixtures/macros.json"));
 }

@@ -104,7 +104,7 @@ jobs:
           python3 scripts/felix/scenarios.py --observer reference/target/debug/hx --runtime helix-25.07.1-x86_64-linux/runtime --steps 48 --seed 250701 > "$FELIX_SCENARIOS"
           python3 scripts/felix/check_coverage.py "$FELIX_SCENARIOS" --terminal evidence/terminal.json >> "$GITHUB_STEP_SUMMARY"
           cmp scripts/felix/fixtures/motions.json "$FELIX_SCENARIOS"
-          for suite in registers macros structure shell navigation comments; do
+          for suite in registers macros structure shell navigation comments increments; do
             python3 scripts/felix/scenarios.py --observer reference/target/debug/hx --runtime helix-25.07.1-x86_64-linux/runtime --suite "$suite" > "evidence/$suite.json"
             cmp "scripts/felix/fixtures/$suite.json" "evidence/$suite.json"
           done
@@ -136,7 +136,7 @@ jobs:
           git -C reference rev-parse HEAD > evidence/reference-commit.txt
           sha256sum Cargo.lock "$ARCHIVE" reference/target/debug/hx target/debug/red \
             scripts/felix/helix-observer.patch scripts/felix/coverage.toml scripts/felix/broad_cases.py \
-            scripts/felix/fixtures/{motions,registers,macros,structure,navigation,shell,comments}.json scripts/felix/*baseline.json \
+            scripts/felix/tutor_{picker,splits}.py scripts/felix/fixtures/{motions,registers,macros,structure,navigation,shell,comments,increments}.json scripts/felix/*baseline.json \
             default_config.toml src/editor/felix_bindings.toml > evidence/sha256.txt
       - uses: actions/upload-artifact@v4
         if: always()

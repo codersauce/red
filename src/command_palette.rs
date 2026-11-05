@@ -7,7 +7,7 @@ use serde_json::json;
 
 use crate::{
     command::{self, CommandSpec},
-    config::{KeyAction, Keys},
+    config::{EditingModel, KeyAction, Keys},
     editor::{Action, Mode, SearchDirection},
     plugin::RegisteredPluginCommand,
     ui::{PickerIcon, PickerItem},
@@ -145,11 +145,11 @@ pub(crate) fn entries(
 pub(crate) fn entries_for_model(
     keys: &Keys,
     plugin_commands: &[RegisteredPluginCommand],
-    model: crate::config::EditingModel,
+    model: EditingModel,
 ) -> Vec<CommandPaletteEntry> {
     let model_command = match model {
         #[cfg(feature = "helix")]
-        crate::config::EditingModel::Helix => Some(builtin(
+        EditingModel::Helix => Some(builtin(
             "copy_between_registers",
             "Copy between registers",
             "Helix",
@@ -196,8 +196,8 @@ pub(crate) fn entries_for_model(
                     .as_deref()
                     .unwrap_or(command.plugin.as_str());
                 let description = command.metadata.description.as_deref().unwrap_or("");
-                let colon =
-                    (!colon_name_is_builtin(&command.name)).then(|| format!(":{}", command.name));
+                let colon = (!colon_name_is_builtin(&command.name, model))
+                    .then(|| format!(":{}", command.name));
 
                 CommandPaletteEntry {
                     id: format!("plugin.{}.{}", command.plugin, command.name),
@@ -222,17 +222,23 @@ pub(crate) fn entries_for_model(
 }
 
 /// Returns exact command-line names available for case-sensitive completion.
-pub(crate) fn colon_completion_names(plugin_commands: &[RegisteredPluginCommand]) -> Vec<String> {
+pub(crate) fn colon_completion_names(
+    plugin_commands: &[RegisteredPluginCommand],
+    model: EditingModel,
+) -> Vec<String> {
     let mut names = BUILTIN_COLON_COMMANDS
         .iter()
         .map(CommandSpec::name)
         .chain(SPECIAL_BUILTIN_COLON_COMMANDS.iter().copied())
+        .chain(command::helix_split::names(model).iter().copied())
         .map(str::to_string)
         .collect::<Vec<_>>();
     names.extend(
         plugin_commands
             .iter()
-            .filter(|command| command.metadata.visible && !colon_name_is_builtin(&command.name))
+            .filter(|command| {
+                command.metadata.visible && !colon_name_is_builtin(&command.name, model)
+            })
             .map(|command| command.name.clone()),
     );
     names.sort_unstable();
@@ -1717,8 +1723,9 @@ fn display_key(key: &str) -> &str {
     }
 }
 
-pub(crate) fn colon_name_is_builtin(name: &str) -> bool {
-    SPECIAL_BUILTIN_COLON_COMMANDS.contains(&name)
+pub(crate) fn colon_name_is_builtin(name: &str, model: EditingModel) -> bool {
+    command::helix_split::names(model).contains(&name)
+        || SPECIAL_BUILTIN_COLON_COMMANDS.contains(&name)
         || command::parse(BUILTIN_COLON_COMMANDS, name).is_some()
 }
 
@@ -1787,7 +1794,7 @@ mod tests {
 
         assert_eq!(entry.action, Action::NewBuffer);
         assert_eq!(entry.colon.as_deref(), Some(":enew"));
-        assert!(colon_completion_names(&[])
+        assert!(colon_completion_names(&[], EditingModel::Vim)
             .iter()
             .any(|name| name == "enew"));
         assert_eq!(
@@ -1861,7 +1868,7 @@ mod tests {
             assert_eq!(entry.action, action);
         }
 
-        let aliases = colon_completion_names(&[]);
+        let aliases = colon_completion_names(&[], EditingModel::Vim);
         for name in [
             "b",
             "buffer",
@@ -1889,7 +1896,7 @@ mod tests {
 
         assert_eq!(entry.colon.as_deref(), Some(":wa"));
         assert_eq!(entry.action, Action::SaveAll);
-        assert!(colon_completion_names(&[])
+        assert!(colon_completion_names(&[], EditingModel::Vim)
             .iter()
             .any(|name| name == "wall"));
     }
@@ -1904,7 +1911,7 @@ mod tests {
 
         assert_eq!(entry.colon.as_deref(), Some(":diffdisk"));
         assert_eq!(entry.action, Action::CompareFileOnDisk);
-        assert!(colon_completion_names(&[])
+        assert!(colon_completion_names(&[], EditingModel::Vim)
             .iter()
             .any(|name| name == "diffdisk"));
     }
@@ -2267,7 +2274,7 @@ mod tests {
         assert!(!entries(&default_keys(), std::slice::from_ref(&plugin))
             .iter()
             .any(|entry| entry.id == "plugin.custom.InternalAction"));
-        assert!(!colon_completion_names(&[plugin])
+        assert!(!colon_completion_names(&[plugin], EditingModel::Vim)
             .iter()
             .any(|name| name == "InternalAction"));
     }

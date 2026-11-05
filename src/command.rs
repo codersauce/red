@@ -5,6 +5,8 @@
 //! `wq` command chain are resolved before arguments are returned. Ambiguous or unknown
 //! names never decompose into unrelated commands, preventing unintended editor changes.
 
+pub(crate) mod helix_split;
+
 /// Accepted values for the first `:set` argument.
 pub(crate) const SET_OPTIONS: &[&str] = &["relativenumber", "rnu", "norelativenumber", "nornu"];
 

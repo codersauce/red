@@ -1275,6 +1275,22 @@ impl Picker {
         self.filter(&query);
     }
 
+    pub(super) fn finish_selection(&self, action: Action) -> KeyAction {
+        let mut actions = Vec::new();
+        if let Some(record_action) = self.record_history_action() {
+            actions.push(record_action);
+        }
+        if self.callback_handle.is_some() {
+            actions.push(action);
+            actions.push(Action::CloseDialog);
+        } else {
+            actions.push(Action::CloseDialog);
+            actions.push(action);
+        }
+
+        KeyAction::Multiple(actions)
+    }
+
     fn record_history_action(&self) -> Option<Action> {
         let key = self.history_key.clone()?;
         if self.search.trim().is_empty() {
@@ -3982,19 +3998,7 @@ impl Component for Picker {
                             Action::Picked(self.list.selected_item(), self.id)
                         };
 
-                        let mut actions = Vec::new();
-                        if let Some(record_action) = self.record_history_action() {
-                            actions.push(record_action);
-                        }
-                        if self.callback_handle.is_some() {
-                            actions.push(action);
-                            actions.push(Action::CloseDialog);
-                        } else {
-                            actions.push(Action::CloseDialog);
-                            actions.push(action);
-                        }
-
-                        Some(KeyAction::Multiple(actions))
+                        Some(self.finish_selection(action))
                     }
                     KeyCode::Char(c)
                         if !event

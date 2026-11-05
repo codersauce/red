@@ -83,3 +83,9 @@ name = "Undo and repeat"
 cases = ["append-and-undo", "repeat-count", "repeat-bracketed-paste", "repeat-change", "repeat-checkpoint", "counted-history-normal", "counted-history-select"]
 terminal = ["repeat", "completion", "completion-repeat"]
 remaining = []
+
+[[area]]
+name = "Window commands"
+cases = []
+terminal = ["tutor-splits", "tutor-picker"]
+remaining = []

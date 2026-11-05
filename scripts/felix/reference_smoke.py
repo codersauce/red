@@ -144,9 +144,8 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
             status = rows[-2].split() if len(rows) >= 2 else []
             if red:
                 count = "1/1" if sels == "1 sel" else sels.split()[0]
-                want_mode = {"NOR": "NORMAL", "INS": "INSERT"}[mode]
                 matches = (any(content.strip() == f"{row} {line}".rstrip() for content in rows)
-                           and status[:2] == [want_mode, count] and any(name in part for part in status))
+                           and status[:2] == [mode, count] and any(name in part for part in status))
             else:
                 matches = (expected_line in rows and status[:2] == [mode, f"~/{name}"]
                            and status[-3:-1] == sels.split())
@@ -195,6 +194,9 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
         columns = (28 if red else 31) if horizontal else (81 if wrapped else 80)
         tmux("new-session", "-d", "-x", str(columns), "-y", "24", "-s", "oracle",
              str(executable or bundle / "hx"), str(fixture), str(other))
+        if scenario == "tutor-picker":
+            from tutor_picker import run_picker_split_trace
+            return run_picker_split_trace(tmux, workdir)
         if horizontal:
             gutter = 4 if red else 7
             # Each count is a grapheme count. The ruler independently identifies
@@ -218,7 +220,7 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
                 while True:
                     rows = tmux("capture-pane", "-p").stdout.splitlines()
                     insert = label == "insert caret"
-                    mode = ("INSERT" if red else "INS") if insert else ("NORMAL" if red else "NOR")
+                    mode = "INS" if insert else "NOR"
                     if (len(rows) >= 5 and rows[1][gutter:] == ruler[offset:offset + 24]
                             and rows[-2].strip().startswith(mode + " ")
                             and rows[-2].rstrip().endswith(f" 1:{position}")):
@@ -235,6 +237,9 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
                         raise RuntimeError(f"{label}: expected offset {offset} and position 1:{position}, saw caret {cursor!r}, rows {rows!r}")
                     time.sleep(.02)
             return checkpoints
+        if scenario == "tutor-splits":
+            import tutor_splits
+            return tutor_splits.run(tmux, observe, workdir)
         if split_search:
             def check_views(label, left, right, prompt=""):
                 deadline = time.monotonic() + 5
@@ -619,8 +624,10 @@ def run_trace(bundle, root, executable=None, trace=None, red=False, scenario="ed
             observe("undo function deletion", line, "NOR", "1 sel")
             tmux("send-keys", "Space", "c")
             observe("toggle the Rust line comment", "// " + line, "NOR", "1 sel")
-            tmux("send-keys", "Space", "c")
-            observe("remove the Rust line comment", line, "NOR", "1 sel")
+            tmux("send-keys", "v")
+            observe("enter Select mode", "// " + line, "SEL", "1 sel")
+            tmux("send-keys", "C-c")
+            observe("remove the Rust line comment with Ctrl-c", line, "NOR", "1 sel")
             return checkpoints
         if scenario == "broad":
             observe("open", "foo foo", "NOR", "1 sel")
@@ -792,7 +799,7 @@ def main():
             red_prefixes = (run_trace(bundle, root / "red-prefix", args.candidate.resolve(strict=True),
                                       red=True, scenario="prefix-count") if args.candidate else None)
             additional_traces = {}
-            for scenario, directory in (("split-search", "split"), ("wrapped-split-search", "wrap"),
+            for scenario, directory in (("split-search", "split"), ("tutor-splits", "tsp"), ("tutor-picker", "tp"), ("wrapped-split-search", "wrap"),
                                         ("selection-errors", "sel"), ("clipboard", "clip"),
                                         ("completion-repeat", "cr"), ("snippet-stops", "st"), ("rust-edit", "rs"),
                                         ("split-completion", "sc"), ("registers", "reg"), ("macros", "mac"), ("broad", "br"), ("syntax-native", "sy"), ("history-view", "hv"), ("embedded", "em")):

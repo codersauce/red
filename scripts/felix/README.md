@@ -124,7 +124,7 @@ Each generator starts the pinned Helix observer in disposable workspaces. Point 
 
 ```sh
 out=$(mktemp -d)
-for suite in registers macros structure shell navigation comments; do
+for suite in registers macros structure shell navigation comments increments; do
   python3 scripts/felix/scenarios.py --observer "$HX" --runtime "$HX_RUNTIME" --suite "$suite" > "$out/$suite.json"
   cmp "scripts/felix/fixtures/$suite.json" "$out/$suite.json"
 done
@@ -135,3 +135,5 @@ cargo test --locked -p red --features helix --lib editor::felix -- --test-thread
 The paired terminal traces `broad`, `syntax-native`, `embedded` and `history-view` combine multiple commands. They surround two selected words, pipe them through a shell and undo the edit, and exercise a Rust function text object, expansion inside a Markdown code fence, comment toggling, visible word jumps and chronological undo across branches. The NeoTree plugin and language-server tests run through the full Red test suite.
 
 Shell commands run in Red’s working directory. Each pipe or predicate receives the corresponding selection on stdin. Insert and append run once and reuse the result. Red collects all outputs before applying an undoable edit and limits output to 8 MiB per stream and across the collected fragments. Moving or editing during a command invalidates the result. In the originating document, Ctrl-C cancels the command and its queued macro continuation. On Unix, cancellation terminates the process group. On Windows, Red terminates the immediate shell process. The live shell fixture uses POSIX commands on macOS and Linux.
+
+The tutor regressions replay a single-digit selection, counted and multi-selection increments and decrements, formatted dates and times, and comment toggles using the pinned observer. The paired terminal scenarios `tutor-splits` and `tutor-picker` check window placement, active file, and return to a single window after picker input.

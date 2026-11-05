@@ -7634,6 +7634,10 @@ impl Editor {
         usize::from(self.size.1).saturating_sub(2)
     }
 
+    pub(crate) fn editing_model(&self) -> crate::config::EditingModel {
+        self.config.editing_model
+    }
+
     pub(crate) fn picker_input_position(&self) -> crate::config::PickerInputPosition {
         self.config.picker.input_position
     }
@@ -19106,6 +19110,22 @@ impl Editor {
             }];
         }
 
+        let (name, arguments) = command::split_invocation(cmd);
+        if command::helix_split::names(self.config.editing_model).contains(&name) {
+            let mut actions = Vec::new();
+            for path in command::helix_split::paths(arguments) {
+                if path.unterminated || path.value.is_empty() {
+                    self.set_routine_error(Some("expected a filename after :hsplit".into()));
+                    return Vec::new();
+                }
+                actions.push(Action::SplitHorizontalWithFile(path.value));
+            }
+            if actions.is_empty() {
+                actions.push(Action::SplitHorizontal);
+            }
+            return actions;
+        }
+
         let (name, arguments) = cmd.split_once(' ').unwrap_or((cmd, ""));
         let name = name.strip_suffix('!').unwrap_or(name);
         let parsed = command::parse(command_palette::BUILTIN_COLON_COMMANDS, cmd);
@@ -19962,6 +19982,7 @@ impl Editor {
             &mut self.command,
             direction,
             plugin_commands,
+            self.config.editing_model,
             |fragment| {
                 self.highlighter
                     .matching_language_ids(fragment)
@@ -52669,6 +52690,35 @@ while True:
             .last_error
             .as_deref()
             .is_some_and(|error| { error.contains("duplicate open buffers") }));
+    }
+
+    #[cfg(feature = "helix")]
+    #[test]
+    fn helix_horizontal_split_aliases_accept_paths_and_preserve_vim_commands() {
+        let mut editor = test_editor(80, 24);
+        let runtime = Runtime::new();
+        assert!(editor.handle_command("hs", &runtime).is_empty());
+        assert_eq!(
+            editor.handle_command("sp two names", &runtime),
+            [Action::SplitHorizontalWithFile("two names".into())]
+        );
+        editor.config.editing_model = crate::config::EditingModel::Helix;
+        for alias in ["hs", "hsplit"] {
+            assert_eq!(
+                editor.handle_command(alias, &runtime),
+                [Action::SplitHorizontal]
+            );
+            assert_eq!(
+                editor.handle_command(&format!("{alias} first 'second file'"), &runtime),
+                [
+                    Action::SplitHorizontalWithFile("first".into()),
+                    Action::SplitHorizontalWithFile("second file".into()),
+                ]
+            );
+        }
+        assert!(editor
+            .handle_command("hs first 'unfinished", &runtime)
+            .is_empty());
     }
 
     #[tokio::test]

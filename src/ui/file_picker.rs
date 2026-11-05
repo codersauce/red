@@ -23,7 +23,7 @@ use crossterm::event::{self};
 use fuzzy_matcher::skim::SkimMatcherV2;
 
 use crate::{
-    config::KeyAction,
+    config::{EditingModel, KeyAction},
     editor::{Action, Editor, RenderBuffer},
     plugin::{LocationColumnEncoding, OpenLocationTarget, PluginLocation},
     theme::Theme,
@@ -42,6 +42,7 @@ use super::{
 };
 
 pub struct FilePicker {
+    helix_split_keys: bool,
     picker: Picker,
     cache: Arc<FilePickerCache>,
     lease: Option<ScanLease>,
@@ -139,11 +140,12 @@ impl FilePicker {
                 file_match_highlights(&highlight_matcher, item, query)
             })
             .history_key("find_files")
-            .select_action(Action::OpenFile)
             .build(editor);
         picker.set_empty_message(Some("Loading files...".to_string()));
 
         FilePicker {
+            helix_split_keys: cfg!(feature = "helix")
+                && editor.editing_model() == EditingModel::Helix,
             picker,
             cache: Arc::clone(&editor.file_picker_cache),
             lease: None,
@@ -162,6 +164,52 @@ impl FilePicker {
             visibility: FilePickerVisibility::default(),
             load_generation: 0,
         }
+    }
+
+    fn open_target(&self, ev: &event::Event) -> Option<OpenLocationTarget> {
+        let event::Event::Key(key) = ev else {
+            return None;
+        };
+        if key.kind == event::KeyEventKind::Release {
+            return None;
+        }
+        match (key.code, key.modifiers) {
+            (event::KeyCode::Enter, _) => Some(OpenLocationTarget::Current),
+            (event::KeyCode::Char('s'), event::KeyModifiers::CONTROL) if self.helix_split_keys => {
+                Some(OpenLocationTarget::Horizontal)
+            }
+            (event::KeyCode::Char('v'), event::KeyModifiers::CONTROL) if self.helix_split_keys => {
+                Some(OpenLocationTarget::Vertical)
+            }
+            _ => None,
+        }
+    }
+
+    fn open_selected(&self, target: OpenLocationTarget) -> Option<KeyAction> {
+        if self.query_pending {
+            return Some(KeyAction::Single(Action::Refresh));
+        }
+        let Some(path) = self.picker.selected_item() else {
+            return (target != OpenLocationTarget::Current)
+                .then_some(KeyAction::Single(Action::CloseDialog));
+        };
+        let action = match FilePickerQuery::parse(self.picker.query()).line {
+            Some(line) => Action::OpenLocation(
+                PluginLocation {
+                    path,
+                    line: line.saturating_sub(1),
+                    column: 0,
+                    column_encoding: LocationColumnEncoding::Utf8Byte,
+                },
+                target,
+            ),
+            None => match target {
+                OpenLocationTarget::Current => Action::OpenFile(path),
+                OpenLocationTarget::Horizontal => Action::SplitHorizontalWithFile(path),
+                OpenLocationTarget::Vertical => Action::SplitVerticalWithFile(path),
+            },
+        };
+        Some(self.picker.finish_selection(action))
     }
 
     fn start_load(&mut self, refresh: bool) {
@@ -230,6 +278,12 @@ impl Component for FilePicker {
             ("Files", "Ctrl+r", "Refresh file index"),
             ("Files", ">", "Open commands when the query is empty"),
         ]));
+        if self.helix_split_keys {
+            actions.extend(super::reference_actions(&[
+                ("Files", "Ctrl+v", "Open in a vertical split"),
+                ("Files", "Ctrl+s", "Open in a horizontal split"),
+            ]));
+        }
         actions
     }
 
@@ -345,17 +399,9 @@ impl Component for FilePicker {
             self.start_load(true);
             return Some(KeyAction::Single(Action::Refresh));
         }
-        if self.query_pending
-            && matches!(ev, event::Event::Key(key) if key.code == event::KeyCode::Enter)
-        {
-            return Some(KeyAction::Single(Action::Refresh));
+        if let Some(target) = self.open_target(ev) {
+            return self.open_selected(target);
         }
-        let line = match ev {
-            event::Event::Key(key) if key.code == event::KeyCode::Enter => {
-                FilePickerQuery::parse(self.picker.query()).line
-            }
-            _ => None,
-        };
         let selected_before = self.picker.selected_item();
         let action = self.picker.handle_event(ev);
         // Follow the best match as batches arrive until the user navigates.
@@ -373,31 +419,7 @@ impl Component for FilePicker {
                 self.picker.set_busy(true);
             }
         }
-        let action = action?;
-        let Some(line) = line else {
-            return Some(action);
-        };
-        let KeyAction::Multiple(actions) = action else {
-            return Some(action);
-        };
-
-        Some(KeyAction::Multiple(
-            actions
-                .into_iter()
-                .map(|action| match action {
-                    Action::OpenFile(path) => Action::OpenLocation(
-                        PluginLocation {
-                            path,
-                            line: line.saturating_sub(1),
-                            column: 0,
-                            column_encoding: LocationColumnEncoding::Utf8Byte,
-                        },
-                        OpenLocationTarget::Current,
-                    ),
-                    action => action,
-                })
-                .collect(),
-        ))
+        action
     }
 
     fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
@@ -532,7 +554,10 @@ mod tests {
     }
 
     fn test_editor_with_theme(theme: Theme) -> Editor {
-        let config = Config::default();
+        test_editor_with_config(Config::default(), theme)
+    }
+
+    fn test_editor_with_config(config: Config, theme: Theme) -> Editor {
         let lsp = Box::new(LspManager::new(config.lsp.clone()));
         let buffer = Buffer::new(None, String::new());
 
@@ -963,6 +988,70 @@ mod tests {
         picker.draw(&mut buffer).unwrap();
 
         assert!(buffer_text(&buffer).contains("Loading files..."));
+    }
+
+    #[cfg(feature = "helix")]
+    #[test]
+    fn helix_picker_splits_keep_history_and_line_suffixes() {
+        let config = Config {
+            editing_model: EditingModel::Helix,
+            ..Default::default()
+        };
+        let editor = test_editor_with_config(config, Theme::default());
+        let mut picker = FilePicker::loading(&editor);
+        send_load(&picker, picker.load_generation, Ok(vec!["tutor".into()]));
+        picker.tick().unwrap();
+        for (key, expected) in [
+            ('v', Action::SplitVerticalWithFile("tutor".into())),
+            ('s', Action::SplitHorizontalWithFile("tutor".into())),
+        ] {
+            assert_eq!(
+                picker.handle_event(&ctrl_key(key)),
+                Some(KeyAction::Multiple(vec![Action::CloseDialog, expected]))
+            );
+        }
+        for c in "tutor:7".chars() {
+            picker.handle_event(&key(KeyCode::Char(c)));
+        }
+        for (key, target) in [
+            ('v', OpenLocationTarget::Vertical),
+            ('s', OpenLocationTarget::Horizontal),
+        ] {
+            assert_eq!(
+                picker.handle_event(&ctrl_key(key)),
+                Some(KeyAction::Multiple(vec![
+                    Action::RecordPickerHistory {
+                        key: "find_files".into(),
+                        query: "tutor:7".into()
+                    },
+                    Action::CloseDialog,
+                    Action::OpenLocation(
+                        PluginLocation {
+                            path: "tutor".into(),
+                            line: 6,
+                            column: 0,
+                            column_encoding: LocationColumnEncoding::Utf8Byte,
+                        },
+                        target,
+                    ),
+                ]))
+            );
+        }
+        picker.query_pending = true;
+        assert_eq!(
+            picker.handle_event(&ctrl_key('v')),
+            Some(KeyAction::Single(Action::Refresh))
+        );
+    }
+
+    #[test]
+    fn vim_picker_keeps_split_shortcuts_unbound() {
+        let mut picker = FilePicker::loading(&test_editor());
+        send_load(&picker, picker.load_generation, Ok(vec!["tutor".into()]));
+        picker.tick().unwrap();
+        assert_eq!(picker.handle_event(&ctrl_key('v')), None);
+        assert_eq!(picker.handle_event(&ctrl_key('s')), None);
+        assert_eq!(selected_file(&mut picker), "tutor");
     }
 
     #[test]

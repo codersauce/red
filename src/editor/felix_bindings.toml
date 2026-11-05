@@ -1,6 +1,7 @@
 # Native document-window actions. Editing commands are resolved by felix-core.
 [normal]
 "=" = "FelixFormatRange"
+"Ctrl-c" = "FelixToggleComments"
 "Alt-m" = { PluginCommand = "AgentModel" }
 "Alt-w" = { PluginCommand = "AgentClose" }
 "Alt-y" = "ScrollDown"

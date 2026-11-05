@@ -519,7 +519,7 @@ mod tests {
         assert_eq!(h.editor.current_buffer().contents(), "abc\n");
         h.editor.edit_batch.cancelled = true;
         h.keys("q").await;
-        assert_eq!(h.editor.felix_status().as_deref(), Some("NORMAL 1/1"));
+        assert_eq!(h.editor.felix_status().as_deref(), Some("NOR 1/1"));
         assert!(!h.editor.transaction_active());
         assert_eq!(h.editor.current_buffer().contents(), "abc\n");
         h.keys("q").await;

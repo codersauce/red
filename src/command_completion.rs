@@ -6,8 +6,8 @@
 use std::{fs, ops::Range, path::PathBuf};
 
 use crate::{
-    command, command_palette, copilot::CopilotCommand, plugin::RegisteredPluginCommand,
-    utils::expand_user_path,
+    command, command_palette, config::EditingModel, copilot::CopilotCommand,
+    plugin::RegisteredPluginCommand, utils::expand_user_path,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,8 +176,12 @@ fn builtin_source(name: &str, argument_index: usize) -> Option<Source> {
     }
 }
 
-fn source(context: &ArgumentContext<'_>, plugins: &[RegisteredPluginCommand]) -> Option<Source> {
-    if command_palette::colon_name_is_builtin(context.command) {
+fn source(
+    context: &ArgumentContext<'_>,
+    plugins: &[RegisteredPluginCommand],
+    model: EditingModel,
+) -> Option<Source> {
+    if command_palette::colon_name_is_builtin(context.command, model) {
         return builtin_source(context.command, context.preceding.len());
     }
     plugins
@@ -200,6 +204,7 @@ pub(crate) fn complete(
     line: &mut String,
     direction: CompletionDirection,
     plugins: &[RegisteredPluginCommand],
+    model: EditingModel,
     language_matches: impl FnOnce(&str) -> Vec<String>,
 ) {
     if let Some(mut current) = state.take() {
@@ -218,7 +223,7 @@ pub(crate) fn complete(
     }
     let nested_start = bufdo_nested_start(line);
     if nested_start == Some(line.len()) {
-        let candidates = command_palette::colon_completion_names(plugins)
+        let candidates = command_palette::colon_completion_names(plugins, model)
             .into_iter()
             .filter(|name| name != "bufdo")
             .collect::<Vec<_>>();
@@ -241,7 +246,7 @@ pub(crate) fn complete(
     let Some(context) = ArgumentContext::parse_at(completion_line, offset) else {
         return;
     };
-    let argument_source = source(&context, plugins);
+    let argument_source = source(&context, plugins, model);
     let command_name = context.command.trim_end_matches('!');
     let accepts_bare_arguments = command_name.len() == 1
         || command_palette::BUILTIN_COLON_COMMANDS
@@ -249,12 +254,26 @@ pub(crate) fn complete(
             .any(|command| command.name() == command_name);
     // Preserve established bare-command argument shortcuts without letting a newly
     // executable prefix, such as :wr, take over command-name completion.
-    let (replacement, needs_leading_space, candidates) = if context.needs_leading_space
+    let helix_split = command::helix_split::names(model).contains(&context.command);
+    let (replacement, needs_leading_space, candidates) = if helix_split {
+        let arguments = &line[context.command_end..];
+        let path = command::helix_split::paths(arguments)
+            .last()
+            .filter(|path| path.span.end == arguments.len());
+        let (start, fragment) = path.map_or((line.len(), String::new()), |path| {
+            (context.command_end + path.span.start, path.value)
+        });
+        let candidates = path_candidates(&fragment)
+            .into_iter()
+            .map(command::helix_split::quote_path)
+            .collect();
+        (start..line.len(), context.needs_leading_space, candidates)
+    } else if context.needs_leading_space
         && (!matches!(argument_source, Some(Source::Files | Source::Syntax))
             || !accepts_bare_arguments)
     {
         let start = context.replacement.start - context.command.len();
-        let names = command_palette::colon_completion_names(plugins)
+        let names = command_palette::colon_completion_names(plugins, model)
             .into_iter()
             .filter(|name| {
                 name.starts_with(context.command) && (nested_start.is_none() || name != "bufdo")
@@ -369,13 +388,20 @@ mod tests {
         direction: CompletionDirection,
         plugins: &[RegisteredPluginCommand],
     ) {
-        complete(state, line, direction, plugins, |fragment| {
-            ["rust", "yaml"]
-                .into_iter()
-                .filter(|name| name.starts_with(fragment))
-                .map(str::to_string)
-                .collect()
-        });
+        complete(
+            state,
+            line,
+            direction,
+            plugins,
+            EditingModel::Vim,
+            |fragment| {
+                ["rust", "yaml"]
+                    .into_iter()
+                    .filter(|name| name.starts_with(fragment))
+                    .map(str::to_string)
+                    .collect()
+            },
+        );
     }
 
     fn completed(input: &str) -> String {
@@ -520,6 +546,27 @@ mod tests {
         }
         assert_eq!(completed("e ."), "e ./");
         assert_eq!(completed("e .."), "e ../");
+    }
+
+    #[cfg(feature = "helix")]
+    #[test]
+    fn helix_split_completes_the_last_path_as_one_quoted_argument() {
+        let directory = tempfile::tempdir().unwrap();
+        let filename = directory.path().join("second file");
+        fs::write(&filename, "").unwrap();
+        let mut line = format!("hs first '{}/sec", directory.path().display());
+        complete(
+            &mut None,
+            &mut line,
+            CompletionDirection::Next,
+            &[],
+            EditingModel::Helix,
+            |_| Vec::new(),
+        );
+        let paths: Vec<_> = command::helix_split::paths(&line[3..])
+            .map(|argument| argument.value)
+            .collect();
+        assert_eq!(paths, ["first", filename.to_str().unwrap()]);
     }
 
     #[test]

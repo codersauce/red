@@ -578,7 +578,7 @@ def dump_suite(commit, seed, cases):
 
 
 def main():
-    from broad_cases import comment_cases, navigation_cases, shell_cases
+    from broad_cases import comment_cases, increment_cases, navigation_cases, shell_cases
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--observer", required=True, type=Path)
@@ -592,6 +592,7 @@ def main():
         "shell": shell_cases,
         "navigation": navigation_cases,
         "comments": comment_cases,
+        "increments": increment_cases,
     }
     parser.add_argument("--suite", choices=["core", *suites], default="core")
     args = parser.parse_args()
