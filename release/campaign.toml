@@ -1,5 +1,5 @@
 schema_version = 1
-version = "0.11.0"
+version = "0.11.1"
 headline = "Markdown that reads like the document, and a new way to explore code"
 summary = "Red v0.11.0 shows Markdown the way it reads: tables as grids, links without their URLs, and images right in the buffer, while every line stays editable source. Code explore is a new reading mode that follows names, dims a function to the calls that matter, and keeps a trail of where you have been, without sending your code to a model."
 website = "https://github.com/codersauce/red/releases/latest"

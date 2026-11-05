@@ -2,6 +2,15 @@
 
 All notable changes to Red are documented in this file.
 
+## [0.11.1](https://github.com/codersauce/red/compare/v0.11.0...v0.11.1)
+
+### Other
+
+- Reduce cursor redraw work and benchmark native editor navigation ([#436](https://github.com/codersauce/red/issues/436)) ([4906e4f](https://github.com/codersauce/red/commit/4906e4fc14bbfb53ef57f3dd5aa8706c140fbb72))
+- Reuse Markdown image pixels during editing and scrolling
+
+(cherry picked from commit 7733e37c6ae8fcf5fc6118428b44c526898df053) ([6706f41](https://github.com/codersauce/red/commit/6706f4194acbcc71eaa00b9c58ce756ab911adcb))
+
 ## [0.11.0](https://github.com/codersauce/red/compare/v0.10.0...v0.11.0)
 
 ### Features
