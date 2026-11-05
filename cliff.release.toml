@@ -33,10 +33,17 @@ postprocessors = [
 conventional_commits = true
 filter_unconventional = false
 split_commits = false
+commit_preprocessors = [
+  # A cherry-pick trailer is provenance, not release-note text.
+  { pattern = '\s*\(cherry picked from commit [0-9a-f]{7,40}\)', replace = "" },
+]
 tag_pattern = "v[0-9].*"
 sort_commits = "newest"
 
 commit_parsers = [
+  # Unprefixed commits that landed on main; group them by what they changed.
+  { sha = "4906e4fc14bbfb53ef57f3dd5aa8706c140fbb72", group = "<!-- 01 -->Performance" },
+  { sha = "6706f4194acbcc71eaa00b9c58ce756ab911adcb", group = "<!-- 01 -->Performance" },
   { message = "^Merge", skip = true },
   { message = "^chore\\(release\\): prepare v", skip = true },
   { message = "^almanac", skip = true },

@@ -768,7 +768,8 @@ mod tests {
     fn embedded_notes_are_for_the_installed_version_only() {
         let notes = embedded_release_notes(env!("CARGO_PKG_VERSION"));
 
-        assert!(notes.contains("### Features") || notes.contains("Included with Red"));
+        // Any changelog group counts: a patch release may have no Features.
+        assert!(notes.contains("\n### ") || notes.contains("Included with Red"));
         assert!(!notes.contains("## [0.4.0]"));
     }
 

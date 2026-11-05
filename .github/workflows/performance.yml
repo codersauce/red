@@ -81,7 +81,7 @@ jobs:
           cargo build --locked --release --bin red
           cargo build --locked --release --manifest-path tools/navigation-bench/Cargo.toml --target-dir target
       - name: Compare incremental navigation with full rendered frames
-        run: cargo test --locked --release --lib editor::navigation_perf_tests::
+        run: 'cargo test --locked --release --lib editor::navigation_perf_tests::'
       - name: Check every displayed position and saved document
         shell: bash
         run: |

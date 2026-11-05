@@ -1,69 +1,35 @@
 schema_version = 1
 version = "0.11.1"
-headline = "Markdown that reads like the document, and a new way to explore code"
-summary = "Red v0.11.0 shows Markdown the way it reads: tables as grids, links without their URLs, and images right in the buffer, while every line stays editable source. Code explore is a new reading mode that follows names, dims a function to the calls that matter, and keeps a trail of where you have been, without sending your code to a model."
+headline = "Faster cursor movement, and Markdown images that stay put"
+summary = "Red v0.11.1 is a performance release. Moving the cursor redraws only the rows that changed, and Markdown images already on screen are reused instead of sent to the terminal again while you type and scroll. It also fixes a Windows startup problem and a scrolling edge case."
 website = "https://github.com/codersauce/red/releases/latest"
-discord_image = "https://raw.githubusercontent.com/codersauce/red/main/docs/images/markdown.jpg"
 
-x_post = """{launch}. Markdown now reads like the document: tables as grids, hidden link URLs, and images drawn right in the buffer. Plus Code explore, a reading mode for unfamiliar code that never asks a model.
-
-{url}"""
-bluesky_post = """{launch}. Markdown shows tables as grids, hides link URLs, and draws images in the buffer, yet every line stays source you can edit. Code explore follows names, dims a function to its key calls, and keeps a trail, no model involved.
+x_post = """{launch}. Moving the cursor now redraws only what changed: median latency on macOS fell from 1.76 to 0.98 ms. Markdown images already on screen are reused while you type and scroll instead of being sent again.
 
 {url}"""
+bluesky_post = """{launch}. A performance release: cursor movement redraws only the rows that changed, cutting median latency on macOS from 1.76 to 0.98 ms, and Markdown images on screen are reused while you type and scroll.
+
+{url}"""
 
 [[stories]]
-id = "markdown-reading"
-title = "Markdown that reads like the document"
-summary = "Pipe tables draw as aligned grids, and link URLs, emphasis markers, and backticks take no space, so paragraphs wrap on the words you see and gj and gk move over them. The file never changes: move onto a line, or enter Insert or Visual mode, and that line shows its raw Markdown. :markdown-tables and :markdown-conceal toggle each split."
-status = "new"
-pull_requests = [424, 429]
+id = "faster-navigation"
+title = "Faster cursor movement"
+summary = "Indentation guides are reused while the cursor stays in the same scope, and a cursor move redraws only the rows that changed since the last frame. Median latency for moving within the screen fell from 1.76 to 0.98 ms on macOS, and p95 fell from 1.82 to 1.15 ms on Linux. Scrolling p95 on Linux fell from 2.47 to 2.20 ms."
+status = "improved"
+pull_requests = [436]
 channels = ["github", "discord", "x", "bluesky", "in_app"]
 
 [[stories]]
-id = "markdown-images"
-title = "Images in your Markdown"
-summary = "A line that holds only ![alt](path) shows the picture in the buffer, at full resolution in Kitty, Ghostty, WezTerm, iTerm2, and Sixel terminals, including through Herdr, Zellij, and tmux passthrough, and as smoothed block characters elsewhere. Moving onto the line shows its source above the picture without shifting the text below, and scrolling crops the image instead of squashing it. Set markdown_images to choose the protocol or turn it off."
-status = "new"
-pull_requests = [430]
+id = "markdown-image-reuse"
+title = "Markdown images stay on screen while you edit"
+summary = "An image already drawn is reused while you type, move the cursor, or scroll, instead of being encoded and sent to the terminal again. In Kitty-protocol terminals, an image entering or leaving the view no longer makes Red upload the others again."
+status = "improved"
 channels = ["github", "discord", "x", "bluesky", "in_app"]
 
 [[stories]]
-id = "markdown-links"
-title = "Follow links and tick tasks"
-summary = "gx follows a link to a web page, a local file, a heading, or a file:line reference, and Ctrl-o comes back. Ctrl-w x opens a link in a split beside the document and reuses that split for the next link. gT toggles a task checkbox as one undoable edit."
-status = "new"
-pull_requests = [424]
-channels = ["github", "discord", "in_app"]
-
-[[stories]]
-id = "code-explore"
-title = "Explore code without asking a model"
-summary = "Space e e opens Code explore: a sidebar that follows the cursor with the enclosing function, the name under it, its definition, and its matches. Space e f follows a name, Space e s dims a function to the calls into your project and the system, and Space e d and Space e b jump to a definition and back along a review trail. The error list moved from Space e to Space D."
-status = "new"
-pull_requests = [426]
-channels = ["github", "discord", "x", "bluesky", "in_app"]
-
-[[stories]]
-id = "config-overrides"
-title = "Change any setting for one launch"
-summary = "red -c theme=onedark.json -c languages.rust.indent_width=2 sets dotted keys for a single run, and quotes are optional for plain words. Later flags win, a mistyped key suggests the closest setting, and red --print-config shows the merged result."
+id = "fixes"
+title = "Steadier on Windows and with wrapped lines"
+summary = "On Windows, the terminal's reply to Red's graphics check no longer arrives as keystrokes at startup. With scrolloff set and long lines wrapping, moving into the top margin scrolls up exactly one row."
 status = "improved"
-pull_requests = [431]
-channels = ["github", "discord", "in_app"]
-
-[[stories]]
-id = "counted-scrolling"
-title = "Scrolling that remembers its distance"
-summary = "A count before Ctrl-d or Ctrl-u sets how far later presses move, as in Vim, until the window is resized. Ctrl-y and Alt-e scroll the view one line and leave the cursor in place."
-status = "improved"
-pull_requests = [432]
-channels = ["github", "in_app"]
-
-[[stories]]
-id = "steadier-editing"
-title = "Steadier under failure"
-summary = "A language server that fails or is missing no longer interrupts editing, an update retries when macOS still reports the new binary busy, and a saved Agent conversation is found again on macOS workspaces under /var and /private/var. Intel Mac builds now come from Intel runners."
-status = "improved"
-pull_requests = [423, 427, 428, 430]
+pull_requests = [436]
 channels = ["github", "discord", "in_app"]
