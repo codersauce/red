@@ -199,6 +199,29 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Package the Linux release for APT and DNF
+        env:
+          TAG_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+        run: |
+          set -euo pipefail
+          tool="$RUNNER_TEMP/nfpm.tar.gz"
+          curl -fsSL --retry 3 https://github.com/goreleaser/nfpm/releases/download/v2.48.0/nfpm_2.48.0_Linux_x86_64.tar.gz -o "$tool"
+          echo "6d7f9a28b2f397934403950fcbba83f598b08d02edbe79a0815b3b4897341750  $tool" | sha256sum --check --status
+          mkdir -p "$RUNNER_TEMP/nfpm-bin" "$RUNNER_TEMP/red-linux"
+          tar -xzf "$tool" -C "$RUNNER_TEMP/nfpm-bin" nfpm
+          tar -xzf dist/red-x86_64-unknown-linux-gnu.tar.gz -C "$RUNNER_TEMP/red-linux"
+          export PATH="$RUNNER_TEMP/nfpm-bin:$PATH"
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          export SOURCE_DATE_EPOCH
+          packaging/linux/build.sh "${TAG_NAME#v}" "$RUNNER_TEMP/red-linux" dist
+          # Both native packages declare glibc 2.34 as their minimum.
+          docker run --rm --network none -v "$RUNNER_TEMP/red-linux:/red:ro" rockylinux:9 /red/red --self-check
+          sudo apt-get update -qq
+          sudo apt-get install -y ./dist/*.deb
+          NO_COLOR=1 /usr/bin/red-editor --self-check
+          docker run --rm -v "$PWD/dist:/packages:ro" fedora:44 sh -ec \
+            'dnf -qy install /packages/*.rpm; NO_COLOR=1 /usr/bin/red-editor --self-check'
+
       - name: Add installer scripts
         run: |
           cp install/install.sh install/install.ps1 dist/

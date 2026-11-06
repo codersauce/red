@@ -1,0 +1,34 @@
+name: red-editor
+arch: amd64
+platform: linux
+version: ${RED_VERSION}
+maintainer: Felipe Coury <felipe.coury@gmail.com>
+description: Modal terminal text editor with built-in Husk plugins
+homepage: https://getred.dev
+license: MIT
+section: editors
+priority: optional
+rpm:
+  buildhost: red-release
+contents:
+  - src: ./red
+    dst: /usr/bin/red-editor
+    file_info:
+      mode: 0755
+  - src: ./LICENSE
+    dst: /usr/share/doc/red-editor/copyright
+overrides:
+  deb:
+    depends:
+      - libc6 (>= 2.34)
+      - libgcc-s1
+      - ripgrep
+    recommends:
+      - git
+  rpm:
+    depends:
+      - glibc >= 2.34
+      - libgcc
+      - ripgrep
+    recommends:
+      - git

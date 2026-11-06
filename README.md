@@ -33,6 +33,27 @@ The current documented release is
 brew install codersauce/tap/red
 ```
 
+### Nix
+
+Run Red directly from this repository:
+
+```shell
+nix run github:codersauce/red
+```
+
+To install the `red-editor` command in your profile, run
+`nix profile add github:codersauce/red`. The flake supports x86-64 Linux,
+ARM64 Linux, and Apple Silicon macOS.
+
+### Scoop
+
+```powershell
+scoop bucket add codersauce https://github.com/codersauce/red
+scoop install codersauce/red-editor
+```
+
+Run `red-editor` to open the editor. Use `scoop update red-editor` to upgrade.
+
 ### macOS and Linux
 
 ```shell
@@ -42,6 +63,18 @@ curl --proto '=https' --tlsv1.2 -fsSL https://getred.dev/install.sh | sh
 The installer selects the correct macOS or x86_64 glibc Linux archive, verifies
 its published SHA-256 checksum, installs to `~/.local/bin`, and runs Red's
 built-in self-check.
+
+For native x86-64 Linux packages, download the DEB or RPM from a
+[Red release](https://github.com/codersauce/red/releases) that includes it,
+then install the downloaded file with the command for your distribution:
+
+```shell
+sudo apt install ./red-editor_*_amd64.deb
+# Fedora
+sudo dnf install ./red-editor-*.x86_64.rpm
+```
+
+Both packages provide the `red-editor` command.
 
 ### Windows
 
@@ -74,8 +107,8 @@ red update
 Inside the editor, use `:update` or **Update Red** in the command palette. By default
 Red checks once per day and installs a newer stable release in the background after
 verifying its signed checksums; running sessions keep their version until restarted.
-Homebrew installations use `brew upgrade codersauce/tap/red`; source builds use
-your existing build process. If you installed Red before v0.8.2 or extracted an
+Use your package manager to upgrade packaged installations. For Homebrew, run
+`brew upgrade codersauce/tap/red`. For source builds, use your existing build process. If you installed Red before v0.8.2 or extracted an
 archive manually, rerun the official installer once into the same directory to
 enable managed updates. See [Updating Red](docs/UPDATING.md) for migration commands,
 restart behavior, and switching to notify-only or disabling automatic checks.
