@@ -20,6 +20,8 @@ harness = false
 members = [
     ".",
     "crates/husk",
+    "crates/red-workspace-search",
+    "tools/fff-parity",
     "crates/husk-analysis",
     "crates/husk-ast",
     "crates/husk-cli",
@@ -69,6 +71,7 @@ husk-value = { version = "0.1.0", path = "crates/husk-value" }
 husk-wasm = { version = "0.1.0", path = "crates/husk-wasm" }
 
 [dependencies]
+red-workspace-search = { path = "crates/red-workspace-search" }
 anyhow = "1.0.79"
 arboard = "3.4.1"
 base64 = "0.22.1"

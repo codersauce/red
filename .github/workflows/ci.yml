@@ -121,6 +121,11 @@ jobs:
       - name: Run tests
         run: cargo test --all-targets --all-features --verbose
 
+      - name: Compare bundled content search against ripgrep
+        run: |
+          cargo build --locked -p red-fff-parity
+          python tools/fff-parity/compare.py target/debug/red-fff-parity
+
       - name: Test platform keyboard decoder
         run: cargo test --locked --manifest-path vendor/crossterm/Cargo.toml --lib red_
 

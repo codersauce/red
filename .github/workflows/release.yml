@@ -72,7 +72,7 @@ jobs:
           archive_root="release/red-${{ matrix.target }}"
           mkdir -p "$archive_root"
           cp "target/${{ matrix.target }}/release/red" "$archive_root/"
-          cp README.md LICENSE default_config.toml "$archive_root/"
+          cp README.md LICENSE default_config.toml licenses/fff-MIT.txt "$archive_root/"
           tar -C "$archive_root" -czf "red-${{ matrix.target }}.tar.gz" .
 
       - name: Prepare release archive (Windows)
@@ -82,7 +82,7 @@ jobs:
           $archiveRoot = "release/red-${{ matrix.target }}"
           New-Item -ItemType Directory -Force -Path $archiveRoot
           Copy-Item "target/${{ matrix.target }}/release/red.exe" $archiveRoot
-          Copy-Item README.md,LICENSE,default_config.toml $archiveRoot
+          Copy-Item README.md,LICENSE,default_config.toml,licenses/fff-MIT.txt $archiveRoot
           Compress-Archive -Path "$archiveRoot/*" -DestinationPath "red-${{ matrix.target }}.zip" -Force
 
       - name: Upload release archive

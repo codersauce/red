@@ -1892,20 +1892,29 @@ impl RedHost {
                 let status = red_required_string(args, 1, "SetPanelStatus")?.to_string();
                 self.send_request(PluginRequest::SetPanelStatus { id, status });
             }
-            "CancelGitStatus" => {
+            "CancelGitStatus" | "CancelWorkspaceSearch" => {
                 let request_id = RequestId::from_raw(
                     args.first()
                         .and_then(value_to_u64)
                         .and_then(|value| i64::try_from(value).ok())
-                        .ok_or_else(|| anyhow::anyhow!("CancelGitStatus requires a request id"))?,
+                        .ok_or_else(|| anyhow::anyhow!("{action} requires a request id"))?,
                 );
                 if let Some(pending) = self.policy().pending_requests.get(&request_id) {
                     anyhow::ensure!(
                         pending.callback.plugin() == plugin,
                         "cannot cancel another plugin's request"
                     );
+                    let cancellation = match (action, pending.request.as_str()) {
+                        ("CancelGitStatus", "GetGitStatus") => {
+                            PluginRequest::CancelGitStatus { request_id }
+                        }
+                        ("CancelWorkspaceSearch", "SearchWorkspaceContent") => {
+                            PluginRequest::CancelWorkspaceSearch { request_id }
+                        }
+                        _ => anyhow::bail!("request type does not match {action}"),
+                    };
                     self.policy_mut().pending_requests.remove(&request_id);
-                    self.send_request(PluginRequest::CancelGitStatus { request_id });
+                    self.send_request(cancellation);
                 }
             }
             "KeepPanelSearch" => {
@@ -2487,6 +2496,14 @@ impl RedHost {
                 directories_only: args.get(2).and_then(Value::as_bool).unwrap_or(false),
                 request_id,
             },
+            "SearchWorkspaceContent" => {
+                PluginRequest::SearchWorkspaceContent {
+                    options: serde_json::from_value(value_to_json(args.first().ok_or_else(
+                        || anyhow::anyhow!("SearchWorkspaceContent requires options"),
+                    )?))?,
+                    request_id,
+                }
+            }
             "GetGitStatus" => PluginRequest::GetGitStatus {
                 path: args
                     .first()
@@ -4633,6 +4650,7 @@ fn validate_command_registration(
 fn trimmable_result_list(request: &str, payload: &Value) -> Option<&'static str> {
     match request {
         "DocumentSymbols" | "WorkspaceSymbols" => Some("symbols"),
+        "SearchWorkspaceContent" => Some("items"),
         "References" => Some("references"),
         // Only the workspace scope promises a newest-first prefix and a `total`;
         // an unscoped history is delivered whole or not at all, as before.
@@ -5694,6 +5712,27 @@ mod tests {
                 .await?;
         }
         Ok(())
+    }
+
+    async fn load_project_search(runtime: &mut Runtime, backend: &str) {
+        runtime
+            .load_plugin(
+                "project_search",
+                include_str!("../../plugins/project_search.hk"),
+            )
+            .await
+            .unwrap();
+        let PluginRequest::GetConfig { key, request_id } = ACTION_DISPATCHER.recv_request() else {
+            panic!("expected project-search configuration");
+        };
+        assert_eq!(key.as_deref(), Some("plugin_config"));
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({"value":{"project_search":{"backend":backend}}}),
+            )
+            .await
+            .unwrap();
     }
 
     async fn open_project_search_picker(runtime: &mut Runtime) -> PickerHandle {
@@ -14826,14 +14865,7 @@ mod tests {
         drain_requests();
         let mut runtime = Runtime::new();
         let timeout_count = runtime.pending_timeout_count();
-        runtime
-            .load_plugin(
-                "project_search",
-                include_str!("../../plugins/project_search.hk"),
-            )
-            .await
-            .unwrap();
-
+        load_project_search(&mut runtime, "rg").await;
         let handle = open_project_search_picker(&mut runtime).await;
 
         runtime
@@ -14857,14 +14889,7 @@ mod tests {
     async fn project_search_recreates_a_restored_export_without_stealing_focus() {
         drain_requests();
         let mut runtime = Runtime::new();
-        runtime
-            .load_plugin(
-                "project_search",
-                include_str!("../../plugins/project_search.hk"),
-            )
-            .await
-            .unwrap();
-
+        load_project_search(&mut runtime, "rg").await;
         runtime
             .notify(
                 "editor:panes_restore",
@@ -14921,14 +14946,7 @@ mod tests {
         drain_requests();
         let mut runtime = Runtime::new();
         let timeout_count = runtime.pending_timeout_count();
-        runtime
-            .load_plugin(
-                "project_search",
-                include_str!("../../plugins/project_search.hk"),
-            )
-            .await
-            .unwrap();
-
+        load_project_search(&mut runtime, "rg").await;
         let handle = open_project_search_picker(&mut runtime).await;
         runtime
             .notify_picker(handle, PickerCallback::Query("needle".to_string()))
@@ -18248,6 +18266,53 @@ mod tests {
         }
     }
 
+    async fn notify_due_timers(runtime: &mut Runtime) {
+        for callback in runtime.poll_timer_callbacks() {
+            if let PluginRequest::TimeoutCallback { timer_id } = callback {
+                runtime
+                    .notify("timeout:callback", json!({ "timer_id": timer_id }))
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn project_search_native_query_supersedes_an_owned_request() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        load_project_search(&mut runtime, "fff").await;
+        let handle = open_project_search_picker(&mut runtime).await;
+        runtime
+            .notify_picker(handle, PickerCallback::Query("first".into()))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        notify_due_timers(&mut runtime).await;
+        let id = drain_collect()
+            .into_iter()
+            .find_map(|request| match request {
+                PluginRequest::SearchWorkspaceContent {
+                    options,
+                    request_id,
+                } if options.query.pattern == "first" => Some(request_id),
+                _ => None,
+            })
+            .expect("FFF search must work with no process permissions");
+        runtime
+            .notify_picker(handle, PickerCallback::Query("second".into()))
+            .unwrap();
+        assert!(drain_collect().into_iter().any(|r| matches!(r,
+            PluginRequest::CancelWorkspaceSearch { request_id } if request_id == id)));
+        assert!(!runtime
+            .resolve_request(id, serde_json::json!({}))
+            .await
+            .unwrap());
+        runtime
+            .notify_picker(handle, PickerCallback::Cancelled)
+            .unwrap();
+        drain_requests();
+    }
+
     #[tokio::test]
     async fn project_search_streams_rg_matches_into_picker() {
         drain_requests();
@@ -18259,14 +18324,7 @@ mod tests {
                 ..PluginPermissions::default()
             },
         )]));
-        runtime
-            .load_plugin(
-                "project_search",
-                include_str!("../../plugins/project_search.hk"),
-            )
-            .await
-            .unwrap();
-
+        load_project_search(&mut runtime, "rg").await;
         let handle = open_project_search_picker(&mut runtime).await;
 
         let query = ["ProjectSearch", "State"].concat();
@@ -18275,17 +18333,7 @@ mod tests {
             .unwrap();
 
         tokio::time::sleep(Duration::from_millis(120)).await;
-        for callback in runtime.poll_timer_callbacks() {
-            if let PluginRequest::TimeoutCallback { timer_id } = callback {
-                runtime
-                    .notify(
-                        "timeout:callback",
-                        serde_json::json!({ "timer_id": timer_id }),
-                    )
-                    .await
-                    .unwrap();
-            }
-        }
+        notify_due_timers(&mut runtime).await;
 
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::UpdatePickerItems { id, items } => {
@@ -18307,17 +18355,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         let item = loop {
             pump_process_events(&mut runtime).await.unwrap();
-            for callback in runtime.poll_timer_callbacks() {
-                if let PluginRequest::TimeoutCallback { timer_id } = callback {
-                    runtime
-                        .notify(
-                            "timeout:callback",
-                            serde_json::json!({ "timer_id": timer_id }),
-                        )
-                        .await
-                        .unwrap();
-                }
-            }
+            notify_due_timers(&mut runtime).await;
             let mut found = None;
             while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
                 if let PluginRequest::UpdatePickerItems { id, items } = request {

@@ -1,4 +1,4 @@
-// Debounced project search picker and export panel backed by a permitted ripgrep process.
+// Debounced project search picker and export panel with selectable search backends.
 //
 // A new query cancels older process and timer state, parsed matches retain byte-encoded
 // locations explicitly, and refreshes are batched to protect the editor loop. Query
@@ -6,6 +6,31 @@
 
 struct StringValueEvent {
     value: String,
+}
+
+struct ProjectSearchBackendOptions {
+    backend: String,
+}
+
+struct ProjectSearchPluginConfig {
+    project_search: ProjectSearchBackendOptions,
+}
+
+struct ProjectSearchConfigEvent {
+    value: ProjectSearchPluginConfig,
+}
+
+struct WorkspaceSearchResult {
+    preview_enabled: bool,
+    items: [ProjectSearchItem],
+    total: i32,
+    truncated: bool,
+    error: String,
+}
+
+#[red::config("plugin_config")]
+fn project_search_config(event: ProjectSearchConfigEvent) {
+    red::state_patch(ProjectSearchState { backend: red::string(event.value.project_search.backend, "rg") });
 }
 
 struct StoredValueEvent {
@@ -81,6 +106,8 @@ struct ProjectSearchState {
     history_draft: String,
     items: [ProjectSearchItem],
     process: String,
+    request: i64,
+    backend: String,
     query: String,
     generation: i32,
     debounce: String,
@@ -108,6 +135,8 @@ fn initial_state() -> ProjectSearchState {
         history_draft: "",
         items: [],
         process: "",
+        request: 0,
+        backend: "rg",
         query: "",
         generation: 0,
         debounce: "",
@@ -146,7 +175,9 @@ fn project_search() {
 
 fn reset_state() {
     cancel_timers();
-    red::state_set(initial_state());
+    let fresh = initial_state();
+    fresh.backend = state().backend;
+    red::state_set(fresh);
 }
 
 fn cwd_loaded(event: StringValueEvent) {
@@ -166,7 +197,7 @@ fn history_loaded(event: StoredValueEvent) {
     red::state_patch(ProjectSearchState { history: history });
     let handle = red::execute("OpenPicker", "Find in Files", [], PickerOptions {
         external_filter: true,
-        placeholder: "Search with ripgrep",
+        placeholder: "Search workspace files",
         status: status_text(),
         actions: [
             PickerAction { action: "open_horizontal", key: "Ctrl-s", label: "Open horizontal split" },
@@ -191,9 +222,12 @@ fn history_loaded(event: StoredValueEvent) {
 }
 
 fn search_query(query: String) {
-    red::state_patch(ProjectSearchState { query: query });
-    red::state_patch(ProjectSearchState { history_index: -1 });
-    red::state_patch(ProjectSearchState { history_draft: query });
+    cancel_native_request();
+    if state().backend == "fff" {
+        red::state_patch(ProjectSearchState { items: [], running: query != "", error: "", truncated: false });
+        refresh_picker();
+    }
+    red::state_patch(ProjectSearchState { query: query, history_index: -1, history_draft: query });
     schedule_run();
 }
 
@@ -222,19 +256,30 @@ fn timeout_callback(event: TimerEvent) {
 
 fn run_search(query: String) {
     cancel_process();
-    red::state_patch(ProjectSearchState { generation: red::int(state().generation, 0) + 1 });
-    red::state_patch(ProjectSearchState { query: query });
-    red::state_patch(ProjectSearchState { items: [] });
-    red::state_patch(ProjectSearchState { stderr: "" });
-    red::state_patch(ProjectSearchState { error: "" });
-    red::state_patch(ProjectSearchState { truncated: false });
-    red::state_patch(ProjectSearchState { running: query != "" });
+    red::state_patch(ProjectSearchState {
+        generation: red::int(state().generation, 0) + 1,
+        query: query, items: [], stderr: "", error: "", truncated: false, running: query != "",
+    });
     refresh_picker();
 
     if query == "" {
         return;
     }
 
+    let current = state();
+    if current.backend == "fff" {
+        let request = red::request("SearchWorkspaceContent", native_search_completed, Json {
+            pattern: query, regex: current.regex, hidden: current.hidden, ignored: current.ignored,
+            follow: current.follow, preview: current.preview, generation: current.generation,
+        });
+        red::state_patch(ProjectSearchState { request: request });
+        return;
+    }
+    if current.backend != "rg" {
+        red::state_patch(ProjectSearchState { running: false, error: "Unknown project search backend: " + current.backend });
+        refresh_picker();
+        return;
+    }
     let process_id = red::execute("SpawnProcess", Process {
         command: "rg",
         args: ripgrep_args(query),
@@ -276,7 +321,40 @@ fn ripgrep_args(query: String) -> [String] {
     return red::push(args, query);
 }
 
+struct WorkspaceSearchFirstMatch {
+    request_id: i64,
+    item: ProjectSearchItem,
+}
+
+#[red::on("workspace_search:first_match")]
+fn native_first_match(event: WorkspaceSearchFirstMatch) {
+    if event.request_id != state().request { return; }
+    red::state_patch(ProjectSearchState { items: [with_preview(event.item, state().preview)] });
+    refresh_picker();
+}
+
+fn native_search_completed(result: WorkspaceSearchResult, request_id: i64) {
+    if request_id != state().request { return; }
+    red::state_patch(ProjectSearchState {
+        request: 0, running: false, error: result.error,
+        truncated: result.truncated || red::len(result.items) < result.total, items: result.items,
+    });
+    if result.preview_enabled != state().preview {
+        rebuild_items();
+    } else {
+        refresh_picker();
+    }
+}
+
+fn cancel_native_request() {
+    if state().request != (0 as i64) {
+        red::execute("CancelWorkspaceSearch", state().request);
+        red::state_patch(ProjectSearchState { request: 0 });
+    }
+}
+
 fn cancel_process() {
+    cancel_native_request();
     let process_id = red::string(state().process, "");
     if process_id != "" {
         red::execute("KillProcess", process_id);
@@ -582,15 +660,20 @@ fn move_history(delta: i32) {
     run_search(query);
 }
 
+fn with_preview(item: ProjectSearchItem, enabled: bool) -> ProjectSearchItem {
+    if enabled {
+        item.preview = item.data.preview;
+    } else {
+        item.preview = red::null();
+    }
+    return item;
+}
+
 fn rebuild_items() {
+    let current = state();
     let rebuilt = [];
-    for item in state().items {
-        let preview = red::null();
-        if state().preview {
-            preview = item.data.preview;
-        }
-        item.preview = preview;
-        rebuilt = red::push(rebuilt, item);
+    for item in current.items {
+        rebuilt = red::push(rebuilt, with_preview(item, current.preview));
     }
     red::state_patch(ProjectSearchState { items: rebuilt });
     refresh_picker();

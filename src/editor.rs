@@ -75,6 +75,7 @@ mod shell_command;
 mod signature_help;
 mod snippet;
 mod update;
+mod workspace_search;
 
 use std::{
     borrow::Cow,
@@ -2329,6 +2330,21 @@ pub enum PluginRequest {
         request_id: RequestId,
         payload: Value,
     },
+    SearchWorkspaceContent {
+        options: workspace_search::Options,
+        request_id: RequestId,
+    },
+    WorkspaceSearchFirstMatch {
+        request_id: RequestId,
+        item: Value,
+    },
+    WorkspaceContentSearched {
+        request_id: RequestId,
+        payload: Value,
+    },
+    CancelWorkspaceSearch {
+        request_id: RequestId,
+    },
     GetGitStatus {
         path: String,
         request_id: RequestId,
@@ -2509,6 +2525,10 @@ impl PluginRequest {
             Self::DirectoryListed { .. } => "DirectoryListed",
             Self::SearchWorkspacePaths { .. } => "SearchWorkspacePaths",
             Self::WorkspacePathsSearched { .. } => "WorkspacePathsSearched",
+            Self::SearchWorkspaceContent { .. } => "SearchWorkspaceContent",
+            Self::WorkspaceSearchFirstMatch { .. } => "WorkspaceSearchFirstMatch",
+            Self::WorkspaceContentSearched { .. } => "WorkspaceContentSearched",
+            Self::CancelWorkspaceSearch { .. } => "CancelWorkspaceSearch",
             Self::GetGitStatus { .. } => "GetGitStatus",
             Self::GitStatusLoaded { .. } => "GitStatusLoaded",
             Self::CancelGitStatus { .. } => "CancelGitStatus",
@@ -3737,6 +3757,7 @@ pub struct Editor {
 
     /// Short-lived Git metadata used by configurable status-line sections.
     statusline_git_cache: StatuslineGitCache,
+    workspace_search: workspace_search::Service,
     pending_git_status: HashMap<RequestId, PendingGitStatus>,
 
     /// Plugin system registry
@@ -5942,6 +5963,7 @@ impl Editor {
                 ..StatuslineGitCache::default()
             },
             plugin_registry,
+            workspace_search: workspace_search::Service::default(),
             pending_git_status: HashMap::new(),
             plugin_catalog: BTreeMap::new(),
             plugin_catalog_url: plugin::catalog::catalog_url(),
@@ -14314,6 +14336,38 @@ impl Editor {
                     self.plugin_registry
                         .resolve_request(runtime, request_id, payload)
                         .await?;
+                }
+                PluginRequest::SearchWorkspaceContent {
+                    options,
+                    request_id,
+                } => {
+                    self.workspace_search
+                        .start(runtime.clone(), request_id, options);
+                }
+                PluginRequest::WorkspaceSearchFirstMatch { request_id, item } => {
+                    if let Some(owner) = runtime.request_plugin(request_id) {
+                        self.plugin_registry
+                            .notify_plugin(
+                                runtime,
+                                &owner,
+                                "workspace_search:first_match",
+                                json!({"request_id": request_id.get(), "item": item}),
+                            )
+                            .await?;
+                    }
+                }
+                PluginRequest::WorkspaceContentSearched {
+                    request_id,
+                    payload,
+                } => {
+                    if self.workspace_search.remove(request_id) {
+                        self.plugin_registry
+                            .resolve_request(runtime, request_id, payload)
+                            .await?;
+                    }
+                }
+                PluginRequest::CancelWorkspaceSearch { request_id } => {
+                    self.workspace_search.remove(request_id);
                 }
                 PluginRequest::GetGitStatus { path, request_id } => {
                     let callback_runtime = runtime.clone();

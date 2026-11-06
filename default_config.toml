@@ -635,6 +635,10 @@ nerd_font = true
 # function = "fn"
 # struct = ""
 
+# Use "fff" to search with the bundled content index.
+[plugin_config.project_search]
+backend = "rg"
+
 [plugin_permissions.project_search]
 process = ["rg"]
 

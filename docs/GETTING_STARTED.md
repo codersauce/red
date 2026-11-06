@@ -301,12 +301,17 @@ Use Neo-tree for file operations.
 | `Ctrl-p`, then `>` | Switch from files to commands |
 | `Ctrl-e` | Toggle hidden files in the picker; open the tree otherwise |
 | `Ctrl-j` or `Space b` | Buffer picker |
-| `Space g` | Project search using `rg` |
+| `Space g` | Find in Files |
 | `Space t` | Theme browser |
 
 Press `Alt-p` or `F4` in the file, buffer, or project-search picker to hide or
 restore its preview. The query and selected result stay in place, and hiding
 the preview gives long result paths more room.
+
+To try the bundled FFF backend for Find in Files, launch Red with
+`red -c plugin_config.project_search.backend=fff` and press `Space g`. To keep
+that setting, put `backend = "fff"` under `[plugin_config.project_search]` in
+your configuration. The `rg` backend is the default.
 
 In the file picker, append `:<line>` to a fuzzy filename query to open the
 selected file at that line. For example, `sona:123` opens `source_name.rs` at line 123.
