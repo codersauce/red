@@ -1648,6 +1648,17 @@ impl RedHost {
                 let status = args.get(1).map(value_to_string);
                 self.send_request(PluginRequest::UpdatePickerStatus { id, status });
             }
+            "UpdatePickerBadges" => {
+                let id = args.first().and_then(value_to_i32).unwrap_or(1);
+                self.ensure_picker_owner(plugin, id, "UpdatePickerBadges")?;
+                let badges = args
+                    .get(1)
+                    .map(value_to_json)
+                    .map(serde_json::from_value::<Vec<String>>)
+                    .transpose()?
+                    .unwrap_or_default();
+                self.send_request(PluginRequest::UpdatePickerBadges { id, badges });
+            }
             "UpdatePickerBusy" => {
                 let id = args.first().and_then(value_to_i32).unwrap_or(1);
                 self.ensure_picker_owner(plugin, id, "UpdatePickerBusy")?;
@@ -5766,6 +5777,7 @@ mod tests {
                 assert_eq!(title.as_deref(), Some("Find in Files"));
                 assert!(items.is_empty());
                 assert!(options.external_filter);
+                assert!(options.badges.is_empty(), "default scope has no badges");
                 assert!(options
                     .actions
                     .iter()
@@ -14867,6 +14879,8 @@ mod tests {
             PluginRequest::UpdatePickerItems { id, items } if id == handle.get() && items.is_empty()));
         assert!(matches!(ACTION_DISPATCHER.recv_request(),
             PluginRequest::UpdatePickerStatus { id, .. } if id == handle.get()));
+        assert!(matches!(ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerBadges { id, .. } if id == handle.get()));
 
         runtime
             .notify_picker(handle, PickerCallback::Cancelled)
@@ -18309,6 +18323,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_search_badges_follow_scope_toggles_before_any_query() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        load_project_search(&mut runtime).await;
+        let handle = open_project_search_picker(&mut runtime).await;
+        let mut toggle = |action: &str| {
+            runtime
+                .notify_picker(
+                    handle,
+                    PickerCallback::Action {
+                        action: action.to_string(),
+                        item: None,
+                        query: String::new(),
+                    },
+                )
+                .unwrap();
+            drain_collect()
+                .into_iter()
+                .filter_map(|request| match request {
+                    PluginRequest::UpdatePickerBadges { id, badges } if id == handle.get() => {
+                        Some(badges)
+                    }
+                    _ => None,
+                })
+                .last()
+                .unwrap_or_else(|| panic!("{action} must refresh the picker badges"))
+        };
+
+        assert_eq!(toggle("toggle_hidden"), ["+hidden"]);
+        assert_eq!(toggle("toggle_ignored"), ["+hidden", "+ignored"]);
+        assert_eq!(toggle("toggle_all"), Vec::<String>::new());
+        assert_eq!(toggle("toggle_all"), ["+hidden", "+ignored"]);
+        assert_eq!(toggle("toggle_regex"), ["literal", "+hidden", "+ignored"]);
+        assert_eq!(
+            toggle("toggle_follow"),
+            ["literal", "+hidden", "+ignored", "+symlinks"]
+        );
+
+        runtime
+            .notify_picker(handle, PickerCallback::Cancelled)
+            .unwrap();
+        drain_requests();
+    }
+
+    #[tokio::test]
     async fn project_search_displays_workspace_results_without_process_permissions() {
         drain_requests();
         let mut runtime = Runtime::new();
@@ -18388,6 +18447,16 @@ mod tests {
         }
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::UpdatePickerStatus { id, .. } => assert_eq!(id, handle.get()),
+            _ => panic!("unexpected plugin request"),
+        }
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdatePickerBadges { id, badges } => {
+                assert_eq!(id, handle.get());
+                assert!(
+                    badges.is_empty(),
+                    "preview is not a scope badge: {badges:?}"
+                );
+            }
             _ => panic!("unexpected plugin request"),
         }
 

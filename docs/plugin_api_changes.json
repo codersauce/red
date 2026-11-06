@@ -4,7 +4,7 @@
     {
       "version": "0.22.0",
       "kind": "introduced",
-      "symbols": ["SearchWorkspaceContent", "CancelWorkspaceSearch", "workspace_search:first_match"],
+      "symbols": ["SearchWorkspaceContent", "CancelWorkspaceSearch", "workspace_search:first_match", "PickerOptions.badges", "UpdatePickerBadges"],
       "migration_note": "docs/PLUGIN_API.md#workspace-content-search"
     },
     {
