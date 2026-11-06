@@ -1,0 +1,29 @@
+{
+    "version": "0.11.1",
+    "description": "Modal terminal text editor with built-in Husk plugins",
+    "homepage": "https://getred.dev",
+    "license": "MIT",
+    "depends": "main/ripgrep",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/codersauce/red/releases/download/v0.11.1/red-x86_64-pc-windows-msvc.zip",
+            "hash": "32e404273bf40633fb1de9c173c00195b9b6c328b12ef476dcfc51be7fa9a560"
+        }
+    },
+    "bin": [
+        ["red.exe", "red-editor"]
+    ],
+    "checkver": {
+        "github": "https://github.com/codersauce/red"
+    },
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/codersauce/red/releases/download/v$version/red-x86_64-pc-windows-msvc.zip"
+            }
+        },
+        "hash": {
+            "url": "https://github.com/codersauce/red/releases/download/v$version/SHA256SUMS.txt"
+        }
+    }
+}

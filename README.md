@@ -33,6 +33,27 @@ The current documented release is
 brew install codersauce/tap/red
 ```
 
+### Nix
+
+Run Red directly from this repository:
+
+```shell
+nix run github:codersauce/red
+```
+
+To install the `red-editor` command in your profile, run
+`nix profile add github:codersauce/red`. The flake supports x86-64 Linux,
+ARM64 Linux, and Apple Silicon macOS.
+
+### Scoop
+
+```powershell
+scoop bucket add codersauce https://github.com/codersauce/red
+scoop install codersauce/red-editor
+```
+
+Run `red-editor` to open the editor. Use `scoop update red-editor` to upgrade.
+
 ### macOS and Linux
 
 ```shell
