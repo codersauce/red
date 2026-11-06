@@ -110,9 +110,6 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Install ripgrep
-        uses: ./.github/actions/install-ripgrep
-
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
         with:
@@ -120,6 +117,11 @@ jobs:
 
       - name: Run tests
         run: cargo test --all-targets --all-features --verbose
+
+      - name: Verify bundled content search fixtures
+        run: |
+          cargo build --locked -p red-fff-parity
+          python tools/fff-parity/compare.py target/debug/red-fff-parity
 
       - name: Test platform keyboard decoder
         run: cargo test --locked --manifest-path vendor/crossterm/Cargo.toml --lib red_

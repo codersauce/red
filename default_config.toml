@@ -635,9 +635,6 @@ nerd_font = true
 # function = "fn"
 # struct = ""
 
-[plugin_permissions.project_search]
-process = ["rg"]
-
 [plugin_permissions.git]
 process = ["git"]
 

@@ -108,7 +108,7 @@ operating system; release builds use separate target-specific caches [@ci].
 | Job | Main checks |
 | --- | --- |
 | `workflow-lint` | Validates GitHub Actions workflows, checks the README release version, validates the main-branch ruleset recipe that requires `CI Gate`, validates the reviewed release campaign, and runs release-campaign, Discord announcement, social-release, and test-tooling unit tests [@ci] [@main-ruleset]. |
-| `test` | Runs `cargo test --all-targets --all-features --verbose` with stable Rust and checksum-verified ripgrep on Ubuntu, macOS, and Windows; then runs the vendored Crossterm keyboard decoder tests and, outside Windows, builds `red` and exercises the terminal keyboard protocol in a Unix PTY [@ci] [@keyboard-protocol]. |
+| `test` | Runs `cargo test --all-targets --all-features --verbose` with stable Rust on Ubuntu, macOS, and Windows; then checks the bundled content search fixtures and runs the vendored Crossterm keyboard decoder tests and, outside Windows, builds `red` and exercises the terminal keyboard protocol in a Unix PTY [@ci] [@keyboard-protocol]. |
 | `clippy` | Denies every all-target, all-feature clippy warning on Ubuntu for code pull requests and manual runs; post-merge pushes and documentation-only pull requests skip it [@ci]. |
 | `fmt` | Runs `cargo fmt --all -- --check` [@ci]. |
 | `self-check` | Runs `cargo run --locked -- --self-check` to initialize and validate bundled runtime state [@ci]. |
@@ -126,11 +126,6 @@ fallback labels are `ubuntu-latest`, `macos-latest`, and `windows-latest`
 `Rustfmt`, `Bundled Runtime Self-Check`, `Changelog`, `Documentation`, and
 `CI Gate` run on GitHub-hosted `ubuntu-latest` rather than WarpBuild runners
 [@ci].
-
-The shared ripgrep action downloads pinned Linux and Windows ripgrep 15.2.0
-release archives, verifies their published SHA-256 digests, and installs them
-without refreshing Linux package indexes. macOS reuses an existing ripgrep or
-installs it with Homebrew [@ci].
 
 The CI cost-control runbook treats `CI Gate` as the stable branch-protection
 check, and the checked-in main-branch ruleset requires `CI Gate` as the only
@@ -203,8 +198,8 @@ Ubuntu and writes check results with the repository `GITHUB_TOKEN`
 ## Nightly Rust Workflow
 
 The Nightly Rust workflow runs on a scheduled Monday cron and can be started
-manually [@nightly]. It installs the nightly toolchain and checksum-verified
-ripgrep on Ubuntu, restores a toolchain-aware Rust cache, and runs the same
+manually [@nightly]. It installs the nightly toolchain
+on Ubuntu, restores a toolchain-aware Rust cache, and runs the same
 all-target, all-feature test command used by the main CI test job [@nightly].
 
 ## Release Workflow

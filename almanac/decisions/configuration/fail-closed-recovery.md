@@ -18,7 +18,7 @@ Red chooses fail-closed recovery for unreadable or malformed whole-file user con
 
 ## Context
 
-Configuration controls both ordinary editor behavior and surfaces that can launch processes or load plugin code. The complete default file enables bundled plugins, maps plugin commands into the default keymap, selects a theme, configures LSP defaults, and grants process permissions to selected bundled plugins such as project search and Git [@defaults]. A malformed whole file therefore cannot be treated as just a missing color or keymap setting.
+Configuration controls both ordinary editor behavior and surfaces that can launch processes or load plugin code. The complete default file enables bundled plugins, maps plugin commands into the default keymap, selects a theme, configures LSP defaults, and grants process permissions to the bundled Git plugin [@defaults]. A malformed whole file therefore cannot be treated as just a missing color or keymap setting.
 
 Red already has a more precise recovery path for partial user errors. Unknown fields produce diagnostics and are ignored, invalid individual values keep previous valid defaults or disable only the affected plugin, plugin permission, language server, agent, or LSP unit, and command-line override fragments remain strict [@config]. Whole-file failure is different because Red cannot reliably identify independent user fields after an unreadable file or malformed TOML document [@config].
 

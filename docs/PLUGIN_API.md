@@ -1,6 +1,6 @@
 # Plugin compatibility
 
-Red host API version `0.21.0` is defined by
+Red host API version `0.22.0` is defined by
 [`src/plugin/host_api.json`](../src/plugin/host_api.json). That file is the canonical,
 machine-readable list of execute actions, request actions, signatures, and introduction
 versions. Runtime dispatch and the bundled-plugin corpus are checked against it in tests.
@@ -24,10 +24,10 @@ required/optional arity (`HUSK-A0002`) and obvious literal argument types
 annotations use `HUSK-A0004`. `--no-typecheck` is an unsupported development
 escape hatch; compatibility guarantees do not apply while it is enabled.
 
-Host API `0.21.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`,
+Host API `0.22.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`,
 `0.8.0`, `0.9.0`,
 `0.10.0`, `0.11.0`, `0.12.0`, `0.14.0`, `0.16.0`, `0.17.0`, `0.18.0`, `0.19.0`,
-and `0.20.0` contracts, so existing packages that declare those minors continue
+`0.20.0`, and `0.21.0` contracts, so existing packages that declare those minors continue
 to load. New packages should target `"red_api_version": "^0.21.0"`.
 
 ## Standalone JSON-RPC packages
@@ -254,6 +254,30 @@ directory `children`, expanded ancestor paths, the total match count,
 `truncated`, and an optional `error`. Paths are normalized relative to the
 requested workspace root. `InvalidateWorkspacePaths(path)` drops its cached
 index after filesystem changes. Neither call grants subprocess permissions.
+
+## Workspace content search
+
+`SearchWorkspaceContent(callback, options)` searches files on disk under the
+editor's current directory, captured when the host accepts the request. Supply
+`pattern` (string) and `regex` (boolean). Optional booleans `hidden`, `ignored`,
+and `follow` default to false. Following links may reach files outside the
+workspace. `preview` defaults to true and `generation` defaults to zero.
+
+When a file matches, the requesting plugin receives one `workspace_search:first_match`
+event with `request_id` and `item`. The final callback includes that row. Check the
+request ID before applying either update to a picker.
+
+The callback receives the result and request ID. The result includes `root`,
+`generation`, `items`, `total`, `truncated`, and `error` (empty on success).
+Each picker item includes an absolute location, zero-based line, UTF-8 byte
+column and preview ranges, plus character ranges relative to its displayed
+detail. Results contain up to 500 matching lines and 2 MiB of item JSON.
+`total` counts collected rows before payload or plugin heap trimming. Compare it
+with the delivered row count when indicating truncation. An error may accompany
+partial results if the worker could not read a path.
+
+`CancelWorkspaceSearch(request_id)` cancels the calling plugin's request and
+suppresses its callback. Both calls were introduced in host API `0.22.0`.
 
 ## Workspace file operations
 

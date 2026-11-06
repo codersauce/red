@@ -1,29 +1,20 @@
-// Debounced project search picker and export panel backed by a permitted ripgrep process.
-//
-// A new query cancels older process and timer state, parsed matches retain byte-encoded
-// locations explicitly, and refreshes are batched to protect the editor loop. Query
-// history is plugin storage, while result text belongs to the current process only.
+// Find in Files presents bundled workspace search results and stores query history per cwd.
 
 struct StringValueEvent {
     value: String,
 }
 
+struct WorkspaceSearchResult {
+    preview_enabled: bool,
+    items: [ProjectSearchItem],
+    total: i32,
+    truncated: bool,
+    error: String,
+}
+
 struct StoredValueEvent {
     // Storage values are user-defined JSON and are keyed by arbitrary workspace paths.
     value: Json,
-}
-
-struct RipgrepSubmatch {
-    start: i32,
-    end: i32,
-}
-
-struct RipgrepMatchData {
-    // Ripgrep text fields may be `{ text }` or `{ bytes }` depending on UTF-8 validity.
-    path: Json,
-    lines: Json,
-    line_number: i32,
-    submatches: [RipgrepSubmatch],
 }
 
 struct ProjectSearchPanelRow {
@@ -80,12 +71,9 @@ struct ProjectSearchState {
     history_index: i32,
     history_draft: String,
     items: [ProjectSearchItem],
-    process: String,
+    request: i64,
     query: String,
-    generation: i32,
     debounce: String,
-    refresh: String,
-    stderr: String,
     running: bool,
     error: String,
     hidden: bool,
@@ -107,12 +95,9 @@ fn initial_state() -> ProjectSearchState {
         history_index: -1,
         history_draft: "",
         items: [],
-        process: "",
+        request: 0,
         query: "",
-        generation: 0,
         debounce: "",
-        refresh: "",
-        stderr: "",
         running: false,
         error: "",
         hidden: false,
@@ -134,19 +119,14 @@ fn state() -> ProjectSearchState {
     title = "Search project",
     category = "Search",
     description = "Find text across the workspace",
-    aliases = ["ripgrep", "find text"],
+    aliases = ["fff", "find text"],
     scope = "global",
 )]
 fn project_search() {
     close_search_picker();
-    cancel_process();
-    reset_state();
-    red::request("GetConfig", cwd_loaded, "cwd");
-}
-
-fn reset_state() {
-    cancel_timers();
+    cancel_search();
     red::state_set(initial_state());
+    red::request("GetConfig", cwd_loaded, "cwd");
 }
 
 fn cwd_loaded(event: StringValueEvent) {
@@ -166,7 +146,7 @@ fn history_loaded(event: StoredValueEvent) {
     red::state_patch(ProjectSearchState { history: history });
     let handle = red::execute("OpenPicker", "Find in Files", [], PickerOptions {
         external_filter: true,
-        placeholder: "Search with ripgrep",
+        placeholder: "Search workspace files",
         status: status_text(),
         actions: [
             PickerAction { action: "open_horizontal", key: "Ctrl-s", label: "Open horizontal split" },
@@ -191,181 +171,78 @@ fn history_loaded(event: StoredValueEvent) {
 }
 
 fn search_query(query: String) {
-    red::state_patch(ProjectSearchState { query: query });
-    red::state_patch(ProjectSearchState { history_index: -1 });
-    red::state_patch(ProjectSearchState { history_draft: query });
-    schedule_run();
+    red::state_patch(ProjectSearchState { history_index: -1, history_draft: query });
+    prepare_search(query);
+    if query != "" {
+        red::state_patch(ProjectSearchState { debounce: red::execute("SetTimeout", 100) });
+    }
 }
 
-fn schedule_run() {
-    let previous = red::string(state().debounce, "");
-    if previous != "" {
-        red::execute("CancelTimeout", previous);
-    }
-    let timer = red::execute("SetTimeout", 100);
-    red::state_patch(ProjectSearchState { debounce: timer });
+fn prepare_search(query: String) {
+    cancel_search();
+    red::state_patch(ProjectSearchState {
+        query: query, items: [], error: "", truncated: false, running: query != "",
+    });
+    refresh_picker();
 }
 
 #[red::on("timeout:callback")]
 fn timeout_callback(event: TimerEvent) {
     if event.timer_id == state().debounce {
         red::state_patch(ProjectSearchState { debounce: "" });
-        run_search(red::string(state().query, ""));
-        return;
-    }
-
-    if event.timer_id == state().refresh {
-        red::state_patch(ProjectSearchState { refresh: "" });
-        refresh_picker();
+        request_matches();
     }
 }
 
 fn run_search(query: String) {
-    cancel_process();
-    red::state_patch(ProjectSearchState { generation: red::int(state().generation, 0) + 1 });
-    red::state_patch(ProjectSearchState { query: query });
-    red::state_patch(ProjectSearchState { items: [] });
-    red::state_patch(ProjectSearchState { stderr: "" });
-    red::state_patch(ProjectSearchState { error: "" });
-    red::state_patch(ProjectSearchState { truncated: false });
-    red::state_patch(ProjectSearchState { running: query != "" });
-    refresh_picker();
+    prepare_search(query);
+    request_matches();
+}
 
-    if query == "" {
-        return;
-    }
-
-    let process_id = red::execute("SpawnProcess", Process {
-        command: "rg",
-        args: ripgrep_args(query),
-        cwd: red::string(state().cwd, "."),
+fn request_matches() {
+    let current = state();
+    if current.query == "" { return; }
+    let request = red::request("SearchWorkspaceContent", search_completed, Json {
+        pattern: current.query, regex: current.regex, hidden: current.hidden,
+        ignored: current.ignored, follow: current.follow, preview: current.preview,
     });
-    red::state_patch(ProjectSearchState { process: process_id });
-    red::on("process:" + process_id, process_event);
+    red::state_patch(ProjectSearchState { request: request });
 }
 
-fn ripgrep_args(query: String) -> [String] {
-    let args: [String] = [
-        "--json",
-        "--color=never",
-        "--no-heading",
-        "--with-filename",
-        "--line-number",
-        "--column",
-        "--smart-case",
-        "--max-columns=500",
-        "--max-columns-preview",
-        "--glob=!.bare",
-        "--glob=!.git",
-    ];
-    if state().hidden {
-        args = red::push(args, "--hidden");
+struct WorkspaceSearchFirstMatch {
+    request_id: i64,
+    item: ProjectSearchItem,
+}
+
+#[red::on("workspace_search:first_match")]
+fn first_match(event: WorkspaceSearchFirstMatch) {
+    if event.request_id != state().request { return; }
+    red::state_patch(ProjectSearchState { items: [with_preview(event.item, state().preview)] });
+    refresh_picker();
+}
+
+fn search_completed(result: WorkspaceSearchResult, request_id: i64) {
+    if request_id != state().request { return; }
+    red::state_patch(ProjectSearchState {
+        request: 0, running: false, error: result.error,
+        truncated: result.truncated || red::len(result.items) < result.total, items: result.items,
+    });
+    if result.preview_enabled != state().preview {
+        rebuild_items();
     } else {
-        args = red::push(args, "--no-hidden");
-    }
-    if state().ignored {
-        args = red::push(args, "--no-ignore");
-    }
-    if state().follow {
-        args = red::push(args, "--follow");
-    }
-    if !state().regex {
-        args = red::push(args, "--fixed-strings");
-    }
-    args = red::push(args, "--");
-    return red::push(args, query);
-}
-
-fn cancel_process() {
-    let process_id = red::string(state().process, "");
-    if process_id != "" {
-        red::execute("KillProcess", process_id);
-        red::state_patch(ProjectSearchState { process: "" });
+        refresh_picker();
     }
 }
 
-fn cancel_timers() {
-    let debounce = red::string(state().debounce, "");
-    if debounce != "" {
-        red::execute("CancelTimeout", debounce);
+fn cancel_search() {
+    let current = state();
+    if current.debounce != "" {
+        red::execute("CancelTimeout", current.debounce);
     }
-    let refresh = red::string(state().refresh, "");
-    if refresh != "" {
-        red::execute("CancelTimeout", refresh);
+    if current.request != (0 as i64) {
+        red::execute("CancelWorkspaceSearch", current.request);
     }
-    red::state_patch(ProjectSearchState { debounce: "" });
-    red::state_patch(ProjectSearchState { refresh: "" });
-}
-
-fn process_event(event: ProcessEvent) {
-    match event {
-        ProcessEvent::Stdout { process_id, line, plugin_name } => {
-            if process_id == state().process {
-                process_stdout(line);
-            }
-        }
-        ProcessEvent::Stderr { process_id, line, plugin_name } => {
-            if process_id == state().process {
-                red::state_patch(ProjectSearchState { stderr: state().stderr + line + "\n" });
-            }
-        }
-        ProcessEvent::Error { process_id, message, plugin_name } => {
-            if process_id == state().process {
-                red::state_patch(ProjectSearchState { running: false });
-                red::state_patch(ProjectSearchState { error: message });
-                red::state_patch(ProjectSearchState { process: "" });
-                schedule_refresh();
-            }
-        }
-        ProcessEvent::Exit { process_id, code, plugin_name } => {
-            if process_id != state().process {
-                return;
-            }
-            red::state_patch(ProjectSearchState { running: false });
-            red::state_patch(ProjectSearchState { process: "" });
-            let exit_code = 0;
-            if let Some(value) = code {
-                exit_code = value;
-            }
-            if !state().truncated && exit_code != 0 && exit_code != 1 {
-                let error = red::trim(state().stderr);
-                if error == "" {
-                    error = "rg exited with code " + exit_code;
-                }
-                red::state_patch(ProjectSearchState { error: error });
-            }
-            schedule_refresh();
-        }
-    }
-}
-
-fn process_stdout(line: String) {
-    let message = red::parse_json(line);
-    if message["type"] != "match" {
-        return;
-    }
-
-    let items = state().items;
-    if red::len(items) >= 500 {
-        return;
-    }
-
-    let item = match_item(message.data, red::len(items));
-    items = red::push(items, item);
-    red::state_patch(ProjectSearchState { items: items });
-    if red::len(items) >= 500 {
-        red::state_patch(ProjectSearchState { truncated: true });
-        red::state_patch(ProjectSearchState { running: false });
-        cancel_process();
-    }
-    schedule_refresh();
-}
-
-fn schedule_refresh() {
-    if red::string(state().refresh, "") != "" {
-        return;
-    }
-    red::state_patch(ProjectSearchState { refresh: red::execute("SetTimeout", 16) });
+    red::state_patch(ProjectSearchState { debounce: "", request: 0 });
 }
 
 fn refresh_picker() {
@@ -422,71 +299,6 @@ fn append_flag(flags: String, flag: String) -> String {
     return flags + " " + flag;
 }
 
-fn match_item(data: RipgrepMatchData, index: i32) -> ProjectSearchItem {
-    let path = red::text_field(data.path);
-    let normalized_path = red::replace_all(path, "\\", "/");
-    let path_parts = red::split(normalized_path, "/");
-    let display_name = red::string(path_parts[red::len(path_parts) - 1], normalized_path);
-    let display_parent = "";
-    if red::len(path_parts) > 1 {
-        let parent_parts = [];
-        let part_index = 0;
-        for part in path_parts {
-            if part_index < red::len(path_parts) - 1 {
-                parent_parts = red::push(parent_parts, part);
-            }
-            part_index = part_index + 1;
-        }
-        display_parent = red::join(parent_parts, "/") + "/";
-    }
-    let line = red::int(data.line_number, 1) - 1;
-    let text = red::trim_line_end(red::text_field(data.lines));
-    let first_match = data.submatches[0];
-    let start = red::int(first_match.start, 0);
-    let end = red::int(first_match.end, start);
-    let detail_matches = [];
-    let preview_matches = [];
-    for submatch in data.submatches {
-        let match_start = red::int(submatch.start, 0);
-        let match_end = red::int(submatch.end, match_start);
-        detail_matches = red::push(detail_matches, [
-            red::utf8_byte_to_char_index(text, match_start),
-            red::utf8_byte_to_char_index(text, match_end),
-        ]);
-        preview_matches = red::push(preview_matches, [match_start, match_end]);
-    }
-
-    let stored_preview = Json {
-        path: path,
-        line: line,
-        column: start,
-        matches: preview_matches,
-    };
-    let preview = red::null();
-    if state().preview {
-        preview = stored_preview;
-    }
-
-    return ProjectSearchItem {
-        id: path + ":" + line + ":" + start + ":" + index,
-        label: display_name,
-        kind: "FileMatch",
-        annotation: display_parent + ":" + (line + 1) + ":" + (start + 1),
-        detail: text,
-        detail_matches: detail_matches,
-        data: Json {
-            location: Location {
-                path: path,
-                line: line,
-                column: start,
-                column_encoding: "utf8-byte",
-            },
-            preview: stored_preview,
-        },
-        preview: preview,
-    };
-}
-
 fn picker_action(event: PickerActionEvent) {
     if event.action == "open_horizontal" {
         open_item(event.item, "horizontal");
@@ -530,8 +342,7 @@ fn open_item(item: PickerItem, target: String) {
         return;
     }
     remember_query();
-    cancel_process();
-    cancel_timers();
+    cancel_search();
     close_search_picker();
     red::execute("OpenLocation", item.data.location, target);
 }
@@ -582,15 +393,20 @@ fn move_history(delta: i32) {
     run_search(query);
 }
 
+fn with_preview(item: ProjectSearchItem, enabled: bool) -> ProjectSearchItem {
+    if enabled {
+        item.preview = item.data.preview;
+    } else {
+        item.preview = red::null();
+    }
+    return item;
+}
+
 fn rebuild_items() {
+    let current = state();
     let rebuilt = [];
-    for item in state().items {
-        let preview = red::null();
-        if state().preview {
-            preview = item.data.preview;
-        }
-        item.preview = preview;
-        rebuilt = red::push(rebuilt, item);
+    for item in current.items {
+        rebuilt = red::push(rebuilt, with_preview(item, current.preview));
     }
     red::state_patch(ProjectSearchState { items: rebuilt });
     refresh_picker();
@@ -674,8 +490,7 @@ fn export_panel_event(event: ProjectSearchPanelEvent) {
 
 fn picker_cancelled(event: PickerCancelled) {
     red::state_patch(ProjectSearchState { picker: None });
-    cancel_process();
-    cancel_timers();
+    cancel_search();
 }
 
 fn close_search_picker() {
@@ -689,8 +504,7 @@ fn close_search_picker() {
 #[red::lifecycle("deactivate")]
 fn deactivate() {
     close_search_picker();
-    cancel_process();
-    cancel_timers();
+    cancel_search();
     red::execute("ClosePanel", "project-search-results");
 }
 
