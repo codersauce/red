@@ -16,6 +16,7 @@
 pub mod agent_check;
 pub mod agent_conversation;
 pub mod agent_tools;
+pub mod agent_watch;
 pub mod assets;
 pub mod buffer;
 pub mod cli;

@@ -4,6 +4,8 @@
 //! message follows the same rules: color only on a TTY and only when the
 //! `NO_COLOR` convention is not set, alignment computed on unstyled text, and
 //! a closed stdout pipe ending the process quietly instead of panicking.
+//! The interactive editor does not use this module for its theme; it opts
+//! back into color in `terminal_output::enable_theme_color`.
 //!
 //! Plain (uncolored) output is a stable interface: release CI and the updater
 //! match `--self-check` lines verbatim, so styling must only ever add ANSI
