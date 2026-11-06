@@ -1,0 +1,19 @@
+pkgbase = red-editor-bin
+	pkgdesc = Modal terminal text editor with built-in Husk plugins
+	pkgver = 0.11.1
+	pkgrel = 1
+	url = https://getred.dev
+	arch = x86_64
+	license = MIT
+	depends = glibc
+	depends = gcc-libs
+	depends = ripgrep
+	optdepends = git: Git integration
+	provides = red-editor=0.11.1
+	conflicts = red-editor
+	options = !strip
+	options = !debug
+	source = red-editor-bin-0.11.1.tar.gz::https://github.com/codersauce/red/releases/download/v0.11.1/red-x86_64-unknown-linux-gnu.tar.gz
+	sha256sums = 26d61a8d9718746f918764b45785183efcb9f052257807640950df8d48bef593
+
+pkgname = red-editor-bin

@@ -195,3 +195,19 @@ git push origin v0.2.0-rc1
   key before switching the secret, so existing installations trust the new key.
 - If a tag was pushed with the wrong version, delete the draft release and tag,
   fix the version, and push a new tag before publishing anything.
+
+
+### Linux and downstream packages
+
+The draft release includes x86-64 DEB and RPM packages for glibc 2.34 or
+newer. They install `/usr/bin/red-editor` alongside GNU ed. Their filenames
+start with `red-`, so the release signs their checksums with the other assets.
+Use `packaging/linux/build.sh VERSION EXTRACTED_ARCHIVE OUTPUT_DIRECTORY`
+with nFPM 2.48.0 to reproduce them from the Linux release tarball.
+
+After publishing a stable release, update the Scoop manifest in
+`bucket/red-editor.json` with its Windows ZIP checksum. Update
+`packaging/arch/PKGBUILD` with the Linux tarball checksum, regenerate
+`.SRCINFO` with `makepkg --printsrcinfo > .SRCINFO`, and publish both files to
+the AUR package repository. The Nix flake reads the version and dependencies
+from the current checkout.
