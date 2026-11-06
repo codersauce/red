@@ -2010,6 +2010,10 @@ pub enum PluginRequest {
         id: i32,
         status: Option<String>,
     },
+    UpdatePickerBadges {
+        id: i32,
+        badges: Vec<String>,
+    },
     UpdatePickerBusy {
         id: i32,
         busy: bool,
@@ -2442,6 +2446,7 @@ impl PluginRequest {
             Self::UpdatePickerQuery { .. } => "UpdatePickerQuery",
             Self::UpdatePickerSelection { .. } => "UpdatePickerSelection",
             Self::UpdatePickerStatus { .. } => "UpdatePickerStatus",
+            Self::UpdatePickerBadges { .. } => "UpdatePickerBadges",
             Self::UpdatePickerBusy { .. } => "UpdatePickerBusy",
             Self::UpdatePickerPreview { .. } => "UpdatePickerPreview",
             Self::ClosePicker { .. } => "ClosePicker",
@@ -13294,6 +13299,12 @@ impl Editor {
                 PluginRequest::UpdatePickerStatus { id, status } => {
                     if let Some(dialog) = &mut self.current_dialog {
                         dialog.update_picker(id, PickerUpdate::Status(status));
+                    }
+                    needs_render = true;
+                }
+                PluginRequest::UpdatePickerBadges { id, badges } => {
+                    if let Some(dialog) = &mut self.current_dialog {
+                        dialog.update_picker(id, PickerUpdate::Badges(badges));
                     }
                     needs_render = true;
                 }

@@ -107,8 +107,13 @@ impl FilePickerVisibility {
         self.ignored = self.hidden;
     }
 
-    fn status(self) -> Option<String> {
-        (self.hidden || self.ignored).then(|| "hidden ignored".to_string())
+    /// Labels each widened scope for the picker divider; the default scope has none.
+    fn badges(self) -> Vec<String> {
+        [(self.hidden, "+hidden"), (self.ignored, "+ignored")]
+            .into_iter()
+            .filter(|(enabled, _)| *enabled)
+            .map(|(_, label)| label.to_string())
+            .collect()
     }
 }
 
@@ -184,13 +189,8 @@ impl FilePicker {
         self.picker.enable_background_filter();
         self.picker
             .set_empty_message(Some("Loading files...".to_string()));
-        self.picker.set_status(Some(format!(
-            "Scanning...{}",
-            self.visibility
-                .status()
-                .map(|status| format!(" {status}"))
-                .unwrap_or_default()
-        )));
+        self.picker.set_status(Some("Scanning...".to_string()));
+        self.picker.set_badges(self.visibility.badges());
         self.picker.set_busy(true);
     }
 
@@ -276,7 +276,7 @@ impl Component for FilePicker {
                     result.discovered
                 ))
             } else {
-                self.visibility.status()
+                None
             };
             self.picker.apply_background_items(
                 result.items,
@@ -284,19 +284,6 @@ impl Component for FilePicker {
                 self.root_path.clone(),
                 selected,
             );
-            let status = if !result.done {
-                status.map(|status| {
-                    format!(
-                        "{status}{}",
-                        self.visibility
-                            .status()
-                            .map(|visibility| format!(" {visibility}"))
-                            .unwrap_or_default()
-                    )
-                })
-            } else {
-                status
-            };
             self.picker.set_status(status);
             self.picker.set_busy(!result.done);
             self.picker.set_empty_message(Some(
@@ -1525,8 +1512,15 @@ mod tests {
         );
         let mut buffer = RenderBuffer::new(80, 24, &Style::default());
         picker.draw(&mut buffer).unwrap();
-        assert!(buffer_text(&buffer).contains("hidden ignored"));
+        assert!(buffer_text(&buffer).contains("+hidden  +ignored"));
         wait_for_load(&mut picker);
+        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+        picker.draw(&mut buffer).unwrap();
+        let text = buffer_text(&buffer);
+        assert!(
+            text.contains("+hidden  +ignored") && text.contains("2/3"),
+            "badges must stay visible next to the result count:\n{text}"
+        );
 
         let expanded_selection = picker.handle_event(&key(KeyCode::Enter));
         assert_eq!(
@@ -1544,6 +1538,9 @@ mod tests {
         picker.handle_event(&ctrl_key('e'));
         assert_eq!(picker.visibility, FilePickerVisibility::default());
         wait_for_load(&mut picker);
+        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+        picker.draw(&mut buffer).unwrap();
+        assert!(!buffer_text(&buffer).contains("+hidden"));
         assert_eq!(
             picker.handle_event(&key(KeyCode::Enter)),
             Some(KeyAction::Multiple(vec![

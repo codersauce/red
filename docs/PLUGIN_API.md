@@ -442,8 +442,8 @@ process-specific and filesystem-watch-specific event names.
 New pickers should use
 `OpenPicker(title: String, items: [PickerItem], options: PickerOptions, handlers: PickerHandlers)`.
 The host returns an opaque integer handle that may be passed to `UpdatePickerItems`,
-`UpdatePickerQuery`, `UpdatePickerSelection`, `UpdatePickerStatus`, and `ClosePicker`. Plugins
-must not assign or interpret this handle.
+`UpdatePickerQuery`, `UpdatePickerSelection`, `UpdatePickerStatus`, `UpdatePickerBadges`,
+and `ClosePicker`. Plugins must not assign or interpret this handle.
 
 ```husk
 red::execute("OpenPicker", "Themes", items, PickerOptions {
@@ -466,6 +466,15 @@ Callbacks are retained by the runtime and delivered only to the plugin that open
 picker. They do not use global `picker:*:<id>` subscriptions. Picker items and callback
 payloads use the declared `PickerItem`, `PickerCancelled`, and `PickerActionEvent` records;
 the `PickerItem.data` field remains `Json` so a plugin can attach its own payload.
+
+`PickerOptions.badges: [String]` labels active filters at the start of the footer divider,
+in the theme's warning color, while `status` keeps its place at the end. Use them for state
+that changes what the picker covers, such as `+hidden` or `+ignored`, and leave them empty
+for defaults so a badge always marks a departure from them.
+`UpdatePickerBadges(id: i32, badges: [String])` replaces the list; send it whenever that
+state changes, including before the user has typed a query. When the divider is too narrow,
+trailing badges are dropped whole rather than truncated. Both were introduced in host API
+`0.22.0`.
 
 `OpenPicker` was added in host API `0.3.0`. New plugins targeting this Red release should
 declare `"red_api_version": "^0.7.0"`. The numeric-ID `OpenDynamicPicker` API remains

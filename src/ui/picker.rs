@@ -134,6 +134,8 @@ const MAX_FILTER_HISTORY_ENTRIES: usize = 8;
 const MAX_FILTER_HISTORY_ITEMS_PER_ENTRY: usize = 16_384;
 const INTRINSIC_COLUMN_GAP: usize = 2;
 const INTRINSIC_FOOTER_GAP: usize = 4;
+/// Divider cells kept between the left corner and the first filter badge.
+const BADGE_DIVIDER_LEAD: usize = 1;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -233,6 +235,9 @@ pub struct PickerOptions {
     pub initial_selection: Option<String>,
     #[serde(default)]
     pub status: Option<String>,
+    /// Short labels for active filters, drawn at the start of the footer divider.
+    #[serde(default)]
+    pub badges: Vec<String>,
     #[serde(default)]
     pub busy: bool,
     #[serde(default)]
@@ -277,6 +282,7 @@ pub enum PickerUpdate {
     Query(String),
     Selection(String),
     Status(Option<String>),
+    Badges(Vec<String>),
     Busy(bool),
     Preview(Option<PickerPreview>),
 }
@@ -426,6 +432,7 @@ pub struct Picker {
     tree_prefixes: RefCell<Option<Arc<[String]>>>,
     external_filter: bool,
     status: Option<String>,
+    badges: Vec<String>,
     busy_since: Option<Instant>,
     busy_frame: u64,
     key_actions: Vec<PickerKeyAction>,
@@ -630,6 +637,7 @@ impl Picker {
             tree_prefixes: RefCell::new(None),
             external_filter: false,
             status: None,
+            badges: Vec::new(),
             busy_since: None,
             busy_frame: 0,
             key_actions: Vec::new(),
@@ -746,6 +754,10 @@ impl Picker {
         } else {
             prompt_width.max(status_width)
         };
+        let badges_width = self.badges_text().map_or(0, |badges| {
+            BADGE_DIVIDER_LEAD + display_width(&badges) + INTRINSIC_FOOTER_GAP + status_width
+        });
+        let footer_width = footer_width.max(badges_width);
         item_width.max(footer_width)
     }
 
@@ -793,6 +805,7 @@ impl Picker {
         picker.external_filter = options.external_filter;
         picker.placeholder = options.placeholder;
         picker.status = options.status;
+        picker.badges = options.badges;
         picker.set_busy(options.busy);
         picker.key_actions = options.actions;
         picker.preview = options.preview;
@@ -1143,6 +1156,7 @@ impl Picker {
             }
             PickerUpdate::Selection(id) => self.select_dynamic_id(&id),
             PickerUpdate::Status(status) => self.status = status,
+            PickerUpdate::Badges(badges) => self.badges = badges,
             PickerUpdate::Busy(busy) => self.set_busy(busy),
             PickerUpdate::Preview(preview) => self.preview = preview,
         }
@@ -1175,6 +1189,11 @@ impl Picker {
 
     pub fn set_status(&mut self, status: Option<String>) {
         self.status = status;
+    }
+
+    /// Replaces the active-filter labels shown on the footer divider.
+    pub fn set_badges(&mut self, badges: Vec<String>) {
+        self.badges = badges;
     }
 
     /// Keeps file previews aligned with structurally shared open-buffer contents.
@@ -2035,9 +2054,47 @@ impl Picker {
             .saturating_sub(inline_status_width)
     }
 
+    /// Joins filter badges into the padded divider label, or `None` when no filter is active.
+    fn badges_text(&self) -> Option<String> {
+        (!self.badges.is_empty()).then(|| format!(" {} ", self.badges.join("  ")))
+    }
+
+    /// Draws as many whole badges as fit before the divider's status text.
+    fn draw_badges(&self, buffer: &mut RenderBuffer, y: usize, reserved: usize) {
+        let available = self.width.saturating_sub(BADGE_DIVIDER_LEAD + reserved + 1);
+        let mut shown = Vec::new();
+        for badge in &self.badges {
+            shown.push(badge.as_str());
+            if display_width(&format!(" {} ", shown.join("  "))) > available {
+                shown.pop();
+                break;
+            }
+        }
+        if shown.is_empty() {
+            return;
+        }
+        let text = format!(" {} ", shown.join("  "));
+        let border = &self.theme.ui_style.popup_border;
+        let accent = self
+            .role_style("warning")
+            .unwrap_or_else(|| self.theme.ui_style.picker_prompt.clone());
+        let style = Style {
+            fg: accent.fg.or(self.theme.ui_style.picker_prompt.fg),
+            bg: border.bg,
+            bold: true,
+            ..Style::default()
+        };
+        buffer.set_text(self.x + 1 + BADGE_DIVIDER_LEAD, y, &text, &style);
+    }
+
     fn draw_prompt(&self, buffer: &mut RenderBuffer, layout: PickerLayout) {
         self.draw_separator(buffer, layout.separator_y);
         let status = self.prompt_status();
+        let separator_status_width = status
+            .as_deref()
+            .filter(|_| !self.status_on_query_line)
+            .map_or(0, display_width);
+        self.draw_badges(buffer, layout.separator_y, separator_status_width);
         let query_width = self.prompt_query_width(status.as_deref());
         buffer.set_text(
             self.x + 1,
@@ -4903,6 +4960,47 @@ mod tests {
         assert!(render_row(&buffer, separator_y).contains("Searching (0/500)"));
         assert!(render_row(&buffer, prompt_y).contains("ProjectSearch"));
         assert!(!render_row(&buffer, prompt_y).contains("Searching"));
+    }
+
+    #[test]
+    fn filter_badges_share_the_divider_with_the_status() {
+        let editor = test_editor();
+        let mut picker = Picker::new(Some("Find in Files".to_string()), &editor, &[], None);
+        picker.status = Some("Type to search".to_string());
+        picker.set_badges(vec!["+hidden".to_string(), "+ignored".to_string()]);
+        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+
+        picker.draw(&mut buffer).unwrap();
+
+        let separator = render_row(&buffer, picker.layout().separator_y);
+        assert!(
+            separator.contains("├─ +hidden  +ignored ─") && separator.contains(" Type to search ┤"),
+            "{separator}"
+        );
+
+        picker.set_badges(Vec::new());
+        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+        picker.draw(&mut buffer).unwrap();
+        assert!(!render_row(&buffer, picker.layout().separator_y).contains("+hidden"));
+    }
+
+    #[test]
+    fn filter_badges_that_would_reach_the_status_are_dropped_whole() {
+        let editor = test_editor();
+        let mut picker = Picker::new(Some("Find in Files".to_string()), &editor, &[], None);
+        picker.width = 36;
+        picker.status = Some("123 matches (limit reached)".to_string());
+        picker.set_badges(vec!["+hidden".to_string(), "+ignored".to_string()]);
+        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+
+        picker.draw(&mut buffer).unwrap();
+
+        let separator = render_row(&buffer, picker.layout().separator_y);
+        assert!(
+            separator.contains("123 matches (limit reached)"),
+            "{separator}"
+        );
+        assert!(!separator.contains("+ign"), "{separator}");
     }
 
     #[test]

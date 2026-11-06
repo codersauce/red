@@ -148,6 +148,7 @@ fn history_loaded(event: StoredValueEvent) {
         external_filter: true,
         placeholder: "Search workspace files",
         status: status_text(),
+        badges: badges(),
         actions: [
             PickerAction { action: "open_horizontal", key: "Ctrl-s", label: "Open horizontal split" },
             PickerAction { action: "open_vertical", key: "Ctrl-v", label: "Open vertical split" },
@@ -251,6 +252,26 @@ fn refresh_picker() {
     };
     red::execute("UpdatePickerItems", handle, state().items);
     red::execute("UpdatePickerStatus", handle, status_text());
+    red::execute("UpdatePickerBadges", handle, badges());
+}
+
+// Labels the settings that change which files or matches the search covers, so a widened
+// search stays visible even before a query is typed. Defaults produce no badges.
+fn badges() -> [String] {
+    let badges = [];
+    if !state().regex {
+        badges = red::push(badges, "literal");
+    }
+    if state().hidden {
+        badges = red::push(badges, "+hidden");
+    }
+    if state().ignored {
+        badges = red::push(badges, "+ignored");
+    }
+    if state().follow {
+        badges = red::push(badges, "+symlinks");
+    }
+    return badges;
 }
 
 fn status_text() -> String {
@@ -259,28 +280,9 @@ fn status_text() -> String {
         return error;
     }
 
-    let flags = "";
-    if state().regex {
-        flags = append_flag(flags, "regex");
-    } else {
-        flags = append_flag(flags, "literal");
-    }
-    if state().hidden {
-        flags = append_flag(flags, "hidden");
-    }
-    if state().ignored {
-        flags = append_flag(flags, "ignored");
-    }
-    if state().follow {
-        flags = append_flag(flags, "follow");
-    }
-    if state().preview {
-        flags = append_flag(flags, "preview");
-    }
-
     let count = red::len(state().items);
     if state().running {
-        return "Searching (" + count + "/500) [" + flags + "]";
+        return "Searching (" + count + "/500)";
     }
     if red::string(state().query, "") == "" {
         return "Type to search";
@@ -289,14 +291,7 @@ fn status_text() -> String {
     if state().truncated {
         status = status + " (limit reached)";
     }
-    return status + " [" + flags + "]";
-}
-
-fn append_flag(flags: String, flag: String) -> String {
-    if flags == "" {
-        return flag;
-    }
-    return flags + " " + flag;
+    return status;
 }
 
 fn picker_action(event: PickerActionEvent) {
