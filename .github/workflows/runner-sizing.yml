@@ -56,9 +56,6 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Install ripgrep
-        uses: ./.github/actions/install-ripgrep
-
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
         with:

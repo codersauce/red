@@ -1,6 +1,6 @@
 # Checking Red's bundled Find in Files backend
 
-Build the driver with the workspace lockfile, then run the differential corpus:
+Build the driver with the workspace lockfile, then run the fixture corpus:
 
 ```sh
 cargo build --release --locked -p red-fff-parity
@@ -9,13 +9,14 @@ python3 tools/fff-parity/compare.py target/release/red-fff-parity
 
 The driver keeps a search engine alive across input queries. The comparison
 waits for its index to become available, then checks paths, line numbers, every
-byte range, regex errors, and truncation against the installed rg. It creates
+byte range, regex errors, and truncation against expected results. Pass
+`--against-rg` to also check those expectations with an installed rg. It creates
 disposable ordinary directories, Git repositories, and linked worktrees.
 `--raw` runs the same comparison against the released FFF FilePicker in an
 isolated driver process. Differences are expected in that mode. The default
 comparison exercises the code Red ships.
 
-For timings, supply a real checkout and queries with at most 500 matching lines:
+For comparative timings, install rg and supply a real checkout and queries with at most 500 matching lines:
 
 ```sh
 python3 tools/fff-parity/bench.py target/release/red-fff-parity . OpenCallbackPicker ZzNoFffSymbol6381
@@ -34,7 +35,7 @@ Red links FFF 0.11.0 with its default Rust walker feature. Upstream's high-level
 grep changes raw patterns, visibility rules, Unicode matching, and offsets after
 512 bytes. Red uses the pinned library's bigram filter on owned input bytes and
 uses the Rust `grep-regex` and `grep-searcher` libraries to search candidates.
-The opt-in backend requires no external executable.
+Find in Files always uses this bundled backend.
 
 Each query walks current ignore rules and follows the requested symlink policy.
 Only indexed ASCII files with a matching identity and change timestamp qualify
@@ -77,7 +78,5 @@ rg 15.2.0. On a synthetic 2,048-file corpus its worker produced the first row in
 completed in 90 ms median (101 ms p95). The Windows Red executable also loaded
 the FFF configuration. The release workflow builds Windows with MSVC.
 
-The configured default remains `rg`. Before switching it, run the packaged
-editor on Windows MSVC, measure search latency and memory on representative
-Windows checkouts, and evaluate first-query latency on large workspaces. The CI
-matrix runs the differential corpus when this branch is published.
+CI runs the fixture corpus on the platform matrix. Only the optional
+`--against-rg` comparison and comparative benchmarks require an rg executable.

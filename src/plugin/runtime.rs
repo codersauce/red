@@ -5714,22 +5714,11 @@ mod tests {
         Ok(())
     }
 
-    async fn load_project_search(runtime: &mut Runtime, backend: &str) {
+    async fn load_project_search(runtime: &mut Runtime) {
         runtime
             .load_plugin(
                 "project_search",
                 include_str!("../../plugins/project_search.hk"),
-            )
-            .await
-            .unwrap();
-        let PluginRequest::GetConfig { key, request_id } = ACTION_DISPATCHER.recv_request() else {
-            panic!("expected project-search configuration");
-        };
-        assert_eq!(key.as_deref(), Some("plugin_config"));
-        runtime
-            .resolve_request(
-                request_id,
-                serde_json::json!({"value":{"project_search":{"backend":backend}}}),
             )
             .await
             .unwrap();
@@ -14865,13 +14854,19 @@ mod tests {
         drain_requests();
         let mut runtime = Runtime::new();
         let timeout_count = runtime.pending_timeout_count();
-        load_project_search(&mut runtime, "rg").await;
+        load_project_search(&mut runtime).await;
         let handle = open_project_search_picker(&mut runtime).await;
 
         runtime
             .notify_picker(handle, PickerCallback::Query("needle".to_string()))
             .unwrap();
         assert_eq!(runtime.pending_timeout_count(), timeout_count + 1);
+
+        // Typing clears the previous rows and shows search progress before the debounce fires.
+        assert!(matches!(ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerItems { id, items } if id == handle.get() && items.is_empty()));
+        assert!(matches!(ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerStatus { id, .. } if id == handle.get()));
 
         runtime
             .notify_picker(handle, PickerCallback::Cancelled)
@@ -14889,7 +14884,7 @@ mod tests {
     async fn project_search_recreates_a_restored_export_without_stealing_focus() {
         drain_requests();
         let mut runtime = Runtime::new();
-        load_project_search(&mut runtime, "rg").await;
+        load_project_search(&mut runtime).await;
         runtime
             .notify(
                 "editor:panes_restore",
@@ -14946,7 +14941,7 @@ mod tests {
         drain_requests();
         let mut runtime = Runtime::new();
         let timeout_count = runtime.pending_timeout_count();
-        load_project_search(&mut runtime, "rg").await;
+        load_project_search(&mut runtime).await;
         let handle = open_project_search_picker(&mut runtime).await;
         runtime
             .notify_picker(handle, PickerCallback::Query("needle".to_string()))
@@ -18281,7 +18276,7 @@ mod tests {
     async fn project_search_native_query_supersedes_an_owned_request() {
         drain_requests();
         let mut runtime = Runtime::new();
-        load_project_search(&mut runtime, "fff").await;
+        load_project_search(&mut runtime).await;
         let handle = open_project_search_picker(&mut runtime).await;
         runtime
             .notify_picker(handle, PickerCallback::Query("first".into()))
@@ -18314,80 +18309,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn project_search_streams_rg_matches_into_picker() {
+    async fn project_search_displays_workspace_results_without_process_permissions() {
         drain_requests();
-
-        let mut runtime = Runtime::new_with_permissions(HashMap::from([(
-            "project_search".to_string(),
-            PluginPermissions {
-                process: vec!["rg".to_string()],
-                ..PluginPermissions::default()
-            },
-        )]));
-        load_project_search(&mut runtime, "rg").await;
+        let mut runtime = Runtime::new();
+        load_project_search(&mut runtime).await;
         let handle = open_project_search_picker(&mut runtime).await;
-
-        let query = ["ProjectSearch", "State"].concat();
+        let query = "needle".to_string();
         runtime
             .notify_picker(handle, PickerCallback::Query(query.clone()))
             .unwrap();
-
         tokio::time::sleep(Duration::from_millis(120)).await;
         notify_due_timers(&mut runtime).await;
+        let request_id = drain_collect()
+            .into_iter()
+            .find_map(|request| match request {
+                PluginRequest::SearchWorkspaceContent {
+                    options,
+                    request_id,
+                } if options.query.pattern == query => Some(request_id),
+                _ => None,
+            })
+            .expect("Find in Files should issue a workspace search");
 
-        match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::UpdatePickerItems { id, items } => {
-                assert_eq!(id, handle.get());
-                assert!(items.is_empty());
-            }
-            _ => panic!("unexpected plugin request"),
-        }
-        match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::UpdatePickerStatus { id, status } => {
-                assert_eq!(id, handle.get());
-                assert!(status
-                    .as_deref()
-                    .is_some_and(|status| status.starts_with("Searching (0/500)")));
-            }
-            _ => panic!("unexpected plugin request"),
-        }
+        let path = std::env::current_dir().unwrap().join("notes.txt");
+        let preview = json!({"path": path, "line": 2, "column": 5, "matches": [[5,11]]});
+        let row = json!({
+            "id":"test-row", "label":"notes.txt", "kind":"FileMatch", "annotation":":3:6",
+            "detail":"😀 needle", "detail_matches":[[2,8]], "preview":preview,
+            "data":{"preview":preview, "location":{"path":path, "line":2, "column":5, "column_encoding":"utf8-byte"}}
+        });
+        assert!(runtime
+            .notify_plugin_isolated(
+                "project_search",
+                "workspace_search:first_match",
+                json!({"request_id":request_id.get(), "item":row})
+            )
+            .is_empty());
+        assert!(drain_collect().iter().any(|request| matches!(request,
+            PluginRequest::UpdatePickerItems { id, items } if *id == handle.get() && items.len() == 1 && items[0].id == "test-row")));
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let item = loop {
-            pump_process_events(&mut runtime).await.unwrap();
-            notify_due_timers(&mut runtime).await;
-            let mut found = None;
-            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
-                if let PluginRequest::UpdatePickerItems { id, items } = request {
-                    assert_eq!(id, handle.get());
-                    if let Some(item) = items.first() {
-                        found = Some(item.clone());
-                        break;
-                    }
+        runtime
+            .resolve_request(
+                request_id,
+                json!({
+                    "preview_enabled":true, "items":[row], "total":1, "truncated":false, "error":""
+                }),
+            )
+            .await
+            .unwrap();
+        let item = drain_collect()
+            .into_iter()
+            .find_map(|request| match request {
+                PluginRequest::UpdatePickerItems { id, items } if id == handle.get() => {
+                    items.into_iter().next()
                 }
-            }
-            if let Some(item) = found {
-                break item;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "project search did not produce a picker item"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        };
+                _ => None,
+            })
+            .expect("completed search must populate the picker");
+        assert_eq!(item.label, "notes.txt");
+        assert!(item.preview.is_some());
 
-        assert_eq!(item.label, "project_search.hk");
-        assert!(item
-            .annotation
-            .as_deref()
-            .is_some_and(|annotation| annotation.starts_with("plugins/:")));
-        assert_eq!(item.kind.as_deref(), Some("FileMatch"));
-        assert!(item
-            .detail
-            .as_deref()
-            .is_some_and(|detail| detail.contains(&["ProjectSearch", "State"].concat())));
-
-        drain_requests();
         runtime
             .notify_picker(
                 handle,
@@ -18430,10 +18411,7 @@ mod tests {
         }
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::OpenLocation { location, target } => {
-                assert_eq!(
-                    PathBuf::from(location.path),
-                    Path::new("plugins").join("project_search.hk")
-                );
+                assert_eq!(PathBuf::from(location.path), path);
                 assert_eq!(target, crate::plugin::OpenLocationTarget::Current);
             }
             _ => panic!("unexpected plugin request"),

@@ -80,9 +80,6 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install ripgrep
-        uses: ./.github/actions/install-ripgrep
-
       - name: Install cargo-nextest
         if: inputs.runner != 'cargo'
         uses: taiki-e/install-action@v2

@@ -308,10 +308,9 @@ Press `Alt-p` or `F4` in the file, buffer, or project-search picker to hide or
 restore its preview. The query and selected result stay in place, and hiding
 the preview gives long result paths more room.
 
-To try the bundled FFF backend for Find in Files, launch Red with
-`red -c plugin_config.project_search.backend=fff` and press `Space g`. To keep
-that setting, put `backend = "fff"` under `[plugin_config.project_search]` in
-your configuration. The `rg` backend is the default.
+Press `Space g` to search file contents with Red’s bundled FFF index. Find in
+Files works out of the box. Existing `plugin_config.project_search.backend`
+settings can be removed.
 
 In the file picker, append `:<line>` to a fuzzy filename query to open the
 selected file at that line. For example, `sona:123` opens `source_name.rs` at line 123.
@@ -603,12 +602,12 @@ disabled_plugins = ["barbecue"]
 enabled = false
 ```
 
-Plugins that spawn processes need an explicit allowlist. For example,
-`project_search` uses:
+Plugins that spawn processes need an explicit allowlist. For example, the Git
+plugin uses:
 
 ```toml
-[plugin_permissions.project_search]
-process = ["rg"]
+[plugin_permissions.git]
+process = ["git"]
 ```
 
 Run `red --runtime-files` to list every visible plugin and theme. Eject a

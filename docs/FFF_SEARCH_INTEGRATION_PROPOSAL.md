@@ -1,7 +1,7 @@
 # FFF integration proposal
 
-Investigated 2026-11-06. **Implementation update.** Find in Files now includes
-an opt-in FFF backend. Launch with `red -c plugin_config.project_search.backend=fff`.
+Investigated 2026-11-06. **Implementation update.** Find in Files now uses bundled
+FFF for every search. Press `Space g` in a default installation.
 Parity testing led to a narrower integration: use FFF’s bigram index to select
 candidate files, then match the current bytes with the same regex and streaming
 search libraries as rg. The editor builds the index on a background thread,
@@ -9,7 +9,7 @@ walks current ignore rules on each query, and verifies file identity and change
 time before skipping a file. This avoids file-backed mmap and an additional
 recursive filesystem watcher. The rest of this document records the original
 proposal. See the [parity harness and validation notes](../tools/fff-parity/README.md)
-for the implemented contract and remaining rollout criteria.
+for the implemented behavior and validation results.
 
 Use the embedded `fff-search` Rust library for **Find in Files**, keeping the
 existing picker, preview, history, split opening, and export behavior. Make the
@@ -34,7 +34,7 @@ current `rg` subprocess dependency.
   differential tests, runtime smoke, or performance measurements were run.
   Upstream performance claims are not evidence of a Red speedup.
 
-## What Red does today
+## Behavior before the migration
 
 | Component | Behavior | Consequence for this work |
 | --- | --- | --- |

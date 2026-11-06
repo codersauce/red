@@ -1,4 +1,4 @@
-"""Compare persistent FFF results with Red's rg invocation on disposable files."""
+"""Check bundled search results on disposable workspaces, optionally comparing with rg."""
 import argparse
 import itertools
 import json
@@ -31,7 +31,7 @@ def corpus(root):
     (root / "invalid").write_bytes(b"\xffinvalid-bytes\n")
 
 
-def rg(root, query, flags):
+def rg(root, query, flags, env):
     args = ["rg", "--json", "--color=never", "--no-heading", "--with-filename",
             "--line-number", "--column", "--smart-case", "--max-columns=500",
             "--max-columns-preview", "--glob=!.bare", "--glob=!.git",
@@ -42,7 +42,7 @@ def rg(root, query, flags):
         args.append("--follow")
     if not query["regex"]:
         args.append("--fixed-strings")
-    proc = subprocess.run([*args, "--", query["pattern"], "."], cwd=root, capture_output=True)
+    proc = subprocess.run([*args, "--", query["pattern"], "."], cwd=root, env=env, capture_output=True)
     if proc.returncode not in (0, 1):
         return None
     rows = []
@@ -55,27 +55,70 @@ def rg(root, query, flags):
     return sorted(rows)
 
 
-def compare(binary, kind, raw):
+# Each expected row is (relative path, zero-based line, UTF-8 byte ranges).
+# None denotes an invalid regex. Dense results are compared as a bounded subset.
+def text_cases():
+    text = "src/utf8.rs"
+    patterns = "src/patterns"
+    unicode_words = [(text, 1, ((0, 6), (7, 13)))]
+    return [
+        ("needle", True, [(text, 0, ((5, 11), (12, 18)))]),
+        ("Needle", True, [(text, 0, ((5, 11),))]),
+        (r"\*", True, [(patterns, 0, ((0, 1), (33, 34)))]),
+        ("[", True, None),
+        (r"\b\w+cole", True, unicode_words),
+        ("école", True, unicode_words),
+        ("TARGET", True, [("src/long", 0, ((621, 627),))]),
+        ("large-tail", True, [("large", 800_000, ((0, 10),))]),
+        ("dense match", True, [("dense", i, ((0, 11),)) for i in range(502)]),
+        ("absent", True, []),
+        ("invalid-bytes", True, [("invalid", 0, ((1, 14),))]),
+        ("binary-needle", True, []),
+        (r"\n", False, [(patterns, 0, ((30, 32),))]),
+        ("*.rs", False, [(patterns, 0, ((0, 4),))]),
+        ("git:modified", False, [(patterns, 0, ((5, 17),))]),
+        ("src/main.rs", False, [(patterns, 0, ((18, 29),))]),
+        ("abc  abc", False, [(text, 2, ((0, 8),))]),
+    ]
+
+
+def visible_rows(kind, flags, has_link):
+    paths = []
+    if flags["hidden"]:
+        paths.append(".hidden")
+    if kind == "non-Git" or flags["ignored"]:
+        paths.append("ignored")
+    if flags["ignored"]:
+        paths.extend(["nested/vendor", "rgignored"])
+    if has_link and flags["follow"]:
+        paths.append("link")
+    return [(path, 0, ((0, 10),)) for path in sorted(paths)]
+
+
+def compare(binary, kind, raw, against_rg):
     failures = []
     total = 0
-    queries = [(s, True) for s in ["needle", "Needle", r"\*", "[", r"\b\w+cole",
-                                    "école", "TARGET", "large-tail", "dense match",
-                                    "absent", "invalid-bytes", "binary-needle"]]
-    queries += [(s, False) for s in [r"\n", "*.rs", "git:modified", "src/main.rs", "abc  abc"]]
     with tempfile.TemporaryDirectory() as temp:
+        # Global Git excludes and rg options belong to the caller, not these fixtures.
+        fixture_home = Path(temp, "home")
+        fixture_home.mkdir()
+        env = dict(os.environ, HOME=str(fixture_home), USERPROFILE=str(fixture_home),
+                   XDG_CONFIG_HOME=str(fixture_home / ".config"), GIT_CONFIG_GLOBAL=os.devnull,
+                   GIT_CONFIG_NOSYSTEM="1")
+        env.pop("RIPGREP_CONFIG_PATH", None)
         root = Path(temp, "repo")
         if kind == "linked":
             base = Path(temp, "base")
-            subprocess.run(["git", "init", "-q", base], check=True)
+            subprocess.run(["git", "init", "-q", base], env=env, check=True)
             subprocess.run(["git", "-C", base, "-c", "user.name=FFF fixture", "-c",
                             "user.email=fixture@example.invalid", "-c", "core.hooksPath="+temp,
-                            "commit", "--allow-empty", "--no-gpg-sign", "-qm", "fixture"], check=True)
+                            "commit", "--allow-empty", "--no-gpg-sign", "-qm", "fixture"], env=env, check=True)
             subprocess.run(["git", "-C", base, "-c", "core.hooksPath="+temp, "worktree",
-                            "add", "-q", "--detach", root], check=True)
+                            "add", "-q", "--detach", root], env=env, check=True)
         else:
             root.mkdir()
         if kind == "Git":
-            subprocess.run(["git", "init", "-q", root], check=True)
+            subprocess.run(["git", "init", "-q", root], env=env, check=True)
         corpus(root)
         try:
             outside = Path(temp, "outside")
@@ -86,19 +129,20 @@ def compare(binary, kind, raw):
                 raise
         for hidden, ignored, follow in itertools.product((False, True), repeat=3):
             flags = dict(hidden=hidden, ignored=ignored, follow=follow)
-            cases = [("visibility", False)]
+            cases = [("visibility", False, visible_rows(kind, flags, (root / "link").is_symlink()))]
             if not any(flags.values()):
-                cases += queries
-            inputs = [dict(pattern=s, regex=r, **flags) for s, r in cases]
+                cases += text_cases()
+            inputs = [dict(pattern=s, regex=r, **flags) for s, r, _ in cases]
             args = [binary, str(root)] + (["--follow"] if follow else []) + ([] if raw else ["--red", "--wait-for-index"])
             proc = subprocess.run(args, input="".join(json.dumps(q) + "\n" for q in inputs),
-                                  text=True, capture_output=True, timeout=150)
+                                  text=True, env=env, capture_output=True, timeout=150)
             if proc.returncode:
                 raise RuntimeError(f"FFF driver exited {proc.returncode}: {proc.stderr}")
-            ready, *results = map(json.loads, proc.stdout.splitlines())
-            for query, result in zip(inputs, results, strict=True):
+            _, *results = map(json.loads, proc.stdout.splitlines())
+            for query, result, (_, _, expected) in zip(inputs, results, cases, strict=True):
                 total += 1
-                expected = rg(root, query, flags)
+                if against_rg and rg(root, query, flags, env) != expected:
+                    raise ValueError(f"rg disagrees with fixture for {kind} root: {query}")
                 actual = sorted((Path(m["path"]).as_posix(), m["line"], tuple(map(tuple, m["spans"])))
                                 for m in result["matches"])
                 if expected is None:
@@ -117,13 +161,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("driver", type=Path)
     parser.add_argument("--raw", action="store_true", help="test upstream FilePicker directly")
+    parser.add_argument("--against-rg", action="store_true", help="also verify expected rows with installed rg")
     args = parser.parse_args()
     if os.name == "nt" and not args.driver.suffix:
         args.driver = args.driver.with_suffix(".exe")
     failed = 0
     for kind in ["non-Git", "Git", "linked"]:
-        total, failures = compare(args.driver.resolve(), kind, args.raw)
-        print(f"{kind} root: {total-len(failures)}/{total} cases matched rg")
+        total, failures = compare(args.driver.resolve(), kind, args.raw, args.against_rg)
+        print(f"{kind} root: {total-len(failures)}/{total} cases passed")
         for query, actual, expected in failures:
             print(f"  {query}: got {actual}, expected {expected}")
         failed += len(failures)

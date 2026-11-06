@@ -3468,8 +3468,8 @@ unknown_setting = true
     fn invalid_capability_entries_fail_closed() {
         let loaded = Config::load_user_toml(
             r#"
-[plugin_permissions.project_search]
-process = "rg"
+[plugin_permissions.git]
+process = "git"
 
 [lsp.servers.rust]
 command = ["rust-analyzer"]
@@ -3479,10 +3479,7 @@ command = ["rust-analyzer"]
         )
         .unwrap();
 
-        assert!(!loaded
-            .config
-            .plugin_permissions
-            .contains_key("project_search"));
+        assert!(!loaded.config.plugin_permissions.contains_key("git"));
         assert!(!loaded.config.lsp.servers.contains_key("rust"));
     }
 
@@ -5056,8 +5053,7 @@ max_buffer_words = 20
             config.plugins.get("project_search").map(String::as_str),
             Some("project_search.hk")
         );
-        let permissions = config.plugin_permissions.get("project_search").unwrap();
-        assert_eq!(permissions.process, vec!["rg".to_string()]);
+        assert!(!config.plugin_permissions.contains_key("project_search"));
         assert_eq!(config.log_file.as_deref(), Some("red.log"));
     }
 
