@@ -5,7 +5,7 @@ pkgdesc='Modal terminal text editor with built-in Husk plugins'
 arch=('x86_64')
 url='https://getred.dev'
 license=('MIT')
-depends=('glibc' 'gcc-libs' 'ripgrep')
+depends=('glibc' 'gcc-libs')
 optdepends=('git: Git integration')
 provides=("red-editor=$pkgver")
 conflicts=('red-editor')

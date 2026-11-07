@@ -22,13 +22,11 @@ overrides:
     depends:
       - libc6 (>= 2.34)
       - libgcc-s1
-      - ripgrep
     recommends:
       - git
   rpm:
     depends:
       - glibc >= 2.34
       - libgcc
-      - ripgrep
     recommends:
       - git

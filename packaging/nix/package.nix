@@ -3,7 +3,6 @@
   source,
   rustPlatform,
   makeWrapper,
-  ripgrep,
   gitMinimal,
 }:
 
@@ -27,20 +26,12 @@ rustPlatform.buildRustPackage (finalAttrs: {
   ];
 
   nativeBuildInputs = [ makeWrapper ];
-  nativeCheckInputs = [
-    ripgrep
-    gitMinimal
-  ];
+  nativeCheckInputs = [ gitMinimal ];
 
   postInstall = ''
     mv "$out/bin/red" "$out/bin/red-editor"
     wrapProgram "$out/bin/red-editor" \
-      --suffix PATH : ${
-        lib.makeBinPath [
-          ripgrep
-          gitMinimal
-        ]
-      }
+      --suffix PATH : ${lib.makeBinPath [ gitMinimal ]}
   '';
 
   doInstallCheck = true;

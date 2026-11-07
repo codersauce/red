@@ -3,7 +3,6 @@
     "description": "Modal terminal text editor with built-in Husk plugins",
     "homepage": "https://getred.dev",
     "license": "MIT",
-    "depends": "main/ripgrep",
     "architecture": {
         "64bit": {
             "url": "https://github.com/codersauce/red/releases/download/v0.11.1/red-x86_64-pc-windows-msvc.zip",
