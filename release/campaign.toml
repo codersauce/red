@@ -1,5 +1,5 @@
 schema_version = 1
-version = "next"
+version = "0.12.0"
 headline = "Find in Files without ripgrep, and new ways to install Red"
 summary = "Red v0.12.0 bundles FFF for Find in Files, so project-wide search works on a fresh install with nothing else on PATH, and both search pickers now show which filters are on. Red can also be installed with Nix, Scoop, or a DEB or RPM package."
 website = "https://github.com/codersauce/red/releases/latest"

@@ -2,6 +2,21 @@
 
 All notable changes to Red are documented in this file.
 
+## [0.12.0](https://github.com/codersauce/red/compare/v0.11.1...v0.12.0)
+
+### Features
+
+- **picker:** Show active search filters as divider badges ([#440](https://github.com/codersauce/red/issues/440)) ([3c793ea](https://github.com/codersauce/red/commit/3c793eaf169e53643d9951202bd87b0d8fe2d78e))
+- **search:** Bundle FFF for Find in Files ([#438](https://github.com/codersauce/red/issues/438)) ([63bd293](https://github.com/codersauce/red/commit/63bd293b4983e98db7886563fad5bde14405ba89))
+
+### Documentation
+
+- **release:** Write the v0.12.0 campaign ([#441](https://github.com/codersauce/red/issues/441)) ([989becd](https://github.com/codersauce/red/commit/989becdf2121b8c47e09a7ffa05effa41e3c37a3))
+
+### Other
+
+- Add Nix, Scoop, DEB/RPM and AUR packaging ([#439](https://github.com/codersauce/red/issues/439)) ([d4108f3](https://github.com/codersauce/red/commit/d4108f3d440cc4c4ad13f40ac9d8cd4fba950027))
+
 ## [0.11.1](https://github.com/codersauce/red/compare/v0.11.0...v0.11.1)
 
 ### Performance
