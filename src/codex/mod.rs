@@ -596,6 +596,7 @@ enum Pending {
     },
     Interrupt {
         session_id: String,
+        turn_id: String,
     },
 }
 
@@ -1307,6 +1308,7 @@ async fn interrupt_active_turn(
         id.clone(),
         Pending::Interrupt {
             session_id: session_id.to_string(),
+            turn_id: turn_id.clone(),
         },
     );
     write_message(
@@ -2173,21 +2175,27 @@ async fn send_pending_failure(
             unreachable!("early requests returned above")
         }
     };
-    if matches!(request, Pending::Interrupt { .. }) {
+    if let Pending::Interrupt { turn_id, .. } = request {
+        // Codex rejects interrupting a turn that already finished. That turn's
+        // terminal event was reported, so the rejection must not reach the next turn.
+        let Some(session) = sessions
+            .get_mut(session_id)
+            .filter(|session| session.active_turn.as_deref() == Some(turn_id.as_str()))
+        else {
+            return;
+        };
         // A rejected interrupt leaves the turn running: allow a retry and report
         // it without ending the turn, so queued prompts keep waiting for it.
-        if let Some(session) = sessions.get_mut(session_id) {
-            session.pending_interrupt_turn_id = None;
-            if matches!(session.kind, SessionKind::Agent) && session.active_turn.is_some() {
-                events
-                    .send(CodexEvent::CancelFailed {
-                        session_id: session_id.clone(),
-                        message: message.to_string(),
-                    })
-                    .await
-                    .ok();
-                return;
-            }
+        session.pending_interrupt_turn_id = None;
+        if matches!(session.kind, SessionKind::Agent) {
+            events
+                .send(CodexEvent::CancelFailed {
+                    session_id: session_id.clone(),
+                    message: message.to_string(),
+                })
+                .await
+                .ok();
+            return;
         }
     }
     let (event, remove_session) = sessions.get(session_id).map_or_else(
@@ -3399,6 +3407,95 @@ mod tests {
         let retry: Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(retry["method"], "turn/interrupt");
         assert_eq!(retry["params"]["turnId"], "turn");
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_rejected_after_its_turn_finished_does_not_fail_the_next_turn() {
+        let host = Arc::new(Mutex::new(InlineReadHost(Arc::new(StdMutex::new(
+            Vec::new(),
+        )))));
+        let mut sessions = HashMap::from([(
+            "agent".into(),
+            Session {
+                model_info: None,
+                cwd: PathBuf::from("/workspace"),
+                active_turn: Some("first".into()),
+                pending_interrupt_turn_id: None,
+                cancelled: Arc::new(AtomicBool::new(false)),
+                allow_sensitive_paths: false,
+                kind: SessionKind::Agent,
+            },
+        )]);
+        let (events, mut received) = mpsc::channel(8);
+        let (internal, _) = mpsc::channel(1);
+        let mut pending = HashMap::new();
+        let mut output = Vec::new();
+        let mut next_id = 0;
+
+        stop_session(
+            "agent".into(),
+            false,
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+        )
+        .await
+        .unwrap();
+        let interrupt: Value = serde_json::from_slice(&output).unwrap();
+        output.clear();
+        assert!(matches!(
+            received.try_recv(),
+            Ok(CodexEvent::Cancelled { .. })
+        ));
+
+        // Codex finishes the turn before it reads the interrupt.
+        handle_message(
+            json!({"method":"turn/completed","params":{"threadId":"agent",
+                "turn":{"id":"first","status":"completed"}}}),
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+            &AgentRuntimePolicy::default(),
+            host,
+            internal,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            received.try_recv(),
+            Ok(CodexEvent::Completed { .. })
+        ));
+        start_turn(
+            "agent".into(),
+            json!([{"type": "text", "text": "second"}]),
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+        )
+        .await
+        .unwrap();
+
+        handle_response(
+            json!({"id": interrupt["id"], "error": {"code": -32600, "message": "no active turn to interrupt"}}),
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+            &AgentRuntimePolicy::default(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            received.try_recv().is_err(),
+            "the rejection belongs to the finished turn, not to \"second\""
+        );
     }
 
     #[tokio::test]
