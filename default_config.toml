@@ -47,6 +47,12 @@ markdown_mermaid = true
 # current split. A block that is not flat pairs stays as source.
 markdown_frontmatter = true
 
+# Render $...$ and $$...$$ math as Unicode in Normal mode. Off by default,
+# because dollar signs are common in prose and shell snippets.
+# :markdown-math toggles this in the current split. A price or an unknown
+# command stays as source.
+markdown_math = false
+
 # Draw standalone Markdown images inline in Normal mode. "auto" queries the
 # terminal (Kitty graphics, then Sixel) and falls back through Unicode
 # half-blocks to a text placeholder. Force "kitty", "iterm2", "sixel", or

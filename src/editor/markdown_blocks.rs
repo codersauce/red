@@ -22,8 +22,12 @@ use crate::{
 
 #[path = "markdown_frontmatter.rs"]
 mod frontmatter;
+#[path = "markdown_math.rs"]
+mod math;
 #[path = "markdown_mermaid.rs"]
 mod mermaid;
+
+pub(super) use math::swaps_by_line;
 
 /// Documents larger than this stay in source form, matching Markdown tables.
 pub(super) const MAX_BLOCK_DOCUMENT_BYTES: usize = 2 * 1024 * 1024;
@@ -135,6 +139,8 @@ pub(super) struct BlockSpec {
     mermaid: Option<mermaid::Region>,
     /// Set when the rows are produced from leading frontmatter at layout time.
     frontmatter: Option<Vec<(String, String)>>,
+    /// Unicode lines of a display-math block, cropped at layout time.
+    math: Option<Vec<String>>,
 }
 
 impl BlockSpec {
@@ -145,6 +151,7 @@ impl BlockSpec {
             rows,
             mermaid: None,
             frontmatter: None,
+            math: None,
         }
     }
 
@@ -154,6 +161,7 @@ impl BlockSpec {
             rows: Vec::new(),
             mermaid: Some(region),
             frontmatter: None,
+            math: None,
         }
     }
 
@@ -163,6 +171,17 @@ impl BlockSpec {
             rows: Vec::new(),
             mermaid: None,
             frontmatter: Some(pairs),
+            math: None,
+        }
+    }
+
+    fn math(lines: Range<usize>, rendered: Vec<String>) -> Self {
+        Self {
+            lines,
+            rows: Vec::new(),
+            mermaid: None,
+            frontmatter: None,
+            math: Some(rendered),
         }
     }
 }
@@ -285,6 +304,7 @@ pub(super) fn block_line_segments(line: usize, rows: &[BlockRow]) -> Vec<LineSeg
             last_segment: index + 1 == usize::from(count),
             visual_offset: 0,
             concealed: Vec::new(),
+            replacements: Vec::new(),
             projection: None,
             projection_left: 0,
             image: None,
@@ -310,10 +330,10 @@ pub(super) fn layout_blocks(
     for spec in specs {
         let rendered = if let Some(region) = spec.mermaid.as_ref() {
             Some(mermaid::render(region, width, ascii))
+        } else if let Some(pairs) = spec.frontmatter.as_ref() {
+            Some(frontmatter::render(pairs, width, ascii))
         } else {
-            spec.frontmatter
-                .as_ref()
-                .map(|pairs| frontmatter::render(pairs, width, ascii))
+            spec.math.as_ref().map(|lines| math::render(lines, width))
         };
         let rows = rendered.as_deref().unwrap_or(spec.rows.as_slice());
         if spec.lines.start >= spec.lines.end || rows.is_empty() {
@@ -389,9 +409,10 @@ impl super::Editor {
     pub(super) fn block_feature_bits(&self, window: &crate::window::Window) -> u8 {
         u8::from(self.markdown_mermaid_enabled(window))
             | (u8::from(self.markdown_frontmatter_enabled(window)) << 1)
+            | (u8::from(self.markdown_math_enabled(window)) << 2)
     }
 
-    /// Mermaid fences and leading frontmatter become blocks when their settings are on.
+    /// Mermaid fences, leading frontmatter, and display math become blocks.
     fn detected_markdown_blocks(&self, window: &crate::window::Window) -> Vec<BlockSpec> {
         let Some(buffer) = self.buffer_manager.get(window.buffer_index) else {
             return Vec::new();
@@ -405,6 +426,9 @@ impl super::Editor {
         }
         if self.markdown_mermaid_enabled(window) {
             blocks.extend(mermaid::find_blocks(&text));
+        }
+        if self.markdown_math_enabled(window) {
+            blocks.extend(math::find_blocks(&text));
         }
         blocks
     }
@@ -442,6 +466,42 @@ impl super::Editor {
             .is_some_and(|window| self.markdown_frontmatter_enabled(window));
         if let Some(window) = self.window_manager.active_window_mut() {
             window.markdown_frontmatter = Some(!enabled);
+        }
+        self.vleft = 0;
+        self.skipcol = 0;
+        self.markdown_block_generation = self.markdown_block_generation.wrapping_add(1);
+        self.layout_cache.borrow_mut().clear();
+    }
+
+    pub(super) fn markdown_math_enabled(&self, window: &crate::window::Window) -> bool {
+        window
+            .markdown_math
+            .unwrap_or(self.config.markdown_math.unwrap_or(false))
+    }
+
+    pub(super) fn markdown_math_active(&self, window: &crate::window::Window) -> bool {
+        if !self.markdown_math_enabled(window) {
+            return false;
+        }
+        if self
+            .highlight_language_id_for_buffer_index(window.buffer_index)
+            .as_deref()
+            != Some("markdown")
+        {
+            return false;
+        }
+        self.buffer_manager
+            .get(window.buffer_index)
+            .is_some_and(|buffer| buffer.byte_len() <= MAX_BLOCK_DOCUMENT_BYTES)
+    }
+
+    pub(super) fn toggle_markdown_math(&mut self) {
+        let enabled = self
+            .window_manager
+            .active_window()
+            .is_some_and(|window| self.markdown_math_enabled(window));
+        if let Some(window) = self.window_manager.active_window_mut() {
+            window.markdown_math = Some(!enabled);
         }
         self.vleft = 0;
         self.skipcol = 0;

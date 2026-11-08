@@ -162,6 +162,19 @@ the string color, and the rules use the indent-guide color.
 `:markdown-frontmatter` toggles the table in the current split. A block that
 is not a list of pairs, or that never closes, stays as source.
 
+## Math
+
+`$…$` and `$$…$$` can be drawn as Unicode, so `$E = mc^2$` shows `E = mc²`.
+This is off by default, because `$` is common in prose and shell snippets.
+`:markdown-math` toggles it in the current split. Set `markdown_math = true`
+to start with math on.
+
+Only unambiguous delimiters render. A price such as `$20$` or `$5 and $6`
+stays as source, and so does an unknown command. Inline math follows the
+cursor: the rest of the line stays rendered, and the cursor inside the
+expression shows the dollars. A `$$` block on its own lines is a rendered
+block. The buffer and the undo history stay unchanged.
+
 ## Settings
 
 | Setting | Default | Effect |
@@ -170,8 +183,9 @@ is not a list of pairs, or that never closes, stays as source.
 | `markdown_conceal` | `true` | Hide inline markup while wrapping |
 | `markdown_mermaid` | `true` | Draw `mermaid` fences as text diagrams |
 | `markdown_frontmatter` | `true` | Draw leading YAML frontmatter as a table |
+| `markdown_math` | `false` | Draw `$...$` and `$$...$$` math as Unicode |
 | `markdown_images` | `"auto"` | How to draw images: `auto`, `kitty`, `iterm2`, `sixel`, `halfblocks`, `off` |
 | `markdown_image_max_height` | `16` | Most rows one image may use |
 | `markdown_link_split_focus` | `"source"` | Pane that keeps focus after `Ctrl-w x` |
 
-Tables, images, diagrams, frontmatter, links, and tasks apply to Markdown documents up to 2 MiB.
+Tables, images, diagrams, frontmatter, math, links, and tasks apply to Markdown documents up to 2 MiB.

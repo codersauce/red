@@ -2977,6 +2977,8 @@ pub enum Action {
     ToggleMarkdownMermaid,
     /// Shows or hides the rendered YAML frontmatter table in the current window.
     ToggleMarkdownFrontmatter,
+    /// Shows or hides rendered LaTeX math in the current window.
+    ToggleMarkdownMath,
     SetRelativeLineNumbers(bool),
 
     DeletePreviousChar,
@@ -19304,6 +19306,9 @@ impl Editor {
             if cmd == "markdown-frontmatter" {
                 actions.push(Action::ToggleMarkdownFrontmatter);
             }
+            if cmd == "markdown-math" {
+                actions.push(Action::ToggleMarkdownMath);
+            }
 
             if cmd == "statusline" {
                 actions.push(Action::OpenStatuslineManager);
@@ -24659,6 +24664,10 @@ impl Editor {
                 }
                 Action::ToggleMarkdownFrontmatter => {
                     self.toggle_markdown_frontmatter();
+                    self.render(buffer)?;
+                }
+                Action::ToggleMarkdownMath => {
+                    self.toggle_markdown_math();
                     self.render(buffer)?;
                 }
                 Action::SetWrap(wrap) => {

@@ -198,6 +198,8 @@ fn line_content_range(source: &str, offsets: &[usize], line: usize) -> Range<usi
 #[derive(Debug)]
 pub(super) struct CachedConcealment {
     revision: u64,
+    conceal: bool,
+    math: bool,
     lines: Arc<LineConcealments>,
 }
 
@@ -217,28 +219,41 @@ impl super::Editor {
         &self,
         window: &crate::window::Window,
     ) -> Option<Arc<LineConcealments>> {
-        if !self.markdown_conceal_enabled(window) {
+        let conceal = self.markdown_conceal_enabled(window);
+        let math = self.markdown_math_active(window);
+        if !conceal && !math {
             return None;
         }
         let buffer = self.buffer_manager.get(window.buffer_index)?;
         if buffer.byte_len() > MAX_TABLE_DOCUMENT_BYTES {
             return None;
         }
+        let id = buffer.id();
+        let revision = buffer.revision();
+        let source = buffer.contents();
         let mut cache = self.markdown_conceal_cache.borrow_mut();
-        if cache.len() >= 8 && !cache.contains_key(&buffer.id()) {
+        if cache.len() >= 8 && !cache.contains_key(&id) {
             cache.clear();
         }
-        let cached = cache
-            .entry(buffer.id())
-            .or_insert_with(|| CachedConcealment {
-                revision: buffer.revision(),
-                lines: Arc::new(conceal_markdown(&buffer.contents())),
-            });
-        if cached.revision != buffer.revision() {
-            *cached = CachedConcealment {
-                revision: buffer.revision(),
-                lines: Arc::new(conceal_markdown(&buffer.contents())),
+        let build = || {
+            let mut lines = if conceal {
+                conceal_markdown(&source)
+            } else {
+                LineConcealments::empty(&source)
             };
+            if math {
+                lines = lines.with_swaps(super::markdown_blocks::swaps_by_line(&source));
+            }
+            CachedConcealment {
+                revision,
+                conceal,
+                math,
+                lines: Arc::new(lines),
+            }
+        };
+        let cached = cache.entry(id).or_insert_with(&build);
+        if cached.revision != revision || cached.conceal != conceal || cached.math != math {
+            *cached = build();
         }
         Some(cached.lines.clone())
     }
@@ -248,7 +263,12 @@ impl super::Editor {
         &self,
         window: &crate::window::Window,
     ) -> Option<Range<usize>> {
-        if !window.active || !self.markdown_conceal_enabled(window) {
+        if !window.active {
+            return None;
+        }
+        let conceal = self.markdown_conceal_enabled(window);
+        let math = self.markdown_math_active(window);
+        if !conceal && !math {
             return None;
         }
         let line = window.vtop + window.cy;

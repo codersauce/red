@@ -299,6 +299,10 @@ pub struct Config {
     /// to on. The cursor inside the block shows the source. A block that is
     /// not flat pairs stays as source.
     pub markdown_frontmatter: Option<bool>,
+    /// Render `$...$` and `$$...$$` math as Unicode. Defaults to off, because
+    /// `$` is common in prose and shell snippets. Only unambiguous delimiters
+    /// render. The cursor inside an expression shows the source.
+    pub markdown_math: Option<bool>,
     /// How standalone Markdown images are drawn. Defaults to automatic detection.
     #[serde(default)]
     pub markdown_images: MarkdownImagesMode,
@@ -2190,6 +2194,7 @@ fn known_top_level_field(field: &str) -> bool {
             | "markdown_conceal"
             | "markdown_mermaid"
             | "markdown_frontmatter"
+            | "markdown_math"
             | "markdown_images"
             | "markdown_image_max_height"
             | "markdown_link_split_focus"

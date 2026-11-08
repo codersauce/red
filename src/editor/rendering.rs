@@ -1345,6 +1345,7 @@ fn render_source_segment(
     clear(geometry.x, geometry.width, buffer);
     let mut grapheme_col = segment.start_grapheme_col;
     let mut byte_offset = 0;
+    let mut skip_until_col = None;
     while byte_offset < text.len() {
         let remaining = &text[byte_offset..];
         let Some(grapheme) = remaining.graphemes(true).next() else {
@@ -1355,6 +1356,31 @@ fn render_source_segment(
         } else {
             display_width(grapheme)
         };
+        if let Some(end_col) = skip_until_col {
+            grapheme_col += width;
+            byte_offset += grapheme.len();
+            if grapheme_col >= end_col {
+                skip_until_col = None;
+            }
+            continue;
+        }
+        if let Some((replacement, end_col)) = segment.replacement_at(grapheme_col) {
+            let local_x = segment.visual_offset + segment.visible_columns_before(grapheme_col);
+            if local_x < geometry.width {
+                let source = segment.source_offset + segment.start_byte + byte_offset;
+                let style = styles.style_at(source).unwrap_or(theme_style);
+                let drawn = truncate_display_width(&replacement, geometry.width - local_x);
+                if !drawn.is_empty() {
+                    buffer.set_text(geometry.x + local_x, geometry.y, &drawn, style);
+                }
+            }
+            grapheme_col += width;
+            byte_offset += grapheme.len();
+            if grapheme_col < end_col {
+                skip_until_col = Some(end_col);
+            }
+            continue;
+        }
         if grapheme_col < segment.start_col || segment.hides_source_column(grapheme_col) {
             grapheme_col += width;
             byte_offset += grapheme.len();
@@ -5096,6 +5122,7 @@ mod tests {
             last_segment: true,
             visual_offset: 0,
             concealed: Vec::new(),
+            replacements: Vec::new(),
             image: None,
             block: None,
         }

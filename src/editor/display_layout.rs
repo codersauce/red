@@ -195,6 +195,7 @@ pub(super) fn image_line_segments(
             last_segment: index + 1 == rows,
             visual_offset: 0,
             concealed: Vec::new(),
+            replacements: Vec::new(),
             projection: None,
             projection_left: 0,
             image: Some(ImageSpan {
@@ -208,14 +209,30 @@ pub(super) fn image_line_segments(
         .collect()
 }
 
+/// One concealed source span drawn as different text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Swap {
+    pub bytes: Range<usize>,
+    pub text: String,
+}
+
+/// Unicode drawn in place of a concealed source-column span.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct VisualReplacement {
+    pub columns: Range<usize>,
+    pub text: String,
+}
+
 /// Byte ranges of one source line that occupy no screen cells.
 ///
 /// Ranges are relative to the line without its line ending. They are sorted,
 /// non-overlapping, and half-open. Wrapping and screen columns skip them, while
 /// source columns stay addressable so a cursor can still enter the hidden text.
+/// Swaps are also hidden, and their Unicode is drawn at the span's start.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct Concealment {
     hidden_bytes: Vec<Range<usize>>,
+    swaps: Vec<Swap>,
 }
 
 impl Concealment {
@@ -234,11 +251,37 @@ impl Concealment {
         }
         Self {
             hidden_bytes: merged,
+            swaps: Vec::new(),
         }
     }
 
+    pub(super) fn push_swap(&mut self, bytes: Range<usize>, text: String) {
+        if bytes.start >= bytes.end || text.is_empty() {
+            return;
+        }
+        let mut hidden = std::mem::take(&mut self.hidden_bytes);
+        hidden.push(bytes.clone());
+        self.hidden_bytes = Concealment::new(hidden).hidden_bytes;
+        let swap = Swap { bytes, text };
+        let index = self
+            .swaps
+            .partition_point(|existing| existing.bytes.start < swap.bytes.start);
+        self.swaps.insert(index, swap);
+    }
+
     pub(super) fn is_empty(&self) -> bool {
-        self.hidden_bytes.is_empty()
+        self.hidden_bytes.is_empty() && self.swaps.is_empty()
+    }
+
+    pub(super) fn has_swaps(&self) -> bool {
+        !self.swaps.is_empty()
+    }
+
+    pub(super) fn swap_at(&self, byte: usize) -> Option<&Swap> {
+        let index = self.swaps.partition_point(|swap| swap.bytes.start < byte);
+        self.swaps
+            .get(index)
+            .filter(|swap| swap.bytes.start == byte)
     }
 
     pub(super) fn hides_byte(&self, byte: usize) -> bool {
@@ -276,23 +319,25 @@ impl LineConcealments {
     pub(super) fn line(&self, index: usize) -> Concealment {
         self.lines.get(index).cloned().unwrap_or_default()
     }
-}
 
-fn visible_columns_between(concealed: &[Range<usize>], from: usize, to: usize) -> usize {
-    if to <= from {
-        return 0;
-    }
-    let mut hidden = 0;
-    for range in concealed {
-        if range.end <= from {
-            continue;
+    pub(super) fn empty(source: &str) -> Self {
+        let count = source.matches('\n').count() + 1;
+        Self {
+            lines: vec![Concealment::default(); count],
         }
-        if range.start >= to {
-            break;
-        }
-        hidden += range.end.min(to).saturating_sub(range.start.max(from));
     }
-    (to - from).saturating_sub(hidden)
+
+    pub(super) fn with_swaps(mut self, swaps: Vec<Vec<(Range<usize>, String)>>) -> Self {
+        if swaps.len() > self.lines.len() {
+            self.lines.resize(swaps.len(), Concealment::default());
+        }
+        for (index, row) in swaps.into_iter().enumerate() {
+            for (range, text) in row {
+                self.lines[index].push_swap(range, text);
+            }
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -320,6 +365,9 @@ pub struct LineSegment {
     /// Source display columns drawn with zero width. Empty for ordinary text.
     /// Ranges are half-open, sorted, and non-overlapping.
     pub(super) concealed: Vec<Range<usize>>,
+    /// Unicode drawn where a concealed span starts. Columns are source display
+    /// columns, the same coordinate as `concealed`.
+    pub(super) replacements: Vec<VisualReplacement>,
     /// A table row maps disjoint cell ranges instead of one linear source slice.
     pub(super) projection: Option<std::sync::Arc<super::markdown_tables::ProjectedRow>>,
     pub(super) projection_left: usize,
@@ -369,8 +417,7 @@ impl LineSegment {
                 .saturating_sub(self.projection_left)
                 .min(width.saturating_sub(1));
         }
-        let visible =
-            visible_columns_between(&self.concealed, self.start_col, col.max(self.start_col));
+        let visible = self.visible_columns_between(self.start_col, col.max(self.start_col));
         (self.visual_offset + visible).min(width.saturating_sub(1))
     }
 
@@ -382,26 +429,34 @@ impl LineSegment {
             return projection.source_for_column(col + self.projection_left);
         }
         let target = col.saturating_sub(self.visual_offset);
-        if self.concealed.is_empty() {
+        if self.concealed.is_empty() && self.replacements.is_empty() {
             return self.start_col + target;
         }
         let mut source = self.start_col;
         let mut visual = 0usize;
-        for range in &self.concealed {
-            if range.start <= source {
-                source = source.max(range.end);
+        while source < self.end_col {
+            if let Some(replacement) = self
+                .replacements
+                .iter()
+                .find(|replacement| replacement.columns.start == source)
+            {
+                let visual_width = display_width(&replacement.text).max(1);
+                if target < visual + visual_width {
+                    return replacement.columns.start;
+                }
+                visual += visual_width;
+                source = replacement.columns.end.max(source + 1);
                 continue;
             }
-            let gap = range.start.saturating_sub(source);
-            if target < visual + gap {
-                return source + (target - visual);
+            if self.hides_source_column(source) {
+                source += 1;
+                continue;
             }
-            visual += gap;
-            source = range.end;
-        }
-        let trailing = self.end_col.saturating_sub(source);
-        if target < visual + trailing {
-            return source + (target - visual);
+            if target < visual + 1 {
+                return source;
+            }
+            visual += 1;
+            source += 1;
         }
         self.last_visible_source_col()
     }
@@ -410,12 +465,38 @@ impl LineSegment {
         self.concealed.iter().any(|range| range.contains(&column))
     }
 
+    pub(super) fn replacement_at(&self, column: usize) -> Option<(String, usize)> {
+        self.replacements
+            .iter()
+            .find(|replacement| replacement.columns.start == column)
+            .map(|replacement| (replacement.text.clone(), replacement.columns.end))
+    }
+
     pub(super) fn visible_columns_before(&self, source_col: usize) -> usize {
-        visible_columns_between(
-            &self.concealed,
-            self.start_col,
-            source_col.max(self.start_col),
-        )
+        self.visible_columns_between(self.start_col, source_col.max(self.start_col))
+    }
+
+    pub(super) fn visible_columns_between(&self, from: usize, to: usize) -> usize {
+        if to <= from {
+            return 0;
+        }
+        let mut hidden = 0usize;
+        for range in &self.concealed {
+            if range.end <= from {
+                continue;
+            }
+            if range.start >= to {
+                break;
+            }
+            hidden += range.end.min(to).saturating_sub(range.start.max(from));
+        }
+        let mut extra = 0usize;
+        for replacement in &self.replacements {
+            if replacement.columns.start >= from && replacement.columns.end <= to {
+                extra += display_width(&replacement.text).max(1);
+            }
+        }
+        (to - from).saturating_sub(hidden).saturating_add(extra)
     }
 
     /// Screen spans, including break-indent, for a source display-column range.
@@ -440,6 +521,20 @@ impl LineSegment {
         let mut column = start;
         while column < end {
             if let Some(hidden) = self.concealed.iter().find(|range| range.contains(&column)) {
+                for replacement in &self.replacements {
+                    if replacement.columns.start >= hidden.start
+                        && replacement.columns.start < hidden.end
+                        && replacement.columns.start < end
+                        && replacement.columns.end > start
+                    {
+                        let local_start = self.visual_offset
+                            + self.visible_columns_before(replacement.columns.start);
+                        let local_end = local_start + display_width(&replacement.text).max(1);
+                        if local_end > local_start {
+                            spans.push((local_start, local_end));
+                        }
+                    }
+                }
                 column = hidden.end;
                 continue;
             }
@@ -467,6 +562,11 @@ impl LineSegment {
             if range.start > column {
                 return column;
             }
+            if let Some(replacement) = self.replacements.iter().find(|replacement| {
+                replacement.columns.start >= column && replacement.columns.start < range.end
+            }) {
+                return replacement.columns.start;
+            }
             column = range.end;
         }
         if column < self.end_col {
@@ -486,6 +586,11 @@ impl LineSegment {
             if range.start < end {
                 end = range.start;
             }
+        }
+        if self.replacements.iter().any(|replacement| {
+            replacement.columns.start == end && replacement.columns.end == self.end_col
+        }) {
+            return end;
         }
         if end > self.start_col {
             end - 1
@@ -895,13 +1000,36 @@ pub(super) fn layout_lines_with_tables(
                     &concealment,
                 )
             } else {
-                nowrap_line_segment(
-                    line,
-                    line_index,
-                    config.content_width,
-                    config.vleft,
-                    config.break_indent.tab_width,
-                )
+                let show_source = reveal.is_some_and(|range| range.contains(&line_index))
+                    || conceal_reveal.is_some_and(|range| range.contains(&line_index))
+                    || images.is_some_and(|images| images.raw_lines.contains(&line_index));
+                let concealment = if show_source {
+                    Concealment::default()
+                } else {
+                    concealments
+                        .map(|concealments| concealments.line(line_index))
+                        .unwrap_or_default()
+                };
+                // One clipped row. Sideways scrolling does not apply to a math swap.
+                if concealment.has_swaps() {
+                    wrap_line_segments_with_limit(
+                        line,
+                        line_index,
+                        usize::MAX / 4,
+                        0,
+                        config.break_indent,
+                        1,
+                        &concealment,
+                    )
+                } else {
+                    nowrap_line_segment(
+                        line,
+                        line_index,
+                        config.content_width,
+                        config.vleft,
+                        config.break_indent.tab_width,
+                    )
+                }
             };
 
         for mut segment in segments {
@@ -987,14 +1115,94 @@ fn wrap_line_segments_with_limit(
     let mut segment_visual = 0;
     let mut grapheme_count = 0;
     let mut concealed_ranges = Vec::new();
+    let mut replacements = Vec::new();
+    let graphemes: Vec<(usize, &str)> = line.grapheme_indices(true).collect();
+    let mut index = 0usize;
 
-    for (grapheme_index, (byte_offset, grapheme)) in line.grapheme_indices(true).enumerate() {
+    while index < graphemes.len() {
+        let (byte_offset, grapheme) = graphemes[index];
         let first_segment = start_col == 0;
         let segment_width = if first_segment {
             width
         } else {
             continuation_width
         };
+        if let Some(swap) = concealment.swap_at(byte_offset) {
+            let swap_end = swap.bytes.end;
+            let swap_text = swap.text.clone();
+            let mut source_width = 0usize;
+            let mut end_index = index;
+            let mut scan_col = col;
+            while end_index < graphemes.len() && graphemes[end_index].0 < swap_end {
+                let piece = graphemes[end_index].1;
+                let piece_width = if piece == "\t" {
+                    tab_width - (scan_col % tab_width)
+                } else {
+                    display_width(piece)
+                };
+                source_width += piece_width;
+                scan_col += piece_width;
+                end_index += 1;
+            }
+            if end_index > index {
+                let visual_width = display_width(&swap_text).max(1);
+                let occupied = visual_col - segment_visual;
+                if occupied > 0 && occupied + visual_width > segment_width {
+                    let end_col = col;
+                    let ranges = std::mem::take(&mut concealed_ranges);
+                    let taken = std::mem::take(&mut replacements);
+                    if end_col > skipcol {
+                        segments.push(LineSegment {
+                            line: line_index,
+                            row: 0,
+                            start_col,
+                            end_col,
+                            start_grapheme,
+                            end_grapheme: index,
+                            start_byte,
+                            end_byte: byte_offset,
+                            start_grapheme_col: start_col,
+                            source_offset: 0,
+                            projection: None,
+                            projection_left: 0,
+                            first_segment,
+                            last_segment: false,
+                            visual_offset: if first_segment { 0 } else { indent },
+                            concealed: ranges,
+                            replacements: taken,
+                            image: None,
+                            block: None,
+                        });
+                        if segments.len() == max_segments {
+                            return segments;
+                        }
+                    }
+                    start_col = end_col;
+                    segment_visual = visual_col;
+                    start_grapheme = index;
+                    start_byte = byte_offset;
+                    continue;
+                }
+                if source_width > 0 {
+                    if let Some(last) = concealed_ranges.last_mut().filter(|range| range.end == col)
+                    {
+                        last.end = col + source_width;
+                    } else {
+                        concealed_ranges.push(col..col + source_width);
+                    }
+                    replacements.push(VisualReplacement {
+                        columns: col..col + source_width,
+                        text: swap_text,
+                    });
+                }
+                col += source_width;
+                visual_col += visual_width;
+                grapheme_count = end_index;
+                index = end_index;
+                continue;
+            }
+        }
+
         let raw_width = if grapheme == "\t" {
             tab_width - (col % tab_width)
         } else {
@@ -1008,6 +1216,7 @@ fn wrap_line_segments_with_limit(
         if visual_width > 0 && occupied > 0 && occupied + visual_width > segment_width {
             let end_col = col;
             let ranges = std::mem::take(&mut concealed_ranges);
+            let taken = std::mem::take(&mut replacements);
             if end_col > skipcol {
                 segments.push(LineSegment {
                     line: line_index,
@@ -1015,7 +1224,7 @@ fn wrap_line_segments_with_limit(
                     start_col,
                     end_col,
                     start_grapheme,
-                    end_grapheme: grapheme_index,
+                    end_grapheme: index,
                     start_byte,
                     end_byte: byte_offset,
                     start_grapheme_col: start_col,
@@ -1026,6 +1235,7 @@ fn wrap_line_segments_with_limit(
                     last_segment: false,
                     visual_offset: if first_segment { 0 } else { indent },
                     concealed: ranges,
+                    replacements: taken,
                     image: None,
                     block: None,
                 });
@@ -1036,7 +1246,7 @@ fn wrap_line_segments_with_limit(
 
             start_col = end_col;
             segment_visual = visual_col;
-            start_grapheme = grapheme_index;
+            start_grapheme = index;
             start_byte = byte_offset;
         }
 
@@ -1050,7 +1260,8 @@ fn wrap_line_segments_with_limit(
 
         col += raw_width;
         visual_col += visual_width;
-        grapheme_count = grapheme_index + 1;
+        grapheme_count = index + 1;
+        index += 1;
     }
 
     let line_width = col;
@@ -1073,6 +1284,7 @@ fn wrap_line_segments_with_limit(
             last_segment: true,
             visual_offset: if first_segment { 0 } else { indent },
             concealed: concealed_ranges,
+            replacements,
             image: None,
             block: None,
         });
@@ -1124,6 +1336,7 @@ fn wrap_line_segments_with_limit(
             last_segment: start_col == line_width,
             visual_offset: if first_segment { 0 } else { indent },
             concealed: Vec::new(),
+            replacements: Vec::new(),
             image: None,
             block: None,
         });
@@ -1190,6 +1403,7 @@ pub(super) fn nowrap_line_segment(
         last_segment: end_byte == line.len(),
         visual_offset: 0,
         concealed: Vec::new(),
+        replacements: Vec::new(),
         image: None,
         block: None,
     }]
@@ -1634,8 +1848,7 @@ mod tests {
         assert!(wrapped.len() < raw.len());
         assert_eq!(wrapped.len(), 2);
         for segment in &wrapped {
-            let visible =
-                visible_columns_between(&segment.concealed, segment.start_col, segment.end_col);
+            let visible = segment.visible_columns_between(segment.start_col, segment.end_col);
             assert!(visible <= 12, "visible width {visible}");
             assert!(visible > 0);
         }
@@ -1691,5 +1904,26 @@ mod tests {
         );
         assert_eq!(segment.display_col_for_screen_col(8), after_col);
         assert_eq!(&line[label..label + "文档".len()], "文档");
+    }
+
+    #[test]
+    fn math_replacement_uses_unicode_width() {
+        let line = "$x$y";
+        let mut concealment = Concealment::default();
+        concealment.push_swap(0..3, "x".to_string());
+        let wrapped = wrap_line_segments_with_limit(
+            line,
+            0,
+            20,
+            0,
+            BreakIndentOptions::disabled(),
+            usize::MAX,
+            &concealment,
+        );
+        assert_eq!(wrapped.len(), 1);
+        let segment = &wrapped[0];
+        assert_eq!(segment.visible_columns_between(0, 4), 2);
+        assert_eq!(segment.display_col_for_screen_col(0), 0);
+        assert_eq!(segment.display_col_for_screen_col(1), 3);
     }
 }
