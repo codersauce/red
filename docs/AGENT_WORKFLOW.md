@@ -419,7 +419,9 @@ here** (press Tab, then `]l` to reach a choice and Enter to pick it, or run
 interrupted turn already made stay applied, and both Retry and Continue tell
 Codex so. A turn that fails on its own while Codex keeps running (an error, or a
 stop you did not ask for) offers the same three choices under its error. A
-crash while the agent is idle resumes quietly.
+crash while the agent is idle resumes quietly. A message Red had not yet handed
+to Codex is not treated as cut off: it is sent once the thread is back, or
+waits with the queue if you had pressed Stop.
 
 ## Followed editing
 

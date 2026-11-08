@@ -403,6 +403,11 @@ impl AgentPaneLifecycle {
     /// is retried in a new thread; a prompt that already ran is not replayed,
     /// because its edits may have applied.
     pub fn session_lost(&mut self, unsent: bool) -> Vec<AgentPaneEffect> {
+        if unsent && self.phase() == AgentPanePhase::Restoring {
+            // A dispatch queued before the crash restore began: `restore_pending`
+            // already put its prompt back, and the thread is coming back.
+            return Vec::new();
+        }
         let running = self.is_running();
         let in_flight = self.in_flight.take();
         let (retry, ran) = if unsent {
@@ -442,10 +447,18 @@ impl AgentPaneLifecycle {
         self.switch_target = None;
         self.switch_previous_session = None;
         if self.is_running() {
+            // Without a turn id the editor never sent the prompt, so Codex never
+            // saw it: queue it again rather than call it cut off.
+            let sent = self.turn_id.is_some();
             if let Some(prompt) = self.in_flight.take() {
-                self.interrupted = Some(prompt);
+                if sent {
+                    self.interrupted = Some(prompt);
+                } else {
+                    self.transcript_tail = std::mem::take(&mut self.in_flight_tail);
+                    self.queue.push_front(prompt);
+                }
             }
-            self.paused = !self.queue.is_empty();
+            self.paused = !self.queue.is_empty() && (sent || self.stop_requested);
         }
         self.close_reply();
         self.session_id = Some(session_id.to_string());
@@ -1305,6 +1318,41 @@ mod tests {
         pane.restored("s1");
         let (_, effects) = pane.submit("next".into(), "");
         assert_eq!(dispatched(&effects), ["next"]);
+    }
+
+    #[test]
+    fn a_message_the_editor_never_sent_is_sent_after_a_crash_resume() {
+        let mut pane = live("s1");
+        assert_eq!(dispatched(&pane.submit("hello".into(), "").1), ["hello"]);
+        pane.restore_pending("s1", "/workspace");
+        // The editor then reaches the dispatch queued before the crash.
+        assert!(pane
+            .observe(
+                "agent:session_lost",
+                &serde_json::json!({
+                    "session_id": "s1",
+                    "prompt": "hello",
+                    "message": "No Codex app-server session is running"
+                }),
+            )
+            .is_empty());
+        let snapshot = pane.snapshot();
+        assert!(snapshot.interrupted.is_none(), "Codex never received it");
+        assert_eq!(snapshot.session_id.as_deref(), Some("s1"));
+        assert_eq!(pane.phase(), AgentPanePhase::Restoring);
+        assert_eq!(dispatched(&pane.restored("s1")), ["hello"]);
+    }
+
+    #[test]
+    fn a_stopped_message_the_editor_never_sent_waits_after_a_crash_resume() {
+        let mut pane = live("s1");
+        pane.submit("hello".into(), "");
+        pane.stop();
+        pane.restore_pending("s1", "/workspace");
+        assert!(pane.snapshot().interrupted.is_none());
+        assert!(pane.restored("s1").is_empty(), "the user asked to stop it");
+        assert_eq!(pane.snapshot().queued[0].text, "hello");
+        assert_eq!(dispatched(&pane.send_queued("")), ["hello"]);
     }
 
     #[test]
