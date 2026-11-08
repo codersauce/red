@@ -195,11 +195,27 @@ pub(super) struct Probe {
     pub cell_height: u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CssUnit {
+    Px,
+    Percent,
+}
+
+/// A `width` or `height` attribute. Pixels are CSS pixels; percent is of the
+/// window columns or of `markdown_image_max_height`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CssLength {
+    value: u32,
+    unit: CssUnit,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ImageRef {
     pub alt: String,
     pub target: String,
     source: ImageSource,
+    width: Option<CssLength>,
+    height: Option<CssLength>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -552,16 +568,41 @@ impl ImageRuntime {
             };
             self.paints.insert((id, line), paint);
             let (cols, image_rows, placeholder) = match (&pixels, presentation) {
-                (Some(image), ImagePresentation::Halfblocks | ImagePresentation::Graphics(_)) => {
-                    let (cols, image_rows) =
-                        image_cell_grid(image.width, image.height, width, max_rows, self.cell);
+                (Some(decoded), ImagePresentation::Halfblocks | ImagePresentation::Graphics(_)) => {
+                    let (cols, image_rows) = sized_cell_grid(
+                        decoded.width,
+                        decoded.height,
+                        image.width,
+                        image.height,
+                        width,
+                        max_rows,
+                        self.cell,
+                    );
                     if cols == 0 || image_rows == 0 {
                         (1, 1, true)
                     } else {
                         (cols, image_rows, false)
                     }
                 }
-                _ => (1, 1, true),
+                _ => {
+                    let (cols, image_rows) = sized_cell_grid(
+                        0,
+                        0,
+                        image.width,
+                        image.height,
+                        width,
+                        max_rows,
+                        self.cell,
+                    );
+                    if image.width.is_none() && image.height.is_none()
+                        || cols == 0
+                        || image_rows == 0
+                    {
+                        (1, 1, true)
+                    } else {
+                        (cols, image_rows, true)
+                    }
+                }
             };
             rows.insert(
                 line,
@@ -1265,6 +1306,13 @@ fn read_probe_response(_timeout: Duration) -> Vec<u8> {
 
 pub(super) fn parse_image_line(line: &str) -> Option<ImageRef> {
     let line = line.trim();
+    if line.starts_with("![") {
+        return parse_markdown_image(line);
+    }
+    parse_html_image_line(line)
+}
+
+fn parse_markdown_image(line: &str) -> Option<ImageRef> {
     let rest = line.strip_prefix("![")?;
     let (alt, rest) = split_bracket(rest)?;
     let rest = rest.strip_prefix("](")?;
@@ -1277,7 +1325,199 @@ pub(super) fn parse_image_line(line: &str) -> Option<ImageRef> {
         alt,
         target,
         source,
+        width: None,
+        height: None,
     })
+}
+
+/// A line whose only content is `<img>`, optionally wrapped in one `<p>`.
+fn parse_html_image_line(line: &str) -> Option<ImageRef> {
+    let inner = unwrap_paragraph(line)?.trim();
+    let (attrs, rest) = parse_img_tag(inner)?;
+    if !rest.trim().is_empty() {
+        return None;
+    }
+    let target = attrs.src?;
+    if target.is_empty() {
+        return None;
+    }
+    let source = classify_target(&target)?;
+    Some(ImageRef {
+        alt: attrs.alt,
+        target,
+        source,
+        width: attrs.width.as_deref().and_then(parse_css_length),
+        height: attrs.height.as_deref().and_then(parse_css_length),
+    })
+}
+
+fn unwrap_paragraph(line: &str) -> Option<&str> {
+    let bytes = line.as_bytes();
+    let is_p = bytes.len() > 2
+        && bytes[0] == b'<'
+        && bytes[1].eq_ignore_ascii_case(&b'p')
+        && !bytes
+            .get(2)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric());
+    if !is_p {
+        return Some(line);
+    }
+    if !line.to_ascii_lowercase().ends_with("</p>") {
+        return None;
+    }
+    let gt = tag_gt(line, 2)?;
+    let close = line.to_ascii_lowercase().rfind("</p>")?;
+    if close <= gt {
+        return None;
+    }
+    Some(line[gt + 1..close].trim())
+}
+
+fn tag_gt(text: &str, from: usize) -> Option<usize> {
+    let mut quote = None;
+    for (offset, character) in text.get(from..)?.char_indices() {
+        match (quote, character) {
+            (None, '"' | '\'') => quote = Some(character),
+            (Some(open), character) if character == open => quote = None,
+            (None, '>') => return Some(from + offset),
+            _ => {}
+        }
+    }
+    None
+}
+
+struct ImgAttrs {
+    src: Option<String>,
+    alt: String,
+    width: Option<String>,
+    height: Option<String>,
+}
+
+fn parse_img_tag(input: &str) -> Option<(ImgAttrs, &str)> {
+    let input = input.trim();
+    let rest = input.strip_prefix('<')?;
+    let name_end = rest.find(|character: char| !character.is_ascii_alphanumeric())?;
+    if !rest[..name_end].eq_ignore_ascii_case("img") {
+        return None;
+    }
+    let mut index = name_end;
+    let mut attrs = ImgAttrs {
+        src: None,
+        alt: String::new(),
+        width: None,
+        height: None,
+    };
+    let bytes = rest.as_bytes();
+    loop {
+        while index < rest.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if rest[index..].starts_with("/>") {
+            return Some((attrs, &rest[index + 2..]));
+        }
+        if rest[index..].starts_with('>') {
+            return Some((attrs, &rest[index + 1..]));
+        }
+        if index >= rest.len() {
+            return None;
+        }
+        let name_start = index;
+        while index < rest.len()
+            && (bytes[index].is_ascii_alphanumeric()
+                || bytes[index] == b'-'
+                || bytes[index] == b':')
+        {
+            index += 1;
+        }
+        if index == name_start {
+            return None;
+        }
+        let name = rest[name_start..index].to_ascii_lowercase();
+        while index < rest.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index >= rest.len() || bytes[index] != b'=' {
+            continue;
+        }
+        index += 1;
+        while index < rest.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        let (value, next) = parse_attr_value(rest, index)?;
+        match name.as_str() {
+            "src" => attrs.src = Some(value),
+            "alt" => attrs.alt = value,
+            "width" => attrs.width = Some(value),
+            "height" => attrs.height = Some(value),
+            _ => {}
+        }
+        index = next;
+    }
+}
+
+fn parse_attr_value(input: &str, index: usize) -> Option<(String, usize)> {
+    let rest = input.get(index..)?;
+    let Some(quote) = rest
+        .chars()
+        .next()
+        .filter(|character| *character == '"' || *character == '\'')
+    else {
+        // Slashes belong in unquoted paths. A slash immediately before `>` is
+        // the tag's own closer (`<img src=a.png/>`).
+        let end = rest
+            .find(|character: char| character.is_ascii_whitespace() || character == '>')
+            .unwrap_or(rest.len());
+        if end == 0 {
+            return None;
+        }
+        let mut value = &rest[..end];
+        let mut next = index + end;
+        if value.ends_with('/') && rest[end..].starts_with('>') {
+            value = &value[..value.len() - 1];
+            next -= 1;
+        }
+        if value.is_empty() {
+            return None;
+        }
+        return Some((value.to_string(), next));
+    };
+    let body = &rest[quote.len_utf8()..];
+    let end = body.find(quote)?;
+    Some((
+        body[..end].to_string(),
+        index + quote.len_utf8() + end + quote.len_utf8(),
+    ))
+}
+
+fn parse_css_length(raw: &str) -> Option<CssLength> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Some(number) = raw.strip_suffix('%') {
+        let value = parse_u32(number.trim())?;
+        return (value > 0).then_some(CssLength {
+            value,
+            unit: CssUnit::Percent,
+        });
+    }
+    let number = raw
+        .len()
+        .checked_sub(2)
+        .filter(|_| raw[raw.len() - 2..].eq_ignore_ascii_case("px"))
+        .map_or(raw, |end| &raw[..end]);
+    let value = parse_u32(number.trim())?;
+    (value > 0).then_some(CssLength {
+        value,
+        unit: CssUnit::Px,
+    })
+}
+
+fn parse_u32(raw: &str) -> Option<u32> {
+    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    raw.parse().ok()
 }
 
 fn split_bracket(input: &str) -> Option<(String, &str)> {
@@ -1402,6 +1642,66 @@ pub(super) fn image_cell_grid(
         cols = cols.min(max_cols).max(1);
     }
     (cols as u16, rows.min(max_rows).max(1) as u16)
+}
+
+/// Columns and rows for an image, with an optional HTML `width` / `height`.
+///
+/// CSS pixels divide by the cell size (`10×20` until the terminal reports
+/// one). A percent is a share of the window columns or of `max_rows`. When
+/// one side is missing, the decoded picture's aspect fills it in. Rows above
+/// `max_rows` shrink the columns and keep that box's proportions.
+fn sized_cell_grid(
+    natural_w: u32,
+    natural_h: u32,
+    html_w: Option<CssLength>,
+    html_h: Option<CssLength>,
+    max_cols: usize,
+    max_rows: usize,
+    cell: CellPixels,
+) -> (u16, u16) {
+    if html_w.is_none() && html_h.is_none() {
+        return image_cell_grid(natural_w, natural_h, max_cols, max_rows, cell);
+    }
+    if max_cols == 0 || max_rows == 0 {
+        return (0, 0);
+    }
+    let max_cols = max_cols.min(usize::from(u16::MAX));
+    let max_rows = max_rows.min(64);
+    let cell_w = u64::from(cell.width.max(1));
+    let cell_h = u64::from(cell.height.max(1));
+    let along = |length: CssLength, span: usize, cell_px: u64| -> usize {
+        let value = u64::from(length.value);
+        let cells = match length.unit {
+            CssUnit::Px => value / cell_px,
+            CssUnit::Percent => value * span as u64 / 100,
+        };
+        cells.max(1) as usize
+    };
+    let mut cols = html_w.map(|length| along(length, max_cols, cell_w));
+    let mut rows = html_h.map(|length| along(length, max_rows, cell_h));
+    if let (None, Some(rows)) = (cols, rows) {
+        if natural_w > 0 && natural_h > 0 {
+            let cols_n =
+                (rows as u64 * u64::from(natural_w) * cell_h) / (u64::from(natural_h) * cell_w);
+            cols = Some(cols_n.max(1) as usize);
+        }
+    }
+    if let (Some(cols_n), None) = (cols, rows) {
+        if natural_w > 0 && natural_h > 0 {
+            let rows_n =
+                (u64::from(natural_h) * cols_n as u64 * cell_w) / (u64::from(natural_w) * cell_h);
+            rows = Some(rows_n.max(1) as usize);
+        }
+    }
+    let mut cols = cols.unwrap_or(1).min(max_cols).max(1);
+    let mut rows = rows.unwrap_or(1).max(1);
+    if rows > max_rows {
+        let scaled = (cols as u64 * max_rows as u64) / rows as u64;
+        rows = max_rows;
+        cols = scaled.max(1) as usize;
+        cols = cols.min(max_cols).max(1);
+    }
+    (cols as u16, rows as u16)
 }
 
 /// Pixel size of a graphics payload. Never larger than the source, and never
@@ -2573,6 +2873,136 @@ mod tests {
         assert!(parse_image_line("![alt](pic.png) trailing").is_none());
         assert!(parse_image_line("![alt][ref]").is_none());
         assert!(parse_image_line("```").is_none());
+    }
+
+    #[test]
+    fn html_img_lines_read_quoted_and_unquoted_attributes() {
+        let quoted = parse_image_line(
+            r#"<img src="https://example.com/a.png" alt="Hello" width="200" height="40%">"#,
+        )
+        .unwrap();
+        assert_eq!(quoted.alt, "Hello");
+        assert!(matches!(quoted.source, ImageSource::Remote(_)));
+        assert_eq!(
+            quoted.width,
+            Some(CssLength {
+                value: 200,
+                unit: CssUnit::Px
+            })
+        );
+        assert_eq!(
+            quoted.height,
+            Some(CssLength {
+                value: 40,
+                unit: CssUnit::Percent
+            })
+        );
+
+        let bare = parse_image_line("<img src=./pic.png alt=shot width=50% />").unwrap();
+        assert_eq!(bare.alt, "shot");
+        assert_eq!(bare.target, "./pic.png");
+        assert!(matches!(bare.source, ImageSource::Local(_)));
+        assert_eq!(
+            bare.width,
+            Some(CssLength {
+                value: 50,
+                unit: CssUnit::Percent
+            })
+        );
+
+        let wrapped = parse_image_line(
+            r#"<p align="center"><img src='./shot.png' alt="x" width="200px"></p>"#,
+        )
+        .unwrap();
+        assert_eq!(wrapped.alt, "x");
+        assert_eq!(wrapped.target, "./shot.png");
+        assert_eq!(
+            wrapped.width,
+            Some(CssLength {
+                value: 200,
+                unit: CssUnit::Px
+            })
+        );
+
+        let upper =
+            parse_image_line(r#"<P ALIGN="center"><IMG SRC="./A.PNG" ALT="Hi"></P>"#).unwrap();
+        assert_eq!(upper.alt, "Hi");
+        assert_eq!(upper.target, "./A.PNG");
+
+        assert!(parse_image_line(r#"<img src="data:image/png;base64,aaaa">"#).is_none());
+        assert!(parse_image_line(r#"<img src="">"#).is_none());
+        assert!(parse_image_line(r#"<img alt="only">"#).is_none());
+        assert!(parse_image_line(r#"see <img src="a.png">"#).is_none());
+        assert!(parse_image_line(r#"<div><img src="a.png"></div>"#).is_none());
+        assert!(parse_image_line(r#"<img src="a.png"> trailing"#).is_none());
+        assert!(parse_image_line(r#"<p><img src="a.png"></p> extra"#).is_none());
+
+        let source = "```\n<img src=\"./pic.png\">\n```\n<img src=\"./real.png\" alt=\"real\">\n";
+        let images = parse_document(source, Path::new("/notes"));
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[&3].alt, "real");
+        match &images[&3].source {
+            ImageSource::Local(path) => {
+                assert!(path.starts_with("/notes"), "{path:?}");
+                assert!(path.ends_with("real.png"), "{path:?}");
+            }
+            ImageSource::Remote(_) => panic!("local src"),
+        }
+    }
+
+    #[test]
+    fn html_width_maps_pixels_and_percent_and_caps_rows() {
+        let cell = CellPixels::default();
+        let width = Some(CssLength {
+            value: 200,
+            unit: CssUnit::Px,
+        });
+        assert_eq!(
+            sized_cell_grid(200, 100, width, None, 80, 16, cell),
+            (20, 5)
+        );
+
+        let percent = Some(CssLength {
+            value: 50,
+            unit: CssUnit::Percent,
+        });
+        assert_eq!(
+            sized_cell_grid(200, 100, percent, None, 80, 16, cell),
+            (40, 10)
+        );
+
+        let tall = Some(CssLength {
+            value: 800,
+            unit: CssUnit::Px,
+        });
+        let high = Some(CssLength {
+            value: 800,
+            unit: CssUnit::Px,
+        });
+        assert_eq!(sized_cell_grid(0, 0, tall, high, 80, 16, cell), (32, 16));
+
+        assert_eq!(
+            sized_cell_grid(200, 100, None, None, 80, 16, cell),
+            image_cell_grid(200, 100, 80, 16, cell)
+        );
+    }
+
+    #[test]
+    fn html_img_reveal_marks_the_source_line() {
+        let mut runtime = ImageRuntime::new();
+        let id = BufferId::from_test_id(11);
+        let source = "<img src=\"./missing.png\" alt=\"pic\" width=\"200\">\nnext\n";
+        runtime.sync_document(id, 1, source, Path::new("/tmp"));
+        let hidden = runtime.layout_for(id, 80, 16, None, MarkdownImagesMode::Halfblocks);
+        let span = hidden.rendered(0).unwrap()[0].image.unwrap();
+        assert!(span.placeholder);
+        assert_eq!((span.cols, span.rows), (20, 1));
+        assert!(!hidden.raw_lines.contains(&0));
+
+        let revealed =
+            runtime.layout_for(id, 80, 16, Some(&(0..1)), MarkdownImagesMode::Halfblocks);
+        assert!(revealed.raw_lines.contains(&0));
+        assert!(!revealed.raw_lines.contains(&1));
     }
 
     #[test]

@@ -106,6 +106,12 @@ Local paths are relative to the Markdown file, and `https` images are
 downloaded; either way an image can be up to 8 MB. Height follows the image's
 proportions, up to `markdown_image_max_height` rows (16 by default).
 
+A line that is only an `<img>` tag is drawn the same way. It may be wrapped in
+one `<p>`. `src` and `alt` pick the file and the placeholder label. `width`
+and `height` are CSS pixels or a percent: `width="200"` is twenty columns when
+a cell is 10 pixels wide, and `width="50%"` is half the window. A missing side
+follows the picture's proportions. `data:` sources stay as the tag.
+
 Move onto the image line and its Markdown appears in the block's first row,
 with the picture still below it, so nothing under the image moves. `j` and `k`
 step onto that line and then past the picture. Counts, half-page motion,
