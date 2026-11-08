@@ -1,17 +1,17 @@
 pkgname=red-editor-bin
-pkgver=0.11.1
+pkgver=0.12.0
 pkgrel=1
 pkgdesc='Modal terminal text editor with built-in Husk plugins'
 arch=('x86_64')
 url='https://getred.dev'
 license=('MIT')
-depends=('glibc' 'gcc-libs' 'ripgrep')
+depends=('glibc' 'gcc-libs')
 optdepends=('git: Git integration')
 provides=("red-editor=$pkgver")
 conflicts=('red-editor')
 options=('!strip' '!debug')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/codersauce/red/releases/download/v$pkgver/red-x86_64-unknown-linux-gnu.tar.gz")
-sha256sums=('26d61a8d9718746f918764b45785183efcb9f052257807640950df8d48bef593')
+sha256sums=('0732742fc90d796e5a28ccc507ca2f437530e58308da10587175415df5999097')
 
 check() {
   export HOME="$srcdir/test-home"
