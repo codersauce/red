@@ -20,6 +20,9 @@ use crate::{
     unicode_utils::{display_width, truncate_display_width},
 };
 
+#[path = "markdown_mermaid.rs"]
+mod mermaid;
+
 /// Documents larger than this stay in source form, matching Markdown tables.
 pub(super) const MAX_BLOCK_DOCUMENT_BYTES: usize = 2 * 1024 * 1024;
 
@@ -61,8 +64,6 @@ impl BlockSpan {
         }
     }
 
-    // Later phases build muted notes and role-tagged spans. Phase 0 only paints
-    // plain rows, so these stay available for that work.
     #[allow(dead_code)]
     pub(super) fn muted(text: impl Into<String>) -> Self {
         Self {
@@ -126,12 +127,26 @@ impl BlockRowView {
 pub(super) struct BlockSpec {
     pub lines: Range<usize>,
     pub rows: Vec<BlockRow>,
+    /// Set when the rows are produced from a Mermaid fence at layout time.
+    mermaid: Option<mermaid::Region>,
 }
 
 impl BlockSpec {
     #[allow(dead_code)]
     pub(super) fn new(lines: Range<usize>, rows: Vec<BlockRow>) -> Self {
-        Self { lines, rows }
+        Self {
+            lines,
+            rows,
+            mermaid: None,
+        }
+    }
+
+    fn mermaid(lines: Range<usize>, region: mermaid::Region) -> Self {
+        Self {
+            lines,
+            rows: Vec::new(),
+            mermaid: Some(region),
+        }
     }
 }
 
@@ -260,13 +275,23 @@ pub(super) fn block_line_segments(line: usize, rows: &[BlockRow]) -> Vec<LineSeg
         .collect()
 }
 
-pub(super) fn layout_blocks(specs: &[BlockSpec], reveal: Option<&Range<usize>>) -> BlockLayout {
+pub(super) fn layout_blocks(
+    specs: &[BlockSpec],
+    reveal: Option<&Range<usize>>,
+    width: usize,
+    ascii: bool,
+) -> BlockLayout {
     let mut layout = BlockLayout::default();
     let mut specs = specs.to_vec();
     specs.sort_by_key(|spec| (spec.lines.start, spec.lines.end));
     let mut occupied_until = 0usize;
     for spec in specs {
-        if spec.lines.start >= spec.lines.end || spec.rows.is_empty() {
+        let rendered = spec
+            .mermaid
+            .as_ref()
+            .map(|region| mermaid::render(region, width, ascii));
+        let rows = rendered.as_deref().unwrap_or(spec.rows.as_slice());
+        if spec.lines.start >= spec.lines.end || rows.is_empty() {
             continue;
         }
         if spec.lines.start < occupied_until {
@@ -277,7 +302,7 @@ pub(super) fn layout_blocks(specs: &[BlockSpec], reveal: Option<&Range<usize>>) 
         }
         layout.rows.insert(
             spec.lines.start,
-            block_line_segments(spec.lines.start, &spec.rows),
+            block_line_segments(spec.lines.start, rows),
         );
         for line in spec.lines.clone() {
             layout.covered.insert(line, spec.lines.clone());
@@ -329,15 +354,46 @@ struct BlockLayoutKey {
 pub(super) struct CachedBlocks {
     revision: u64,
     theme_generation: u64,
+    /// Which rendered Markdown features produced `specs`.
+    features: u8,
     specs: Vec<BlockSpec>,
     layouts: HashMap<BlockLayoutKey, Arc<BlockLayout>>,
 }
 
 impl super::Editor {
-    /// Blocks supplied by later phases. Phase 0 has no document syntax yet.
+    pub(super) fn block_feature_bits(&self, window: &crate::window::Window) -> u8 {
+        u8::from(self.markdown_mermaid_enabled(window))
+    }
+
+    /// Mermaid fences become blocks when the window setting is on.
     fn detected_markdown_blocks(&self, window: &crate::window::Window) -> Vec<BlockSpec> {
-        let _ = window;
-        Vec::new()
+        if !self.markdown_mermaid_enabled(window) {
+            return Vec::new();
+        }
+        let Some(buffer) = self.buffer_manager.get(window.buffer_index) else {
+            return Vec::new();
+        };
+        mermaid::find_blocks(&buffer.contents())
+    }
+
+    pub(super) fn markdown_mermaid_enabled(&self, window: &crate::window::Window) -> bool {
+        window
+            .markdown_mermaid
+            .unwrap_or(self.config.markdown_mermaid.unwrap_or(true))
+    }
+
+    pub(super) fn toggle_markdown_mermaid(&mut self) {
+        let enabled = self
+            .window_manager
+            .active_window()
+            .is_some_and(|window| self.markdown_mermaid_enabled(window));
+        if let Some(window) = self.window_manager.active_window_mut() {
+            window.markdown_mermaid = Some(!enabled);
+        }
+        self.vleft = 0;
+        self.skipcol = 0;
+        self.markdown_block_generation = self.markdown_block_generation.wrapping_add(1);
+        self.layout_cache.borrow_mut().clear();
     }
 
     fn markdown_block_specs(&self, window: &crate::window::Window) -> Vec<BlockSpec> {
@@ -368,8 +424,12 @@ impl super::Editor {
         let id = buffer.id();
         let revision = buffer.revision();
         let theme_generation = self.theme_generation;
+        let features = self.block_feature_bits(window);
         if let Some(cached) = self.markdown_block_cache.borrow().get(&id) {
-            if cached.revision == revision && cached.theme_generation == theme_generation {
+            if cached.revision == revision
+                && cached.theme_generation == theme_generation
+                && cached.features == features
+            {
                 return cached.specs.clone();
             }
         }
@@ -383,6 +443,7 @@ impl super::Editor {
             CachedBlocks {
                 revision,
                 theme_generation,
+                features,
                 specs: specs.clone(),
                 layouts: HashMap::new(),
             },
@@ -401,7 +462,12 @@ impl super::Editor {
         let reveal = self.markdown_block_reveal_range(window);
         #[cfg(test)]
         if self.markdown_block_override.is_some() {
-            return Some(Arc::new(layout_blocks(&specs, reveal.as_ref())));
+            return Some(Arc::new(layout_blocks(
+                &specs,
+                reveal.as_ref(),
+                self.window_content_width(window),
+                self.config.window_borders_ascii,
+            )));
         }
         let buffer = self.buffer_manager.get(window.buffer_index)?;
         let mut cache = self.markdown_block_cache.borrow_mut();
@@ -410,9 +476,11 @@ impl super::Editor {
             .as_ref()
             .map(|range| (range.start, range.end))
             .unwrap_or((usize::MAX, usize::MAX));
+        let width = self.window_content_width(window);
+        let ascii = self.config.window_borders_ascii;
         let key = BlockLayoutKey {
-            width: self.window_content_width(window),
-            ascii: self.config.window_borders_ascii,
+            width,
+            ascii,
             wrap: window.wrap,
             reveal_start: reveal_pair.0,
             reveal_end: reveal_pair.1,
@@ -424,7 +492,7 @@ impl super::Editor {
             cached
                 .layouts
                 .entry(key)
-                .or_insert_with(|| Arc::new(layout_blocks(&specs, reveal.as_ref())))
+                .or_insert_with(|| Arc::new(layout_blocks(&specs, reveal.as_ref(), width, ascii)))
                 .clone(),
         )
     }
@@ -622,7 +690,7 @@ mod tests {
     fn reserves_rows_and_collapses_them_when_the_range_is_revealed() {
         let (lines, count) = source(1, 3);
         let specs = [BlockSpec::new(1..4, rows(&["ALPHA", "BETA", "GAMMA"]))];
-        let hidden = layout_blocks(&specs, None);
+        let hidden = layout_blocks(&specs, None, 20, false);
         let layout = layout_lines_with_tables(
             &lines,
             count,
@@ -646,7 +714,7 @@ mod tests {
         assert_eq!(layout.rows.last().unwrap().line, 4);
         assert!(layout.rows.iter().any(|row| row.line == 0));
 
-        let revealed = layout_blocks(&specs, Some(&(1..2)));
+        let revealed = layout_blocks(&specs, Some(&(1..2)), 20, false);
         assert!(revealed.is_empty());
         let layout = layout_lines_with_tables(
             &lines,
@@ -670,7 +738,7 @@ mod tests {
     fn scrolls_inside_a_tall_block_with_skipcol() {
         let lines = vec!["anchor\n".to_string(), "tail\n".to_string()];
         let specs = [BlockSpec::new(0..1, rows(&["r0", "r1", "r2", "r3", "r4"]))];
-        let plan = layout_blocks(&specs, None);
+        let plan = layout_blocks(&specs, None, 20, false);
         let scrolled = layout_lines_with_tables(
             &lines,
             2,
@@ -692,7 +760,12 @@ mod tests {
     #[test]
     fn places_a_block_at_the_top_and_clips_one_at_the_bottom() {
         let top_lines = vec!["only\n".to_string(), "next\n".to_string()];
-        let top = layout_blocks(&[BlockSpec::new(0..1, rows(&["TOP-A", "TOP-B"]))], None);
+        let top = layout_blocks(
+            &[BlockSpec::new(0..1, rows(&["TOP-A", "TOP-B"]))],
+            None,
+            20,
+            false,
+        );
         let top_layout = layout_lines_with_tables(
             &top_lines,
             2,
@@ -712,6 +785,8 @@ mod tests {
         let bottom = layout_blocks(
             &[BlockSpec::new(2..4, rows(&["b0", "b1", "b2", "b3"]))],
             None,
+            20,
+            false,
         );
         let clipped = layout_lines_with_tables(
             &lines,
@@ -741,7 +816,7 @@ mod tests {
             "after\n".to_string(),
         ];
         let specs = [BlockSpec::new(1..2, rows(&["BLOCK"]))];
-        let plan = layout_blocks(&specs, None);
+        let plan = layout_blocks(&specs, None, 20, false);
         let wrapped = layout_lines_with_tables(
             &lines,
             3,

@@ -291,6 +291,10 @@ pub struct Config {
     /// width of the visible text. Defaults to on. The cursor line is shown raw
     /// while editing or when the cursor enters a concealed span.
     pub markdown_conceal: Option<bool>,
+    /// Render Mermaid fences as text diagrams. Defaults to on. The cursor
+    /// inside a diagram, and any non-Normal mode on that range, shows the
+    /// fence source. A diagram that cannot be parsed stays visible.
+    pub markdown_mermaid: Option<bool>,
     /// How standalone Markdown images are drawn. Defaults to automatic detection.
     #[serde(default)]
     pub markdown_images: MarkdownImagesMode,
@@ -2180,6 +2184,7 @@ fn known_top_level_field(field: &str) -> bool {
             | "wrap"
             | "markdown_tables"
             | "markdown_conceal"
+            | "markdown_mermaid"
             | "markdown_images"
             | "markdown_image_max_height"
             | "markdown_link_split_focus"

@@ -36,6 +36,12 @@ markdown_tables = true
 # concealed syntax show that line's raw text. Tables keep their own grid.
 markdown_conceal = true
 
+# Render ```mermaid fences as text diagrams in Normal mode. The cursor inside
+# a diagram shows the fence again. :markdown-mermaid toggles this in the
+# current split. A fence that cannot be parsed stays on screen with one
+# muted error line.
+markdown_mermaid = true
+
 # Draw standalone Markdown images inline in Normal mode. "auto" queries the
 # terminal (Kitty graphics, then Sixel) and falls back through Unicode
 # half-blocks to a text placeholder. Force "kitty", "iterm2", "sixel", or

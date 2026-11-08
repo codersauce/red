@@ -1002,6 +1002,7 @@ struct RenderedViewport {
     markdown_image_epoch: u64,
     markdown_block_reveal: Option<(usize, usize)>,
     markdown_block_generation: u64,
+    markdown_block_features: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2972,6 +2973,8 @@ pub enum Action {
     ToggleMarkdownTables,
     /// Shows or hides inline Markdown syntax when measuring wrapped lines.
     ToggleMarkdownConceal,
+    /// Shows or hides rendered Mermaid diagrams in the current window.
+    ToggleMarkdownMermaid,
     SetRelativeLineNumbers(bool),
 
     DeletePreviousChar,
@@ -3493,6 +3496,7 @@ struct LayoutCacheKey {
     markdown_ascii: bool,
     markdown_block_reveal: Option<std::ops::Range<usize>>,
     markdown_block_generation: u64,
+    markdown_block_features: u8,
 }
 
 #[derive(Debug)]
@@ -6567,6 +6571,7 @@ impl Editor {
                 .markdown_block_reveal_range(window)
                 .map(|range| (range.start, range.end)),
             markdown_block_generation: self.markdown_block_generation,
+            markdown_block_features: self.block_feature_bits(window),
         })
     }
 
@@ -7747,6 +7752,7 @@ impl Editor {
             markdown_ascii: self.config.window_borders_ascii,
             markdown_block_reveal: self.markdown_block_reveal_range(window),
             markdown_block_generation: self.markdown_block_generation,
+            markdown_block_features: self.block_feature_bits(window),
         };
         if let Some(layout) = self.layout_cache.borrow().get(&key) {
             return layout.clone();
@@ -19290,6 +19296,9 @@ impl Editor {
             if cmd == "markdown-conceal" {
                 actions.push(Action::ToggleMarkdownConceal);
             }
+            if cmd == "markdown-mermaid" {
+                actions.push(Action::ToggleMarkdownMermaid);
+            }
 
             if cmd == "statusline" {
                 actions.push(Action::OpenStatuslineManager);
@@ -24637,6 +24646,10 @@ impl Editor {
                     // Keep this arm tiny. `execute_action_inner` is already near the
                     // 2MB test-thread stack limit when a command re-enters it.
                     self.toggle_markdown_conceal();
+                    self.render(buffer)?;
+                }
+                Action::ToggleMarkdownMermaid => {
+                    self.toggle_markdown_mermaid();
                     self.render(buffer)?;
                 }
                 Action::SetWrap(wrap) => {

@@ -130,14 +130,35 @@ range, or leave Normal mode on that range, and the source lines return. `j`
 and `k` step over the whole block. A block taller than the window scrolls
 inside itself. The buffer and the undo history stay unchanged.
 
+## Mermaid
+
+A fenced `mermaid` block becomes a text diagram in Normal mode:
+
+````markdown
+```mermaid
+flowchart TD
+    A[Start] --> B[End]
+```
+````
+
+Flowcharts, sequence diagrams, class diagrams, and state diagrams use Unicode
+box drawing. Pie charts are rows of bars. Set `window_borders_ascii = true`
+for ASCII frames. A diagram wider than the window is cropped, and a muted
+`→ wider than window` line marks that. If the diagram cannot be parsed, the
+fence stays on screen with one muted `mermaid: could not render:` line.
+
+`:markdown-mermaid` toggles diagrams in the current split. Set
+`markdown_mermaid = false` to keep every fence as source.
+
 ## Settings
 
 | Setting | Default | Effect |
 | --- | --- | --- |
 | `markdown_tables` | `true` | Draw pipe tables as grids |
 | `markdown_conceal` | `true` | Hide inline markup while wrapping |
+| `markdown_mermaid` | `true` | Draw `mermaid` fences as text diagrams |
 | `markdown_images` | `"auto"` | How to draw images: `auto`, `kitty`, `iterm2`, `sixel`, `halfblocks`, `off` |
 | `markdown_image_max_height` | `16` | Most rows one image may use |
 | `markdown_link_split_focus` | `"source"` | Pane that keeps focus after `Ctrl-w x` |
 
-Tables, images, links, and tasks apply to Markdown documents up to 2 MiB.
+Tables, images, diagrams, links, and tasks apply to Markdown documents up to 2 MiB.
