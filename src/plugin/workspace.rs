@@ -25,8 +25,10 @@ use crate::{
 use super::PanelSegment;
 
 mod diff;
+mod paired;
 
 use diff::word_changes;
+use paired::{pair_visible, paired_pane_widths, PairedRow};
 
 /// How changed lines are emphasized in a structured diff.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +46,24 @@ impl DiffHighlightMode {
             Self::SmartWords => "smart words",
         }
     }
+}
+
+/// Unified detail, or old/new columns aligned by hunk.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DetailLayout {
+    #[default]
+    Unified,
+    Paired,
+}
+
+/// Which paired column owns the cursor.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DetailSide {
+    Before,
+    #[default]
+    After,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,6 +147,9 @@ pub struct WorkspaceModel {
     pub status: String,
     #[serde(default)]
     pub detail_title: String,
+    /// When set, `v` toggles paired columns instead of visual line selection.
+    #[serde(default)]
+    pub paired_columns: bool,
 }
 
 /// Plugin actions are filtered locally, so cursor movement never requires a plugin round trip.
@@ -379,6 +402,8 @@ pub struct WorkspaceEvent {
     pub detail_selection: Option<[usize; 2]>,
     pub detail_wrap: bool,
     pub detail_diff_highlights: DiffHighlightMode,
+    pub detail_layout: DetailLayout,
+    pub detail_side: DetailSide,
     /// Core-only delivery policy used by the editor and omitted from the
     /// plugin payload.
     #[serde(skip)]
@@ -400,6 +425,9 @@ pub struct PluginWorkspace {
     detail_wrap: bool,
     detail_diff_highlights: DiffHighlightMode,
     detail_selection_anchor: Option<usize>,
+    detail_layout: DetailLayout,
+    detail_side: DetailSide,
+    detail_pairs: Vec<PairedRow>,
     key_prefix: Option<String>,
     detail_highlights: Vec<Vec<crate::editor::StyleInfo>>,
     detail_word_changes: Vec<Vec<Range<usize>>>,
@@ -433,6 +461,9 @@ impl PluginWorkspace {
             detail_wrap,
             detail_diff_highlights,
             detail_selection_anchor: None,
+            detail_layout: DetailLayout::Unified,
+            detail_side: DetailSide::After,
+            detail_pairs: Vec::new(),
             key_prefix: None,
             detail_highlights: Vec::new(),
             detail_word_changes: Vec::new(),
@@ -515,6 +546,12 @@ impl PluginWorkspace {
         if document_changed {
             self.detail_selection_anchor = None;
         }
+        if model.paired_columns && !self.model.paired_columns {
+            self.detail_layout = DetailLayout::Paired;
+            self.detail_selection_anchor = None;
+        } else if !model.paired_columns {
+            self.detail_layout = DetailLayout::Unified;
+        }
         let first_change = model.detail_document.as_ref().and_then(|document| {
             document
                 .lines
@@ -545,6 +582,9 @@ impl PluginWorkspace {
         self.rebuild_rows();
         self.scroll = self.scroll.min(self.selected);
         self.detail_scroll = self.detail_scroll.min(self.detail_cursor);
+        if self.detail_layout == DetailLayout::Paired && self.model.paired_columns {
+            self.snap_side_to_cursor();
+        }
     }
 
     fn move_selection(&mut self, delta: isize, visible_rows: usize) {
@@ -681,8 +721,42 @@ impl PluginWorkspace {
             detail_selection,
             detail_wrap: self.detail_wrap,
             detail_diff_highlights: self.detail_diff_highlights,
+            detail_layout: self.detail_layout,
+            detail_side: self.reported_side(),
             notify_plugin,
         }
+    }
+
+    fn reported_side(&self) -> DetailSide {
+        if self.detail_layout == DetailLayout::Paired && self.model.paired_columns {
+            self.detail_side
+        } else if self.current_line_removed() {
+            DetailSide::Before
+        } else {
+            DetailSide::After
+        }
+    }
+
+    fn current_line_removed(&self) -> bool {
+        self.model
+            .detail_document
+            .as_ref()
+            .and_then(|document| document.lines.get(self.detail_cursor))
+            .is_some_and(|line| line.kind == "removed")
+    }
+
+    fn shows_paired_width(&self, detail_width: usize) -> bool {
+        self.detail_layout == DetailLayout::Paired
+            && self.model.paired_columns
+            && paired_pane_widths(detail_width).is_some()
+    }
+
+    fn shows_paired_layout(&self, height: usize, width: usize) -> bool {
+        let detail_width = WorkspaceLayout::calculate(self, height, width)
+            .detail
+            .map(|rect| rect.width)
+            .unwrap_or(0);
+        self.shows_paired_width(detail_width)
     }
 
     fn detail_len(&self) -> usize {
@@ -713,6 +787,14 @@ impl PluginWorkspace {
                     .collect()
             })
             .unwrap_or_default();
+        self.detail_pairs = pair_visible(
+            self.model
+                .detail_document
+                .as_ref()
+                .map(|document| document.lines.as_slice())
+                .unwrap_or(&[]),
+            &self.detail_visible,
+        );
         if let Err(position) = self.detail_visible.binary_search(&self.detail_cursor) {
             self.detail_cursor = self
                 .detail_visible
@@ -761,6 +843,167 @@ impl PluginWorkspace {
         document.lines.len().saturating_sub(1)
     }
 
+    fn pair_index_for_line(&self, line: usize) -> Option<usize> {
+        self.detail_pairs.iter().position(|row| {
+            row.span == Some(line) || row.left == Some(line) || row.right == Some(line)
+        })
+    }
+
+    fn pair_index_for_scroll(&self) -> usize {
+        if self.detail_pairs.is_empty() {
+            return 0;
+        }
+        let mut found = 0;
+        for (index, row) in self.detail_pairs.iter().enumerate() {
+            if row.min_line().unwrap_or(0) <= self.detail_scroll {
+                found = index;
+            } else {
+                break;
+            }
+        }
+        found
+    }
+
+    fn focus_pair(&mut self, index: usize) {
+        let Some(row) = self.detail_pairs.get(index).copied() else {
+            return;
+        };
+        if let Some(span) = row.span {
+            self.detail_cursor = span;
+            return;
+        }
+        let chosen = match self.detail_side {
+            DetailSide::Before => row.left.or(row.right),
+            DetailSide::After => row.right.or(row.left),
+        };
+        let Some(line) = chosen else {
+            return;
+        };
+        if self.detail_side == DetailSide::Before && row.left.is_none() {
+            self.detail_side = DetailSide::After;
+        } else if self.detail_side == DetailSide::After && row.right.is_none() {
+            self.detail_side = DetailSide::Before;
+        }
+        self.detail_cursor = line;
+    }
+
+    fn snap_side_to_cursor(&mut self) {
+        let Some(index) = self.pair_index_for_line(self.detail_cursor) else {
+            return;
+        };
+        let row = self.detail_pairs[index];
+        if row.span.is_some() {
+            return;
+        }
+        let on_before = row.left == Some(self.detail_cursor);
+        let on_after = row.right == Some(self.detail_cursor);
+        if self.detail_side == DetailSide::Before && !on_before && on_after {
+            self.detail_side = DetailSide::After;
+        } else if self.detail_side == DetailSide::After && !on_after && on_before {
+            self.detail_side = DetailSide::Before;
+        }
+    }
+
+    fn move_paired(&mut self, delta: isize, visible_rows: usize) {
+        if self.detail_pairs.is_empty() {
+            return;
+        }
+        let current = self
+            .pair_index_for_line(self.detail_cursor)
+            .unwrap_or_else(|| self.pair_index_for_scroll());
+        let next = current
+            .saturating_add_signed(delta)
+            .min(self.detail_pairs.len() - 1);
+        self.focus_pair(next);
+        let scroll_pair = self.pair_index_for_scroll();
+        if next < scroll_pair || next >= scroll_pair + visible_rows.max(1) {
+            self.detail_scroll = self.detail_pairs[next]
+                .min_line()
+                .unwrap_or(self.detail_cursor);
+        }
+    }
+
+    fn line_visual_rows(&self, index: usize, code_width: usize) -> usize {
+        if !self.detail_wrap {
+            return 1;
+        }
+        let text = self
+            .model
+            .detail_document
+            .as_ref()
+            .and_then(|document| document.lines.get(index))
+            .map(|line| line.text.as_str())
+            .unwrap_or("");
+        display_width(text).max(1).div_ceil(code_width.max(1))
+    }
+
+    fn pair_screen_rows(
+        &self,
+        row: PairedRow,
+        left_width: usize,
+        right_width: usize,
+        full_width: usize,
+    ) -> usize {
+        if let Some(index) = row.span {
+            let code_width = full_width
+                .saturating_sub(self.gutter_width().saturating_add(1))
+                .max(1);
+            return self.line_visual_rows(index, code_width);
+        }
+        let gutter = self.side_gutter_width();
+        let left = row
+            .left
+            .map(|index| self.line_visual_rows(index, left_width.saturating_sub(gutter).max(1)))
+            .unwrap_or(1);
+        let right = row
+            .right
+            .map(|index| self.line_visual_rows(index, right_width.saturating_sub(gutter).max(1)))
+            .unwrap_or(1);
+        left.max(right)
+    }
+
+    fn side_gutter_width(&self) -> usize {
+        self.line_number_width() + 3
+    }
+
+    fn line_number_width(&self) -> usize {
+        let maximum = self
+            .model
+            .detail_document
+            .as_ref()
+            .into_iter()
+            .flat_map(|document| &document.lines)
+            .flat_map(|line| [line.old_line, line.new_line])
+            .flatten()
+            .max()
+            .unwrap_or(1);
+        maximum.to_string().len().max(2)
+    }
+
+    fn focus_paired_visual(&mut self, offset: usize, detail_width: usize) {
+        let Some((left_width, right_width)) = paired_pane_widths(detail_width) else {
+            return;
+        };
+        let mut remaining = offset;
+        let start = self.pair_index_for_scroll();
+        for index in start..self.detail_pairs.len() {
+            let rows = self.pair_screen_rows(
+                self.detail_pairs[index],
+                left_width,
+                right_width,
+                detail_width,
+            );
+            if remaining < rows {
+                self.focus_pair(index);
+                return;
+            }
+            remaining = remaining.saturating_sub(rows);
+        }
+        if let Some(last) = self.detail_pairs.len().checked_sub(1) {
+            self.focus_pair(last);
+        }
+    }
+
     fn move_detail(&mut self, delta: isize, visible_rows: usize) {
         let len = self.detail_visible.len();
         if len == 0 {
@@ -784,6 +1027,35 @@ impl PluginWorkspace {
 
     fn ensure_detail_cursor_visible(&mut self, layout: WorkspaceLayout) {
         let visible_rows = layout.visible_rows(WorkspaceFocus::Detail);
+        let detail_width = layout.detail.map(|rect| rect.width).unwrap_or(0);
+        if self.shows_paired_width(detail_width) {
+            if self.detail_pairs.is_empty() {
+                return;
+            }
+            let Some((left_width, right_width)) = paired_pane_widths(detail_width) else {
+                return;
+            };
+            let pair = self
+                .pair_index_for_line(self.detail_cursor)
+                .unwrap_or_else(|| self.pair_index_for_scroll());
+            let scroll_pair = self.pair_index_for_scroll();
+            if pair < scroll_pair {
+                self.detail_scroll = self.detail_pairs[pair]
+                    .min_line()
+                    .unwrap_or(self.detail_cursor);
+                return;
+            }
+            let occupied = self.detail_pairs[scroll_pair..=pair]
+                .iter()
+                .map(|row| self.pair_screen_rows(*row, left_width, right_width, detail_width))
+                .sum::<usize>();
+            if occupied > visible_rows {
+                self.detail_scroll = self.detail_pairs[pair]
+                    .min_line()
+                    .unwrap_or(self.detail_cursor);
+            }
+            return;
+        }
         if self.detail_cursor < self.detail_scroll {
             self.detail_scroll = self.detail_cursor;
             return;
@@ -811,7 +1083,7 @@ impl PluginWorkspace {
         }
     }
 
-    fn move_to_hunk(&mut self, forward: bool, visible_rows: usize) {
+    fn move_to_hunk(&mut self, forward: bool, visible_rows: usize, paired: bool) {
         let Some(document) = self.model.detail_document.as_ref() else {
             return;
         };
@@ -846,15 +1118,24 @@ impl PluginWorkspace {
                 .map(|(index, _)| index)
         };
         if let Some(target) = target {
-            let current = self
-                .detail_visible
-                .binary_search(&self.detail_cursor)
-                .unwrap_or(0);
-            let target = self
-                .detail_visible
-                .binary_search(&target)
-                .unwrap_or(current);
-            self.move_detail(target as isize - current as isize, visible_rows);
+            if paired {
+                let visible_target = match self.detail_visible.binary_search(&target) {
+                    Ok(position) => self.detail_visible[position],
+                    Err(position) => self.detail_visible.get(position).copied().unwrap_or(target),
+                };
+                self.detail_cursor = visible_target;
+                self.snap_side_to_cursor();
+            } else {
+                let current = self
+                    .detail_visible
+                    .binary_search(&self.detail_cursor)
+                    .unwrap_or(0);
+                let target = self
+                    .detail_visible
+                    .binary_search(&target)
+                    .unwrap_or(current);
+                self.move_detail(target as isize - current as isize, visible_rows);
+            }
         }
     }
 
@@ -921,10 +1202,13 @@ impl PluginWorkspace {
             return self.event("prefix".to_string());
         }
 
+        let paired_nav = self.shows_paired_layout(height, width);
         if action == "escape" && self.detail_selection_anchor.is_some() {
             action = "cancel_selection".to_string();
         } else if self.focus == WorkspaceFocus::Detail {
             action = match action.as_str() {
+                "h" if paired_nav => "focus_before",
+                "l" if paired_nav => "focus_after",
                 "h" => "left",
                 "l" => "right",
                 "0" if !self.detail_wrap => "horizontal_start",
@@ -932,6 +1216,7 @@ impl PluginWorkspace {
                 "W" => "toggle_wrap",
                 "H" => "toggle_diff_highlights",
                 "M" => "toggle_metadata",
+                "v" if self.model.paired_columns => "toggle_paired_layout",
                 "v" => "visual",
                 other => other,
             }
@@ -1013,14 +1298,23 @@ impl PluginWorkspace {
             "focus_detail" if self.model.detail_document.is_some() => {
                 self.focus = WorkspaceFocus::Detail;
             }
+            "up" if self.focus == WorkspaceFocus::Detail && paired_nav => {
+                self.move_paired(-1, visible_rows);
+            }
             "up" => match self.focus {
                 WorkspaceFocus::Rows => self.move_selection(-1, visible_rows),
                 WorkspaceFocus::Detail => self.move_detail(-1, visible_rows),
             },
+            "down" if self.focus == WorkspaceFocus::Detail && paired_nav => {
+                self.move_paired(1, visible_rows);
+            }
             "down" => match self.focus {
                 WorkspaceFocus::Rows => self.move_selection(1, visible_rows),
                 WorkspaceFocus::Detail => self.move_detail(1, visible_rows),
             },
+            "half_page_up" if self.focus == WorkspaceFocus::Detail && paired_nav => {
+                self.move_paired(-((visible_rows / 2).max(1) as isize), visible_rows);
+            }
             "half_page_up" => match self.focus {
                 WorkspaceFocus::Rows => {
                     self.move_selection(-((visible_rows / 2).max(1) as isize), visible_rows)
@@ -1029,6 +1323,9 @@ impl PluginWorkspace {
                     self.move_detail(-((visible_rows / 2).max(1) as isize), visible_rows)
                 }
             },
+            "half_page_down" if self.focus == WorkspaceFocus::Detail && paired_nav => {
+                self.move_paired((visible_rows / 2).max(1) as isize, visible_rows);
+            }
             "half_page_down" => match self.focus {
                 WorkspaceFocus::Rows => {
                     self.move_selection((visible_rows / 2).max(1) as isize, visible_rows)
@@ -1037,14 +1334,24 @@ impl PluginWorkspace {
                     self.move_detail((visible_rows / 2).max(1) as isize, visible_rows)
                 }
             },
+            "page_up" if self.focus == WorkspaceFocus::Detail && paired_nav => {
+                self.move_paired(-(visible_rows as isize), visible_rows);
+            }
             "page_up" => match self.focus {
                 WorkspaceFocus::Rows => self.move_selection(-(visible_rows as isize), visible_rows),
                 WorkspaceFocus::Detail => self.move_detail(-(visible_rows as isize), visible_rows),
             },
+            "page_down" if self.focus == WorkspaceFocus::Detail && paired_nav => {
+                self.move_paired(visible_rows as isize, visible_rows);
+            }
             "page_down" => match self.focus {
                 WorkspaceFocus::Rows => self.move_selection(visible_rows as isize, visible_rows),
                 WorkspaceFocus::Detail => self.move_detail(visible_rows as isize, visible_rows),
             },
+            "first" if self.focus == WorkspaceFocus::Detail && paired_nav => {
+                let current = self.pair_index_for_line(self.detail_cursor).unwrap_or(0);
+                self.move_paired(-(current as isize), visible_rows);
+            }
             "first" => match self.focus {
                 WorkspaceFocus::Rows => {
                     self.move_selection(-(self.selected as isize), visible_rows)
@@ -1053,6 +1360,9 @@ impl PluginWorkspace {
                     self.move_detail(-(self.detail_cursor as isize), visible_rows)
                 }
             },
+            "last" if self.focus == WorkspaceFocus::Detail && paired_nav => {
+                self.move_paired(self.detail_pairs.len() as isize, visible_rows);
+            }
             "last" => match self.focus {
                 WorkspaceFocus::Rows => {
                     self.move_selection(self.model.rows.len() as isize, visible_rows)
@@ -1062,10 +1372,31 @@ impl PluginWorkspace {
                 }
             },
             "previous_hunk" if self.focus == WorkspaceFocus::Detail => {
-                self.move_to_hunk(false, visible_rows)
+                self.move_to_hunk(false, visible_rows, paired_nav)
             }
             "next_hunk" if self.focus == WorkspaceFocus::Detail => {
-                self.move_to_hunk(true, visible_rows)
+                self.move_to_hunk(true, visible_rows, paired_nav)
+            }
+            "toggle_paired_layout"
+                if self.focus == WorkspaceFocus::Detail && self.model.paired_columns =>
+            {
+                self.detail_layout = match self.detail_layout {
+                    DetailLayout::Unified => DetailLayout::Paired,
+                    DetailLayout::Paired => DetailLayout::Unified,
+                };
+                self.detail_selection_anchor = None;
+            }
+            "focus_before" if self.focus == WorkspaceFocus::Detail && paired_nav => {
+                self.detail_side = DetailSide::Before;
+                if let Some(index) = self.pair_index_for_line(self.detail_cursor) {
+                    self.focus_pair(index);
+                }
+            }
+            "focus_after" if self.focus == WorkspaceFocus::Detail && paired_nav => {
+                self.detail_side = DetailSide::After;
+                if let Some(index) = self.pair_index_for_line(self.detail_cursor) {
+                    self.focus_pair(index);
+                }
             }
             "visual" if self.focus == WorkspaceFocus::Detail => {
                 self.detail_selection_anchor = match self.detail_selection_anchor {
@@ -1126,6 +1457,16 @@ impl PluginWorkspace {
         }
         if self.focus == WorkspaceFocus::Detail {
             self.ensure_detail_cursor_visible(WorkspaceLayout::calculate(self, height, width));
+        }
+        if self.detail_layout == DetailLayout::Paired
+            && self.model.paired_columns
+            && !self.shows_paired_layout(height, width)
+        {
+            self.detail_side = if self.current_line_removed() {
+                DetailSide::Before
+            } else {
+                DetailSide::After
+            };
         }
         self.event(action)
     }
@@ -1211,11 +1552,28 @@ impl PluginWorkspace {
             .collect::<Vec<_>>();
         if !actions.is_empty() {
             if detail {
-                actions.extend([
-                    UiAction::new("visual", "v", "select").with_enabled(!selected),
-                    UiAction::new("cancel_selection", "Esc", "clear selection")
-                        .with_enabled(selected)
+                if self.model.paired_columns {
+                    actions.push(
+                        UiAction::new(
+                            "toggle_paired_layout",
+                            "v",
+                            if self.detail_layout == DetailLayout::Paired {
+                                "unified"
+                            } else {
+                                "split"
+                            },
+                        )
                         .with_priority(ActionPriority::Essential),
+                    );
+                } else {
+                    actions.extend([
+                        UiAction::new("visual", "v", "select").with_enabled(!selected),
+                        UiAction::new("cancel_selection", "Esc", "clear selection")
+                            .with_enabled(selected)
+                            .with_priority(ActionPriority::Essential),
+                    ]);
+                }
+                actions.extend([
                     UiAction::new("previous_hunk", "[h", "previous hunk")
                         .with_priority(ActionPriority::Secondary),
                     UiAction::new("next_hunk", "]h", "next hunk")
@@ -1279,7 +1637,20 @@ impl PluginWorkspace {
                 ("Panes", "Ctrl+w w / Ctrl+w W", "Next / previous pane"),
                 ("Panes", "Ctrl+w z", "Maximize / restore the focused pane"),
             ]));
-            if detail && !self.detail_wrap {
+            if detail && self.model.paired_columns && self.detail_layout == DetailLayout::Paired {
+                actions.extend(crate::ui::reference_actions(&[(
+                    "Navigation",
+                    "h / l",
+                    "Focus the before / after column",
+                )]));
+                if !self.detail_wrap {
+                    actions.extend(crate::ui::reference_actions(&[(
+                        "Navigation",
+                        "← / → / 0 / $",
+                        "Scroll horizontally",
+                    )]));
+                }
+            } else if detail && !self.detail_wrap {
                 actions.extend(crate::ui::reference_actions(&[(
                     "Navigation",
                     "h / l / ← / → / 0 / $",
@@ -1324,6 +1695,9 @@ fn is_core_detail_interaction(focus: WorkspaceFocus, action: &str) -> bool {
                 | "toggle_wrap"
                 | "toggle_diff_highlights"
                 | "toggle_metadata"
+                | "toggle_paired_layout"
+                | "focus_before"
+                | "focus_after"
                 | "left"
                 | "right"
                 | "horizontal_start"
@@ -1485,13 +1859,17 @@ impl WorkspaceManager {
             }
         }
         let visible_rows = layout.visible_rows(workspace.focus);
+        let detail_width = layout.detail.map(|rect| rect.width).unwrap_or(0);
+        let paired = workspace.shows_paired_width(detail_width);
         match action {
             "mouse_up" => match workspace.focus {
                 WorkspaceFocus::Rows => workspace.move_selection(-3, visible_rows),
+                WorkspaceFocus::Detail if paired => workspace.move_paired(-3, visible_rows),
                 WorkspaceFocus::Detail => workspace.move_detail(-3, visible_rows),
             },
             "mouse_down" => match workspace.focus {
                 WorkspaceFocus::Rows => workspace.move_selection(3, visible_rows),
+                WorkspaceFocus::Detail if paired => workspace.move_paired(3, visible_rows),
                 WorkspaceFocus::Detail => workspace.move_detail(3, visible_rows),
             },
             "mouse_left" if workspace.focus == WorkspaceFocus::Detail && !workspace.detail_wrap => {
@@ -1521,10 +1899,22 @@ impl WorkspaceManager {
                         .and_then(|rect| rect.content_offset(row))
                         .and_then(|offset| offset.checked_sub(1))
                     {
-                        workspace.detail_cursor = workspace.detail_line_at_visual_offset(
-                            offset,
-                            layout.detail_code_width(workspace.gutter_width()),
-                        );
+                        if paired {
+                            if let Some(rect) = layout.detail {
+                                let local = column.saturating_sub(rect.x);
+                                workspace.detail_side = if local.saturating_mul(2) < rect.width {
+                                    DetailSide::Before
+                                } else {
+                                    DetailSide::After
+                                };
+                            }
+                            workspace.focus_paired_visual(offset, detail_width);
+                        } else {
+                            workspace.detail_cursor = workspace.detail_line_at_visual_offset(
+                                offset,
+                                layout.detail_code_width(workspace.gutter_width()),
+                            );
+                        }
                     }
                 }
             },
@@ -1533,6 +1923,16 @@ impl WorkspaceManager {
         if workspace.focus == WorkspaceFocus::Detail {
             workspace
                 .ensure_detail_cursor_visible(WorkspaceLayout::calculate(workspace, height, width));
+        }
+        if workspace.detail_layout == DetailLayout::Paired
+            && workspace.model.paired_columns
+            && !workspace.shows_paired_width(detail_width)
+        {
+            workspace.detail_side = if workspace.current_line_removed() {
+                DetailSide::Before
+            } else {
+                DetailSide::After
+            };
         }
         Some(workspace.event(action.to_string()))
     }
@@ -1937,14 +2337,22 @@ fn render_detail_pane(
                 )
             })
             .unwrap_or_else(|| "File details".to_string());
+        let layout_label = if workspace.model.paired_columns {
+            match workspace.detail_layout {
+                DetailLayout::Paired => " · split",
+                DetailLayout::Unified => " · unified",
+            }
+        } else {
+            ""
+        };
         let context = if document.truncated {
             format!(
-                "{context} · {highlight_label} · first {}/{} lines · L full patch",
+                "{context} · {highlight_label} · first {}/{} lines · L full patch{layout_label}",
                 document.lines.len(),
                 document.total_lines
             )
         } else {
-            format!("{context} · {wrap_label} · {highlight_label}")
+            format!("{context} · {wrap_label} · {highlight_label}{layout_label}")
         };
         buffer.set_text(
             x,
@@ -1952,6 +2360,11 @@ fn render_detail_pane(
             &fit_display_width(&format!(" {context}"), width),
             &palette.muted,
         );
+    }
+
+    if workspace.shows_paired_width(width) {
+        render_paired_columns(buffer, workspace, theme, x, width, content_top, content_height);
+        return;
     }
 
     let gutter_width = workspace.gutter_width().min(width.saturating_sub(1));
@@ -2088,6 +2501,392 @@ fn render_detail_pane(
             screen_row += 1;
         }
     }
+}
+
+struct PairedFrame<'a> {
+    workspace: &'a PluginWorkspace,
+    theme: &'a Theme,
+    document: &'a WorkspaceDocument,
+    palette: &'a DiffPalette,
+    number_width: usize,
+    active: bool,
+}
+
+struct CellGeom<'a> {
+    x: usize,
+    y: usize,
+    column_width: usize,
+    gutter_width: usize,
+    code_width: usize,
+    line_index: Option<usize>,
+    segment: Option<&'a DisplaySlice>,
+    segment_index: usize,
+    side: DetailSide,
+}
+
+struct CodeDraw<'a> {
+    x: usize,
+    y: usize,
+    width: usize,
+    line_index: usize,
+    line: &'a WorkspaceDocumentLine,
+    segment: &'a DisplaySlice,
+    style: &'a Style,
+    cursor: bool,
+}
+
+fn render_paired_columns(
+    buffer: &mut RenderBuffer,
+    workspace: &PluginWorkspace,
+    theme: &Theme,
+    x: usize,
+    width: usize,
+    content_top: usize,
+    content_height: usize,
+) {
+    let Some(document) = workspace.model.detail_document.as_ref() else {
+        return;
+    };
+    let Some((left_width, right_width)) = paired_pane_widths(width) else {
+        return;
+    };
+    let palette = DiffPalette::new(theme);
+    let frame = PairedFrame {
+        workspace,
+        theme,
+        document,
+        palette: &palette,
+        number_width: workspace.line_number_width(),
+        active: workspace.focus == WorkspaceFocus::Detail,
+    };
+    let rule_style = SurfacePalette::new(theme, &theme.style).muted;
+    let number_width = workspace.line_number_width();
+    let side_gutter = workspace.side_gutter_width();
+    let full_gutter = workspace.gutter_width().min(width.saturating_sub(1));
+    let full_code = width.saturating_sub(full_gutter + 1).max(1);
+    let left_code = left_width.saturating_sub(side_gutter).max(1);
+    let right_code = right_width.saturating_sub(side_gutter).max(1);
+    let mut screen_row = 0;
+    for row in workspace
+        .detail_pairs
+        .iter()
+        .copied()
+        .skip(workspace.pair_index_for_scroll())
+    {
+        if screen_row >= content_height {
+            break;
+        }
+        if let Some(index) = row.span {
+            let Some(line) = document.lines.get(index) else {
+                continue;
+            };
+            let segments = detail_line_segments(workspace, &line.text, full_code);
+            for (segment_index, segment) in segments.into_iter().enumerate() {
+                if screen_row >= content_height {
+                    break;
+                }
+                let y = content_top + screen_row;
+                let cursor = frame.active && index == workspace.detail_cursor;
+                let line_style =
+                    detail_paint_style(workspace, theme, &palette, &line.kind, index, cursor);
+                buffer.set_text(x, y, &fit_display_width("", width), &line_style);
+                if segment_index == 0 {
+                    buffer.set_text(
+                        x,
+                        y,
+                        &truncate_display_width(&unified_gutter(line, number_width), full_gutter),
+                        &gutter_style(&line.kind, &line_style, &palette),
+                    );
+                }
+                paint_code(
+                    buffer,
+                    &frame,
+                    &CodeDraw {
+                        x: x + full_gutter,
+                        y,
+                        width: full_code,
+                        line_index: index,
+                        line,
+                        segment: &segment,
+                        style: &line_style,
+                        cursor,
+                    },
+                );
+                screen_row += 1;
+            }
+            continue;
+        }
+
+        let left_segments = paired_cell_segments(workspace, document, row.left, left_code);
+        let right_segments = paired_cell_segments(workspace, document, row.right, right_code);
+        let count = left_segments.len().max(right_segments.len()).max(1);
+        for segment_index in 0..count {
+            if screen_row >= content_height {
+                break;
+            }
+            let y = content_top + screen_row;
+            paint_paired_cell(
+                buffer,
+                &frame,
+                &CellGeom {
+                    x,
+                    y,
+                    column_width: left_width,
+                    gutter_width: side_gutter,
+                    code_width: left_code,
+                    line_index: row.left,
+                    segment: left_segments.get(segment_index),
+                    segment_index,
+                    side: DetailSide::Before,
+                },
+            );
+            buffer.set_text(x + left_width, y, "│", &rule_style);
+            paint_paired_cell(
+                buffer,
+                &frame,
+                &CellGeom {
+                    x: x + left_width + 1,
+                    y,
+                    column_width: right_width,
+                    gutter_width: side_gutter,
+                    code_width: right_code,
+                    line_index: row.right,
+                    segment: right_segments.get(segment_index),
+                    segment_index,
+                    side: DetailSide::After,
+                },
+            );
+            screen_row += 1;
+        }
+    }
+}
+
+fn paired_cell_segments(
+    workspace: &PluginWorkspace,
+    document: &WorkspaceDocument,
+    line_index: Option<usize>,
+    code_width: usize,
+) -> Vec<DisplaySlice> {
+    let Some(text) = line_index
+        .and_then(|index| document.lines.get(index))
+        .map(|line| line.text.as_str())
+    else {
+        return vec![DisplaySlice {
+            text: String::new(),
+            byte_start: 0,
+            byte_end: 0,
+        }];
+    };
+    detail_line_segments(workspace, text, code_width)
+}
+
+fn detail_line_segments(
+    workspace: &PluginWorkspace,
+    text: &str,
+    code_width: usize,
+) -> Vec<DisplaySlice> {
+    if workspace.detail_wrap {
+        wrapped_slices(text, code_width)
+    } else {
+        vec![display_slice(text, workspace.detail_horizontal, code_width)]
+    }
+}
+
+fn paint_paired_cell(buffer: &mut RenderBuffer, frame: &PairedFrame<'_>, cell: &CellGeom<'_>) {
+    let line = cell
+        .line_index
+        .and_then(|index| frame.document.lines.get(index));
+    let cursor = cell.line_index.is_some_and(|index| {
+        frame.active && index == frame.workspace.detail_cursor && cell.side == frame.workspace.detail_side
+    });
+    let line_style = match line {
+        Some(line) => detail_paint_style(
+            frame.workspace,
+            frame.theme,
+            frame.palette,
+            &line.kind,
+            cell.line_index.unwrap_or(0),
+            cursor,
+        ),
+        None => frame.theme.style.clone(),
+    };
+    buffer.set_text(
+        cell.x,
+        cell.y,
+        &fit_display_width("", cell.column_width),
+        &line_style,
+    );
+    let Some(line) = line else {
+        return;
+    };
+    if cell.segment_index == 0 {
+        buffer.set_text(
+            cell.x,
+            cell.y,
+            &truncate_display_width(
+                &side_gutter_text(line, frame.number_width, cell.side),
+                cell.gutter_width.min(cell.column_width),
+            ),
+            &gutter_style(&line.kind, &line_style, frame.palette),
+        );
+    }
+    let Some(segment) = cell.segment else {
+        return;
+    };
+    paint_code(
+        buffer,
+        frame,
+        &CodeDraw {
+            x: cell.x + cell.gutter_width.min(cell.column_width),
+            y: cell.y,
+            width: cell.code_width,
+            line_index: cell.line_index.unwrap_or(0),
+            line,
+            segment,
+            style: &line_style,
+            cursor,
+        },
+    );
+}
+
+fn paint_code(buffer: &mut RenderBuffer, frame: &PairedFrame<'_>, code: &CodeDraw<'_>) {
+    buffer.set_text(
+        code.x,
+        code.y,
+        &fit_display_width(&code.segment.text, code.width),
+        code.style,
+    );
+    render_syntax_overlays(
+        buffer,
+        (code.x, code.y, code.width),
+        &code.line.text,
+        code.segment,
+        frame
+            .workspace
+            .detail_highlights
+            .get(code.line_index)
+            .map_or(&[], Vec::as_slice),
+        code.style,
+    );
+    let selected = frame
+        .workspace
+        .detail_selection_anchor
+        .is_some_and(|anchor| {
+            let start = anchor.min(frame.workspace.detail_cursor);
+            let end = anchor.max(frame.workspace.detail_cursor);
+            code.line_index >= start && code.line_index <= end
+        });
+    if frame.workspace.detail_diff_highlights == DiffHighlightMode::SmartWords
+        && !selected
+        && !code.cursor
+    {
+        let background = match code.line.kind.as_str() {
+            "added" => Some(frame.palette.added_text),
+            "removed" => Some(frame.palette.removed_text),
+            _ => None,
+        };
+        if let Some(background) = background {
+            for range in frame
+                .workspace
+                .detail_word_changes
+                .get(code.line_index)
+                .into_iter()
+                .flatten()
+            {
+                let start = range
+                    .start
+                    .max(code.segment.byte_start)
+                    .min(code.segment.byte_end);
+                let end = range.end.min(code.segment.byte_end).max(start);
+                if start < end {
+                    let first = display_width(&code.line.text[code.segment.byte_start..start]);
+                    let last = display_width(&code.line.text[code.segment.byte_start..end]);
+                    for column in first..last.min(code.width) {
+                        buffer.set_bg(code.x + column, code.y, &background, frame.theme);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn detail_paint_style(
+    workspace: &PluginWorkspace,
+    theme: &Theme,
+    palette: &DiffPalette,
+    kind: &str,
+    line_index: usize,
+    cursor: bool,
+) -> Style {
+    let selected = workspace.detail_selection_anchor.is_some_and(|anchor| {
+        let start = anchor.min(workspace.detail_cursor);
+        let end = anchor.max(workspace.detail_cursor);
+        line_index >= start && line_index <= end
+    });
+    let mut line_style = diff_line_style(kind, theme, palette);
+    if selected {
+        line_style = theme.selected_style(
+            &line_style,
+            &theme.editor_selection_style(),
+            SelectionForegroundPriority::Content,
+        );
+    } else if cursor {
+        let cursor_style = Style {
+            bg: theme
+                .line_highlight_style
+                .as_ref()
+                .and_then(|style| style.bg)
+                .or(theme.ui_style.picker_selected_item.bg),
+            ..Style::default()
+        };
+        line_style = theme.selected_style(
+            &line_style,
+            &cursor_style,
+            SelectionForegroundPriority::Content,
+        );
+    }
+    line_style
+}
+
+fn unified_gutter(line: &WorkspaceDocumentLine, number_width: usize) -> String {
+    let marker = diff_marker(&line.kind, &line.text);
+    format!(
+        "{:>number_width$} {:>number_width$} {marker} ",
+        line.old_line.map_or(String::new(), |line| line.to_string()),
+        line.new_line.map_or(String::new(), |line| line.to_string()),
+    )
+}
+
+fn side_gutter_text(line: &WorkspaceDocumentLine, number_width: usize, side: DetailSide) -> String {
+    let marker = diff_marker(&line.kind, &line.text);
+    let number = match side {
+        DetailSide::Before => line.old_line,
+        DetailSide::After => line.new_line,
+    };
+    format!(
+        "{:>number_width$} {marker} ",
+        number.map_or(String::new(), |line| line.to_string())
+    )
+}
+
+fn diff_marker(kind: &str, text: &str) -> &'static str {
+    match kind {
+        "added" => "+",
+        "removed" => "−",
+        "hunk" => "@",
+        _ if text.trim_start().starts_with('\\') => "\\",
+        _ => " ",
+    }
+}
+
+fn gutter_style(kind: &str, line_style: &Style, palette: &DiffPalette) -> Style {
+    let mut gutter_style = line_style.clone();
+    gutter_style.fg = match kind {
+        "added" => Some(palette.added_marker),
+        "removed" => Some(palette.removed_marker),
+        _ => gutter_style.fg,
+    };
+    gutter_style
 }
 
 #[derive(Debug)]
@@ -3036,5 +3835,162 @@ mod tests {
         assert!(added_row
             .iter()
             .any(|cell| cell.style.fg.is_some() && cell.style.fg != theme.style.fg));
+    }
+
+    fn diff_line(
+        kind: &str,
+        text: &str,
+        old_line: Option<usize>,
+        new_line: Option<usize>,
+    ) -> WorkspaceDocumentLine {
+        WorkspaceDocumentLine {
+            id: text.to_string(),
+            text: text.to_string(),
+            kind: kind.to_string(),
+            old_line,
+            new_line,
+            hunk_id: Some("h1".to_string()),
+            ..WorkspaceDocumentLine::default()
+        }
+    }
+
+    fn paired_diff_model() -> WorkspaceModel {
+        WorkspaceModel {
+            rows: vec![row("file", true)],
+            actions: vec![WorkspaceAction {
+                hint: UiAction::new("q", "q", "close"),
+                focus: String::new(),
+                sections: Vec::new(),
+                selection: String::new(),
+                change_only: false,
+                hunk_only: false,
+            }],
+            paired_columns: true,
+            detail_document: Some(WorkspaceDocument {
+                path: "src/main.rs".to_string(),
+                lines: vec![
+                    WorkspaceDocumentLine {
+                        id: "header".to_string(),
+                        text: "@@ -1,3 +1,4 @@".to_string(),
+                        kind: "hunk".to_string(),
+                        hunk_id: Some("h1".to_string()),
+                        ..WorkspaceDocumentLine::default()
+                    },
+                    diff_line("context", "keep", Some(1), Some(1)),
+                    diff_line("removed", "old line", Some(2), None),
+                    diff_line("added", "new line", None, Some(2)),
+                    diff_line("removed", "only old", Some(3), None),
+                    diff_line("added", "only new a", None, Some(3)),
+                    diff_line("added", "only new b", None, Some(4)),
+                    diff_line("context", "tail", Some(4), Some(5)),
+                    diff_line("meta", "\\ No newline at end of file", None, None),
+                ],
+                ..WorkspaceDocument::default()
+            }),
+            ..WorkspaceModel::default()
+        }
+    }
+
+    #[test]
+    fn paired_columns_align_hunks_and_v_toggles_without_a_plugin_round_trip() {
+        let model: WorkspaceModel = serde_json::from_str(r#"{"paired_columns":true}"#).unwrap();
+        assert!(model.paired_columns);
+        let omitted: WorkspaceModel = serde_json::from_str("{}").unwrap();
+        assert!(!omitted.paired_columns);
+
+        let theme = Theme::default();
+        let mut manager = WorkspaceManager::default();
+        manager.open(
+            "git".to_string(),
+            WorkspaceConfig {
+                notify_detail_navigation: false,
+                min_two_pane_width: 80,
+                ..WorkspaceConfig::default()
+            },
+        );
+        manager.update("git", paired_diff_model(), &theme);
+        manager.handle_action("focus_detail".to_string(), 30, 160);
+        let event = manager.handle_action("l".to_string(), 30, 160).unwrap();
+        assert_eq!(event.action, "focus_after");
+        assert_eq!(event.detail_layout, DetailLayout::Paired);
+        assert_eq!(event.detail_side, DetailSide::After);
+        assert_eq!(event.detail_line.unwrap().text, "new line");
+        assert!(!event.notify_plugin);
+
+        let event = manager.handle_action("down".to_string(), 30, 160).unwrap();
+        assert_eq!(event.detail_line.unwrap().text, "only new a");
+        let event = manager.handle_action("h".to_string(), 30, 160).unwrap();
+        assert_eq!(event.detail_side, DetailSide::Before);
+        assert_eq!(event.detail_line.unwrap().text, "only old");
+        let event = manager.handle_action("down".to_string(), 30, 160).unwrap();
+        assert_eq!(event.detail_side, DetailSide::After);
+        assert_eq!(event.detail_line.unwrap().text, "only new b");
+
+        let mut buffer = RenderBuffer::new(160, 30, &theme.style);
+        manager.render(&mut buffer, &theme, PickerIconsConfig::default());
+        let text = buffer_text(&buffer);
+        assert!(text.contains("split"));
+        let replacement = text.lines().find(|line| line.contains("old line")).unwrap();
+        assert!(replacement.contains("new line"));
+        let pad = text
+            .lines()
+            .find(|line| line.contains("only new b"))
+            .unwrap();
+        assert!(!pad.contains("only old"));
+        assert!(text.contains("\\ No newline at end of file"));
+
+        let event = manager.handle_action("v".to_string(), 30, 160).unwrap();
+        assert_eq!(event.action, "toggle_paired_layout");
+        assert_eq!(event.detail_layout, DetailLayout::Unified);
+        assert!(!event.notify_plugin);
+        assert!(manager
+            .active
+            .as_ref()
+            .unwrap()
+            .actions()
+            .iter()
+            .any(|action| action.label == "split"));
+        manager.update("git", paired_diff_model(), &theme);
+        assert_eq!(
+            manager
+                .handle_action("noop".to_string(), 30, 160)
+                .unwrap()
+                .detail_layout,
+            DetailLayout::Unified
+        );
+
+        let mut plain = paired_diff_model();
+        plain.paired_columns = false;
+        manager.update("git", plain, &theme);
+        let event = manager.handle_action("v".to_string(), 30, 160).unwrap();
+        assert_eq!(event.action, "visual");
+        assert!(event.detail_selection.is_some());
+    }
+
+    #[test]
+    fn a_narrow_paired_pane_falls_back_to_unified_rendering() {
+        let theme = Theme::default();
+        let mut manager = WorkspaceManager::default();
+        manager.open(
+            "git".to_string(),
+            WorkspaceConfig {
+                min_two_pane_width: 10,
+                min_stacked_height: 100,
+                ..WorkspaceConfig::default()
+            },
+        );
+        manager.update("git", paired_diff_model(), &theme);
+        manager.handle_action("focus_detail".to_string(), 20, 50);
+        let event = manager.handle_action("h".to_string(), 20, 50).unwrap();
+        assert_eq!(event.action, "left");
+        assert_eq!(event.detail_layout, DetailLayout::Paired);
+        let mut buffer = RenderBuffer::new(50, 20, &theme.style);
+        manager.render(&mut buffer, &theme, PickerIconsConfig::default());
+        let row = buffer_text(&buffer)
+            .lines()
+            .find(|line| line.contains("old line"))
+            .unwrap()
+            .to_string();
+        assert!(!row.contains("new line"));
     }
 }
