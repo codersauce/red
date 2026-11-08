@@ -45,6 +45,23 @@ markdown_conceal = true
 # toggles this in the current split. It follows markdown_conceal.
 markdown_extended_marks = true
 
+# Render ```mermaid fences as text diagrams in Normal mode. The cursor inside
+# a diagram shows the fence again. :markdown-mermaid toggles this in the
+# current split. A fence that cannot be parsed stays on screen with one
+# muted error line.
+markdown_mermaid = true
+
+# Render a leading `---` YAML block as a key/value table. The cursor inside
+# the block shows the source. :markdown-frontmatter toggles this in the
+# current split. A block that is not flat pairs stays as source.
+markdown_frontmatter = true
+
+# Render $...$ and $$...$$ math as Unicode in Normal mode. Off by default,
+# because dollar signs are common in prose and shell snippets.
+# :markdown-math toggles this in the current split. A price or an unknown
+# command stays as source.
+markdown_math = false
+
 # Draw standalone Markdown images inline in Normal mode, including a line whose
 # only content is an `<img>` tag (optionally wrapped in `<p>`). "auto" queries the
 # terminal (Kitty graphics, then Sixel) and falls back through Unicode

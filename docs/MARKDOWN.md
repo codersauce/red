@@ -225,6 +225,60 @@ restart to move focus to the opened file. **Clear link destination** in the
 command palette lets go of the split without closing it, and closing either
 pane or switching the document to another file does the same.
 
+## Rendered blocks
+
+Some Markdown constructs draw as one block anchored on their first source
+line. The other lines in that range take no rows while the block is on
+screen. In Normal mode you see the rendered rows. Move the cursor into the
+range, or leave Normal mode on that range, and the source lines return. `j`
+and `k` step over the whole block. A block taller than the window scrolls
+inside itself. The buffer and the undo history stay unchanged.
+
+## Mermaid
+
+A fenced `mermaid` block becomes a text diagram in Normal mode:
+
+````markdown
+```mermaid
+flowchart TD
+    A[Start] --> B[End]
+```
+````
+
+Flowcharts, sequence diagrams, class diagrams, and state diagrams use Unicode
+box drawing. Pie charts are rows of bars. Set `window_borders_ascii = true`
+for ASCII frames. A diagram wider than the window is cropped, and a muted
+`→ wider than window` line marks that. If the diagram cannot be parsed, the
+fence stays on screen with one muted `mermaid: could not render:` line.
+
+`:markdown-mermaid` toggles diagrams in the current split. Set
+`markdown_mermaid = false` to keep every fence as source.
+
+## Frontmatter
+
+A Markdown file that starts with a `---` fence renders that YAML block as a
+table. Fewer than five pairs sit in one row of keys over one row of values.
+Five or more pairs, or a table that does not fit, stack as key and value
+columns. Lists join with commas. Nested lines and folded text stay on one
+line and are cut to the window. Keys use the property-name color, values use
+the string color, and the rules use the indent-guide color.
+
+`:markdown-frontmatter` toggles the table in the current split. A block that
+is not a list of pairs, or that never closes, stays as source.
+
+## Math
+
+`$…$` and `$$…$$` can be drawn as Unicode, so `$E = mc^2$` shows `E = mc²`.
+This is off by default, because `$` is common in prose and shell snippets.
+`:markdown-math` toggles it in the current split. Set `markdown_math = true`
+to start with math on.
+
+Only unambiguous delimiters render. A price such as `$20$` or `$5 and $6`
+stays as source, and so does an unknown command. Inline math follows the
+cursor: the rest of the line stays rendered, and the cursor inside the
+expression shows the dollars. A `$$` block on its own lines is a rendered
+block. The buffer and the undo history stay unchanged.
+
 ## Settings
 
 | Setting | Default | Effect |
@@ -232,8 +286,11 @@ pane or switching the document to another file does the same.
 | `markdown_tables` | `true` | Draw pipe tables as grids |
 | `markdown_conceal` | `true` | Hide inline markup while wrapping, including GitHub alert markers and balanced inline HTML tags |
 | `markdown_extended_marks` | `true` | Hide `==highlight==` markers and paint the text like `<mark>` |
+| `markdown_mermaid` | `true` | Draw `mermaid` fences as text diagrams |
+| `markdown_frontmatter` | `true` | Draw leading YAML frontmatter as a table |
+| `markdown_math` | `false` | Draw `$...$` and `$$...$$` math as Unicode |
 | `markdown_images` | `"auto"` | How to draw images: `auto`, `kitty`, `iterm2`, `sixel`, `halfblocks`, `off` |
 | `markdown_image_max_height` | `16` | Most rows one image may use |
 | `markdown_link_split_focus` | `"source"` | Pane that keeps focus after `Ctrl-w x` |
 
-Tables, images, links, and tasks apply to Markdown documents up to 2 MiB.
+Tables, images, diagrams, frontmatter, math, links, and tasks apply to Markdown documents up to 2 MiB.

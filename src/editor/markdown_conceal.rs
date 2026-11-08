@@ -989,23 +989,11 @@ fn apply_html_styles(
 pub(super) struct CachedConcealment {
     revision: u64,
     extended_marks: bool,
+    conceal: bool,
+    math: bool,
     lines: Arc<LineConcealments>,
     alerts: Arc<AlertMap>,
     html: Arc<HtmlMap>,
-}
-
-fn cache_concealment(
-    parsed: ConcealedSource,
-    revision: u64,
-    extended_marks: bool,
-) -> CachedConcealment {
-    CachedConcealment {
-        revision,
-        extended_marks,
-        lines: Arc::new(parsed.lines),
-        alerts: Arc::new(parsed.alerts),
-        html: Arc::new(parsed.html),
-    }
 }
 
 pub(super) fn alert_color(theme: &Theme, kind: AlertKind) -> Color {
@@ -1044,7 +1032,9 @@ impl super::Editor {
         &self,
         window: &crate::window::Window,
     ) -> Option<Arc<LineConcealments>> {
-        if !self.markdown_conceal_enabled(window) {
+        let conceal = self.markdown_conceal_enabled(window);
+        let math = self.markdown_math_active(window);
+        if !conceal && !math {
             return None;
         }
         let buffer = self.buffer_manager.get(window.buffer_index)?;
@@ -1052,17 +1042,44 @@ impl super::Editor {
             return None;
         }
         let extended_marks = self.markdown_extended_marks_enabled(window);
+        let id = buffer.id();
+        let revision = buffer.revision();
+        let source = buffer.contents();
         let mut cache = self.markdown_conceal_cache.borrow_mut();
-        if cache.len() >= 8 && !cache.contains_key(&buffer.id()) {
+        if cache.len() >= 8 && !cache.contains_key(&id) {
             cache.clear();
         }
-        let cached = cache.entry(buffer.id()).or_insert_with(|| {
-            let parsed = parse_concealment(&buffer.contents(), extended_marks);
-            cache_concealment(parsed, buffer.revision(), extended_marks)
-        });
-        if cached.revision != buffer.revision() || cached.extended_marks != extended_marks {
-            let parsed = parse_concealment(&buffer.contents(), extended_marks);
-            *cached = cache_concealment(parsed, buffer.revision(), extended_marks);
+        let build = || {
+            let parsed = if conceal {
+                parse_concealment(&source, extended_marks)
+            } else {
+                ConcealedSource {
+                    lines: LineConcealments::empty(&source),
+                    alerts: AlertMap::default(),
+                    html: HtmlMap::default(),
+                }
+            };
+            let mut lines = parsed.lines;
+            if math {
+                lines = lines.with_swaps(super::markdown_blocks::swaps_by_line(&source));
+            }
+            CachedConcealment {
+                revision,
+                extended_marks,
+                conceal,
+                math,
+                lines: Arc::new(lines),
+                alerts: Arc::new(parsed.alerts),
+                html: Arc::new(parsed.html),
+            }
+        };
+        let cached = cache.entry(id).or_insert_with(&build);
+        if cached.revision != revision
+            || cached.extended_marks != extended_marks
+            || cached.conceal != conceal
+            || cached.math != math
+        {
+            *cached = build();
         }
         Some(cached.lines.clone())
     }
@@ -1223,7 +1240,12 @@ impl super::Editor {
         &self,
         window: &crate::window::Window,
     ) -> Option<Range<usize>> {
-        if !window.active || !self.markdown_conceal_enabled(window) {
+        if !window.active {
+            return None;
+        }
+        let conceal = self.markdown_conceal_enabled(window);
+        let math = self.markdown_math_active(window);
+        if !conceal && !math {
             return None;
         }
         let line = window.vtop + window.cy;
