@@ -69,6 +69,7 @@ pub fn run_stdio(options: ServerOptions) -> anyhow::Result<()> {
             write_message(&mut writer, &response)?;
         }
         if server.exited {
+            anyhow::ensure!(server.shutdown_requested, "exit received before shutdown");
             break;
         }
     }
@@ -80,7 +81,6 @@ struct Server {
     workspace: Option<Workspace>,
     shutdown_requested: bool,
     exited: bool,
-    cancelled: HashSet<String>,
     dependency_diagnostics: Vec<String>,
 }
 
@@ -91,7 +91,6 @@ impl Server {
             workspace: None,
             shutdown_requested: false,
             exited: false,
-            cancelled: HashSet::new(),
             dependency_diagnostics: Vec::new(),
         }
     }
@@ -109,13 +108,25 @@ impl Server {
         let params = object.get("params").cloned().unwrap_or(Value::Null);
         match (id, method) {
             (Some(id), Some(method)) => {
-                if self.cancelled.remove(&request_key(&id)) {
-                    return vec![error_response(id, -32800, "request cancelled")];
+                if self.shutdown_requested {
+                    return vec![error_response(id, -32600, "shutdown already requested")];
+                }
+                if self.workspace.is_none() && method != "initialize" {
+                    return vec![error_response(
+                        id,
+                        -32002,
+                        "Husk language server is not initialized",
+                    )];
                 }
                 vec![match self.handle_request(method, params) {
                     Ok(result) => success_response(id, result),
                     Err(error) => error_response(id, -32603, &format!("{error:#}")),
                 }]
+            }
+            (None, Some(method))
+                if method != "exit" && (self.workspace.is_none() || self.shutdown_requested) =>
+            {
+                Vec::new()
             }
             (None, Some(method)) => {
                 self.handle_notification(method, params)
@@ -136,9 +147,6 @@ impl Server {
     }
 
     fn handle_request(&mut self, method: &str, params: Value) -> anyhow::Result<Value> {
-        if method != "initialize" && self.workspace.is_none() {
-            anyhow::bail!("Husk language server is not initialized");
-        }
         match method {
             "initialize" => self.initialize(params),
             "shutdown" => {
@@ -183,12 +191,9 @@ impl Server {
                 self.exited = true;
                 Ok(Vec::new())
             }
-            "$/cancelRequest" => {
-                if let Some(id) = params.get("id") {
-                    self.cancelled.insert(request_key(id));
-                }
-                Ok(Vec::new())
-            }
+            // The stdio loop finishes each request before reading the next message.
+            // A cancellation received here cannot belong to outstanding work.
+            "$/cancelRequest" => Ok(Vec::new()),
             "textDocument/didOpen" => {
                 let item = params
                     .get("textDocument")
@@ -1509,10 +1514,6 @@ fn deduplicate_locations(locations: &mut Vec<Value>) {
     });
 }
 
-fn request_key(id: &Value) -> String {
-    serde_json::to_string(id).unwrap_or_else(|_| "null".to_string())
-}
-
 fn success_response(id: Value, result: Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "result": result})
 }
@@ -1557,6 +1558,34 @@ mod tests {
             call_context("build(1, nested(2, 3), ", 23),
             Some(("build".to_string(), 2))
         );
+    }
+
+    #[test]
+    fn requests_and_notifications_obey_the_server_lifetime() {
+        let root = tempfile::tempdir().unwrap();
+        let mut server = Server::new(ServerOptions::default());
+        let query = json!({"id":2,"method":"workspace/diagnostic"});
+        let open = json!({"method":"textDocument/didOpen","params":{}});
+        assert_eq!(server.handle(query.clone())[0]["error"]["code"], -32002);
+        assert!(server.handle(open.clone()).is_empty());
+        server.handle(json!({"id":1,"method":"initialize","params":{"rootUri":file_uri(root.path()).unwrap()}}));
+        assert!(server.handle(query.clone())[0].get("result").is_some());
+        server.handle(json!({"id":3,"method":"shutdown"}));
+        assert_eq!(server.handle(query)[0]["error"]["code"], -32600);
+        assert!(server.handle(open).is_empty());
+        server.handle(json!({"method":"exit"}));
+        assert!(server.exited);
+    }
+
+    #[test]
+    fn late_cancellation_cannot_cancel_a_reused_request_id() {
+        let root = tempfile::tempdir().unwrap();
+        let mut server = Server::new(ServerOptions::default());
+        server.handle(json!({"id":1,"method":"initialize","params":{"rootUri":file_uri(root.path()).unwrap()}}));
+        let query = json!({"id":2,"method":"workspace/diagnostic"});
+        assert!(server.handle(query.clone())[0].get("result").is_some());
+        server.handle(json!({"method":"$/cancelRequest","params":{"id":2}}));
+        assert!(server.handle(query)[0].get("result").is_some());
     }
 
     #[test]

@@ -69,7 +69,7 @@ impl Editor {
             };
             match saved {
                 Ok(_) => {
-                    if self.buffer_has_pending_format_save(target) {
+                    if self.pending_format_save(target).is_some() {
                         pending += 1;
                     } else if self.current_buffer().is_dirty() {
                         first_error.get_or_insert_with(|| {
@@ -263,7 +263,7 @@ impl Editor {
                 if matches!(action, Action::Save | Action::ForceSave)
                     && dirty_before
                     && self.current_buffer().is_dirty()
-                    && !self.buffer_has_pending_format_save(target)
+                    && self.pending_format_save(target).is_none()
                 {
                     return Ok(());
                 }
@@ -293,13 +293,5 @@ impl Editor {
                 | Action::SetSyntax(_)
                 | Action::DeleteBuffer(_)
         )
-    }
-
-    fn buffer_has_pending_format_save(&self, buffer_id: BufferId) -> bool {
-        self.pending_lsp_format_saves.keys().any(|request_id| {
-            self.pending_lsp_edit_requests
-                .get(request_id)
-                .is_some_and(|pending| pending.buffer_id == buffer_id)
-        })
     }
 }

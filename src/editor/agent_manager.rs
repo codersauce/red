@@ -303,6 +303,13 @@ impl AgentManager {
         }
     }
 
+    /// A rejected interrupt restores tool access only for a still-stopping turn.
+    pub fn interrupt_rejected(&mut self, session_id: &str) {
+        if let Some(phase @ AgentTurnPhase::Stopping) = self.turn_phases.get_mut(session_id) {
+            *phase = AgentTurnPhase::Running;
+        }
+    }
+
     /// Returns whether a new turn must wait for this session's current turn.
     pub fn is_session_busy(&self, session_id: &str) -> bool {
         self.turn_phases.contains_key(session_id)
@@ -329,6 +336,8 @@ impl AgentManager {
 
     /// Drops busy state and queued prompts for a session that is being closed.
     pub fn discard_session_queue(&mut self, session_id: &str) -> usize {
+        self.active_turn_ids.remove(session_id);
+        self.turn_started_at.remove(session_id);
         self.turn_phases.remove(session_id);
         self.queued_prompts
             .remove(session_id)

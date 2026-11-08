@@ -72,6 +72,7 @@ async fn inline_context_dispatch_is_request_bound_and_does_not_move_focus() {
     let buffer_id = editor.current_buffer().id();
     let (response, receive) = tokio::sync::oneshot::channel();
     editor.dispatch_inline_context_request(PendingEditorTool {
+        cancelled: None,
         request: EditorToolRequest {
             session_id: "provider".into(),
             call: EditorToolCall::InlineContext {

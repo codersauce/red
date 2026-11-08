@@ -354,9 +354,28 @@ impl Editor {
     ) -> anyhow::Result<bool> {
         for (index, action) in actions.iter().enumerate() {
             let checkpoint = self.rpc_command_checkpoint();
+            let write_before_quit = matches!(actions.get(index + 1), Some(Action::Quit(_)))
+                && matches!(
+                    action,
+                    Action::Save | Action::SaveAs(_) | Action::ForceSave | Action::ForceSaveAs(_)
+                );
+            let previous_save = write_before_quit.then(|| self.current_buffer().save_generation());
             self.set_legacy_message(None);
             if self.execute(action, buffer, runtime).await? {
                 return Ok(true);
+            }
+            // A clean buffer can still fail to write. Preserve its error and
+            // only continue to quit if this write committed or is in flight.
+            if previous_save == Some(self.current_buffer().save_generation()) {
+                let pending = self.pending_format_save(self.current_buffer().id());
+                let waiting = match (action, pending) {
+                    (Action::Save, Some(_)) => true,
+                    (Action::SaveAs(path), Some((_, save))) => save.save_as.as_ref() == Some(path),
+                    _ => false,
+                };
+                if !waiting {
+                    return Ok(false);
+                }
             }
             if let Some(command) = self.rpc_command_started_since(checkpoint) {
                 self.defer_rpc_action(

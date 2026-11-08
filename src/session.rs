@@ -5,7 +5,10 @@ use std::{
     fs::{self, File},
     io::{self, Read as _, Write as _},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
 };
 
 #[cfg(not(unix))]
@@ -276,6 +279,8 @@ pub struct RecoveryDivergence {
 pub struct SessionStore {
     directory: PathBuf,
     namespace_root: Option<PathBuf>,
+    // Editors retain the claim between snapshots. Standalone writes hold it for one rotation.
+    editor_writer: Option<Arc<Mutex<Option<crate::utils::ExclusiveFileLock>>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,6 +298,7 @@ impl SessionStore {
         Self {
             directory: directory.into(),
             namespace_root: None,
+            editor_writer: None,
         }
     }
 
@@ -320,7 +326,24 @@ impl SessionStore {
         Ok(Self {
             directory: directory.join(owner),
             namespace_root: Some(directory.to_path_buf()),
+            editor_writer: None,
         })
+    }
+
+    /// Retains this editor's recovery namespace from its first write until its last clone drops.
+    pub fn for_editor(mut self) -> Self {
+        self.editor_writer = Some(Arc::default());
+        self
+    }
+
+    /// Claims an existing recovery namespace before continuing its history.
+    /// Re-read after claiming because another writer may have finished since selection.
+    pub fn resume_for_editor(root: &Path) -> anyhow::Result<(Self, SessionSnapshot)> {
+        let (mut store, _) = Self::load_latest_with_store(root)?;
+        let claim = SnapshotWriteDirectory::open(&store)?.claim_writer()?;
+        store.editor_writer = Some(Arc::new(Mutex::new(Some(claim))));
+        let snapshot = store.load()?;
+        Ok((store, snapshot))
     }
 
     /// Loads the preferred recoverable snapshot from the root and owner stores.
@@ -358,6 +381,7 @@ impl SessionStore {
                         stores.push(Self {
                             directory: entry.path(),
                             namespace_root: Some(directory.to_path_buf()),
+                            editor_writer: None,
                         });
                     }
                 }
@@ -464,6 +488,15 @@ impl SessionStore {
         after_directory_open: impl FnOnce(),
     ) -> anyhow::Result<()> {
         let directory = SnapshotWriteDirectory::open(self)?;
+        let mut editor_writer = self
+            .editor_writer
+            .as_ref()
+            .map(|writer| writer.lock().unwrap_or_else(|poison| poison.into_inner()));
+        let mut temporary_claim = None;
+        let claim = editor_writer.as_deref_mut().unwrap_or(&mut temporary_claim);
+        if claim.is_none() {
+            *claim = Some(directory.claim_writer()?);
+        }
         after_directory_open();
         let (previous_generation, rotate_latest) =
             self.previous_generation_for_write(&directory)?;
@@ -536,6 +569,37 @@ impl SessionStore {
             Err(error) => anyhow::bail!(
                 "cannot replace the latest session snapshot ({latest_error}); last known-good snapshot is unavailable ({error})"
             ),
+        }
+    }
+}
+
+impl SnapshotWriteDirectory {
+    fn claim_writer(&self) -> anyhow::Result<crate::utils::ExclusiveFileLock> {
+        // Unix can lock the pinned directory itself. Windows locks a regular
+        // child opened relative to its retained, no-follow directory handle.
+        #[cfg(unix)]
+        let file = self.directory.try_clone()?;
+        #[cfg(windows)]
+        let file = open_windows_session_child(
+            self.directory()?,
+            "writer.lock".as_ref(),
+            windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE,
+            windows_sys::Wdk::Storage::FileSystem::FILE_OPEN_IF,
+            Some(false),
+            false,
+        )?;
+        #[cfg(not(any(unix, windows)))]
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.directory.join("writer.lock"))?;
+        match crate::utils::ExclusiveFileLock::acquire(file) {
+            Ok(claim) => Ok(claim),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                anyhow::bail!("another editor is using this recovery session")
+            }
+            Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
         }
     }
 }
@@ -3482,6 +3546,53 @@ mod tests {
             "newer"
         );
         assert_ne!(first.latest_path(), second.latest_path());
+    }
+
+    #[test]
+    fn overlapping_recovery_writers_cannot_rotate_the_same_store() {
+        let root = tempfile::tempdir().unwrap();
+        let owner = SessionStore::for_owner(root.path(), "same").unwrap();
+        owner.write(&mut snapshot("initial")).unwrap();
+        let (resumer, mut recovered) = SessionStore::load_latest_with_store(root.path()).unwrap();
+        owner
+            .write_with_fault_and_directory_hook(
+                &mut snapshot("owner"),
+                SnapshotFault::None,
+                || {
+                    assert!(
+                        resumer.write(&mut recovered).is_err(),
+                        "a second writer entered the same rotation"
+                    );
+                },
+            )
+            .unwrap();
+        assert_eq!(owner.load().unwrap().buffers[0].contents, "owner");
+        resumer.write(&mut recovered).unwrap();
+        assert_eq!(recovered.generation, 3);
+    }
+
+    #[test]
+    fn live_editors_keep_the_recovery_claim_between_snapshots() {
+        let root = tempfile::tempdir().unwrap();
+        let editor = SessionStore::for_owner(root.path(), "editor-one")
+            .unwrap()
+            .for_editor();
+        editor.write(&mut snapshot("live")).unwrap();
+        assert!(SessionStore::resume_for_editor(root.path()).is_err());
+        drop(editor);
+        let (resumed, mut work) = SessionStore::resume_for_editor(root.path()).unwrap();
+        assert!(SessionStore::resume_for_editor(root.path()).is_err());
+        work.buffers[0].contents = "resumed".into();
+        resumed.write(&mut work).unwrap();
+        drop(resumed);
+        assert_eq!(
+            SessionStore::resume_for_editor(root.path())
+                .unwrap()
+                .1
+                .buffers[0]
+                .contents,
+            "resumed"
+        );
     }
 
     #[test]

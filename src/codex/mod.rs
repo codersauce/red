@@ -347,7 +347,7 @@ pub enum CodexEvent {
         /// Bounded app-server update payload.
         update: Value,
     },
-    /// Active turn reached a terminal success state.
+    /// Active turn reached a terminal state reported by the provider.
     Completed {
         /// Owning session.
         session_id: String,
@@ -477,6 +477,34 @@ pub trait CodexToolHost: Send + 'static {
     ) -> Result<Value>;
     /// Dispatches an editor-owned semantic tool request.
     async fn editor_tool(&mut self, request: EditorToolRequest) -> Result<Value>;
+
+    /// Dispatches a call admitted for this turn. Queuing hosts retain the flag
+    /// until the editor admits the operation at its mutation boundary.
+    async fn editor_tool_for_turn(
+        &mut self,
+        request: EditorToolRequest,
+        _cancelled: Arc<AtomicBool>,
+    ) -> Result<Value> {
+        match request.call {
+            EditorToolCall::ReadFile {
+                path,
+                start_line,
+                line_count,
+            } => {
+                self.read_file(&request.session_id, &path, start_line, line_count)
+                    .await
+            }
+            EditorToolCall::WriteFile {
+                path,
+                expected_revision,
+                content,
+            } => {
+                self.write_file(&request.session_id, &path, expected_revision, content)
+                    .await
+            }
+            _ => self.editor_tool(request).await,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -488,6 +516,12 @@ struct Session {
     cancelled: Arc<AtomicBool>,
     allow_sensitive_paths: bool,
     kind: SessionKind,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug)]
@@ -596,6 +630,7 @@ enum Pending {
     },
     Interrupt {
         session_id: String,
+        turn_id: String,
     },
 }
 
@@ -1221,7 +1256,7 @@ async fn start_turn(
             .ok();
         return Ok(());
     }
-    session.cancelled.store(false, Ordering::Relaxed);
+    session.cancelled = Arc::new(AtomicBool::new(false));
     session.pending_interrupt_turn_id = None;
     if let SessionKind::Inline { result, .. } = &mut session.kind {
         *result = None;
@@ -1307,6 +1342,7 @@ async fn interrupt_active_turn(
         id.clone(),
         Pending::Interrupt {
             session_id: session_id.to_string(),
+            turn_id: turn_id.clone(),
         },
     );
     write_message(
@@ -1497,6 +1533,7 @@ async fn handle_message<H: CodexToolHost>(
             let mut completed_event = None;
             if let Some(session) = sessions.get_mut(&session_id) {
                 if session.active_turn.as_deref() == Some(turn_id) {
+                    let was_cancelled = session.cancelled.swap(true, Ordering::Relaxed);
                     session.active_turn = None;
                     session.pending_interrupt_turn_id = None;
                     completed_event = Some(match &mut session.kind {
@@ -1505,7 +1542,7 @@ async fn handle_message<H: CodexToolHost>(
                             stop_reason: status.clone(),
                         },
                         SessionKind::Inline { request_id, result } => {
-                            match result.take().filter(|_| status == "completed" && !session.cancelled.load(Ordering::Relaxed)) {
+                            match result.take().filter(|_| status == "completed" && !was_cancelled) {
                                 Some(result) => CodexEvent::InlineResult {
                                     request_id: request_id.clone(),
                                     session_id: session_id.clone(),
@@ -2173,21 +2210,25 @@ async fn send_pending_failure(
             unreachable!("early requests returned above")
         }
     };
-    if matches!(request, Pending::Interrupt { .. }) {
-        // A rejected interrupt leaves the turn running: allow a retry and report
-        // it without ending the turn, so queued prompts keep waiting for it.
-        if let Some(session) = sessions.get_mut(session_id) {
-            session.pending_interrupt_turn_id = None;
-            if matches!(session.kind, SessionKind::Agent) && session.active_turn.is_some() {
-                events
-                    .send(CodexEvent::CancelFailed {
-                        session_id: session_id.clone(),
-                        message: message.to_string(),
-                    })
-                    .await
-                    .ok();
-                return;
-            }
+    if let Pending::Interrupt { turn_id, .. } = request {
+        // A terminal notification can arrive before the interrupt response.
+        let Some(session) = sessions
+            .get_mut(session_id)
+            .filter(|session| session.pending_interrupt_turn_id.as_ref() == Some(turn_id))
+        else {
+            return;
+        };
+        session.pending_interrupt_turn_id = None;
+        if matches!(session.kind, SessionKind::Agent) {
+            // Work started before cancellation keeps its old cancellation flag.
+            session.cancelled = Arc::new(AtomicBool::new(false));
+            let _ = events
+                .send(CodexEvent::CancelFailed {
+                    session_id: session_id.clone(),
+                    message: message.to_string(),
+                })
+                .await;
+            return;
         }
     }
     let (event, remove_session) = sessions.get(session_id).map_or_else(
@@ -2229,6 +2270,24 @@ async fn send_pending_failure(
         sessions.remove(session_id);
     }
     events.send(event).await.ok();
+}
+
+async fn dispatch_turn_tool<H: CodexToolHost>(
+    host: &Mutex<H>,
+    cancelled: &Arc<AtomicBool>,
+    session_id: &str,
+    call: EditorToolCall,
+) -> Result<Value> {
+    let mut host = host.lock().await;
+    anyhow::ensure!(!cancelled.load(Ordering::Relaxed), "inactive Codex turn");
+    host.editor_tool_for_turn(
+        EditorToolRequest {
+            session_id: session_id.to_string(),
+            call,
+        },
+        Arc::clone(cancelled),
+    )
+    .await
 }
 
 async fn handle_tool_call<H: CodexToolHost>(
@@ -2340,15 +2399,9 @@ async fn handle_tool_call<H: CodexToolHost>(
     tokio::spawn(async move {
         let started_at = Instant::now();
         let result = timeout(tool_timeout, async {
+            let dispatch = |call| dispatch_turn_tool(host.as_ref(), &cancelled, &session_id, call);
             if let Some(call) = inline_call {
-                return host
-                    .lock()
-                    .await
-                    .editor_tool(EditorToolRequest {
-                        session_id: session_id.clone(),
-                        call,
-                    })
-                    .await;
+                return dispatch(call).await;
             }
             match tool.as_str() {
                 "list_files" => {
@@ -2417,11 +2470,7 @@ async fn handle_tool_call<H: CodexToolHost>(
                     };
                     let expected_revision =
                         arguments.get("expected_revision").and_then(Value::as_u64);
-                    let page = host
-                        .lock()
-                        .await
-                        .read_file(&session_id, path, start_line, line_count)
-                        .await?;
+                    let page = dispatch(EditorToolCall::ReadFile { path: path.to_string(), start_line, line_count }).await?;
                     if let Some(expected_revision) = expected_revision {
                         anyhow::ensure!(
                             page["revision"].as_u64() == Some(expected_revision),
@@ -2437,10 +2486,7 @@ async fn handle_tool_call<H: CodexToolHost>(
                         .and_then(Value::as_u64)
                         .ok_or_else(|| anyhow::anyhow!("write_file requires expected_revision"))?;
                     let content = required_string(&arguments, "content")?.to_string();
-                    host.lock()
-                        .await
-                        .write_file(&session_id, path, expected_revision, content)
-                        .await
+                    dispatch(EditorToolCall::WriteFile { path: path.to_string(), expected_revision, content }).await
                 }
                 "get_editor_state"
                 | "open_file"
@@ -2456,13 +2502,7 @@ async fn handle_tool_call<H: CodexToolHost>(
                 | "lsp_preview_rename"
                 | "lsp_apply_edit" => {
                     let call = EditorToolCall::parse(&tool, arguments)?;
-                    host.lock()
-                        .await
-                        .editor_tool(EditorToolRequest {
-                            session_id: session_id.clone(),
-                            call,
-                        })
-                        .await
+                    dispatch(call).await
                 }
                 _ => anyhow::bail!("unsupported Codex dynamic tool"),
             }
@@ -3385,6 +3425,10 @@ mod tests {
         );
         assert_eq!(sessions["agent"].active_turn.as_deref(), Some("turn"));
 
+        assert!(
+            !sessions["agent"].cancelled.load(Ordering::Relaxed),
+            "a rejected interrupt must admit subsequent deltas and tools"
+        );
         stop_session(
             "agent".into(),
             false,
@@ -3399,6 +3443,49 @@ mod tests {
         let retry: Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(retry["method"], "turn/interrupt");
         assert_eq!(retry["params"]["turnId"], "turn");
+    }
+
+    #[tokio::test]
+    async fn a_tool_waiting_for_the_host_cannot_run_after_its_turn_stops() {
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let host = Arc::new(Mutex::new(InlineReadHost(Arc::clone(&calls))));
+        let guard = host.lock().await;
+        let mut sessions = HashMap::from([(
+            "agent".into(),
+            Session {
+                model_info: None,
+                cwd: PathBuf::from("/workspace"),
+                active_turn: Some("one".into()),
+                pending_interrupt_turn_id: None,
+                cancelled: Arc::new(AtomicBool::new(false)),
+                allow_sensitive_paths: false,
+                kind: SessionKind::Agent,
+            },
+        )]);
+        let (internal, mut results) = mpsc::channel(1);
+        let (events, _received) = mpsc::channel(4);
+        let mut output = Vec::new();
+        let mut pending = HashMap::new();
+        let mut next_id = 0;
+        handle_tool_call(json!({"id":"mkdir","params":{"threadId":"agent","turnId":"one","tool":"create_directory","arguments":{"path":"old"}}}), &mut output, &mut sessions, Arc::clone(&host), internal).await.unwrap();
+        stop_session(
+            "agent".into(),
+            false,
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+        )
+        .await
+        .unwrap();
+        drop(guard);
+        let InternalEvent::ToolResult { result, .. } = results.recv().await.unwrap();
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "the cancelled tool reached the host"
+        );
+        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -3494,19 +3581,6 @@ mod tests {
         assert_eq!(output.len(), output_len);
         assert!(received.try_recv().is_err());
 
-        handle_response(
-            json!({"id": request["id"], "result": {}}),
-            &mut output,
-            &events,
-            &mut pending,
-            &mut sessions,
-            &mut next_id,
-            &AgentRuntimePolicy::default(),
-        )
-        .await
-        .unwrap();
-        assert!(received.try_recv().is_err());
-
         let (internal, _) = mpsc::channel(1);
         handle_message(
             json!({"method":"turn/completed","params":{"threadId":"agent",
@@ -3530,6 +3604,64 @@ mod tests {
         ));
         assert_eq!(sessions["agent"].active_turn, None);
         assert_eq!(sessions["agent"].pending_interrupt_turn_id, None);
+        output.clear();
+        start_turn(
+            "agent".into(),
+            json!([]),
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+        )
+        .await
+        .unwrap();
+        let start: Value = serde_json::from_slice(&output).unwrap();
+        handle_response(
+            json!({"id":start["id"],"result":{"turn":{"id":"next"}}}),
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+            &AgentRuntimePolicy::default(),
+        )
+        .await
+        .unwrap();
+        stop_session(
+            "agent".into(),
+            false,
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            received.try_recv(),
+            Ok(CodexEvent::Cancelled { .. })
+        ));
+        handle_response(
+            json!({"id":request["id"],"error":{"code":-32000,"message":"old turn ended"}}),
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+            &AgentRuntimePolicy::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sessions["agent"].pending_interrupt_turn_id.as_deref(),
+            Some("next")
+        );
+        assert!(
+            received.try_recv().is_err(),
+            "the first turn's reply cannot reject the next turn's interrupt"
+        );
     }
 
     #[tokio::test]

@@ -526,9 +526,11 @@ impl SessionPaths {
 #[cfg(unix)]
 /// Bound owner endpoint and its private authentication material.
 ///
-/// Dropping this value removes all rendezvous files.
+/// Dropping this value removes the socket and credentials, then releases the name.
 pub struct BoundSession {
     listener: UnixListener,
+    // Held across publication and Drop. The lock file keeps a stable inode for retries.
+    _owner_lock: crate::utils::ExclusiveFileLock,
     paths: SessionPaths,
     token: String,
 }
@@ -568,6 +570,26 @@ pub fn bind_session(directory: &Path, name: &str) -> anyhow::Result<BoundSession
     );
     std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
     let paths = SessionPaths::new(directory, name)?;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let owner_lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(directory.join(format!("{name}.lock")))?;
+    anyhow::ensure!(
+        owner_lock.metadata()?.is_file(),
+        "invalid detach owner lock"
+    );
+    let owner_lock = match crate::utils::ExclusiveFileLock::acquire(owner_lock) {
+        Ok(guard) => guard,
+        Err(std::fs::TryLockError::WouldBlock) => {
+            anyhow::bail!("detach session `{name}` is already running")
+        }
+        Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+    };
+
     if std::fs::symlink_metadata(&paths.socket).is_ok() {
         let active = session_is_active(directory, name)?;
         anyhow::ensure!(!active, "detach session `{name}` is already running");
@@ -586,6 +608,7 @@ pub fn bind_session(directory: &Path, name: &str) -> anyhow::Result<BoundSession
     write_private_file(&paths.pid, std::process::id().to_string().as_bytes())?;
     Ok(BoundSession {
         listener,
+        _owner_lock: owner_lock,
         paths,
         token,
     })
@@ -1803,6 +1826,24 @@ mod tests {
 
         assert!(error.contains("detach paste exceeds"));
         assert!(owner.pending_paste.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_second_owner_cannot_replace_incomplete_rendezvous_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner = bind_session(directory.path(), "writing-pid").unwrap();
+        // Reproduce the observable interval between binding and publishing the PID.
+        std::fs::remove_file(&owner.paths.pid).unwrap();
+        assert!(bind_session(directory.path(), "writing-pid").is_err());
+        assert_eq!(
+            std::fs::read_to_string(&owner.paths.token).unwrap(),
+            owner.token()
+        );
+        assert!(UnixStream::connect(&owner.paths.socket).await.is_ok());
+        drop(owner);
+        let retry = bind_session(directory.path(), "writing-pid").unwrap();
+        assert!(UnixStream::connect(&retry.paths.socket).await.is_ok());
     }
 
     #[cfg(unix)]

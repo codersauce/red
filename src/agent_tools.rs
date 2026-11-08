@@ -2,7 +2,13 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::time::Duration;
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use tokio::{
@@ -376,7 +382,11 @@ impl EditorToolHost {
         Self { sender }
     }
 
-    async fn request(&self, request: EditorToolRequest) -> anyhow::Result<Value> {
+    async fn request(
+        &self,
+        request: EditorToolRequest,
+        cancelled: Option<Arc<AtomicBool>>,
+    ) -> anyhow::Result<Value> {
         let response_timeout = if request.call.may_wait_for_user() {
             USER_DECISION_TOOL_TIMEOUT
         } else {
@@ -386,6 +396,7 @@ impl EditorToolHost {
         timeout(
             Duration::from_secs(30),
             self.sender.send(PendingEditorTool {
+                cancelled,
                 request,
                 response: response_tx,
             }),
@@ -410,14 +421,17 @@ impl CodexToolHost for EditorToolHost {
         start_line: usize,
         line_count: usize,
     ) -> anyhow::Result<Value> {
-        self.request(EditorToolRequest {
-            session_id: session_id.to_string(),
-            call: EditorToolCall::ReadFile {
-                path: path.to_string(),
-                start_line,
-                line_count,
+        self.request(
+            EditorToolRequest {
+                session_id: session_id.to_string(),
+                call: EditorToolCall::ReadFile {
+                    path: path.to_string(),
+                    start_line,
+                    line_count,
+                },
             },
-        })
+            None,
+        )
         .await
     }
 
@@ -428,29 +442,52 @@ impl CodexToolHost for EditorToolHost {
         expected_revision: u64,
         content: String,
     ) -> anyhow::Result<Value> {
-        self.request(EditorToolRequest {
-            session_id: session_id.to_string(),
-            call: EditorToolCall::WriteFile {
-                path: path.to_string(),
-                expected_revision,
-                content,
+        self.request(
+            EditorToolRequest {
+                session_id: session_id.to_string(),
+                call: EditorToolCall::WriteFile {
+                    path: path.to_string(),
+                    expected_revision,
+                    content,
+                },
             },
-        })
+            None,
+        )
         .await
     }
 
     async fn editor_tool(&mut self, request: EditorToolRequest) -> anyhow::Result<Value> {
-        self.request(request).await
+        self.request(request, None).await
+    }
+
+    async fn editor_tool_for_turn(
+        &mut self,
+        request: EditorToolRequest,
+        cancelled: Arc<AtomicBool>,
+    ) -> anyhow::Result<Value> {
+        self.request(request, Some(cancelled)).await
     }
 }
 
 /// One bounded request waiting for the editor main loop to produce a result.
 #[derive(Debug)]
 pub struct PendingEditorTool {
+    /// Revoked by the bridge when the owning turn stops.
+    pub cancelled: Option<Arc<AtomicBool>>,
     /// Request to execute on the editor owner task.
     pub request: EditorToolRequest,
     /// One-shot result channel back to the Codex worker.
     pub response: oneshot::Sender<Result<Value, String>>,
+}
+
+impl PendingEditorTool {
+    pub(crate) fn is_expired(&self) -> bool {
+        self.response.is_closed()
+            || self
+                .cancelled
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    }
 }
 
 /// Completed editor tool held briefly so its visible result can be followed.

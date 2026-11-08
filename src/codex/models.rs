@@ -494,7 +494,9 @@ mod tests {
     #[tokio::test]
     async fn settings_ack_uses_normalized_server_values() {
         let (events, mut received) = mpsc::channel(2);
-        let previous = session("first", "high", SessionKind::Agent).model_info;
+        let previous = session("first", "high", SessionKind::Agent)
+            .model_info
+            .take();
         let mut sessions = HashMap::from([(
             "thread-1".into(),
             session("second", "low", SessionKind::Agent),

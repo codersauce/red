@@ -66,8 +66,13 @@ pub fn run(config_dir: &Path) -> anyhow::Result<Outcome> {
 /// them in their config directory.
 fn write_default_assets(config_dir: &Path) -> anyhow::Result<()> {
     fs::create_dir_all(config_dir)?;
-    fs::write(config_dir.join("config.toml"), assets::starter_config())?;
-    Ok(())
+    match crate::utils::write_new_file(
+        &config_dir.join("config.toml"),
+        assets::starter_config().as_bytes(),
+    ) {
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        result => Ok(result?),
+    }
 }
 
 /// Writes an optional starter config without overwriting an existing user file.
@@ -207,6 +212,15 @@ mod tests {
         assert!(parsed.is_ok(), "starter config should parse: {parsed:?}");
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn starter_config_preserves_a_file_created_after_the_welcome_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "# user settings").unwrap();
+        write_default_assets(dir.path()).unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), "# user settings");
     }
 
     #[test]

@@ -29,6 +29,45 @@ pub fn normalized_file_path(path: &str) -> anyhow::Result<PathBuf> {
     Ok(absolutize_file_path(&path)?.into_owned())
 }
 
+/// Releases the advisory lock before closing, even if a forked child still has a duplicate descriptor.
+#[derive(Debug)]
+pub(crate) struct ExclusiveFileLock(pub(crate) std::fs::File);
+
+impl ExclusiveFileLock {
+    pub(crate) fn acquire(file: std::fs::File) -> Result<Self, std::fs::TryLockError> {
+        file.try_lock()?;
+        Ok(Self(file))
+    }
+}
+
+impl Drop for ExclusiveFileLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+/// Publishes complete file contents without replacing an existing directory entry.
+pub(crate) fn write_new_file(path: &Path, contents: &[u8]) -> io::Result<()> {
+    use io::Write as _;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".red-save-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        builder.permissions(std::fs::Permissions::from_mode(0o666));
+    }
+    let mut temporary = builder.tempfile_in(parent)?;
+    temporary.write_all(contents)?;
+    temporary
+        .persist_noclobber(path)
+        .map(|_| ())
+        .map_err(|error| error.error)
+}
+
 /// Returns whether two paths identify the same file.
 ///
 /// Lexical equality also covers files that do not exist yet. When both paths exist,

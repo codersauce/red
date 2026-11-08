@@ -16,6 +16,7 @@ pub(crate) mod directory;
 use ropey::{Rope, RopeSlice};
 use std::{
     collections::HashSet,
+    io::{Read, Seek, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -744,33 +745,36 @@ impl Buffer {
 
     /// Rejects writes when the destination no longer matches its last known disk state.
     pub(crate) fn ensure_backing_file_unchanged(&self, path: &Path) -> anyhow::Result<()> {
-        let disk_contents = Self::read_disk_contents(path)?;
-
-        let Some(backing_file) = self
-            .backing_file
-            .as_ref()
-            .filter(|backing_file| same_file_path(&backing_file.path, path))
-        else {
-            anyhow::ensure!(
-                disk_contents.is_none(),
-                "Refusing to overwrite existing file {:?}; it was not opened or saved by Red",
-                path.display().to_string()
-            );
-            return Ok(());
-        };
-
-        let unchanged = match (&backing_file.contents, disk_contents.as_deref()) {
+        let actual = Self::read_disk_contents(path)?;
+        let backing = self.backing_file_at(path);
+        let expected = backing.and_then(|file| file.contents.as_ref());
+        let unchanged = match (expected, actual) {
             (None, None) => true,
-            (Some(expected), Some(actual)) => Self::rope_matches_disk_contents(expected, actual),
+            (Some(expected), Some(actual)) => Self::rope_matches_disk_contents(expected, &actual),
             _ => false,
         };
+        if unchanged {
+            Ok(())
+        } else {
+            Err(Self::save_conflict(path, backing))
+        }
+    }
 
-        anyhow::ensure!(
-            unchanged,
-            "File changed on disk since Red last read or saved it: {:?}; use :diffdisk to compare, :e! to reload, :w <file> to save elsewhere, or :w! to overwrite",
-            path.display().to_string()
-        );
-        Ok(())
+    fn backing_file_at(&self, path: &Path) -> Option<&BackingFileSnapshot> {
+        self.backing_file
+            .as_ref()
+            .filter(|file| same_file_path(&file.path, path))
+    }
+
+    fn save_conflict(path: &Path, backing: Option<&BackingFileSnapshot>) -> anyhow::Error {
+        if backing.is_some() {
+            anyhow::anyhow!("File changed on disk since Red last read or saved it: {:?}; use :diffdisk to compare, :e! to reload, :w <file> to save elsewhere, or :w! to overwrite", path.display().to_string())
+        } else {
+            anyhow::anyhow!(
+                "Refusing to overwrite existing file {:?}; it was not opened or saved by Red",
+                path.display().to_string()
+            )
+        }
     }
 
     /// Keeps the last known contents attached to a file moved by Red or an LSP server.
@@ -822,26 +826,73 @@ impl Buffer {
         );
         let path = normalized_file_path(new_file_name)?;
         let file = path.to_string_lossy().into_owned();
-        if !force {
-            if let Err(error) = self.ensure_backing_file_unchanged(&path) {
-                if self
-                    .backing_file
-                    .as_ref()
-                    .is_some_and(|backing_file| same_file_path(&backing_file.path, &path))
-                {
-                    if let Ok(change) = self.detect_external_file_change() {
-                        self.set_external_file_change(change);
-                    }
-                }
-                return Err(error);
-            }
-        }
         let contents = self.contents();
-        std::fs::write(&path, &contents)?;
+        if let Err(error) = self.write_buffer_contents(&path, contents.as_bytes(), force) {
+            if self.backing_file_at(&path).is_some() {
+                if let Ok(change) = self.detect_external_file_change() {
+                    self.set_external_file_change(change);
+                }
+            }
+            return Err(error);
+        }
         self.file = Some(file.clone());
         self.mark_saved();
         let message = format!("{:?} {}L, {}B written", file, self.len(), contents.len());
         Ok(message)
+    }
+
+    fn write_buffer_contents(
+        &self,
+        path: &Path,
+        contents: &[u8],
+        force: bool,
+    ) -> anyhow::Result<()> {
+        let backing = self.backing_file_at(path);
+        let expected = backing.and_then(|file| file.contents.as_ref());
+        if !force && expected.is_none() {
+            // Publish complete bytes only if nobody has claimed this name meanwhile.
+            return match crate::utils::write_new_file(path, contents) {
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    Err(Self::save_conflict(path, backing))
+                }
+                result => Ok(result?),
+            };
+        }
+        // Keep the inode (including hard links and permissions) and compare on
+        // the same locked handle that writes it. Opening must not truncate it.
+        let file = match std::fs::OpenOptions::new()
+            .write(true)
+            .read(!force)
+            .create(force)
+            .truncate(false)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(error) if !force && error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Self::save_conflict(path, backing))
+            }
+            Err(error) => return Err(error.into()),
+        };
+        // Special files (e.g. /dev/null) accept writes but do not support resizing.
+        if !file.metadata()?.is_file() {
+            if !force {
+                self.ensure_backing_file_unchanged(path)?;
+            }
+            return Ok((&file).write_all(contents)?);
+        }
+        let mut locked = crate::utils::ExclusiveFileLock::acquire(file)?;
+        let file = &mut locked.0;
+        if let Some(expected) = expected.filter(|_| !force) {
+            let mut previous = Vec::new();
+            file.read_to_end(&mut previous)?;
+            if !Self::rope_matches_disk_contents(expected, &previous) {
+                return Err(Self::save_conflict(path, backing));
+            }
+            file.rewind()?;
+        }
+        file.write_all(contents)?;
+        file.set_len(contents.len() as u64)?;
+        Ok(())
     }
 
     /// Returns the display name used by buffer and status UI.
@@ -1799,6 +1850,52 @@ mod test {
         assert!(!buffer.is_dirty());
         assert_eq!(fs::read_to_string(first).unwrap(), "def");
         assert_eq!(fs::read_to_string(second).unwrap(), "abc");
+    }
+
+    #[test]
+    fn concurrent_saves_from_the_same_baseline_have_one_winner() {
+        use std::sync::Barrier;
+        for exists in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("shared");
+            let original = if exists {
+                "baseline".repeat(32768)
+            } else {
+                String::new()
+            };
+            if exists {
+                std::fs::write(&path, &original).unwrap();
+            }
+            let barrier = Barrier::new(4);
+            let buffers = (0..4)
+                .map(|index| {
+                    let mut buffer =
+                        Buffer::new(Some(path.to_str().unwrap().into()), original.clone());
+                    buffer.insert_str(0, 0, &index.to_string().repeat(262144));
+                    buffer
+                })
+                .collect::<Vec<_>>();
+            let winners = std::thread::scope(|scope| {
+                let threads = buffers
+                    .into_iter()
+                    .map(|mut buffer| {
+                        let barrier = &barrier;
+                        scope.spawn(move || {
+                            barrier.wait();
+                            let saved = buffer.save().is_ok();
+                            assert_eq!(buffer.is_dirty(), !saved);
+                            saved.then(|| buffer.contents())
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                threads
+                    .into_iter()
+                    .filter_map(|thread| thread.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(winners.len(), 1, "file existed: {exists}");
+            assert_eq!(std::fs::read_to_string(path).unwrap(), winners[0]);
+        }
     }
 
     #[tokio::test]

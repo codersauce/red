@@ -314,7 +314,11 @@ async fn run_editor_inner(args: Args) -> anyhow::Result<()> {
 
     let session_root = session_root(&Config::config_dir());
     let (resumed_store, resumed_session) = if args.resume {
-        let (store, snapshot) = SessionStore::load_latest_with_store(&session_root)?;
+        let (store, snapshot) = if args.core_session.is_some() {
+            SessionStore::load_latest_with_store(&session_root)?
+        } else {
+            SessionStore::resume_for_editor(&session_root)?
+        };
         if !snapshot.cwd.is_empty() {
             std::env::set_current_dir(&snapshot.cwd)?;
         }
@@ -324,11 +328,12 @@ async fn run_editor_inner(args: Args) -> anyhow::Result<()> {
     };
     let session_store = match (&args.core_session, resumed_store) {
         (Some(session), _) => {
-            SessionStore::for_owner(&session_root, &format!("detached-{session}"))?
+            SessionStore::for_owner(&session_root, &format!("detached-{session}"))?.for_editor()
         }
         (None, Some(store)) => store,
         (None, None) => {
             SessionStore::for_owner(&session_root, &format!("editor-{}", uuid::Uuid::new_v4()))?
+                .for_editor()
         }
     };
 

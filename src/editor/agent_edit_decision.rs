@@ -31,6 +31,7 @@ pub enum AgentUnsavedChoice {
 pub(super) struct PendingAgentEditDecision {
     tool: PendingEditorTool,
     path: PathBuf,
+    buffer_id: BufferId,
     title: String,
     shown: bool,
 }
@@ -39,7 +40,7 @@ pub(super) struct PendingAgentEditDecision {
 pub(super) struct AgentEditDecisions {
     /// Choice per conversation and file, valid while the buffer's save generation
     /// is unchanged.
-    choices: HashMap<(String, PathBuf), (AgentUnsavedChoice, u64)>,
+    choices: HashMap<(String, PathBuf), (AgentUnsavedChoice, BufferId, u64)>,
     pending: Option<PendingAgentEditDecision>,
     /// The answer for the held write being run now. It wins even if the buffer
     /// was saved while the question was open.
@@ -51,12 +52,12 @@ impl AgentEditDecisions {
         &self,
         session_id: &str,
         path: &Path,
-        generation: u64,
+        buffer: &Buffer,
     ) -> Option<AgentUnsavedChoice> {
         self.choices
             .get(&(session_id.to_string(), path.to_path_buf()))
-            .filter(|(_, saved_at)| *saved_at == generation)
-            .map(|(choice, _)| *choice)
+            .filter(|(_, id, saved_at)| *id == buffer.id() && *saved_at == buffer.save_generation())
+            .map(|(choice, _, _)| *choice)
     }
 
     pub(super) fn is_waiting(&self) -> bool {
@@ -82,7 +83,7 @@ impl Editor {
             return AgentUnsavedChoice::SaveAll;
         }
         self.agent_edit_decisions
-            .remembered(session_id, path, buffer.save_generation())
+            .remembered(session_id, path, buffer)
             .unwrap_or(AgentUnsavedChoice::KeepUnsaved)
     }
 
@@ -92,7 +93,7 @@ impl Editor {
     pub(super) fn agent_write_needing_decision(
         &self,
         request: &EditorToolRequest,
-    ) -> Option<PathBuf> {
+    ) -> Option<(PathBuf, BufferId)> {
         let (path, expected_revision) = match &request.call {
             EditorToolCall::WriteFile {
                 path,
@@ -129,13 +130,18 @@ impl Editor {
             return None;
         }
         self.agent_edit_decisions
-            .remembered(&request.session_id, &path, buffer.save_generation())
+            .remembered(&request.session_id, &path, buffer)
             .is_none()
-            .then_some(path)
+            .then_some((path, buffer.id()))
     }
 
     /// Holds an agent write until the user answers.
-    pub(super) fn hold_agent_write_for_decision(&mut self, tool: PendingEditorTool, path: PathBuf) {
+    pub(super) fn hold_agent_write_for_decision(
+        &mut self,
+        tool: PendingEditorTool,
+        path: PathBuf,
+        buffer_id: BufferId,
+    ) {
         let name = self
             .agent_manager
             .root()
@@ -147,6 +153,7 @@ impl Editor {
             tool,
             title: format!("Unsaved changes in {name}"),
             path,
+            buffer_id,
             shown: false,
         });
     }
@@ -161,7 +168,7 @@ impl Editor {
         let Some(pending) = self.agent_edit_decisions.pending.as_mut() else {
             return Ok(());
         };
-        if pending.tool.response.is_closed() {
+        if pending.tool.is_expired() {
             self.abandon_agent_edit_decision(None, "the tool call ended");
             return self.render(render_buffer);
         }
@@ -227,19 +234,26 @@ impl Editor {
         let Some(pending) = self.agent_edit_decisions.pending.take() else {
             return Ok(());
         };
-        if let Some(buffer) = self
+        if pending.tool.is_expired() {
+            return Ok(());
+        }
+        let Some(buffer) = self
             .file_buffer_index(&pending.path)
             .and_then(|index| self.buffer_manager.get(index))
-        {
-            let generation = buffer.save_generation();
-            self.agent_edit_decisions.choices.insert(
-                (
-                    pending.tool.request.session_id.clone(),
-                    pending.path.clone(),
-                ),
-                (choice, generation),
-            );
-        }
+            .filter(|buffer| buffer.id() == pending.buffer_id)
+        else {
+            let _ = pending.tool.response.send(Err(
+                "the buffer awaiting approval was closed or renamed".into(),
+            ));
+            return Ok(());
+        };
+        self.agent_edit_decisions.choices.insert(
+            (
+                pending.tool.request.session_id.clone(),
+                pending.path.clone(),
+            ),
+            (choice, buffer.id(), buffer.save_generation()),
+        );
         self.agent_edit_decisions.answering = Some(choice);
         let result = self
             .run_staged_agent_tool(pending.tool, render_buffer, runtime)

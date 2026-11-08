@@ -11978,7 +11978,11 @@ impl Editor {
             let _ = completed.response.send(completed.result);
         }
         if !self.agent_manager.has_playback_work() && !self.agent_edit_decisions.is_waiting() {
-            if let Some(pending) = self.agent_manager.try_recv_tool_request() {
+            if let Some(pending) = self
+                .agent_manager
+                .try_recv_tool_request()
+                .filter(|tool| !tool.is_expired())
+            {
                 if matches!(pending.request.call, EditorToolCall::InlineContext { .. }) {
                     self.dispatch_inline_context_request(pending);
                 } else if pending.request.call.is_lsp() {
@@ -12001,9 +12005,13 @@ impl Editor {
                 }
             }
         }
-        if let Some(pending) = self.agent_manager.take_ready_playback_tool(Instant::now()) {
-            if let Some(path) = self.agent_write_needing_decision(&pending.request) {
-                self.hold_agent_write_for_decision(pending, path);
+        if let Some(pending) = self
+            .agent_manager
+            .take_ready_playback_tool(Instant::now())
+            .filter(|tool| !tool.is_expired())
+        {
+            if let Some((path, buffer_id)) = self.agent_write_needing_decision(&pending.request) {
+                self.hold_agent_write_for_decision(pending, path, buffer_id);
             } else {
                 let _ = self.run_staged_agent_tool(pending, buffer, runtime).await;
             }
@@ -12332,16 +12340,21 @@ impl Editor {
                 _ => {}
             }
             match &event {
-                CodexEvent::Completed { session_id, .. } => self.finish_inline_agent_outcome(
+                CodexEvent::Completed {
                     session_id,
-                    crate::inline_history::InlineAgentState::Completed,
-                    None,
-                ),
-                CodexEvent::Cancelled { session_id } => self.finish_inline_agent_outcome(
-                    session_id,
-                    crate::inline_history::InlineAgentState::Cancelled,
-                    Some("Agent turn cancelled; any completed writes remain applied."),
-                ),
+                    stop_reason,
+                } => {
+                    use crate::inline_history::InlineAgentState;
+                    let (state, message) = match stop_reason.as_str() {
+                        "completed" | "end_turn" | "" => (InlineAgentState::Completed, None),
+                        "interrupted" | "cancelled" => (
+                            InlineAgentState::Cancelled,
+                            Some("Agent turn cancelled; any completed writes remain applied."),
+                        ),
+                        reason => (InlineAgentState::Failed, Some(reason)),
+                    };
+                    self.finish_inline_agent_outcome(session_id, state, message);
+                }
                 CodexEvent::Failed {
                     session_id: Some(session_id),
                     message,
@@ -12373,8 +12386,8 @@ impl Editor {
                         .finish_turn(session_id)
                         .map(|prompt| (session_id.clone(), prompt));
                 }
-                CodexEvent::Cancelled { session_id } => {
-                    self.agent_manager.mark_session_inactive(session_id);
+                CodexEvent::CancelFailed { session_id, .. } => {
+                    self.agent_manager.interrupt_rejected(session_id);
                 }
                 _ => {}
             }
@@ -30814,30 +30827,38 @@ impl Editor {
             .collect()
     }
 
-    fn has_pending_format_save(&self, buffer_id: BufferId) -> bool {
-        self.pending_lsp_format_saves.keys().any(|request_id| {
-            self.pending_lsp_edit_requests
-                .get(request_id)
-                .is_some_and(|pending| pending.buffer_id == buffer_id)
-        })
+    fn pending_format_save(&self, buffer_id: BufferId) -> Option<(i64, &PendingLspFormatSave)> {
+        self.pending_lsp_format_saves
+            .iter()
+            .find_map(|(&id, save)| {
+                let edit = self.pending_lsp_edit_requests.get(&id)?;
+                (edit.buffer_id == buffer_id).then_some((id, save))
+            })
     }
 
-    /// Defers a quit when every unsaved buffer is waiting on its own
-    /// format-on-save, as after `:wq`, `:wqa`, or `:xa`; the quit then happens
-    /// once all of them are written.
-    fn defer_quit_for_pending_save(&mut self) -> bool {
-        let dirty = self
-            .buffer_manager
-            .iter()
-            .filter(|buffer| buffer.is_dirty())
-            .map(Buffer::id)
-            .collect::<Vec<_>>();
-        let should_defer =
-            !dirty.is_empty() && dirty.iter().all(|id| self.has_pending_format_save(*id));
-        if should_defer {
-            self.deferred_quit = DeferredQuit::AfterSaves(dirty);
+    fn retire_superseded_format_save(&mut self, buffer_id: BufferId) {
+        if let Some((id, _)) = self.pending_format_save(buffer_id) {
+            self.pending_lsp_format_saves.remove(&id);
+            self.pending_lsp_edit_requests.remove(&id);
+            self.finish_deferred_quit(buffer_id, true);
         }
-        should_defer
+    }
+
+    /// Wait for every requested write, including formatting a previously clean file.
+    fn defer_quit_for_pending_save(&mut self) -> bool {
+        let mut waiting = Vec::new();
+        for buffer in self.buffer_manager.iter() {
+            if self.pending_format_save(buffer.id()).is_some() {
+                waiting.push(buffer.id());
+            } else if buffer.is_dirty() {
+                return false;
+            }
+        }
+        if waiting.is_empty() {
+            return false;
+        }
+        self.deferred_quit = DeferredQuit::AfterSaves(waiting);
+        true
     }
 
     fn finish_deferred_quit(&mut self, buffer_id: BufferId, saved: bool) {
@@ -30874,7 +30895,9 @@ impl Editor {
             }
             // A save that vanished without reporting back cancels the quit.
             DeferredQuit::AfterSaves(ref waiting)
-                if waiting.iter().any(|id| !self.has_pending_format_save(*id)) =>
+                if waiting
+                    .iter()
+                    .any(|id| self.pending_format_save(*id).is_none()) =>
             {
                 self.deferred_quit = DeferredQuit::None;
                 false
@@ -33263,11 +33286,9 @@ impl Editor {
         target_uri: &str,
         previous_file: Option<String>,
     ) {
-        let Some(index) = self
-            .buffer_manager
-            .iter()
-            .position(|buffer| buffer.id() == buffer_id)
-        else {
+        let Some(index) = self.buffer_manager.iter().position(|buffer| {
+            buffer.id() == buffer_id && buffer.uri().ok().flatten().as_deref() == Some(target_uri)
+        }) else {
             return;
         };
         self.buffer_manager[index].file = previous_file;
@@ -33421,6 +33442,7 @@ impl Editor {
         match save_result {
             Ok(msg) => {
                 let id = self.current_buffer().id();
+                self.retire_superseded_format_save(id);
                 self.resolve_external_file_notification(id);
                 self.resolve_buffer_issues(id);
                 let severity = if format_warning.is_some() {
@@ -33571,6 +33593,7 @@ impl Editor {
         match save_result {
             Ok(msg) => {
                 let id = self.current_buffer().id();
+                self.retire_superseded_format_save(id);
                 self.resolve_external_file_notification(id);
                 self.resolve_buffer_issues(id);
                 let severity = if format_warning.is_some() {
@@ -33970,7 +33993,7 @@ impl Editor {
         save_as: Option<String>,
     ) -> anyhow::Result<FormatOnSaveRequest> {
         let buffer_id = self.current_buffer().id();
-        if self.has_pending_format_save(buffer_id) {
+        if self.pending_format_save(buffer_id).is_some() {
             self.set_legacy_message(Some(
                 "format-on-save is already pending for this buffer".to_string(),
             ));
@@ -35482,7 +35505,11 @@ impl Editor {
         if request.call.is_lsp() {
             let (response, mut receiver) = tokio::sync::oneshot::channel();
             self.dispatch_agent_lsp(
-                crate::agent_tools::PendingEditorTool { request, response },
+                crate::agent_tools::PendingEditorTool {
+                    cancelled: None,
+                    request,
+                    response,
+                },
                 &mut render_buffer,
                 &mut runtime,
             )
@@ -37798,6 +37825,7 @@ mod test {
         let at = |character| crate::agent_tools::EditorPosition { line, character };
         sender
             .send(crate::agent_tools::PendingEditorTool {
+                cancelled: None,
                 request: EditorToolRequest {
                     session_id: "session-1".to_string(),
                     call: EditorToolCall::ApplyEdits {
@@ -37929,6 +37957,72 @@ mod test {
             (json!(false), json!(true))
         );
         assert_eq!(editor.current_buffer().contents(), "xmore human one\n2\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_expired_agent_write_cannot_be_approved_before_the_next_tick() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("document.rs");
+        let (mut editor, sender) = unsaved_document_editor(root.path()).await;
+        let response = send_agent_line_edit(&editor, &sender, 1, 3, "TWO").await;
+        editor.test_service_background().await.unwrap();
+        assert!(editor.agent_edit_decisions.is_waiting());
+        drop(response);
+        editor
+            .test_execute_production_action(Action::AgentUnsavedEditChoice(
+                AgentUnsavedChoice::SaveAll,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "one\ntwo\n");
+        assert_eq!(editor.current_buffer().contents(), "human one\ntwo\n");
+
+        let _retry = send_agent_line_edit(&editor, &sender, 1, 3, "TWO").await;
+        editor.test_service_background().await.unwrap();
+        assert!(
+            editor.agent_edit_decisions.is_waiting(),
+            "the expired choice must not authorize the retry"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_expired_queued_tool_leaves_the_saved_file_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("document.rs");
+        let (mut editor, sender) = unsaved_document_editor(root.path()).await;
+        editor.current_buffer_mut().save().unwrap();
+        drop(send_agent_line_edit(&editor, &sender, 1, 3, "TWO").await);
+        editor.test_service_background().await.unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), "human one\ntwo\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reopening_a_file_requires_a_fresh_agent_edit_decision() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("document.rs");
+        let (mut editor, sender) = unsaved_document_editor(root.path()).await;
+        let result = send_agent_line_edit(&editor, &sender, 1, 3, "TWO").await;
+        editor.test_service_background().await.unwrap();
+        editor
+            .test_execute_production_action(Action::AgentUnsavedEditChoice(
+                AgentUnsavedChoice::SaveAll,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(result.await.unwrap().unwrap()["saved"], true);
+
+        let reopened = Buffer::load_or_create(Some(path.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+        editor.buffer_manager.replace_buffers(vec![reopened]);
+        editor.current_buffer_mut().insert_str(0, 0, "private ");
+        let _result = send_agent_line_edit(&editor, &sender, 1, 3, "two").await;
+        editor.test_service_background().await.unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), "human one\nTWO\n");
+        assert!(editor.agent_edit_decisions.is_waiting());
     }
 
     #[tokio::test]
@@ -38392,6 +38486,7 @@ mod test {
         let (response, result) = tokio::sync::oneshot::channel();
         sender
             .send(crate::agent_tools::PendingEditorTool {
+                cancelled: None,
                 request: EditorToolRequest {
                     session_id: "session-1".to_string(),
                     call: EditorToolCall::ReadFile {
@@ -38414,6 +38509,7 @@ mod test {
         let (response, result) = tokio::sync::oneshot::channel();
         sender
             .send(crate::agent_tools::PendingEditorTool {
+                cancelled: None,
                 request: EditorToolRequest {
                     session_id: "session-1".to_string(),
                     call: EditorToolCall::ReadFile {
@@ -38440,6 +38536,7 @@ mod test {
         let (response, result) = tokio::sync::oneshot::channel();
         sender
             .send(crate::agent_tools::PendingEditorTool {
+                cancelled: None,
                 request: EditorToolRequest {
                     session_id: "session-1".to_string(),
                     call: EditorToolCall::OpenFile {
@@ -41094,6 +41191,10 @@ builtin = "rust"
             "a failed cancel must not release the held follow-up"
         );
         assert!(editor.agent_manager.is_session_busy("session-1"));
+        assert!(
+            editor.agent_manager.is_session_active("session-1"),
+            "a rejected interrupt resumes the existing turn"
+        );
 
         worker
             .send(CodexEvent::Completed {
@@ -50968,6 +51069,97 @@ while True:
         assert!(events.contains(&format!("textDocument/formatting {uri}")));
         assert_eq!(editor.buffer_manager[0].contents(), "value\n");
         assert!(!editor.buffer_manager[0].is_dirty());
+    }
+
+    #[tokio::test]
+    async fn wq_stays_open_when_a_synchronous_write_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let existing = root.path().join("existing");
+        std::fs::write(&source, "clean\n").unwrap();
+        std::fs::write(&existing, "another file\n").unwrap();
+        let buffer = Buffer::load_or_create(Some(source.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+        let mut editor = lsp_test_editor(vec![buffer]);
+        editor.config.formatting.on_save = false;
+        let mut frame = RenderBuffer::new(60, 12, &Style::default());
+        let mut runtime = Runtime::new();
+        for command in [
+            format!("wq {}", existing.display()),
+            format!("wq! {}", root.path().join("missing/file").display()),
+        ] {
+            let quit = editor
+                .execute(&Action::Command(command), &mut frame, &mut runtime)
+                .await
+                .unwrap();
+            assert!(
+                !quit,
+                "a failed write must keep the editor and its error visible"
+            );
+            assert!(editor.last_error.is_some());
+            assert_eq!(editor.current_buffer().path(), source.to_str());
+        }
+        assert_eq!(std::fs::read_to_string(existing).unwrap(), "another file\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wq_waits_for_the_requested_write_even_when_the_buffer_is_clean() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("clean.rs");
+        std::fs::write(&path, "unformatted\n").unwrap();
+        let buffer = Buffer::load_or_create(Some(path.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+        let (mut editor, _, release, _) = delayed_formatter_editor(root.path(), buffer);
+        let mut frame = RenderBuffer::new(60, 12, &Style::default());
+        let mut runtime = Runtime::new();
+        let quit = editor
+            .execute(&Action::Command("wq".into()), &mut frame, &mut runtime)
+            .await
+            .unwrap();
+        assert!(!quit, "the event loop must service the pending write");
+        assert!(!editor.current_buffer().is_dirty());
+        std::fs::write(release, "release").unwrap();
+        complete_delayed_format_save(&mut editor, &path, "value\n").await;
+        assert!(editor.take_deferred_quit());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_old_format_reply_cannot_undo_a_later_forced_save_as() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first.rs");
+        let second = root.path().join("second.rs");
+        let (mut editor, _, release, _) =
+            delayed_formatter_editor(root.path(), Buffer::new(None, "my text\n".into()));
+        editor
+            .test_execute_production_action(Action::SaveAs(first.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+        let id = *editor.pending_lsp_format_saves.keys().next().unwrap();
+        editor
+            .test_execute_production_action(Action::ForceSaveAs(
+                second.to_string_lossy().into_owned(),
+            ))
+            .await
+            .unwrap();
+        std::fs::write(release, "release").unwrap();
+        let response = ResponseMessage {
+            id,
+            result: json!([]),
+            request: None,
+        };
+        if let Some(action) = editor.formatting_action(&response) {
+            editor.test_execute_production_action(action).await.unwrap();
+        }
+        assert_eq!(
+            editor.current_buffer().path(),
+            Some(second.to_str().unwrap())
+        );
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "my text\n");
+        assert!(!first.exists());
     }
 
     #[cfg(unix)]

@@ -149,7 +149,11 @@ impl Editor {
             &Style::default(),
         );
         self.dispatch_agent_lsp(
-            PendingEditorTool { request, response },
+            PendingEditorTool {
+                cancelled: None,
+                request,
+                response,
+            },
             &mut render,
             &mut Runtime::new(),
         )
@@ -173,7 +177,7 @@ impl Editor {
         _render_buffer: &mut RenderBuffer,
         _runtime: &mut Runtime,
     ) {
-        if tool.response.is_closed() {
+        if tool.is_expired() {
             return;
         }
         match self.start_agent_lsp(&tool.request).await {
@@ -685,7 +689,7 @@ impl Editor {
         let Some(pending) = self.agent_lsp.pending.remove(&id) else {
             return false;
         };
-        if pending.tool.response.is_closed() {
+        if pending.tool.is_expired() {
             return true;
         }
         let result = self
@@ -805,7 +809,7 @@ impl Editor {
                     })
                     .is_some_and(|stamp| stamp.sequence > sequence)
             });
-            if !pending.tool.response.is_closed()
+            if !pending.tool.is_expired()
                 && invalid.is_none()
                 && now < pending.deadline
                 && !received
@@ -857,7 +861,7 @@ impl Editor {
         }
         let workers = std::mem::take(&mut self.agent_lsp.workers);
         for worker in workers {
-            if worker.tool.response.is_closed() || now >= worker.deadline {
+            if worker.tool.is_expired() || now >= worker.deadline {
                 worker.task.abort();
                 let _ = worker.tool.response.send(Ok(result_status(
                     "timeout",
