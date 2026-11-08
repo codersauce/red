@@ -44,6 +44,65 @@ hidden.
 Bold, emphasis, inline code, and links are highlighted either way, including
 nested formatting, reference links, and URL or email autolinks.
 
+## Alerts
+
+A quote that opens with a GitHub alert marker shows a colored label instead of
+that marker:
+
+```markdown
+> [!NOTE]
+> The buffer underneath is still the source.
+```
+
+`> [!NOTE]` draws as `ℹ Note`. Tip, Important, Warning, and Caution use their
+own label and color, and the `>` at the start of the quote uses that color
+too. The kind is case-insensitive, and it has to be the whole first line of
+the quote. `> [!NOPE]`, a marker with trailing words, and a quote nested
+inside another quote keep the ordinary quote style unless that nested quote
+has an alert of its own.
+
+Move onto the marker line, or enter Insert, Visual, or search there, and the
+raw `> [!NOTE]` comes back. Other lines of the quote stay as they were.
+
+Colors come from the theme: Note uses `editorInfo.foreground`, Tip
+`terminal.ansiGreen`, Important `terminal.ansiMagenta`, Warning
+`editorWarning.foreground`, and Caution `editorError.foreground`. A missing
+color falls back to `markup.quote`. Alerts follow `markdown_conceal` and have
+no separate switch.
+
+## Inline HTML
+
+Balanced inline tags on one line hide the tags and style the text between
+them. The buffer line stays one row, so `<br>` disappears and does not insert
+a break.
+
+| Tags | What you see |
+| --- | --- |
+| `<b>`, `<strong>` | bold |
+| `<i>`, `<em>` | italic |
+| `<u>`, `<ins>` | underline |
+| `<s>`, `<del>`, `<strike>` | the letters with a combining strike |
+| `<mark>` | `editor.findMatchHighlightBackground` |
+| `<code>` | inline code style (`markup.inline.raw`) |
+| `<kbd>` | `badge.foreground` and `badge.background`, or an underline when those colors are missing |
+| `<sub>`, `<sup>` | Unicode subscripts and superscripts where a mapping exists |
+| `<br>` | nothing |
+
+`<b><i>both</i></b>` nests. An unknown tag, an unbalanced tag, a tag inside a
+code span or fence, and a tag inside an HTML block stay on screen. `<code>`
+and `<kbd>` show their contents as written, including any tags inside them.
+Move onto a hidden tag, or enter Insert, Visual, or search on that line, and
+the tags come back. This follows `markdown_conceal` and has no separate switch.
+
+## Highlight marks
+
+`==highlight==` hides the markers and paints the text with the same background
+as `<mark>`. The text cannot be empty or start or end with a space, and an
+unclosed `==` stays as written. Marks inside code spans, fences, and HTML
+blocks stay as written. This is not CommonMark. Set
+`markdown_extended_marks = false` or run `:markdown-extended-marks` to leave
+every `==` visible. It follows `markdown_conceal`.
+
 ## Images
 
 A line that holds only an image becomes the picture itself in Normal mode:
@@ -55,6 +114,12 @@ A line that holds only an image becomes the picture itself in Normal mode:
 Local paths are relative to the Markdown file, and `https` images are
 downloaded; either way an image can be up to 8 MB. Height follows the image's
 proportions, up to `markdown_image_max_height` rows (16 by default).
+
+A line that is only an `<img>` tag is drawn the same way. It may be wrapped in
+one `<p>`. `src` and `alt` pick the file and the placeholder label. `width`
+and `height` are CSS pixels or a percent: `width="200"` is twenty columns when
+a cell is 10 pixels wide, and `width="50%"` is half the window. A missing side
+follows the picture's proportions. `data:` sources stay as the tag.
 
 Move onto the image line and its Markdown appears in the block's first row,
 with the picture still below it, so nothing under the image moves. `j` and `k`
@@ -126,7 +191,8 @@ pane or switching the document to another file does the same.
 | Setting | Default | Effect |
 | --- | --- | --- |
 | `markdown_tables` | `true` | Draw pipe tables as grids |
-| `markdown_conceal` | `true` | Hide inline markup while wrapping |
+| `markdown_conceal` | `true` | Hide inline markup while wrapping, including GitHub alert markers and balanced inline HTML tags |
+| `markdown_extended_marks` | `true` | Hide `==highlight==` markers and paint the text like `<mark>` |
 | `markdown_images` | `"auto"` | How to draw images: `auto`, `kitty`, `iterm2`, `sixel`, `halfblocks`, `off` |
 | `markdown_image_max_height` | `16` | Most rows one image may use |
 | `markdown_link_split_focus` | `"source"` | Pane that keeps focus after `Ctrl-w x` |
