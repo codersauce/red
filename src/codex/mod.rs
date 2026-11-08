@@ -1262,9 +1262,19 @@ async fn stop_session(
     sessions: &mut HashMap<String, Session>,
     next_id: &mut u64,
 ) -> Result<()> {
-    let notify_cancelled = sessions
+    // With no turn running or starting, the stop arrived after the turn ended and
+    // that turn's terminal event was reported; a confirmation would land on the
+    // next turn instead.
+    let has_turn = sessions
         .get(&session_id)
-        .is_none_or(|session| matches!(session.kind, SessionKind::Agent));
+        .is_some_and(|session| session.active_turn.is_some())
+        || pending.values().any(
+            |request| matches!(request, Pending::Turn { session_id: id } if *id == session_id),
+        );
+    let notify_cancelled = has_turn
+        && sessions
+            .get(&session_id)
+            .is_none_or(|session| matches!(session.kind, SessionKind::Agent));
     let newly_cancelled = sessions
         .get_mut(&session_id)
         .is_none_or(|session| !session.cancelled.swap(true, Ordering::Relaxed));
@@ -3495,6 +3505,43 @@ mod tests {
         assert!(
             received.try_recv().is_err(),
             "the rejection belongs to the finished turn, not to \"second\""
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_read_after_the_turn_finished_reports_nothing() {
+        let mut sessions = HashMap::from([(
+            "agent".into(),
+            Session {
+                model_info: None,
+                cwd: PathBuf::from("/workspace"),
+                active_turn: None,
+                pending_interrupt_turn_id: None,
+                cancelled: Arc::new(AtomicBool::new(false)),
+                allow_sensitive_paths: false,
+                kind: SessionKind::Agent,
+            },
+        )]);
+        let (events, mut received) = mpsc::channel(2);
+        let mut pending = HashMap::new();
+        let mut output = Vec::new();
+        let mut next_id = 0;
+
+        stop_session(
+            "agent".into(),
+            false,
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+        )
+        .await
+        .unwrap();
+        assert!(output.is_empty());
+        assert!(
+            received.try_recv().is_err(),
+            "a cancel confirmation would stop the next message"
         );
     }
 
