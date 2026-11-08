@@ -224,12 +224,19 @@ impl Editor {
         }
         let bytes = self.current_buffer().byte_len();
         if bytes > crate::explore::MAX_SOURCE_BYTES {
-            self.explore.install_analysis(
-                key,
-                revision,
-                0,
-                crate::explore::Analysis::empty("file is too large for the explore parse"),
-            );
+            let language = self.current_language_id();
+            let outline = if language.as_deref() == Some("markdown") {
+                let source = self.current_buffer().contents();
+                Some(crate::markdown_outline::headings(&source))
+            } else {
+                None
+            };
+            let note = if outline.is_some() && bytes > crate::markdown_outline::MAX_DOCUMENT_BYTES {
+                "file is too large for the outline"
+            } else {
+                "file is too large for the explore parse"
+            };
+            self.explore.install_outline(key, revision, note, outline);
             return;
         }
         let source = self.current_buffer().contents();
@@ -1082,9 +1089,50 @@ fn row_style(tone: &Tone, palette: &Palette) -> Style {
 }
 
 fn sidebar_rows(view: &View, width: usize, height: usize) -> Vec<Row> {
+    if view.outline.is_some() {
+        return markdown_outline_rows(view, width, height);
+    }
     let mut rows = body_rows(view, width);
     rows.push(blank());
     rows.extend(note_rows(view, width));
+    rows.truncate(height);
+    rows
+}
+
+fn markdown_outline_rows(view: &View, width: usize, height: usize) -> Vec<Row> {
+    let mut rows = Vec::new();
+    if !view.note.is_empty() {
+        rows.push(muted(&view.note, width));
+    }
+    rows.push(heading("Outline"));
+    let Some(outline) = view.outline.as_deref() else {
+        return rows;
+    };
+    if outline.is_empty() {
+        rows.push(muted("No headings", width));
+        rows.truncate(height);
+        return rows;
+    }
+    let room = height.saturating_sub(rows.len());
+    let range = crate::markdown_outline::visible_range(outline.len(), view.outline_active, room);
+    for (index, item) in outline.iter().enumerate().take(range.end).skip(range.start) {
+        let indent = "  ".repeat(usize::from(item.level.saturating_sub(1)));
+        let tone = if view.outline_active == Some(index) {
+            Tone::Selected
+        } else {
+            Tone::Body
+        };
+        rows.push(row(
+            clip(&format!("{indent}{}", item.title), width),
+            tone,
+            Some(Jump {
+                label: item.title.clone(),
+                file: view.file_key.clone(),
+                line: item.line,
+                column: 0,
+            }),
+        ));
+    }
     rows.truncate(height);
     rows
 }
@@ -1501,6 +1549,114 @@ fn review(owned: bool) -> bool {
             text.contains("let  ") || text.contains("let 3") || text.contains("let  3"),
             "the definition count stays beside the kind: {text}"
         );
+    }
+
+    #[test]
+    fn markdown_sidebar_keeps_the_active_section_on_screen() {
+        use crate::explore::Session;
+        use crate::highlighter::LanguageRegistry;
+
+        let source = (0..30)
+            .map(|index| format!("# Section {index}\n\nbody\n"))
+            .collect::<String>();
+        let registry = LanguageRegistry::bundled();
+        let mut session = Session::default();
+        session.enabled = true;
+        session.sync(SyncInput {
+            key: "/tmp/outline.md",
+            revision: 1,
+            language: Some("markdown"),
+            source: &source,
+            registry: &registry,
+        });
+        let early = session.view(0, 0);
+        assert_eq!(early.outline_active, Some(0));
+        let headings = early.outline.clone().unwrap();
+        let line = headings[24].line + 1;
+        let view = session.view(line, 0);
+        assert_eq!(view.outline_active, Some(24));
+        assert_eq!(view.language, "markdown");
+        let rows = sidebar_rows(&view, 24, 6);
+        assert!(
+            rows.iter()
+                .any(|row| matches!(row.tone, Tone::Selected) && row.text.contains("Section 24")),
+            "the section under the cursor stays selected"
+        );
+        assert!(
+            rows.iter().all(|row| !row.text.contains("Section 0")),
+            "a long outline scrolls so the active heading stays visible: {:?}",
+            rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>()
+        );
+        assert!(rows
+            .iter()
+            .all(|row| row.text != "Inside" && row.text != "Definition"));
+        let jump = rows
+            .iter()
+            .find(|row| row.text.contains("Section 24"))
+            .and_then(|row| row.jump.clone())
+            .unwrap();
+        assert_eq!(jump.line, headings[24].line);
+        assert_eq!(jump.column, 0);
+    }
+
+    #[tokio::test]
+    async fn markdown_sidebar_click_records_a_jump() {
+        let source = "# First\n\nbody\n\n## Second\n\nmore\n";
+        let mut config: Config = toml::from_str(include_str!("../../default_config.toml")).unwrap();
+        config.lsp.servers.clear();
+        let lsp = Box::new(LspManager::new(config.lsp.clone()));
+        let buffer = crate::buffer::Buffer::new(Some("notes.md".into()), source.to_string());
+        let theme = crate::theme::parse_vscode_theme_contents(include_str!(
+            "../../themes/tokyo-night.json"
+        ))
+        .unwrap_or_else(|_| Theme::default());
+        let mut editor = Editor::with_size(lsp, 120, 36, config, theme, vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+        editor.splash_dismissed = true;
+        editor.explore.enabled = true;
+        editor.sync_to_window();
+        let mut screen = RenderBuffer::new(120, 36, &editor.theme.style);
+        editor.render(&mut screen).unwrap();
+        let text = screen_text(&screen);
+        assert!(text.contains("Outline"), "{text}");
+        assert!(text.contains("First"), "{text}");
+        assert!(!text.contains("Inside"), "{text}");
+        let mut target = None;
+        for y in 0..screen.height {
+            for x in 0..screen.width {
+                if editor
+                    .explore
+                    .hit_at(x, y)
+                    .is_some_and(|jump| jump.label == "Second")
+                {
+                    target = Some((x, y));
+                }
+            }
+        }
+        let (x, y) = target.expect("second heading is a sidebar hit");
+        let origin = editor.buffer_line();
+        let mut runtime = Runtime::new();
+        editor
+            .explore_activate_hit(x, y, &mut screen, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(
+            editor.buffer_line(),
+            source.lines().position(|line| line == "## Second").unwrap()
+        );
+        assert_eq!(editor.active_jump_list().entries.len(), 1);
+        editor
+            .test_execute_event(crossterm::event::Event::Key(
+                crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Char('o'),
+                    crossterm::event::KeyModifiers::CONTROL,
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(editor.buffer_line(), origin);
+        assert_eq!(editor.current_buffer().contents(), source);
+        assert!(!editor.current_buffer().is_dirty());
     }
 
     #[test]

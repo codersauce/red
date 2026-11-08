@@ -4,7 +4,7 @@
 use std::{collections::HashMap, ops::Range, path::Path, sync::Arc};
 
 use anyhow::{anyhow, bail, Context as _};
-use pulldown_cmark::{BrokenLink, Event, LinkType, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{BrokenLink, Event, LinkType, Options, Parser, Tag};
 use unicode_segmentation::UnicodeSegmentation as _;
 
 use super::{render_buffer::RenderBuffer, Action, Editor, Mode, Runtime};
@@ -60,49 +60,25 @@ impl LinkIndex {
                 destination: Ok(definition.dest.to_string()),
             });
         }
-        let mut heading = None;
-        let mut suffixes = HashMap::new();
         for (event, range) in parser.into_offset_iter() {
-            match event {
-                Event::Start(Tag::Link {
-                    dest_url,
-                    link_type,
-                    ..
-                }) => index.links.push(Link {
+            if let Event::Start(Tag::Link {
+                dest_url,
+                link_type,
+                ..
+            }) = event
+            {
+                index.links.push(Link {
                     source: range,
                     destination: Ok(if link_type == LinkType::Email {
                         format!("mailto:{dest_url}")
                     } else {
                         dest_url.to_string()
                     }),
-                }),
-                Event::Start(Tag::Heading { .. }) => {
-                    heading = Some((range.start, String::new()));
-                }
-                Event::Text(text) | Event::Code(text) => {
-                    if let Some((_, title)) = &mut heading {
-                        title.push_str(&text);
-                    }
-                }
-                Event::SoftBreak | Event::HardBreak => {
-                    if let Some((_, title)) = &mut heading {
-                        title.push(' ');
-                    }
-                }
-                Event::End(TagEnd::Heading(_)) => {
-                    if let Some((offset, title)) = heading.take() {
-                        let base = heading_slug(&title);
-                        let suffix = suffixes.entry(base.clone()).or_insert(0);
-                        let mut slug = base.clone();
-                        while index.headings.contains_key(&slug) {
-                            *suffix += 1;
-                            slug = format!("{base}-{suffix}");
-                        }
-                        index.headings.insert(slug, offset);
-                    }
-                }
-                _ => {}
+                });
             }
+        }
+        for heading in crate::markdown_outline::headings(source) {
+            index.headings.insert(heading.slug, heading.offset);
         }
         index.links.extend(unresolved);
         index.links.sort_by_key(|link| link.source.start);
@@ -119,28 +95,6 @@ impl LinkIndex {
             .as_deref()
             .map_err(|error| anyhow!("{error}"))
     }
-}
-
-/// Use rendered heading text: lowercase, omit punctuation, replace spaces with
-/// hyphens, and retain Unicode letters/marks. Duplicate identifiers get -1, -2…
-fn heading_slug(title: &str) -> String {
-    title
-        .chars()
-        .flat_map(char::to_lowercase)
-        .filter_map(|character| {
-            if character.is_whitespace() {
-                Some('-')
-            } else if character == '-'
-                || character == '_'
-                || character.is_alphanumeric()
-                || unicode_ident::is_xid_continue(character)
-            {
-                Some(character)
-            } else {
-                None
-            }
-        })
-        .collect()
 }
 
 #[derive(Debug, PartialEq, Eq)]

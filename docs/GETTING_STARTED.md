@@ -47,7 +47,7 @@ both the config file and the embedded defaults:
 
 ```shell
 red -c theme=onedark.json -c languages.rust.indent_width=2 src/main.rs
-red --print-config
+red --print-config          # effective config, then the resolved theme
 ```
 
 ## Updating Red
@@ -623,6 +623,26 @@ assets with the same filename. An ejected copy continues to shadow future
 bundled updates until it is removed. Read the
 [plugin system guide](PLUGIN_SYSTEM.md) for runtime details.
 
+A theme can inherit another theme with `extends`. Red resolves the parent
+like any other theme file: a file in your config directory wins, then
+`$RED_RUNTIME`, then the bundled theme. `colors` merge one key at a time.
+`tokenColors` are appended, so a rule in the child overrides the same scope
+from the parent. `type` is kept from the parent unless the child sets it.
+Inheritance follows at most four parents. A cycle names the file chain, for
+example `a.json → b.json → a.json`.
+
+```json
+{
+  "name": "my-red",
+  "extends": "red.json",
+  "colors": { "editor.background": "#FFFFFF" }
+}
+```
+
+`red --print-config` prints the effective configuration, then the resolved
+theme JSON with `extends` already merged. The theme browser previews that
+same resolved theme.
+
 ## Command-line reference
 
 ```text
@@ -630,6 +650,8 @@ red [files...]              # open one or more files
 red -r <path>               # set the working directory root
 red -c 'wrap = false'       # inline TOML override; repeatable
 red --version               # print the installed version
+red --print-config          # print effective config and the resolved theme
+red completions <shell>     # bash, zsh, fish, powershell, or elvish
 red --runtime-files         # list visible plugins/themes and their sources
 red --eject <asset>         # copy a bundled plugin/theme into your config dir
 red --agent-check           # report Codex integration prerequisites

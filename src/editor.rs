@@ -53,9 +53,11 @@ mod keyboard_shortcuts;
 mod learning;
 mod lsp_coordinator;
 mod markdown_conceal;
+mod markdown_fence;
 mod markdown_images;
 mod markdown_links;
 mod markdown_lists;
+mod markdown_outline;
 mod markdown_tables;
 mod mouse;
 mod multi_cursor;
@@ -176,7 +178,7 @@ use crate::{
         SessionVisualSelection, SessionWindowJumps, SESSION_SCHEMA_VERSION,
     },
     textobjects::{ResolvedTextObject, SyntaxObjectKind, SyntaxTextObjectService},
-    theme::{parse_vscode_theme, parse_vscode_theme_contents, Style, Theme},
+    theme::{Style, Theme},
     tutorial::{
         TutorialController, TutorialLesson, TutorialObservation, TutorialProgress, TutorialTrack,
         PRACTICE_CONTENTS,
@@ -2972,6 +2974,8 @@ pub enum Action {
     ToggleMarkdownConceal,
     /// Shows or hides `==highlight==` markers in Markdown.
     ToggleMarkdownExtendedMarks,
+    /// Opens the heading outline for the current Markdown buffer.
+    MarkdownOutline,
     SetRelativeLineNumbers(bool),
 
     DeletePreviousChar,
@@ -3235,6 +3239,9 @@ pub enum Action {
     Yank,
     YankCurrentLine,
     YankCurrentLines(u16),
+    /// Copies the fenced block around the cursor, without the fences.
+    #[serde(rename = "yank-code-block")]
+    YankCodeBlock,
     Delete,
     ChangeSelection,
     Paste,
@@ -19210,6 +19217,12 @@ impl Editor {
             if cmd == "markdown-extended-marks" {
                 actions.push(Action::ToggleMarkdownExtendedMarks);
             }
+            if cmd == "MarkdownOutline" {
+                actions.push(Action::MarkdownOutline);
+            }
+            if cmd == "yank-code-block" {
+                actions.push(Action::YankCodeBlock);
+            }
 
             if cmd == "statusline" {
                 actions.push(Action::OpenStatuslineManager);
@@ -20099,7 +20112,53 @@ impl Editor {
             panic!("expected nested mappings");
         };
 
-        self.event_to_key_action(&nested_mappings, ev)
+        if let Some(action) = self.event_to_key_action(&nested_mappings, ev) {
+            return Some(action);
+        }
+        self.markdown_outline_binding(&nested_mappings, ev)
+    }
+
+    /// `Space o` lists headings in a Markdown buffer and stays unbound elsewhere,
+    /// so the leader key is left free in other languages.
+    fn markdown_outline_binding(
+        &self,
+        mappings: &HashMap<String, KeyAction>,
+        ev: &event::Event,
+    ) -> Option<KeyAction> {
+        if self.keymap_hint_prefix != ["Space"] || mappings.contains_key("o") {
+            return None;
+        }
+        if Self::key_string_for_event(ev).as_deref() != Some("o") {
+            return None;
+        }
+        if self.current_language_id().as_deref() != Some("markdown") {
+            return None;
+        }
+        Some(KeyAction::Single(Action::MarkdownOutline))
+    }
+
+    fn keymap_hints_for_waiting(
+        &self,
+        mappings: &HashMap<String, KeyAction>,
+    ) -> Vec<crate::command_palette::KeymapHint> {
+        let mut hints = crate::command_palette::keymap_hints(&self.keymap_hint_prefix, mappings);
+        if self.keymap_hint_prefix == ["Space"]
+            && !mappings.contains_key("o")
+            && self.current_language_id().as_deref() == Some("markdown")
+        {
+            hints.push(crate::command_palette::KeymapHint {
+                key: "o".to_string(),
+                label: "Markdown outline".to_string(),
+                is_group: false,
+            });
+            hints.sort_unstable_by(|left, right| {
+                left.is_group
+                    .cmp(&right.is_group)
+                    .then_with(|| left.key.to_lowercase().cmp(&right.key.to_lowercase()))
+                    .then_with(|| left.key.cmp(&right.key))
+            });
+        }
+        hints
     }
 
     fn clear_keymap_hints(&mut self) {
@@ -25245,6 +25304,12 @@ impl Editor {
                     self.open_diagnostics_picker(diagnostics_picker::DiagnosticFilter::All);
                     self.render(buffer)?;
                 }
+                Action::MarkdownOutline => {
+                    add_to_history = false;
+                    self.release_current_dialog_callbacks(runtime);
+                    self.open_markdown_outline();
+                    self.render(buffer)?;
+                }
                 Action::OpenErrorDiagnosticsPicker => {
                     self.release_current_dialog_callbacks(runtime);
                     self.open_diagnostics_picker(diagnostics_picker::DiagnosticFilter::Errors);
@@ -25721,6 +25786,10 @@ impl Editor {
                         self.set_default_register(Content::linewise(text));
                         self.draw_commandline(buffer);
                     }
+                }
+                Action::YankCodeBlock => {
+                    self.yank_code_block();
+                    self.draw_commandline(buffer);
                 }
                 Action::Delete => {
                     if self.selection.is_some() {
@@ -29213,15 +29282,7 @@ impl Editor {
     }
 
     fn apply_theme(&mut self, theme_name: &str, update_config: bool) -> anyhow::Result<()> {
-        let Some(theme_asset) = crate::assets::resolve_theme(theme_name, &Config::config_dir())
-        else {
-            anyhow::bail!("Theme file {} not found", theme_name);
-        };
-        let theme = if let Some(path) = theme_asset.path() {
-            parse_vscode_theme(&path.to_string_lossy())?
-        } else {
-            parse_vscode_theme_contents(&theme_asset.read_to_string()?)?
-        };
+        let theme = crate::theme::load_resolved_theme(theme_name, &Config::config_dir())?;
         let highlighter = Highlighter::with_registry(&theme, self.highlighter.registry())?;
         self.theme = theme;
         self.highlighter = highlighter;
@@ -35954,6 +36015,7 @@ impl Editor {
 mod test {
     use super::*;
     use crate::lsp::DiagnosticSeverity;
+    use crate::theme::parse_vscode_theme;
     use std::path::{Path, PathBuf};
     use std::process::Command;
 

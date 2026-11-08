@@ -28,7 +28,7 @@ use crossterm::{style, QueueableCommand};
 
 use red::assets;
 use red::buffer::Buffer;
-use red::cli::{Args, LanguageCommand, PluginCommand, RootCommand};
+use red::cli::{write_completions, Args, LanguageCommand, PluginCommand, RootCommand};
 use red::cli_style;
 use red::clipboard::{ClipboardProvider as _, SessionClipboard};
 use red::config::{
@@ -44,7 +44,9 @@ use red::logger::Logger;
 use red::lsp::{LspClient, LspManager};
 use red::preferences::PreferencesStore;
 use red::session::SessionStore;
-use red::theme::{parse_vscode_theme, parse_vscode_theme_contents, Theme};
+use red::theme::{
+    load_resolved_theme, parse_vscode_theme_contents, resolved_vscode_theme_json, Theme,
+};
 use red::utils::expand_user_path;
 use red::{log, run_self_check, LOGGER};
 
@@ -94,6 +96,15 @@ async fn run() -> anyhow::Result<()> {
         );
         let loaded = Config::load_user_file(&Config::path("config.toml"), &args.config_overrides)?;
         cli_style::print_text(&loaded.render_effective_toml());
+        let resolved = resolved_vscode_theme_json(&loaded.config.theme, &Config::config_dir())
+            .map_err(|error| {
+                anyhow::anyhow!("could not resolve theme {}: {error:#}", loaded.config.theme)
+            })?;
+        let json = serde_json::to_string_pretty(&resolved)?;
+        cli_style::print_text(&format!(
+            "# resolved theme {}\n{json}\n",
+            loaded.config.theme
+        ));
         return Ok(());
     }
 
@@ -133,6 +144,10 @@ async fn run() -> anyhow::Result<()> {
         Some(RootCommand::Plugin(plugin)) => return run_plugin_command(&plugin.command).await,
         Some(RootCommand::Language(language)) => {
             return run_language_command(&language.command, &args.config_overrides)
+        }
+        Some(RootCommand::Completions(completions)) => {
+            write_completions(completions.shell, &mut std::io::stdout())?;
+            return Ok(());
         }
         None => {}
     }
@@ -1304,15 +1319,7 @@ fn format_error(error: &anyhow::Error, color: bool) -> String {
 }
 
 fn load_theme(theme_name: &str) -> anyhow::Result<Theme> {
-    let Some(theme_asset) = assets::resolve_theme(theme_name, &Config::config_dir()) else {
-        anyhow::bail!("Theme file {} not found", theme_name);
-    };
-
-    if let Some(path) = theme_asset.path() {
-        parse_vscode_theme(&path.to_string_lossy())
-    } else {
-        parse_vscode_theme_contents(&theme_asset.read_to_string()?)
-    }
+    load_resolved_theme(theme_name, &Config::config_dir())
 }
 
 fn finalize_runtime_config(
