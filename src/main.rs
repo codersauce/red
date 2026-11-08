@@ -28,7 +28,7 @@ use crossterm::{style, QueueableCommand};
 
 use red::assets;
 use red::buffer::Buffer;
-use red::cli::{Args, LanguageCommand, PluginCommand, RootCommand};
+use red::cli::{write_completions, Args, LanguageCommand, PluginCommand, RootCommand};
 use red::cli_style;
 use red::clipboard::{ClipboardProvider as _, SessionClipboard};
 use red::config::{
@@ -144,6 +144,10 @@ async fn run() -> anyhow::Result<()> {
         Some(RootCommand::Plugin(plugin)) => return run_plugin_command(&plugin.command).await,
         Some(RootCommand::Language(language)) => {
             return run_language_command(&language.command, &args.config_overrides)
+        }
+        Some(RootCommand::Completions(completions)) => {
+            write_completions(completions.shell, &mut std::io::stdout())?;
+            return Ok(());
         }
         None => {}
     }

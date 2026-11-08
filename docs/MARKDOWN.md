@@ -68,6 +68,21 @@ With Code explore open (`Space e e`), a Markdown file shows this outline in
 the sidebar instead of the code index. The section under the cursor stays
 highlighted as you move, and clicking a heading jumps there.
 
+## Code blocks
+
+`:yank-code-block` copies the fenced block around the cursor. The copy is the
+lines between the fences, with a trailing newline when those lines exist. An
+empty fence copies an empty string. The opening fence, its language tag, and
+the closing fence stay out of the copy. The buffer is left as it was, and the
+copy is not an undo entry.
+
+The text goes to the default register. With clipboard sync on yank enabled, it
+also goes to the system clipboard. The cursor can sit on the opening line, a
+content line, or the closing line. A fence with no closing line runs through
+the end of the buffer. A fence starts with at least three backticks or tildes
+and at most three spaces of indent. `:ycb` is the short form. Bind the action
+in a keymap as `yank-code-block`.
+
 ## Images
 
 A line that holds only an image becomes the picture itself in Normal mode:

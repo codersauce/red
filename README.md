@@ -113,6 +113,37 @@ archive manually, rerun the official installer once into the same directory to
 enable managed updates. See [Updating Red](docs/UPDATING.md) for migration commands,
 restart behavior, and switching to notify-only or disabling automatic checks.
 
+### Shell completions
+
+`red completions` prints a completion script for bash, zsh, fish, PowerShell,
+or Elvish. The script completes the `red` command.
+
+```shell
+# bash, with the bash-completion package installed
+mkdir -p ~/.local/share/bash-completion/completions
+red completions bash > ~/.local/share/bash-completion/completions/red
+
+# zsh. Add ~/.zfunc to fpath before compinit.
+mkdir -p ~/.zfunc
+red completions zsh > ~/.zfunc/_red
+
+# fish loads this file on its own
+mkdir -p ~/.config/fish/completions
+red completions fish > ~/.config/fish/completions/red.fish
+```
+
+```powershell
+red completions powershell > $HOME\Documents\PowerShell\red-completions.ps1
+# In your PowerShell profile:
+# . $HOME\Documents\PowerShell\red-completions.ps1
+```
+
+```shell
+mkdir -p ~/.config/elvish/lib
+red completions elvish > ~/.config/elvish/lib/red-completions.elv
+# Then, in Elvish: use red-completions
+```
+
 Agent support is optional. It requires Codex CLI 0.144.1 or newer and a
 completed `codex login`.
 

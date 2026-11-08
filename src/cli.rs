@@ -7,7 +7,10 @@
 
 use std::path::PathBuf;
 
-use clap::{Args as ClapArgs, Parser, Subcommand};
+use std::io::Write;
+
+use clap::{Args as ClapArgs, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::{generate, Shell};
 
 #[derive(Debug, Parser)]
 #[command(version)]
@@ -130,6 +133,44 @@ pub enum RootCommand {
     Plugin(PluginArgs),
     /// Inspect and approve explicitly configured native language grammars.
     Language(LanguageArgs),
+    /// Print a shell completion script.
+    Completions(CompletionArgs),
+}
+
+/// Shell selected by `red completions`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
+    Powershell,
+    Elvish,
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct CompletionArgs {
+    /// Shell that should complete the `red` command.
+    pub shell: CompletionShell,
+}
+
+impl CompletionShell {
+    fn complete_shell(self) -> Shell {
+        match self {
+            Self::Bash => Shell::Bash,
+            Self::Zsh => Shell::Zsh,
+            Self::Fish => Shell::Fish,
+            Self::Powershell => Shell::PowerShell,
+            Self::Elvish => Shell::Elvish,
+        }
+    }
+}
+
+/// Writes the completion script for `shell` to `out`.
+pub fn write_completions(shell: CompletionShell, out: &mut impl Write) -> std::io::Result<()> {
+    let mut command = Args::command();
+    let name = command.get_name().to_string();
+    generate(shell.complete_shell(), &mut command, name, out);
+    Ok(())
 }
 
 #[derive(Debug, ClapArgs)]
@@ -536,6 +577,38 @@ mod tests {
         assert!(args.validate_utility_args().is_err());
 
         let args = Args::try_parse_from(["red", "--check-config", "src/main.rs"]).unwrap();
+        assert!(args.validate_utility_args().is_err());
+    }
+
+    #[test]
+    fn completions_cover_bash_zsh_fish_powershell_and_elvish() {
+        for (name, shell) in [
+            ("bash", CompletionShell::Bash),
+            ("zsh", CompletionShell::Zsh),
+            ("fish", CompletionShell::Fish),
+            ("powershell", CompletionShell::Powershell),
+            ("elvish", CompletionShell::Elvish),
+        ] {
+            let args = Args::try_parse_from(["red", "completions", name]).unwrap();
+            assert!(matches!(
+                args.command,
+                Some(RootCommand::Completions(CompletionArgs { shell: parsed })) if parsed == shell
+            ));
+            let mut script = Vec::new();
+            write_completions(shell, &mut script).unwrap();
+            let script = String::from_utf8(script).unwrap();
+            assert!(script.contains("print-config"), "{name}:\n{script}");
+            assert!(script.to_lowercase().contains("red"), "{name}");
+        }
+
+        let err = Args::try_parse_from(["red", "completions", "nushell"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidValue);
+
+        let err = Args::try_parse_from(["red", "completions", "fish", "src/main.rs"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
+
+        let mut args = Args::try_parse_from(["red", "completions", "fish"]).unwrap();
+        args.files.push("src/main.rs".to_string());
         assert!(args.validate_utility_args().is_err());
     }
 

@@ -63,6 +63,7 @@ pub(crate) const BUILTIN_COLON_COMMANDS: &[CommandSpec] = &[
     CommandSpec::exact("markdown-tables"),
     CommandSpec::exact("markdown-conceal"),
     CommandSpec::exact("MarkdownOutline"),
+    CommandSpec::exact("yank-code-block"),
     CommandSpec::new("syntax", 2),
     CommandSpec::exact("syn"),
     CommandSpec::exact("ft"),
@@ -918,6 +919,15 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             Action::MarkdownOutline,
         ),
         builtin(
+            "edit.yank_code_block",
+            "Copy code block",
+            "Edit",
+            "Copy the fenced code block around the cursor, without its fences",
+            Some(":yank-code-block"),
+            &["fence", "code block"],
+            Action::YankCodeBlock,
+        ),
+        builtin(
             "view.enable_wrap",
             "Enable line wrapping",
             "View",
@@ -1639,6 +1649,7 @@ fn action_label(action: &Action) -> String {
         Action::ToggleMarkdownTables => "Toggle Markdown tables".to_string(),
         Action::ToggleMarkdownConceal => "Toggle Markdown conceal".to_string(),
         Action::MarkdownOutline => "Markdown outline".to_string(),
+        Action::YankCodeBlock => "Copy code block".to_string(),
         Action::SplitHorizontal => "Split horizontally".to_string(),
         Action::SplitVertical => "Split vertically".to_string(),
         Action::SplitHorizontalNewBuffer => "New buffer in horizontal split".to_string(),
@@ -1792,6 +1803,23 @@ mod tests {
             ["enew"]
         );
         assert_eq!(command::parse(BUILTIN_COLON_COMMANDS, "en"), None);
+    }
+
+    #[test]
+    fn yank_code_block_accepts_its_initials_and_rejects_a_single_y() {
+        assert_eq!(
+            command::parse(BUILTIN_COLON_COMMANDS, "yank-code-block")
+                .unwrap()
+                .commands,
+            ["yank-code-block"]
+        );
+        assert_eq!(
+            command::parse(BUILTIN_COLON_COMMANDS, "ycb")
+                .unwrap()
+                .commands,
+            ["yank-code-block"]
+        );
+        assert_eq!(command::parse(BUILTIN_COLON_COMMANDS, "y"), None);
     }
 
     #[test]

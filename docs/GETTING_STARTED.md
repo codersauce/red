@@ -651,6 +651,7 @@ red -r <path>               # set the working directory root
 red -c 'wrap = false'       # inline TOML override; repeatable
 red --version               # print the installed version
 red --print-config          # print effective config and the resolved theme
+red completions <shell>     # bash, zsh, fish, powershell, or elvish
 red --runtime-files         # list visible plugins/themes and their sources
 red --eject <asset>         # copy a bundled plugin/theme into your config dir
 red --agent-check           # report Codex integration prerequisites

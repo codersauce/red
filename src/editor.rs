@@ -53,6 +53,7 @@ mod keyboard_shortcuts;
 mod learning;
 mod lsp_coordinator;
 mod markdown_conceal;
+mod markdown_fence;
 mod markdown_images;
 mod markdown_links;
 mod markdown_lists;
@@ -3235,6 +3236,9 @@ pub enum Action {
     Yank,
     YankCurrentLine,
     YankCurrentLines(u16),
+    /// Copies the fenced block around the cursor, without the fences.
+    #[serde(rename = "yank-code-block")]
+    YankCodeBlock,
     Delete,
     ChangeSelection,
     Paste,
@@ -19205,6 +19209,9 @@ impl Editor {
             if cmd == "MarkdownOutline" {
                 actions.push(Action::MarkdownOutline);
             }
+            if cmd == "yank-code-block" {
+                actions.push(Action::YankCodeBlock);
+            }
 
             if cmd == "statusline" {
                 actions.push(Action::OpenStatuslineManager);
@@ -25764,6 +25771,10 @@ impl Editor {
                         self.set_default_register(Content::linewise(text));
                         self.draw_commandline(buffer);
                     }
+                }
+                Action::YankCodeBlock => {
+                    self.yank_code_block();
+                    self.draw_commandline(buffer);
                 }
                 Action::Delete => {
                     if self.selection.is_some() {
