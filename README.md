@@ -275,7 +275,8 @@ smartcase = true
 ```
 
 The commented [`default_config.toml`](default_config.toml) documents every
-setting that ships with Red. Custom themes go in `~/.config/red/themes/`, and
+setting that ships with Red. Red's own theme comes in two versions: `red.json`
+(dark, the default) and `red-light.json`. Custom themes go in `~/.config/red/themes/`, and
 custom Husk plugins go in `~/.config/red/plugins/`. Run `red --runtime-files`
 to see every visible runtime asset and its source.
 
