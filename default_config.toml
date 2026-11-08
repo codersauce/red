@@ -42,6 +42,11 @@ markdown_conceal = true
 # muted error line.
 markdown_mermaid = true
 
+# Render a leading `---` YAML block as a key/value table. The cursor inside
+# the block shows the source. :markdown-frontmatter toggles this in the
+# current split. A block that is not flat pairs stays as source.
+markdown_frontmatter = true
+
 # Draw standalone Markdown images inline in Normal mode. "auto" queries the
 # terminal (Kitty graphics, then Sixel) and falls back through Unicode
 # half-blocks to a text placeholder. Force "kitty", "iterm2", "sixel", or

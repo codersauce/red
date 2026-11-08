@@ -2975,6 +2975,8 @@ pub enum Action {
     ToggleMarkdownConceal,
     /// Shows or hides rendered Mermaid diagrams in the current window.
     ToggleMarkdownMermaid,
+    /// Shows or hides the rendered YAML frontmatter table in the current window.
+    ToggleMarkdownFrontmatter,
     SetRelativeLineNumbers(bool),
 
     DeletePreviousChar,
@@ -19299,6 +19301,9 @@ impl Editor {
             if cmd == "markdown-mermaid" {
                 actions.push(Action::ToggleMarkdownMermaid);
             }
+            if cmd == "markdown-frontmatter" {
+                actions.push(Action::ToggleMarkdownFrontmatter);
+            }
 
             if cmd == "statusline" {
                 actions.push(Action::OpenStatuslineManager);
@@ -24650,6 +24655,10 @@ impl Editor {
                 }
                 Action::ToggleMarkdownMermaid => {
                     self.toggle_markdown_mermaid();
+                    self.render(buffer)?;
+                }
+                Action::ToggleMarkdownFrontmatter => {
+                    self.toggle_markdown_frontmatter();
                     self.render(buffer)?;
                 }
                 Action::SetWrap(wrap) => {

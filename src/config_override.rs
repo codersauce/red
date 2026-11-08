@@ -25,6 +25,7 @@ const EXTRA_SCHEMA_PATHS: &[&[&str]] = &[
     &["markdown_tables"],
     &["markdown_conceal"],
     &["markdown_mermaid"],
+    &["markdown_frontmatter"],
     &["lsp", "enabled"],
     &["lsp", "format_on_save"],
     &["formatting", "on_save"],

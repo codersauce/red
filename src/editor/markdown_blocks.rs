@@ -20,6 +20,8 @@ use crate::{
     unicode_utils::{display_width, truncate_display_width},
 };
 
+#[path = "markdown_frontmatter.rs"]
+mod frontmatter;
 #[path = "markdown_mermaid.rs"]
 mod mermaid;
 
@@ -43,6 +45,8 @@ pub(super) enum BlockRole {
     Label,
     /// Arrows and edges. `descriptionForeground`.
     Edge,
+    /// Frontmatter rules. `editorIndentGuide.background`.
+    Guide,
     /// Frontmatter keys. `support.type.property-name`.
     Key,
     /// Frontmatter values. `string`.
@@ -129,6 +133,8 @@ pub(super) struct BlockSpec {
     pub rows: Vec<BlockRow>,
     /// Set when the rows are produced from a Mermaid fence at layout time.
     mermaid: Option<mermaid::Region>,
+    /// Set when the rows are produced from leading frontmatter at layout time.
+    frontmatter: Option<Vec<(String, String)>>,
 }
 
 impl BlockSpec {
@@ -138,6 +144,7 @@ impl BlockSpec {
             lines,
             rows,
             mermaid: None,
+            frontmatter: None,
         }
     }
 
@@ -146,6 +153,16 @@ impl BlockSpec {
             lines,
             rows: Vec::new(),
             mermaid: Some(region),
+            frontmatter: None,
+        }
+    }
+
+    fn frontmatter(lines: Range<usize>, pairs: Vec<(String, String)>) -> Self {
+        Self {
+            lines,
+            rows: Vec::new(),
+            mermaid: None,
+            frontmatter: Some(pairs),
         }
     }
 }
@@ -222,6 +239,11 @@ pub(super) fn block_role_style(theme: &Theme, role: BlockRole) -> Style {
             "descriptionForeground".to_string(),
             "editor.foreground".to_string(),
         ],
+        BlockRole::Guide => vec![
+            "editorIndentGuide.background".to_string(),
+            "descriptionForeground".to_string(),
+            "editor.foreground".to_string(),
+        ],
         BlockRole::Key => vec![
             "scope:support.type.property-name".to_string(),
             "editor.foreground".to_string(),
@@ -286,10 +308,13 @@ pub(super) fn layout_blocks(
     specs.sort_by_key(|spec| (spec.lines.start, spec.lines.end));
     let mut occupied_until = 0usize;
     for spec in specs {
-        let rendered = spec
-            .mermaid
-            .as_ref()
-            .map(|region| mermaid::render(region, width, ascii));
+        let rendered = if let Some(region) = spec.mermaid.as_ref() {
+            Some(mermaid::render(region, width, ascii))
+        } else {
+            spec.frontmatter
+                .as_ref()
+                .map(|pairs| frontmatter::render(pairs, width, ascii))
+        };
         let rows = rendered.as_deref().unwrap_or(spec.rows.as_slice());
         if spec.lines.start >= spec.lines.end || rows.is_empty() {
             continue;
@@ -363,17 +388,25 @@ pub(super) struct CachedBlocks {
 impl super::Editor {
     pub(super) fn block_feature_bits(&self, window: &crate::window::Window) -> u8 {
         u8::from(self.markdown_mermaid_enabled(window))
+            | (u8::from(self.markdown_frontmatter_enabled(window)) << 1)
     }
 
-    /// Mermaid fences become blocks when the window setting is on.
+    /// Mermaid fences and leading frontmatter become blocks when their settings are on.
     fn detected_markdown_blocks(&self, window: &crate::window::Window) -> Vec<BlockSpec> {
-        if !self.markdown_mermaid_enabled(window) {
-            return Vec::new();
-        }
         let Some(buffer) = self.buffer_manager.get(window.buffer_index) else {
             return Vec::new();
         };
-        mermaid::find_blocks(&buffer.contents())
+        let text = buffer.contents();
+        let mut blocks = Vec::new();
+        if self.markdown_frontmatter_enabled(window) {
+            if let Some(block) = frontmatter::find_block(&text) {
+                blocks.push(block);
+            }
+        }
+        if self.markdown_mermaid_enabled(window) {
+            blocks.extend(mermaid::find_blocks(&text));
+        }
+        blocks
     }
 
     pub(super) fn markdown_mermaid_enabled(&self, window: &crate::window::Window) -> bool {
@@ -389,6 +422,26 @@ impl super::Editor {
             .is_some_and(|window| self.markdown_mermaid_enabled(window));
         if let Some(window) = self.window_manager.active_window_mut() {
             window.markdown_mermaid = Some(!enabled);
+        }
+        self.vleft = 0;
+        self.skipcol = 0;
+        self.markdown_block_generation = self.markdown_block_generation.wrapping_add(1);
+        self.layout_cache.borrow_mut().clear();
+    }
+
+    pub(super) fn markdown_frontmatter_enabled(&self, window: &crate::window::Window) -> bool {
+        window
+            .markdown_frontmatter
+            .unwrap_or(self.config.markdown_frontmatter.unwrap_or(true))
+    }
+
+    pub(super) fn toggle_markdown_frontmatter(&mut self) {
+        let enabled = self
+            .window_manager
+            .active_window()
+            .is_some_and(|window| self.markdown_frontmatter_enabled(window));
+        if let Some(window) = self.window_manager.active_window_mut() {
+            window.markdown_frontmatter = Some(!enabled);
         }
         self.vleft = 0;
         self.skipcol = 0;
@@ -576,7 +629,11 @@ impl super::Editor {
             return None;
         }
         while self.markdown_block_hides_line(previous) {
-            previous = previous.checked_sub(1)?;
+            match previous.checked_sub(1) {
+                Some(earlier) => previous = earlier,
+                // A block on the first line has no source row above it.
+                None => return Some(previous),
+            }
         }
         Some(previous)
     }
@@ -872,6 +929,7 @@ mod tests {
                 BlockRole::Plain,
                 BlockRole::Muted,
                 BlockRole::Border,
+                BlockRole::Guide,
                 BlockRole::Key,
                 BlockRole::Value,
                 BlockRole::Edge,

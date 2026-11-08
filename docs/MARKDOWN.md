@@ -150,6 +150,18 @@ fence stays on screen with one muted `mermaid: could not render:` line.
 `:markdown-mermaid` toggles diagrams in the current split. Set
 `markdown_mermaid = false` to keep every fence as source.
 
+## Frontmatter
+
+A Markdown file that starts with a `---` fence renders that YAML block as a
+table. Fewer than five pairs sit in one row of keys over one row of values.
+Five or more pairs, or a table that does not fit, stack as key and value
+columns. Lists join with commas. Nested lines and folded text stay on one
+line and are cut to the window. Keys use the property-name color, values use
+the string color, and the rules use the indent-guide color.
+
+`:markdown-frontmatter` toggles the table in the current split. A block that
+is not a list of pairs, or that never closes, stays as source.
+
 ## Settings
 
 | Setting | Default | Effect |
@@ -157,8 +169,9 @@ fence stays on screen with one muted `mermaid: could not render:` line.
 | `markdown_tables` | `true` | Draw pipe tables as grids |
 | `markdown_conceal` | `true` | Hide inline markup while wrapping |
 | `markdown_mermaid` | `true` | Draw `mermaid` fences as text diagrams |
+| `markdown_frontmatter` | `true` | Draw leading YAML frontmatter as a table |
 | `markdown_images` | `"auto"` | How to draw images: `auto`, `kitty`, `iterm2`, `sixel`, `halfblocks`, `off` |
 | `markdown_image_max_height` | `16` | Most rows one image may use |
 | `markdown_link_split_focus` | `"source"` | Pane that keeps focus after `Ctrl-w x` |
 
-Tables, images, diagrams, links, and tasks apply to Markdown documents up to 2 MiB.
+Tables, images, diagrams, frontmatter, links, and tasks apply to Markdown documents up to 2 MiB.
