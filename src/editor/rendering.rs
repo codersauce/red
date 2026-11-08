@@ -2205,6 +2205,7 @@ impl Editor {
                 &theme_style,
                 &self.theme,
             );
+            self.paint_markdown_html_segment(buffer, window, segment, line);
             self.paint_markdown_alert_segment(buffer, window, segment, line);
             self.render_decorations_for_segment(
                 buffer,
@@ -2923,6 +2924,7 @@ impl Editor {
                 &theme_style,
                 &self.theme,
             );
+            self.paint_markdown_html_segment(buffer, window, segment, line);
             self.paint_markdown_alert_segment(buffer, window, segment, line);
             self.render_decorations_for_segment(
                 buffer,

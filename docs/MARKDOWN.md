@@ -70,6 +70,30 @@ Colors come from the theme: Note uses `editorInfo.foreground`, Tip
 color falls back to `markup.quote`. Alerts follow `markdown_conceal` and have
 no separate switch.
 
+## Inline HTML
+
+Balanced inline tags on one line hide the tags and style the text between
+them. The buffer line stays one row, so `<br>` disappears and does not insert
+a break.
+
+| Tags | What you see |
+| --- | --- |
+| `<b>`, `<strong>` | bold |
+| `<i>`, `<em>` | italic |
+| `<u>`, `<ins>` | underline |
+| `<s>`, `<del>`, `<strike>` | the letters with a combining strike |
+| `<mark>` | `editor.findMatchHighlightBackground` |
+| `<code>` | inline code style (`markup.inline.raw`) |
+| `<kbd>` | `badge.foreground` and `badge.background`, or an underline when those colors are missing |
+| `<sub>`, `<sup>` | Unicode subscripts and superscripts where a mapping exists |
+| `<br>` | nothing |
+
+`<b><i>both</i></b>` nests. An unknown tag, an unbalanced tag, a tag inside a
+code span or fence, and a tag inside an HTML block stay on screen. `<code>`
+and `<kbd>` show their contents as written, including any tags inside them.
+Move onto a hidden tag, or enter Insert, Visual, or search on that line, and
+the tags come back. This follows `markdown_conceal` and has no separate switch.
+
 ## Images
 
 A line that holds only an image becomes the picture itself in Normal mode:
@@ -152,7 +176,7 @@ pane or switching the document to another file does the same.
 | Setting | Default | Effect |
 | --- | --- | --- |
 | `markdown_tables` | `true` | Draw pipe tables as grids |
-| `markdown_conceal` | `true` | Hide inline markup while wrapping, including GitHub alert markers |
+| `markdown_conceal` | `true` | Hide inline markup while wrapping, including GitHub alert markers and balanced inline HTML tags |
 | `markdown_images` | `"auto"` | How to draw images: `auto`, `kitty`, `iterm2`, `sixel`, `halfblocks`, `off` |
 | `markdown_image_max_height` | `16` | Most rows one image may use |
 | `markdown_link_split_focus` | `"source"` | Pane that keeps focus after `Ctrl-w x` |

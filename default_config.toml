@@ -31,8 +31,10 @@ wrap = true
 markdown_tables = true
 
 # Hide inline Markdown markers while wrapping: link URLs and brackets, emphasis
-# markers, image markup, code-span backticks, and GitHub alert markers
-# (`> [!NOTE]` and the other four kinds) take no cells. `:markdown-conceal`
+# markers, image markup, code-span backticks, GitHub alert markers
+# (`> [!NOTE]` and the other four kinds), and balanced inline HTML tags
+# (`<b>`, `<code>`, `<br>`, and the other kinds listed in docs/MARKDOWN.md)
+# take no cells. `:markdown-conceal`
 # toggles this in the current split. Insert, visual, search, and a cursor inside
 # concealed syntax show that line's raw text. Tables keep their own grid.
 markdown_conceal = true
