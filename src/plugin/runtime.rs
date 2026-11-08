@@ -3062,6 +3062,8 @@ impl RedHost {
                     "parse_status" => Some("GitState"),
                     "parse_commit_files" => Some("GitCommitFiles"),
                     "detail_document" => Some("GitWorkspaceDocument"),
+                    "parse_git_diff_invocation" => Some("GitDiffInvocation"),
+                    "preview_blobs" => Some("GitPreviewBlobs"),
                     _ => None,
                 };
                 if let Some((schema, record)) =
@@ -3117,6 +3119,12 @@ impl RedHost {
             "hunk_diff_args" => "commands::hunk_diff_args",
             "commit_args" => "commands::commit_args",
             "commit_history_args" => "commands::commit_history_args",
+            "parse_git_diff_invocation" => "commands::parse_git_diff_invocation",
+            "range_name_status_args" => "commands::range_name_status_args",
+            "range_diff_args" => "commands::range_diff_args",
+            "range_numstat_args" => "commands::range_numstat_args",
+            "preview_blobs" => "patch::preview_blobs",
+            "reconstruct_after" => "patch::reconstruct_after",
             _ => anyhow::bail!("unknown Git core operation `{operation}`"),
         };
 
@@ -6182,6 +6190,181 @@ mod tests {
         assert_eq!(document["removed"], 1);
         assert_eq!(document["total_lines"], 15006);
         assert_eq!(document["truncated"], true);
+    }
+
+    #[test]
+    fn git_core_range_commands_parse_invocations_and_reconstruct_worktree_sides() {
+        let mut host = RedHost::new(HashMap::new());
+        let mut invocation = |args: serde_json::Value| {
+            host.call_git_core("parse_git_diff_invocation", &[Value::from_json(args)])
+                .unwrap()
+                .to_json()
+        };
+        let cached = invocation(json!(["cached", "--", "src/a.rs"]));
+        assert_eq!(cached["ok"], true);
+        assert_eq!(cached["source"], "cached");
+        assert_eq!(cached["label"], "staged");
+        assert_eq!(cached["paths"], json!(["src/a.rs"]));
+
+        let two = invocation(json!(["main", "feature", "--", "src/a.rs"]));
+        assert_eq!(two["source"], "needs_rev");
+        assert_eq!(two["pending_token"], "feature");
+        assert_eq!(two["revs"], json!(["main"]));
+        assert_eq!(two["label"], "main feature");
+
+        let rejected = invocation(json!(["HEAD", "feature", "src/a.rs"]));
+        assert_eq!(rejected["ok"], false);
+        assert_eq!(rejected["error"], "GitDiff paths belong after --");
+        assert_eq!(invocation(json!([]))["ok"], false);
+        assert_eq!(invocation(json!(["HEAD", "--"]))["ok"], false);
+        drop(invocation);
+
+        let mut argv =
+            |operation: &str, source: &str, revs: serde_json::Value, paths: serde_json::Value| {
+                host.call_git_core(
+                    operation,
+                    &[
+                        Value::String(source.to_string()),
+                        Value::from_json(revs),
+                        Value::from_json(paths),
+                    ],
+                )
+                .unwrap()
+                .to_json()
+            };
+        assert_eq!(
+            argv(
+                "range_name_status_args",
+                "cached",
+                json!([]),
+                json!(["src/a.rs"])
+            ),
+            json!([
+                "-c",
+                "core.quotePath=false",
+                "diff",
+                "--name-status",
+                "-z",
+                "--find-renames",
+                "--cached",
+                "--",
+                "src/a.rs"
+            ])
+        );
+        assert_eq!(
+            argv(
+                "range_name_status_args",
+                "ref",
+                json!(["HEAD~2"]),
+                json!([])
+            ),
+            json!([
+                "-c",
+                "core.quotePath=false",
+                "diff",
+                "--name-status",
+                "-z",
+                "--find-renames",
+                "HEAD~2"
+            ])
+        );
+        assert_eq!(
+            argv(
+                "range_diff_args",
+                "revs",
+                json!(["main", "feature"]),
+                json!(["old name.rs", "new name.rs"])
+            ),
+            json!([
+                "-c",
+                "core.quotePath=false",
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "--color=never",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+                "--find-renames",
+                "--full-index",
+                "main",
+                "feature",
+                "--",
+                "old name.rs",
+                "new name.rs"
+            ])
+        );
+        assert_eq!(
+            argv("range_numstat_args", "working", json!([]), json!([])),
+            json!([
+                "-c",
+                "core.quotePath=false",
+                "diff",
+                "--numstat",
+                "-z",
+                "--find-renames"
+            ])
+        );
+        drop(argv);
+
+        let patch = "diff --git a/notes.txt b/notes.txt\nindex 1111111111111111111111111111111111111111..2222222222222222222222222222222222222222 100644\n--- a/notes.txt\n+++ b/notes.txt\n@@ -1,2 +1,3 @@\n alpha\n beta\n+gamma\n";
+        let blobs = host
+            .call_git_core("preview_blobs", &[Value::String(patch.to_string())])
+            .unwrap()
+            .to_json();
+        assert_eq!(
+            blobs["before_oid"],
+            "1111111111111111111111111111111111111111"
+        );
+        assert_eq!(blobs["after_empty"], false);
+        assert_eq!(blobs["binary"], false);
+        let rebuilt = host
+            .call_git_core(
+                "reconstruct_after",
+                &[
+                    Value::String("alpha\nbeta\n".to_string()),
+                    Value::String(patch.to_string()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(rebuilt.to_json(), json!("alpha\nbeta\ngamma\n"));
+
+        let created = "@@ -0,0 +1,2 @@\n+alpha\n+beta\n";
+        let created_blobs = host
+            .call_git_core(
+                "preview_blobs",
+                &[Value::String(format!(
+                    "index 0000000..abcdef1 100644\n{created}"
+                ))],
+            )
+            .unwrap()
+            .to_json();
+        assert_eq!(created_blobs["before_empty"], true);
+        assert_eq!(
+            host.call_git_core(
+                "reconstruct_after",
+                &[
+                    Value::String(String::new()),
+                    Value::String(created.to_string()),
+                ],
+            )
+            .unwrap()
+            .to_json(),
+            json!("alpha\nbeta\n")
+        );
+        assert_eq!(
+            host.call_git_core(
+                "reconstruct_after",
+                &[
+                    Value::String("old\n".to_string()),
+                    Value::String(
+                        "@@ -1 +1 @@\n-old\n+new\n\\ No newline at end of file\n".to_string()
+                    ),
+                ],
+            )
+            .unwrap()
+            .to_json(),
+            json!("new")
+        );
     }
 
     #[test]
@@ -16300,6 +16483,219 @@ mod tests {
             .iter()
             .all(|row| !row.id.starts_with("commit:")));
         assert!(restored.actions.iter().any(|action| action.hint.id == "s"));
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn git_diff_range_lists_files_and_previews_a_side_without_changing_status() {
+        drain_requests();
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        };
+        let commit = |subject: &str| {
+            git(&[
+                "-c",
+                "user.name=Red Test",
+                "-c",
+                "user.email=red@example.test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                subject,
+            ]);
+        };
+        git(&["init", "-q", "-b", "main"]);
+        fs::write(root.join("notes.txt"), "alpha\nbeta\n").unwrap();
+        git(&["add", "notes.txt"]);
+        commit("base");
+        fs::write(root.join("notes.txt"), "alpha\nBETA\n").unwrap();
+        git(&["add", "notes.txt"]);
+        commit("head");
+
+        let mut runtime = load_git_runtime(root).await;
+        runtime
+            .execute_command("GitDiff HEAD~1 HEAD -- notes.txt")
+            .await
+            .unwrap();
+        let model = wait_for_git_dashboard_model(
+            &mut runtime,
+            |model| {
+                model.paired_columns
+                    && model.rows.iter().any(|row| row.id == "range:notes.txt")
+                    && model.detail_document.as_ref().is_some_and(|document| {
+                        document.path == "notes.txt"
+                            && document
+                                .lines
+                                .iter()
+                                .any(|line| line.kind == "removed" && line.text == "beta")
+                            && document
+                                .lines
+                                .iter()
+                                .any(|line| line.kind == "added" && line.text == "BETA")
+                    })
+            },
+            "GitDiff did not render the range file list and diff",
+        )
+        .await;
+        assert!(model
+            .header
+            .iter()
+            .any(|segment| segment.text.contains("HEAD~1 HEAD")));
+        assert!(model.actions.iter().any(|action| action.hint.id == "p"));
+        assert!(model.actions.iter().all(|action| action.hint.id != "s"));
+
+        let porcelain = || {
+            Command::new("git")
+                .args(["status", "--porcelain=v1", "-z"])
+                .current_dir(root)
+                .output()
+                .unwrap()
+                .stdout
+        };
+        let status_before = porcelain();
+        runtime
+            .notify(
+                "workspace:event:git-dashboard",
+                json!({ "action": "v", "focus": "detail", "row": null }),
+            )
+            .await
+            .unwrap();
+        pump_process_events(&mut runtime).await.unwrap();
+        assert_eq!(porcelain(), status_before, "v changed the worktree");
+
+        runtime
+            .notify(
+                "workspace:event:git-dashboard",
+                json!({
+                    "action": "p",
+                    "focus": "detail",
+                    "detail_side": "before",
+                    "detail_layout": "paired",
+                    "detail_line": { "kind": "removed", "old_line": 2, "text": "beta" },
+                    "row": null,
+                }),
+            )
+            .await
+            .unwrap();
+        let preview = wait_for_git_preview(&mut runtime).await;
+        assert_eq!(preview.text, "alpha\nbeta\n");
+        assert_eq!(preview.side.as_deref(), Some("before"));
+        assert!(preview.name.starts_with("[Git before] notes.txt@"));
+        assert_eq!(preview.syntax.as_deref(), Some("notes.txt"));
+        assert_eq!(porcelain(), status_before, "preview changed the worktree");
+
+        runtime
+            .notify(
+                "workspace:event:git-dashboard",
+                json!({ "action": "q", "focus": "rows", "row": null }),
+            )
+            .await
+            .unwrap();
+        let restored = wait_for_git_dashboard_model(
+            &mut runtime,
+            |model| {
+                !model.paired_columns
+                    && model.rows.iter().all(|row| !row.id.starts_with("range:"))
+                    && model.actions.iter().any(|action| action.hint.id == "s")
+            },
+            "leaving the range did not restore the working-tree dashboard",
+        )
+        .await;
+        assert!(restored.rows.iter().any(|row| row.id == "clean"
+            || row
+                .segments
+                .iter()
+                .any(|segment| segment.text.contains("clean"))));
+
+        fs::write(root.join("notes.txt"), "alpha\nBETA\ngamma\n").unwrap();
+        runtime.execute_command("GitDiff working").await.unwrap();
+        wait_for_git_dashboard_model(
+            &mut runtime,
+            |model| {
+                model.paired_columns
+                    && model.rows.iter().any(|row| row.id == "range:notes.txt")
+                    && model.detail_document.as_ref().is_some_and(|document| {
+                        document
+                            .lines
+                            .iter()
+                            .any(|line| line.kind == "added" && line.text == "gamma")
+                    })
+            },
+            "GitDiff working did not render the worktree change",
+        )
+        .await;
+        let status_during = porcelain();
+        runtime
+            .notify(
+                "workspace:event:git-dashboard",
+                json!({
+                    "action": "p",
+                    "focus": "detail",
+                    "detail_side": "after",
+                    "detail_layout": "unified",
+                    "detail_line": { "kind": "added", "new_line": 3, "text": "gamma" },
+                    "row": null,
+                }),
+            )
+            .await
+            .unwrap();
+        let after = wait_for_git_preview(&mut runtime).await;
+        assert_eq!(after.text, "alpha\nBETA\ngamma\n");
+        assert_eq!(after.side.as_deref(), Some("after"));
+        assert!(after.name.starts_with("[Git after] notes.txt@"));
+        assert_eq!(
+            porcelain(),
+            status_during,
+            "worktree preview changed git status"
+        );
+    }
+
+    #[cfg(not(windows))]
+    struct OpenedGitPreview {
+        text: String,
+        side: Option<String>,
+        name: String,
+        syntax: Option<String>,
+    }
+
+    #[cfg(not(windows))]
+    async fn wait_for_git_preview(runtime: &mut Runtime) -> OpenedGitPreview {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            pump_process_events(runtime).await.unwrap();
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                if let PluginRequest::OpenReadonlySplit {
+                    text,
+                    side,
+                    name,
+                    syntax,
+                    ..
+                } = request
+                {
+                    return OpenedGitPreview {
+                        text,
+                        side,
+                        name,
+                        syntax,
+                    };
+                }
+            }
+            assert!(Instant::now() < deadline, "read-only preview did not open");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[cfg(not(windows))]
