@@ -121,6 +121,15 @@ restart to move focus to the opened file. **Clear link destination** in the
 command palette lets go of the split without closing it, and closing either
 pane or switching the document to another file does the same.
 
+## Rendered blocks
+
+Some Markdown constructs draw as one block anchored on their first source
+line. The other lines in that range take no rows while the block is on
+screen. In Normal mode you see the rendered rows. Move the cursor into the
+range, or leave Normal mode on that range, and the source lines return. `j`
+and `k` step over the whole block. A block taller than the window scrolls
+inside itself. The buffer and the undo history stay unchanged.
+
 ## Settings
 
 | Setting | Default | Effect |

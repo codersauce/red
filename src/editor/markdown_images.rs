@@ -2947,7 +2947,7 @@ mod tests {
             break_indent: BreakIndentOptions::disabled(),
         };
         let layout =
-            layout_lines_with_tables(&lines, 2, config, None, None, None, None, Some(&plan));
+            layout_lines_with_tables(&lines, 2, config, None, None, None, None, Some(&plan), None);
         assert_eq!(layout.rows.len(), 5);
         assert!(layout.rows[..4]
             .iter()
@@ -2967,6 +2967,7 @@ mod tests {
             None,
             None,
             Some(&plan),
+            None,
         );
         let image_rows: Vec<_> = scrolled.rows.iter().filter(|row| row.line == 0).collect();
         assert_eq!(image_rows.len(), 2);
@@ -3881,7 +3882,7 @@ mod tests {
             break_indent: BreakIndentOptions::disabled(),
         };
         let hidden =
-            layout_lines_with_tables(&lines, 2, config, None, None, None, None, Some(&plan));
+            layout_lines_with_tables(&lines, 2, config, None, None, None, None, Some(&plan), None);
         let mut revealed_plan = plan;
         revealed_plan.raw_lines.insert(0);
         let revealed = layout_lines_with_tables(
@@ -3893,6 +3894,7 @@ mod tests {
             None,
             None,
             Some(&revealed_plan),
+            None,
         );
         assert_eq!(hidden.rows.len(), revealed.rows.len());
         assert!(revealed.rows[0].image.is_none());
@@ -3923,8 +3925,17 @@ mod tests {
             raw_lines: long_plan.raw_lines.clone(),
         };
         revealed_long_plan.raw_lines.insert(0);
-        let hidden_long =
-            layout_lines_with_tables(&long, 2, narrow, None, None, None, None, Some(&long_plan));
+        let hidden_long = layout_lines_with_tables(
+            &long,
+            2,
+            narrow,
+            None,
+            None,
+            None,
+            None,
+            Some(&long_plan),
+            None,
+        );
         let revealed_long = layout_lines_with_tables(
             &long,
             2,
@@ -3934,6 +3945,7 @@ mod tests {
             None,
             None,
             Some(&revealed_long_plan),
+            None,
         );
         assert_eq!(hidden_long.rows.len(), revealed_long.rows.len());
         assert!(revealed_long.rows[0].image.is_none());

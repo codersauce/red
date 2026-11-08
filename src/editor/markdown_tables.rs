@@ -1097,6 +1097,7 @@ fn projected_segment(
         visual_offset: 0,
         concealed: Vec::new(),
         image: None,
+        block: None,
         projection: Some(Arc::new(projection)),
         projection_left: 0,
     }

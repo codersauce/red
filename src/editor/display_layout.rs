@@ -203,6 +203,7 @@ pub(super) fn image_line_segments(
                 cols,
                 placeholder,
             }),
+            block: None,
         })
         .collect()
 }
@@ -324,11 +325,13 @@ pub struct LineSegment {
     pub(super) projection_left: usize,
     /// Set when this row is part of an inline Markdown image.
     pub(super) image: Option<ImageSpan>,
+    /// Set when this row is rendered text standing in for a source range.
+    pub(super) block: Option<super::markdown_blocks::BlockRowView>,
 }
 
 impl LineSegment {
     pub fn contains_display_col(&self, col: usize) -> bool {
-        if self.image.is_some() {
+        if self.image.is_some() || self.block.is_some() {
             return col == 0;
         }
         if let Some(projection) = &self.projection {
@@ -344,6 +347,9 @@ impl LineSegment {
     /// Includes the insertion caret after the final character, but keeps
     /// boundaries between wrapped segments exclusive on the preceding row.
     pub fn contains_cursor_col(&self, col: usize) -> bool {
+        if self.block.is_some() {
+            return false;
+        }
         if let Some(image) = self.image {
             return image.index == 0 && col == 0;
         }
@@ -354,7 +360,7 @@ impl LineSegment {
     }
 
     pub fn screen_col_for_display_col(&self, col: usize, width: usize) -> usize {
-        if self.image.is_some() {
+        if self.image.is_some() || self.block.is_some() {
             return 0;
         }
         if let Some(projection) = &self.projection {
@@ -369,7 +375,7 @@ impl LineSegment {
     }
 
     pub fn display_col_for_screen_col(&self, col: usize) -> usize {
-        if self.image.is_some() {
+        if self.image.is_some() || self.block.is_some() {
             return 0;
         }
         if let Some(projection) = &self.projection {
@@ -743,7 +749,9 @@ pub struct LayoutConfig {
 }
 
 pub fn layout_lines(lines: &[String], line_count: usize, config: LayoutConfig) -> DisplayLayout {
-    layout_lines_with_tables(lines, line_count, config, None, None, None, None, None)
+    layout_lines_with_tables(
+        lines, line_count, config, None, None, None, None, None, None,
+    )
 }
 
 /// The declaration takes the image rows its text occupies. A wrapped source
@@ -810,6 +818,7 @@ pub(super) fn layout_lines_with_tables(
     concealments: Option<&LineConcealments>,
     conceal_reveal: Option<&Range<usize>>,
     images: Option<&super::markdown_images::ImageLayout>,
+    blocks: Option<&super::markdown_blocks::BlockLayout>,
 ) -> DisplayLayout {
     if config.content_width == 0 || config.height == 0 {
         return DisplayLayout::default();
@@ -837,7 +846,15 @@ pub(super) fn layout_lines_with_tables(
             0
         };
         let segments =
-            if let Some(image_rows) = images.and_then(|images| images.rendered(line_index)) {
+            if let Some(block_rows) = blocks.and_then(|blocks| blocks.display_rows(line_index)) {
+                block_rows
+                    .iter()
+                    .filter(|segment| line_skipcol == 0 || segment.start_col >= line_skipcol)
+                    .cloned()
+                    .collect()
+            } else if blocks.is_some_and(|blocks| blocks.hides(line_index)) {
+                Vec::new()
+            } else if let Some(image_rows) = images.and_then(|images| images.rendered(line_index)) {
                 image_rows_with_declaration(
                     line,
                     line_index,
@@ -1010,6 +1027,7 @@ fn wrap_line_segments_with_limit(
                     visual_offset: if first_segment { 0 } else { indent },
                     concealed: ranges,
                     image: None,
+                    block: None,
                 });
                 if segments.len() == max_segments {
                     return segments;
@@ -1056,6 +1074,7 @@ fn wrap_line_segments_with_limit(
             visual_offset: if first_segment { 0 } else { indent },
             concealed: concealed_ranges,
             image: None,
+            block: None,
         });
     }
 
@@ -1106,6 +1125,7 @@ fn wrap_line_segments_with_limit(
             visual_offset: if first_segment { 0 } else { indent },
             concealed: Vec::new(),
             image: None,
+            block: None,
         });
     }
 
@@ -1171,6 +1191,7 @@ pub(super) fn nowrap_line_segment(
         visual_offset: 0,
         concealed: Vec::new(),
         image: None,
+        block: None,
     }]
 }
 

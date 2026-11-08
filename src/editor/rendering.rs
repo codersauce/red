@@ -2167,6 +2167,16 @@ impl Editor {
                 self.fill_line_in_window(buffer, term_x, term_y, content_width, &theme_style);
                 continue;
             };
+            if self.paint_markdown_block_segment(
+                buffer,
+                window,
+                segment,
+                term_x,
+                term_y,
+                content_width,
+            ) {
+                continue;
+            }
             if segment.image.is_some() {
                 self.paint_markdown_image_segment(
                     buffer,
@@ -2884,6 +2894,16 @@ impl Editor {
         for segment in &layout.rows {
             let term_y = self.window_to_terminal_y(window, segment.row);
             let term_x = self.window_to_terminal_x(window, gutter_width + 1);
+            if self.paint_markdown_block_segment(
+                buffer,
+                window,
+                segment,
+                term_x,
+                term_y,
+                content_width,
+            ) {
+                continue;
+            }
             if segment.image.is_some() {
                 self.paint_markdown_image_segment(
                     buffer,
@@ -5077,6 +5097,7 @@ mod tests {
             visual_offset: 0,
             concealed: Vec::new(),
             image: None,
+            block: None,
         }
     }
 
