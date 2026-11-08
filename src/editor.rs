@@ -177,7 +177,7 @@ use crate::{
         SessionVisualSelection, SessionWindowJumps, SESSION_SCHEMA_VERSION,
     },
     textobjects::{ResolvedTextObject, SyntaxObjectKind, SyntaxTextObjectService},
-    theme::{parse_vscode_theme, parse_vscode_theme_contents, Style, Theme},
+    theme::{Style, Theme},
     tutorial::{
         TutorialController, TutorialLesson, TutorialObservation, TutorialProgress, TutorialTrack,
         PRACTICE_CONTENTS,
@@ -29256,15 +29256,7 @@ impl Editor {
     }
 
     fn apply_theme(&mut self, theme_name: &str, update_config: bool) -> anyhow::Result<()> {
-        let Some(theme_asset) = crate::assets::resolve_theme(theme_name, &Config::config_dir())
-        else {
-            anyhow::bail!("Theme file {} not found", theme_name);
-        };
-        let theme = if let Some(path) = theme_asset.path() {
-            parse_vscode_theme(&path.to_string_lossy())?
-        } else {
-            parse_vscode_theme_contents(&theme_asset.read_to_string()?)?
-        };
+        let theme = crate::theme::load_resolved_theme(theme_name, &Config::config_dir())?;
         let highlighter = Highlighter::with_registry(&theme, self.highlighter.registry())?;
         self.theme = theme;
         self.highlighter = highlighter;
@@ -35997,6 +35989,7 @@ impl Editor {
 mod test {
     use super::*;
     use crate::lsp::DiagnosticSeverity;
+    use crate::theme::parse_vscode_theme;
     use std::path::{Path, PathBuf};
     use std::process::Command;
 

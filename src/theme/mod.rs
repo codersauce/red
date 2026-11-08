@@ -13,8 +13,10 @@ pub(crate) use surface::{DiffPalette, SurfaceCardColors, SurfaceCardPalette, Sur
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+pub use vscode::load_resolved_theme;
 pub use vscode::parse_vscode_theme;
 pub use vscode::parse_vscode_theme_contents;
+pub use vscode::resolved_vscode_theme_json;
 
 use crate::color::{blend_color, contrast_ratio, ensure_minimum_contrast, Color};
 

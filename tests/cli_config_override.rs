@@ -90,6 +90,38 @@ fn print_config_names_an_unknown_key_and_suggests_a_close_match() {
 }
 
 #[test]
+fn print_config_prints_the_resolved_theme_after_extends() {
+    let home = tempfile::tempdir().unwrap();
+    let config_dir = home.path().join("red");
+    fs::create_dir_all(config_dir.join("themes")).unwrap();
+    fs::write(config_dir.join("config.toml"), "theme = \"mine.json\"\n").unwrap();
+    fs::write(
+        config_dir.join("themes").join("mine.json"),
+        r##"{
+            "name": "mine",
+            "extends": "red.json",
+            "type": "light",
+            "colors": { "editor.background": "#FFFFFF" },
+            "tokenColors": []
+        }"##,
+    )
+    .unwrap();
+
+    let output = red(home.path(), &["--print-config"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("theme = \"mine.json\""));
+    assert!(stdout.contains("# resolved theme mine.json"));
+    assert!(stdout.contains("\"editor.background\": \"#FFFFFF\""));
+    assert!(stdout.contains("\"type\": \"light\""));
+    assert!(!stdout.contains("\"extends\""));
+}
+
+#[test]
 fn print_config_rejects_a_malformed_override() {
     let home = tempfile::tempdir().unwrap();
     fs::create_dir_all(home.path().join("red")).unwrap();
