@@ -184,6 +184,9 @@ pub struct Buffer {
     /// Whether the buffer has unsaved changes
     pub dirty: bool,
 
+    /// Generated preview text. Insert, replace, and save are refused.
+    read_only: bool,
+
     /// Counts saves, so state tied to "until the next save" can tell one has happened.
     save_generation: u64,
 
@@ -233,6 +236,7 @@ impl Buffer {
             content,
             dirty_revision: 0,
             dirty: false,
+            read_only: false,
             save_generation: 0,
             pos: (0, 0),
             vtop: 0,
@@ -343,6 +347,42 @@ impl Buffer {
         self.refresh_dirty();
         self.syntax_selection = SyntaxSelection::Off;
         Ok(())
+    }
+
+    /// A display-only buffer whose name is not a file that can be written.
+    pub(crate) fn readonly_text(name: String, text: String) -> Self {
+        let mut buffer = Self::with_content(Some(name), Rope::from_str(&text));
+        buffer.backing_file = None;
+        buffer.read_only = true;
+        buffer.dirty = false;
+        buffer
+    }
+
+    /// Replaces generated preview text without an undo step or a disk write.
+    pub(crate) fn replace_generated_text(&mut self, text: &str) {
+        self.content = Rope::from_str(text);
+        self.saved_content = Some(self.content.clone());
+        self.undo_history = UndoHistory::default();
+        self.revision = self.revision.wrapping_add(1);
+        self.dirty = false;
+        self.dirty_revision = self.revision;
+        let last = self.len();
+        if self.vtop > last {
+            self.vtop = last;
+        }
+        if self.pos.1 > last {
+            self.pos.1 = last;
+        }
+    }
+
+    /// Changes the tab label without attaching a backing file.
+    pub(crate) fn set_display_name(&mut self, name: String) {
+        self.file = Some(name);
+    }
+
+    /// Generated preview text, as opposed to a directory listing.
+    pub(crate) fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     /// Identity for user-facing buffer lookup, without making directories text documents.

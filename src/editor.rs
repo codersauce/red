@@ -65,6 +65,7 @@ mod notifications;
 mod package_actions;
 pub(crate) mod perf;
 mod plugin_status;
+mod readonly_preview;
 pub mod render_buffer;
 pub mod rendering;
 #[cfg(test)]
@@ -2093,6 +2094,15 @@ pub enum PluginRequest {
         submit_command: Option<String>,
         cancel_command: Option<String>,
     },
+    OpenReadonlySplit {
+        request_id: RequestId,
+        key: String,
+        name: String,
+        text: String,
+        line: usize,
+        syntax: Option<String>,
+        side: Option<String>,
+    },
     CloseScratchBuffer {
         buffer_index: usize,
     },
@@ -2463,6 +2473,7 @@ impl PluginRequest {
             Self::GetSelection { .. } => "GetSelection",
             Self::GetAgentContext { .. } => "GetAgentContext",
             Self::OpenScratchBuffer { .. } => "OpenScratchBuffer",
+            Self::OpenReadonlySplit { .. } => "OpenReadonlySplit",
             Self::CloseScratchBuffer { .. } => "CloseScratchBuffer",
             Self::GetViewportLayout { .. } => "GetViewportLayout",
             Self::GetWindows { .. } => "GetWindows",
@@ -3802,6 +3813,7 @@ pub struct Editor {
     markdown_images: RefCell<markdown_images::ImageRuntime>,
     markdown_link_cache: RefCell<HashMap<BufferId, markdown_links::CachedLinks>>,
     markdown_link_destinations: HashMap<WindowId, markdown_links::LinkDestination>,
+    readonly_previews: Vec<readonly_preview::PreviewPane>,
 
     /// Window manager handling splits and layout
     window_manager: WindowManager,
@@ -5990,6 +6002,7 @@ impl Editor {
             markdown_images: RefCell::new(markdown_images::ImageRuntime::new()),
             markdown_link_cache: RefCell::new(HashMap::new()),
             markdown_link_destinations: HashMap::new(),
+            readonly_previews: Vec::new(),
             window_manager,
             stdout,
             keyboard_protocol: crate::keyboard::KeyboardProtocol::default(),
@@ -13523,6 +13536,31 @@ impl Editor {
                             json!({ "buffer_index": buffer_index }),
                         )
                         .await?;
+                    needs_render = true;
+                }
+                PluginRequest::OpenReadonlySplit {
+                    request_id,
+                    key,
+                    name,
+                    text,
+                    line,
+                    syntax,
+                    side,
+                } => {
+                    self.open_readonly_split(
+                        buffer,
+                        runtime,
+                        request_id,
+                        readonly_preview::SplitPreview {
+                            key,
+                            name,
+                            text,
+                            line,
+                            syntax,
+                            side,
+                        },
+                    )
+                    .await?;
                     needs_render = true;
                 }
                 PluginRequest::CloseScratchBuffer { buffer_index } => {
@@ -22288,6 +22326,15 @@ impl Editor {
                     .await?;
             }
             Action::Quit(force) => {
+                if self.window_manager.window_count() > 1
+                    && self.active_window_is_readonly_preview()
+                {
+                    *add_to_history = false;
+                    if self.close_active_window() {
+                        self.render(buffer)?;
+                    }
+                    return Ok(Some((true, false)));
+                }
                 let scratch_command = self
                     .scratch_buffers
                     .get(&self.current_buffer().id())
@@ -23792,19 +23839,7 @@ impl Editor {
         if self.intercept_learn_action(action, buffer, runtime)? {
             return Ok(false);
         }
-        if self.current_buffer().directory.is_some()
-            && matches!(
-                action,
-                Action::Save
-                    | Action::ForceSave
-                    | Action::SaveAs(_)
-                    | Action::ForceSaveAs(_)
-                    | Action::SetBufferName(_)
-                    | Action::EnterMode(Mode::Insert)
-                    | Action::SetSyntax(_)
-            )
-        {
-            self.set_legacy_message(Some("Directory buffers are read-only".to_string()));
+        if self.block_readonly_mutation(action) {
             self.render(buffer)?;
             return Ok(false);
         }
@@ -26120,7 +26155,7 @@ impl Editor {
                     }
                 }
                 Action::CloseWindow => {
-                    if self.update_window_layout(WindowManager::close_window) {
+                    if self.close_active_window() {
                         self.render(buffer)?;
                     }
                 }
@@ -30069,8 +30104,7 @@ impl Editor {
     }
 
     fn replace_range(&mut self, range: TextRange, new_text: &str) {
-        if self.current_buffer().directory.is_some() {
-            self.set_legacy_message(Some("Directory buffers are read-only".to_string()));
+        if self.note_readonly_text_edit() {
             return;
         }
         let diagnostic_edit = (!self.diagnostics.is_empty())

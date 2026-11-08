@@ -1713,6 +1713,7 @@ fn is_core_detail_interaction(focus: WorkspaceFocus, action: &str) -> bool {
 #[derive(Debug, Default)]
 pub struct WorkspaceManager {
     active: Option<PluginWorkspace>,
+    suspended: Option<PluginWorkspace>,
     widths: HashMap<String, Option<usize>>,
 }
 
@@ -1721,9 +1722,35 @@ impl WorkspaceManager {
         if let Some(active) = &self.active {
             self.widths.insert(active.id.clone(), active.rows_width);
         }
+        if let Some(suspended) = self.suspended.take() {
+            self.widths.insert(suspended.id, suspended.rows_width);
+        }
         let mut workspace = PluginWorkspace::new(id.clone(), config);
         workspace.rows_width = self.widths.get(&id).copied().flatten();
         self.active = Some(workspace);
+    }
+
+    /// Hides the modal workspace so a split opened underneath it can be seen.
+    pub fn suspend(&mut self) {
+        if self.active.is_some() {
+            self.suspended = self.active.take();
+        }
+    }
+
+    /// Restores a workspace hidden by [`suspend`](Self::suspend).
+    pub fn resume(&mut self) -> bool {
+        if self.active.is_none() {
+            if let Some(workspace) = self.suspended.take() {
+                self.active = Some(workspace);
+                return true;
+            }
+        }
+        false
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_suspended(&self) -> bool {
+        self.suspended.is_some()
     }
 
     pub fn update(&mut self, id: &str, model: WorkspaceModel, theme: &Theme) -> bool {
@@ -1758,10 +1785,23 @@ impl WorkspaceManager {
                     .and_then(|workspace| workspace.rows_width),
             );
             self.active = None;
-            true
-        } else {
-            false
+            return true;
         }
+        if self
+            .suspended
+            .as_ref()
+            .is_some_and(|workspace| workspace.id == id)
+        {
+            self.widths.insert(
+                id.to_string(),
+                self.suspended
+                    .as_ref()
+                    .and_then(|workspace| workspace.rows_width),
+            );
+            self.suspended = None;
+            return true;
+        }
+        false
     }
 
     pub fn update_theme(&mut self, theme: &Theme) {
@@ -2363,7 +2403,15 @@ fn render_detail_pane(
     }
 
     if workspace.shows_paired_width(width) {
-        render_paired_columns(buffer, workspace, theme, x, width, content_top, content_height);
+        render_paired_columns(
+            buffer,
+            workspace,
+            theme,
+            x,
+            width,
+            content_top,
+            content_height,
+        );
         return;
     }
 
@@ -2697,7 +2745,9 @@ fn paint_paired_cell(buffer: &mut RenderBuffer, frame: &PairedFrame<'_>, cell: &
         .line_index
         .and_then(|index| frame.document.lines.get(index));
     let cursor = cell.line_index.is_some_and(|index| {
-        frame.active && index == frame.workspace.detail_cursor && cell.side == frame.workspace.detail_side
+        frame.active
+            && index == frame.workspace.detail_cursor
+            && cell.side == frame.workspace.detail_side
     });
     let line_style = match line {
         Some(line) => detail_paint_style(

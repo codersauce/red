@@ -2414,6 +2414,45 @@ impl RedHost {
                         .map(str::to_string),
                 }
             }
+            "OpenReadonlySplit" => {
+                let preview = args
+                    .first()
+                    .map(value_to_json)
+                    .ok_or_else(|| anyhow::anyhow!("OpenReadonlySplit requires a preview"))?;
+                let field = |key: &str| {
+                    preview
+                        .get(key)
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string()
+                };
+                let name = field("name");
+                PluginRequest::OpenReadonlySplit {
+                    request_id,
+                    key: field("key"),
+                    name: if name.is_empty() {
+                        "[preview]".to_string()
+                    } else {
+                        name
+                    },
+                    text: field("text"),
+                    line: preview
+                        .get("line")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|line| usize::try_from(line).ok())
+                        .unwrap_or(0),
+                    syntax: preview
+                        .get("syntax")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|syntax| !syntax.is_empty())
+                        .map(str::to_string),
+                    side: preview
+                        .get("side")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|side| !side.is_empty())
+                        .map(str::to_string),
+                }
+            }
             "GetConfig" => PluginRequest::GetConfig {
                 request_id,
                 key: args.first().and_then(Value::as_str).map(str::to_string),
@@ -5241,6 +5280,51 @@ mod tests {
                 assert_eq!(cancel_command.as_deref(), Some("CancelPrompt"));
             }
             _ => panic!("expected a managed scratch-buffer request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn readonly_split_requests_keep_preview_fields() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "preview_owner",
+                r#"
+                    pub fn activate() {
+                        red::request("OpenReadonlySplit", opened, Json {
+                            key: "before:src/main.rs",
+                            name: "[Git before] src/main.rs@HEAD",
+                            text: "fn main() {}\n",
+                            line: 2,
+                            syntax: "src/main.rs",
+                            side: "before"
+                        });
+                    }
+                    fn opened(event: Json) {}
+                "#,
+            )
+            .await
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenReadonlySplit {
+                key,
+                name,
+                text,
+                line,
+                syntax,
+                side,
+                ..
+            } => {
+                assert_eq!(key, "before:src/main.rs");
+                assert_eq!(name, "[Git before] src/main.rs@HEAD");
+                assert_eq!(text, "fn main() {}\n");
+                assert_eq!(line, 2);
+                assert_eq!(syntax.as_deref(), Some("src/main.rs"));
+                assert_eq!(side.as_deref(), Some("before"));
+            }
+            _ => panic!("expected a read-only split request"),
         }
     }
 
