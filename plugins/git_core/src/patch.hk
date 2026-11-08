@@ -720,3 +720,185 @@ fn saturates_pathological_diff_range_values() {
     assert(document.lines[5].new_line == Some(2147483647));
     assert(editor_hunk(text, 2147483647).contains("-one\n-two\n+ONE\n+TWO"));
 }
+
+pub struct GitPreviewBlobs {
+    before_oid: String,
+    after_oid: String,
+    before_empty: bool,
+    after_empty: bool,
+    binary: bool,
+}
+
+pub fn preview_blobs(patch: String) -> GitPreviewBlobs {
+    let mut before_oid = "";
+    let mut after_oid = "";
+    let mut binary = false;
+    for line in patch.split("\n") {
+        if line.starts_with("Binary files ") || line.starts_with("GIT binary patch") {
+            binary = true;
+        }
+        if let Some(rest) = line.strip_prefix("index ") {
+            let mut spec = rest;
+            if let Some(fields) = rest.split_once(" ") {
+                spec = fields.0;
+            }
+            if let Some(parts) = spec.split_once("..") {
+                before_oid = parts.0;
+                after_oid = parts.1;
+            }
+        }
+    }
+    GitPreviewBlobs {
+        before_oid: before_oid,
+        after_oid: after_oid,
+        before_empty: oid_empty(before_oid),
+        after_empty: oid_empty(after_oid),
+        binary: binary,
+    }
+}
+
+// Apply the unified hunks to `before`. The caller supplies the patch text it
+// already fetched. This does not read the worktree.
+pub fn reconstruct_after(before: String, patch: String) -> String {
+    let parsed = parse_patch(patch);
+    let source = text_lines(before);
+    let mut result = [];
+    let mut cursor = 0;
+    let mut saw_after_marker = false;
+    let mut ended_in_hunk = false;
+    let before_newline = before == "" || before.ends_with("\n");
+
+    for file in parsed.files {
+        for hunk in file.hunks {
+            let mut target = hunk.old.start;
+            if hunk.old.count != 0 {
+                target = hunk.old.start - 1;
+            }
+            if target < 0 {
+                target = 0;
+            }
+            while cursor < target && cursor < source.len() {
+                result.push(source[cursor]);
+                cursor = cursor + 1;
+                ended_in_hunk = false;
+            }
+            let mut marker_side = "";
+            for line in hunk.lines {
+                match line.kind {
+                    DiffLineKind::Context => {
+                        result.push(line.raw.strip_prefix(" ").unwrap_or(line.raw));
+                        if cursor < source.len() {
+                            cursor = cursor + 1;
+                        }
+                        marker_side = "after";
+                        saw_after_marker = false;
+                    },
+                    DiffLineKind::Removed => {
+                        if cursor < source.len() {
+                            cursor = cursor + 1;
+                        }
+                        marker_side = "before";
+                    },
+                    DiffLineKind::Added => {
+                        result.push(line.raw.strip_prefix("+").unwrap_or(line.raw));
+                        marker_side = "after";
+                        saw_after_marker = false;
+                    },
+                    DiffLineKind::NoNewlineMarker => {
+                        if marker_side == "after" {
+                            saw_after_marker = true;
+                        }
+                    },
+                    DiffLineKind::Metadata => {},
+                };
+            }
+            ended_in_hunk = cursor >= source.len();
+        }
+    }
+    while cursor < source.len() {
+        result.push(source[cursor]);
+        cursor = cursor + 1;
+        ended_in_hunk = false;
+    }
+    let mut no_newline = !before_newline;
+    if ended_in_hunk {
+        no_newline = saw_after_marker;
+    }
+    join_lines(result, no_newline)
+}
+
+fn text_lines(text: String) -> [String] {
+    if text == "" {
+        return [];
+    }
+    let lines = text.split("\n");
+    if !text.ends_with("\n") {
+        return lines;
+    }
+    let mut trimmed = [];
+    let mut index = 0;
+    while index < lines.len() - 1 {
+        trimmed.push(lines[index]);
+        index = index + 1;
+    }
+    trimmed
+}
+
+fn join_lines(lines: [String], no_newline: bool) -> String {
+    if lines.is_empty() {
+        return "";
+    }
+    let mut text = "";
+    let mut index = 0;
+    for line in lines {
+        if index > 0 {
+            text = text + "\n";
+        }
+        text = text + line;
+        index = index + 1;
+    }
+    if !no_newline {
+        text = text + "\n";
+    }
+    text
+}
+
+fn oid_empty(oid: String) -> bool {
+    if oid == "" {
+        return true;
+    }
+    for character in oid {
+        if character != "0" {
+            return false;
+        }
+    }
+    true
+}
+
+#[test]
+fn reads_preview_blob_ids_and_rebuilds_a_worktree_side() {
+    let patch = "diff --git a/notes.txt b/notes.txt\nindex 1111111111111111111111111111111111111111..2222222222222222222222222222222222222222 100644\n--- a/notes.txt\n+++ b/notes.txt\n@@ -1,2 +1,3 @@\n alpha\n beta\n+gamma\n";
+    let blobs = preview_blobs(patch);
+    assert(blobs.before_oid == "1111111111111111111111111111111111111111");
+    assert(blobs.after_oid == "2222222222222222222222222222222222222222");
+    assert(!blobs.before_empty);
+    assert(!blobs.after_empty);
+    assert(!blobs.binary);
+    assert(reconstruct_after("alpha\nbeta\n", patch) == "alpha\nbeta\ngamma\n");
+
+    let created = "diff --git a/notes.txt b/notes.txt\nindex 0000000..2222222 100644\n--- /dev/null\n+++ b/notes.txt\n@@ -0,0 +1,2 @@\n+alpha\n+beta\n";
+    let created_blobs = preview_blobs(created);
+    assert(created_blobs.before_empty);
+    assert(!created_blobs.after_empty);
+    assert(reconstruct_after("", created) == "alpha\nbeta\n");
+
+    let removed = "diff --git a/notes.txt b/notes.txt\n@@ -1 +0,0 @@\n-old\n";
+    assert(reconstruct_after("old\n", removed) == "");
+
+    let bare = "diff --git a/notes.txt b/notes.txt\n@@ -1 +1 @@\n-old\n+new\n\\ No newline at end of file\n";
+    assert(reconstruct_after("old\n", bare) == "new");
+
+    let binary = preview_blobs("diff --git a/x.bin b/x.bin\nBinary files a/x.bin and b/x.bin differ\n");
+    assert(binary.binary);
+    assert(binary.before_empty);
+}

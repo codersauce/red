@@ -185,6 +185,142 @@ fn commit_mode(mode: String) -> CommitMode {
     CommitMode::Create
 }
 
+// Range argv is data. The plugin spawns `git` with the array and never builds
+// a shell string. A second token stays unresolved until the plugin's own
+// `rev-parse` accepts it.
+pub struct GitDiffInvocation {
+    ok: bool,
+    error: String,
+    source: String,
+    label: String,
+    revs: [String],
+    paths: [String],
+    pending_token: String,
+}
+
+pub fn parse_git_diff_invocation(args: [String]) -> GitDiffInvocation {
+    let mut range = [];
+    let mut paths = [];
+    let mut seen_separator = false;
+    for arg in args {
+        if !seen_separator && arg == "--" {
+            seen_separator = true;
+        } else if seen_separator {
+            paths.push(arg);
+        } else {
+            range.push(arg);
+        }
+    }
+    if seen_separator && paths.is_empty() {
+        return invalid_invocation("GitDiff requires a path after --");
+    }
+    if range.is_empty() {
+        return invalid_invocation("GitDiff requires a range");
+    }
+    if range.len() > 2 {
+        return invalid_invocation("GitDiff paths belong after --");
+    }
+    let first = range[0];
+    if first == "cached" || first == "staged" {
+        if range.len() != 1 {
+            return invalid_invocation("GitDiff staged does not take a second revision");
+        }
+        return GitDiffInvocation {
+            ok: true,
+            error: "",
+            source: "cached",
+            label: "staged",
+            revs: [],
+            paths: paths,
+            pending_token: "",
+        };
+    }
+    if first == "working" {
+        if range.len() != 1 {
+            return invalid_invocation("GitDiff working does not take a second revision");
+        }
+        return GitDiffInvocation {
+            ok: true,
+            error: "",
+            source: "working",
+            label: "working tree",
+            revs: [],
+            paths: paths,
+            pending_token: "",
+        };
+    }
+    if range.len() == 1 {
+        return GitDiffInvocation {
+            ok: true,
+            error: "",
+            source: "ref",
+            label: first,
+            revs: [first],
+            paths: paths,
+            pending_token: "",
+        };
+    }
+    GitDiffInvocation {
+        ok: true,
+        error: "",
+        source: "needs_rev",
+        label: first + " " + range[1],
+        revs: [first],
+        paths: paths,
+        pending_token: range[1],
+    }
+}
+
+pub fn range_name_status_args(source: String, revs: [String], paths: [String]) -> [String] {
+    let mut args = ["-c", "core.quotePath=false", "diff", "--name-status", "-z", "--find-renames"];
+    append_range(args, source, revs, paths)
+}
+
+pub fn range_diff_args(source: String, revs: [String], paths: [String]) -> [String] {
+    let mut args = [
+        "-c", "core.quotePath=false", "diff",
+        "--no-color", "--no-ext-diff", "--color=never",
+        "--src-prefix=a/", "--dst-prefix=b/",
+        "--find-renames", "--full-index",
+    ];
+    append_range(args, source, revs, paths)
+}
+
+pub fn range_numstat_args(source: String, revs: [String], paths: [String]) -> [String] {
+    let mut args = ["-c", "core.quotePath=false", "diff", "--numstat", "-z", "--find-renames"];
+    append_range(args, source, revs, paths)
+}
+
+fn append_range(args: [String], source: String, revs: [String], paths: [String]) -> [String] {
+    let mut args = args;
+    if source == "cached" {
+        args.push("--cached");
+    } else if source == "ref" || source == "revs" {
+        for rev in revs {
+            args.push(rev);
+        }
+    }
+    if !paths.is_empty() {
+        args.push("--");
+        for path in paths {
+            args.push(path);
+        }
+    }
+    args
+}
+
+fn invalid_invocation(message: String) -> GitDiffInvocation {
+    GitDiffInvocation {
+        ok: false,
+        error: message,
+        source: "",
+        label: "",
+        revs: [],
+        paths: [],
+        pending_token: "",
+    }
+}
+
 #[test]
 fn builds_explicit_apply_modes() {
     assert(apply_hunk_args("stage").join(" ") == "apply --cached --unidiff-zero -");
@@ -212,4 +348,55 @@ fn builds_navigation_selection_and_commit_modes_explicitly() {
     assert(commit_args("--amend").join(" ") == "commit --amend --no-edit");
     assert(commit_history_args(20).join(" ") == "log --no-merges -n 20 --format=%H%n%B%x1e");
     assert(commit_history_args(100).join(" ") == "log --no-merges -n 50 --format=%H%n%B%x1e");
+}
+
+#[test]
+fn parses_git_diff_ranges_and_requires_a_path_separator() {
+    let cached = parse_git_diff_invocation(["cached", "--", "src/a.rs"]);
+    assert(cached.ok);
+    assert(cached.source == "cached");
+    assert(cached.label == "staged");
+    assert(cached.paths.join(" ") == "src/a.rs");
+
+    let staged = parse_git_diff_invocation(["staged"]);
+    assert(staged.source == "cached");
+    let working = parse_git_diff_invocation(["working", "--", "src/a.rs", "src/b.rs"]);
+    assert(working.source == "working");
+    assert(working.paths.join(" ") == "src/a.rs src/b.rs");
+
+    let one = parse_git_diff_invocation(["HEAD~2"]);
+    assert(one.source == "ref");
+    assert(one.revs.join(" ") == "HEAD~2");
+    let dotted = parse_git_diff_invocation(["main..feature"]);
+    assert(dotted.source == "ref");
+    assert(dotted.label == "main..feature");
+
+    let two = parse_git_diff_invocation(["main", "feature", "--", "src/a.rs"]);
+    assert(two.ok);
+    assert(two.source == "needs_rev");
+    assert(two.pending_token == "feature");
+    assert(two.revs.join(" ") == "main");
+    assert(two.label == "main feature");
+    assert(two.paths.join(" ") == "src/a.rs");
+
+    let missing = parse_git_diff_invocation([]);
+    assert(!missing.ok);
+    let bare_separator = parse_git_diff_invocation(["HEAD", "--"]);
+    assert(!bare_separator.ok);
+    let extra = parse_git_diff_invocation(["HEAD", "feature", "src/a.rs"]);
+    assert(!extra.ok);
+    assert(extra.error == "GitDiff paths belong after --");
+    let staged_rev = parse_git_diff_invocation(["cached", "HEAD"]);
+    assert(!staged_rev.ok);
+}
+
+#[test]
+fn builds_range_diff_argv_without_a_shell_string() {
+    assert(range_name_status_args("cached", [], ["src/a.rs"]).join(" ") == "-c core.quotePath=false diff --name-status -z --find-renames --cached -- src/a.rs");
+    assert(range_name_status_args("working", [], []).join(" ") == "-c core.quotePath=false diff --name-status -z --find-renames");
+    assert(range_name_status_args("ref", ["HEAD~2"], []).join(" ") == "-c core.quotePath=false diff --name-status -z --find-renames HEAD~2");
+    assert(range_name_status_args("revs", ["main", "feature"], ["src/a.rs"]).join(" ") == "-c core.quotePath=false diff --name-status -z --find-renames main feature -- src/a.rs");
+    assert(range_diff_args("revs", ["main", "feature"], ["old name.rs", "new name.rs"]).join(" ") == "-c core.quotePath=false diff --no-color --no-ext-diff --color=never --src-prefix=a/ --dst-prefix=b/ --find-renames --full-index main feature -- old name.rs new name.rs");
+    assert(range_numstat_args("cached", [], []).join(" ") == "-c core.quotePath=false diff --numstat -z --find-renames --cached");
+    assert(range_diff_args("working", [], ["notes.txt"]).join(" ") == "-c core.quotePath=false diff --no-color --no-ext-diff --color=never --src-prefix=a/ --dst-prefix=b/ --find-renames --full-index -- notes.txt");
 }

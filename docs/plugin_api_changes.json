@@ -1,6 +1,12 @@
 {
-  "api_version": "0.22.0",
+  "api_version": "0.23.0",
   "changes": [
+    {
+      "version": "0.23.0",
+      "kind": "introduced",
+      "symbols": ["OpenReadonlySplit", "WorkspaceModel.paired_columns", "WorkspaceEvent.detail_layout", "WorkspaceEvent.detail_side"],
+      "migration_note": "docs/PLUGIN_API.md#read-only-split-preview"
+    },
     {
       "version": "0.22.0",
       "kind": "introduced",

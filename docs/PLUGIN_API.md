@@ -1,6 +1,6 @@
 # Plugin compatibility
 
-Red host API version `0.22.0` is defined by
+Red host API version `0.23.0` is defined by
 [`src/plugin/host_api.json`](../src/plugin/host_api.json). That file is the canonical,
 machine-readable list of execute actions, request actions, signatures, and introduction
 versions. Runtime dispatch and the bundled-plugin corpus are checked against it in tests.
@@ -24,10 +24,10 @@ required/optional arity (`HUSK-A0002`) and obvious literal argument types
 annotations use `HUSK-A0004`. `--no-typecheck` is an unsupported development
 escape hatch; compatibility guarantees do not apply while it is enabled.
 
-Host API `0.22.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`,
+Host API `0.23.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`,
 `0.8.0`, `0.9.0`,
 `0.10.0`, `0.11.0`, `0.12.0`, `0.14.0`, `0.16.0`, `0.17.0`, `0.18.0`, `0.19.0`,
-`0.20.0`, and `0.21.0` contracts, so existing packages that declare those minors continue
+`0.20.0`, `0.21.0`, and `0.22.0` contracts, so existing packages that declare those minors continue
 to load. New packages should target `"red_api_version": "^0.21.0"`.
 
 ## Standalone JSON-RPC packages
@@ -194,6 +194,29 @@ the submit command without writing the display name to disk, while `:q` and `:q!
 invoke the cancel command without quitting Red. `Save`, `Quit`, and configured key
 bindings follow the same routing. The options were added in host API `0.8.0`; calls
 using the original three required arguments remain compatible.
+
+## Read-only split preview
+
+`OpenReadonlySplit(callback, preview)` opens a read-only buffer in a vertical
+split. `preview` is JSON:
+
+| Field | Meaning |
+| --- | --- |
+| `key` | Reuses one destination window. A later call with the same key replaces that preview. |
+| `name` | Tab label. It is not a path Red will write. |
+| `text` | Buffer contents. |
+| `line` | Zero-based line to reveal. |
+| `syntax` | Path used only to choose a highlighter. |
+| `side` | Caller label, returned on the callback as `side`. |
+
+The callback receives `buffer_index`, `reused`, and `side`.
+`markdown_link_split_focus` chooses which pane keeps focus. Opening the preview
+suspends an active workspace so the split is visible. Closing that preview
+window, including `:q` from the preview buffer, resumes the workspace. Insert,
+replace, and save are refused. The request, `WorkspaceModel.paired_columns`, and
+the workspace event fields `detail_layout` (`unified` or `paired`) and
+`detail_side` (`before` or `after`) were introduced in host API `0.23.0`.
+`0.22.0` remains accepted. Omitted `paired_columns` defaults to false.
 
 ## External package primitives
 

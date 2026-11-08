@@ -482,6 +482,14 @@ or discard the current changed line or selection; uppercase `S`, `U`, and `X`
 apply the same operation to the current hunk. Destructive actions remain
 confirmation-gated.
 
+`:GitDiff <range>` opens this workspace on a commit range. `cached` and
+`staged` show the index. `working` shows unstaged changes. A revision such as
+`HEAD~2` or `main..feature`, or two revisions, selects that comparison. Paths
+follow `--`, as in `:GitDiff HEAD~2 -- src/lib.rs`. `q` returns to the
+working-tree list. In a range, `v` toggles old and new columns and `h` / `l`
+move between them. `p` opens the focused side in a read-only split. `:q` in
+that split returns to the diff.
+
 ## Agent workflow
 
 Agent features require Codex CLI 0.144.1 or newer and a completed `codex login`.
