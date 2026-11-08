@@ -52,6 +52,22 @@ attribute, and string scopes as an `.html` file. A fenced `html` block is
 highlighted the same way, so Markdown does not need an HTML language pack.
 HTML written inside another language's fence stays that language.
 
+## Outline
+
+`:MarkdownOutline` lists the headings in the current buffer. In a Markdown
+buffer, `Space o` opens the same list. It is not bound in other languages, so
+the leader key stays free there. Type to filter the titles. The preview shows
+the heading in place, including unsaved edits. Enter jumps to that line, and
+`Ctrl-o` comes back.
+
+Headings inside lists and quotes are included. Headings inside fenced or
+indented code are not. Duplicate headings use the same `-1`, `-2` suffixes as
+`#heading` links. The list is read from the buffer and does not change it.
+
+With Code explore open (`Space e e`), a Markdown file shows this outline in
+the sidebar instead of the code index. The section under the cursor stays
+highlighted as you move, and clicking a heading jumps there.
+
 ## Images
 
 A line that holds only an image becomes the picture itself in Normal mode:

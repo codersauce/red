@@ -3795,8 +3795,7 @@ impl Editor {
 
         if self.keymap_hints_visible {
             if let Some(KeyAction::Nested(mappings)) = &self.waiting_key_action {
-                let hints =
-                    crate::command_palette::keymap_hints(&self.keymap_hint_prefix, mappings);
+                let hints = self.keymap_hints_for_waiting(mappings);
                 crate::ui::draw_keymap_hints(
                     buffer,
                     &self.theme,

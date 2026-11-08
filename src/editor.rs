@@ -56,6 +56,7 @@ mod markdown_conceal;
 mod markdown_images;
 mod markdown_links;
 mod markdown_lists;
+mod markdown_outline;
 mod markdown_tables;
 mod mouse;
 mod multi_cursor;
@@ -2969,6 +2970,8 @@ pub enum Action {
     ToggleMarkdownTables,
     /// Shows or hides inline Markdown syntax when measuring wrapped lines.
     ToggleMarkdownConceal,
+    /// Opens the heading outline for the current Markdown buffer.
+    MarkdownOutline,
     SetRelativeLineNumbers(bool),
 
     DeletePreviousChar,
@@ -19199,6 +19202,9 @@ impl Editor {
             if cmd == "markdown-conceal" {
                 actions.push(Action::ToggleMarkdownConceal);
             }
+            if cmd == "MarkdownOutline" {
+                actions.push(Action::MarkdownOutline);
+            }
 
             if cmd == "statusline" {
                 actions.push(Action::OpenStatuslineManager);
@@ -20088,7 +20094,53 @@ impl Editor {
             panic!("expected nested mappings");
         };
 
-        self.event_to_key_action(&nested_mappings, ev)
+        if let Some(action) = self.event_to_key_action(&nested_mappings, ev) {
+            return Some(action);
+        }
+        self.markdown_outline_binding(&nested_mappings, ev)
+    }
+
+    /// `Space o` lists headings in a Markdown buffer and stays unbound elsewhere,
+    /// so the leader key is left free in other languages.
+    fn markdown_outline_binding(
+        &self,
+        mappings: &HashMap<String, KeyAction>,
+        ev: &event::Event,
+    ) -> Option<KeyAction> {
+        if self.keymap_hint_prefix != ["Space"] || mappings.contains_key("o") {
+            return None;
+        }
+        if Self::key_string_for_event(ev).as_deref() != Some("o") {
+            return None;
+        }
+        if self.current_language_id().as_deref() != Some("markdown") {
+            return None;
+        }
+        Some(KeyAction::Single(Action::MarkdownOutline))
+    }
+
+    fn keymap_hints_for_waiting(
+        &self,
+        mappings: &HashMap<String, KeyAction>,
+    ) -> Vec<crate::command_palette::KeymapHint> {
+        let mut hints = crate::command_palette::keymap_hints(&self.keymap_hint_prefix, mappings);
+        if self.keymap_hint_prefix == ["Space"]
+            && !mappings.contains_key("o")
+            && self.current_language_id().as_deref() == Some("markdown")
+        {
+            hints.push(crate::command_palette::KeymapHint {
+                key: "o".to_string(),
+                label: "Markdown outline".to_string(),
+                is_group: false,
+            });
+            hints.sort_unstable_by(|left, right| {
+                left.is_group
+                    .cmp(&right.is_group)
+                    .then_with(|| left.key.to_lowercase().cmp(&right.key.to_lowercase()))
+                    .then_with(|| left.key.cmp(&right.key))
+            });
+        }
+        hints
     }
 
     fn clear_keymap_hints(&mut self) {
@@ -25228,6 +25280,12 @@ impl Editor {
                 Action::OpenDiagnosticsPicker => {
                     self.release_current_dialog_callbacks(runtime);
                     self.open_diagnostics_picker(diagnostics_picker::DiagnosticFilter::All);
+                    self.render(buffer)?;
+                }
+                Action::MarkdownOutline => {
+                    add_to_history = false;
+                    self.release_current_dialog_callbacks(runtime);
+                    self.open_markdown_outline();
                     self.render(buffer)?;
                 }
                 Action::OpenErrorDiagnosticsPicker => {

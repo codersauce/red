@@ -33,6 +33,10 @@ The sidebar follows the cursor. `Explore` shares the top row with the file name.
 - **Matches** lists occurrences of that name in the current function first,
   then other indexed files. These are shared spellings, not type-checked cross
   references.
+- **Outline**, on a Markdown file, replaces those sections with the heading
+  list. The section under the cursor stays highlighted. Click a heading to
+  jump there; `Ctrl-o` comes back. `:MarkdownOutline` or `Space o` opens the
+  same list in a picker. See [Markdown](MARKDOWN.md).
 - A plain count sits just after a function, struct, enum, trait, or type
   definition when the line is short enough to leave room. The number is the
   name matches in the index, in the status-line color. Dim and review show as

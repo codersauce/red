@@ -45,6 +45,7 @@ pub mod language;
 mod learn;
 pub mod logger;
 pub mod lsp;
+pub mod markdown_outline;
 pub mod matchit;
 pub mod notification;
 pub mod onboarding;
