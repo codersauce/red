@@ -44,6 +44,32 @@ hidden.
 Bold, emphasis, inline code, and links are highlighted either way, including
 nested formatting, reference links, and URL or email autolinks.
 
+## Alerts
+
+A quote that opens with a GitHub alert marker shows a colored label instead of
+that marker:
+
+```markdown
+> [!NOTE]
+> The buffer underneath is still the source.
+```
+
+`> [!NOTE]` draws as `ℹ Note`. Tip, Important, Warning, and Caution use their
+own label and color, and the `>` at the start of the quote uses that color
+too. The kind is case-insensitive, and it has to be the whole first line of
+the quote. `> [!NOPE]`, a marker with trailing words, and a quote nested
+inside another quote keep the ordinary quote style unless that nested quote
+has an alert of its own.
+
+Move onto the marker line, or enter Insert, Visual, or search there, and the
+raw `> [!NOTE]` comes back. Other lines of the quote stay as they were.
+
+Colors come from the theme: Note uses `editorInfo.foreground`, Tip
+`terminal.ansiGreen`, Important `terminal.ansiMagenta`, Warning
+`editorWarning.foreground`, and Caution `editorError.foreground`. A missing
+color falls back to `markup.quote`. Alerts follow `markdown_conceal` and have
+no separate switch.
+
 ## Images
 
 A line that holds only an image becomes the picture itself in Normal mode:
@@ -126,7 +152,7 @@ pane or switching the document to another file does the same.
 | Setting | Default | Effect |
 | --- | --- | --- |
 | `markdown_tables` | `true` | Draw pipe tables as grids |
-| `markdown_conceal` | `true` | Hide inline markup while wrapping |
+| `markdown_conceal` | `true` | Hide inline markup while wrapping, including GitHub alert markers |
 | `markdown_images` | `"auto"` | How to draw images: `auto`, `kitty`, `iterm2`, `sixel`, `halfblocks`, `off` |
 | `markdown_image_max_height` | `16` | Most rows one image may use |
 | `markdown_link_split_focus` | `"source"` | Pane that keeps focus after `Ctrl-w x` |

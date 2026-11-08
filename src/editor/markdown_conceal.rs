@@ -4,8 +4,11 @@
 //! wrapped on the raw line, so a hidden URL consumed screen columns the user
 //! could not see. This module records the syntax that should occupy no cells —
 //! emphasis and strike markers, link brackets and destinations, image markup,
-//! and code-span backticks — and display layout skips those bytes when it
-//! measures a row.
+//! code-span backticks, and GitHub alert markers — and display layout skips
+//! those bytes when it measures a row. A `> [!NOTE]` line conceals into a
+//! colored label, and the `>` gutter of that quote takes the same color.
+//! Leaf draws the same five alert kinds; Red keeps each source line on its
+//! own row so the cursor still edits the raw marker.
 //!
 //! The buffer stays the raw document. A cursor that steps into a concealed span,
 //! or an insert, visual, search, or operator-pending edit, reveals that line so
@@ -13,12 +16,14 @@
 
 use std::{ops::Range, sync::Arc};
 
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{BlockQuoteKind, Event, Options, Parser, Tag, TagEnd};
 use unicode_segmentation::UnicodeSegmentation as _;
 
-use super::display_layout::{Concealment, LineConcealments};
+use super::display_layout::{Concealment, LineConcealments, LineSegment};
 use super::markdown_tables::MAX_TABLE_DOCUMENT_BYTES;
-use crate::unicode_utils::trim_line_ending;
+use crate::color::Color;
+use crate::theme::{Style, Theme};
+use crate::unicode_utils::{display_width_with_tabs, trim_line_ending};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -36,15 +41,116 @@ struct Frame {
     visible: Vec<Range<usize>>,
 }
 
+/// One GitHub alert kind. The names match leaf's callouts and GitHub's syntax.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AlertKind {
+    Note,
+    Tip,
+    Important,
+    Warning,
+    Caution,
+}
+
+impl AlertKind {
+    fn from_pulldown(kind: BlockQuoteKind) -> Self {
+        match kind {
+            BlockQuoteKind::Note => Self::Note,
+            BlockQuoteKind::Tip => Self::Tip,
+            BlockQuoteKind::Important => Self::Important,
+            BlockQuoteKind::Warning => Self::Warning,
+            BlockQuoteKind::Caution => Self::Caution,
+        }
+    }
+
+    fn needle(self) -> &'static str {
+        match self {
+            Self::Note => "[!note]",
+            Self::Tip => "[!tip]",
+            Self::Important => "[!important]",
+            Self::Warning => "[!warning]",
+            Self::Caution => "[!caution]",
+        }
+    }
+
+    /// Label drawn in place of `> [!KIND]`. The symbols are single-cell stand-ins
+    /// for leaf's `[i]` / `[*]` / `[!]` / `[x]` icons.
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Note => "ℹ Note",
+            Self::Tip => "✦ Tip",
+            Self::Important => "◆ Important",
+            Self::Warning => "⚠ Warning",
+            Self::Caution => "× Caution",
+        }
+    }
+
+    fn color_key(self) -> &'static str {
+        match self {
+            Self::Note => "editorInfo.foreground",
+            Self::Tip => "terminal.ansiGreen",
+            Self::Important => "terminal.ansiMagenta",
+            Self::Warning => "editorWarning.foreground",
+            Self::Caution => "editorError.foreground",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AlertGutter {
+    byte: usize,
+    kind: AlertKind,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AlertLabel {
+    kind: AlertKind,
+    /// Byte of the concealed `>` that the label replaces.
+    byte: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct AlertLine {
+    gutters: Vec<AlertGutter>,
+    label: Option<AlertLabel>,
+}
+
+/// Per-line alert gutters and marker labels. Indexed like [`LineConcealments`].
+#[derive(Clone, Debug, Default)]
+pub(super) struct AlertMap {
+    lines: Vec<AlertLine>,
+}
+
+impl AlertMap {
+    fn line(&self, index: usize) -> Option<&AlertLine> {
+        self.lines
+            .get(index)
+            .filter(|line| line.label.is_some() || !line.gutters.is_empty())
+    }
+}
+
+struct ConcealedSource {
+    lines: LineConcealments,
+    alerts: AlertMap,
+}
+
 /// Concealed byte ranges for every line in `source`.
-pub(super) fn conceal_markdown(source: &str) -> LineConcealments {
+#[cfg(test)]
+fn conceal_markdown(source: &str) -> LineConcealments {
+    parse_concealment(source).lines
+}
+
+fn parse_concealment(source: &str) -> ConcealedSource {
     let mut offsets = vec![0];
     offsets.extend(source.match_indices('\n').map(|(index, _)| index + 1));
     let mut hidden = vec![Vec::new(); offsets.len()];
     let mut stack = Vec::new();
-    let options = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH;
+    let mut alerts = Vec::new();
+    let options = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_GFM;
     for (event, range) in Parser::new_ext(source, options).into_offset_iter() {
         match event {
+            Event::Start(Tag::BlockQuote(Some(kind))) => {
+                alerts.push((range, AlertKind::from_pulldown(kind)));
+            }
             Event::Start(tag) => {
                 if let Some(kind) = kind_of_tag(&tag) {
                     stack.push(Frame {
@@ -81,7 +187,113 @@ pub(super) fn conceal_markdown(source: &str) -> LineConcealments {
             _ => {}
         }
     }
-    LineConcealments::new(hidden.into_iter().map(Concealment::new).collect())
+    let alert_lines = record_alerts(source, &offsets, &alerts, &mut hidden);
+    ConcealedSource {
+        lines: LineConcealments::new(hidden.into_iter().map(Concealment::new).collect()),
+        alerts: AlertMap { lines: alert_lines },
+    }
+}
+
+fn record_alerts(
+    source: &str,
+    offsets: &[usize],
+    alerts: &[(Range<usize>, AlertKind)],
+    hidden: &mut [Vec<Range<usize>>],
+) -> Vec<AlertLine> {
+    let mut lines = vec![AlertLine::default(); offsets.len()];
+    for (range, kind) in alerts {
+        let Some(first) = line_index_at(offsets, range.start) else {
+            continue;
+        };
+        let last = line_index_at(offsets, range.end.saturating_sub(1)).unwrap_or(first);
+        let content = line_content_range(source, offsets, first);
+        let text = source.get(content.clone()).unwrap_or("");
+        let Some(marker) = alert_marker(text, *kind) else {
+            continue;
+        };
+        push_gap(
+            source,
+            offsets,
+            hidden,
+            (content.start + marker.gt)..content.end,
+        );
+        if let Some(line) = lines.get_mut(first) {
+            line.label = Some(AlertLabel {
+                kind: *kind,
+                byte: marker.gt,
+            });
+        }
+        for index in first..=last {
+            let content = line_content_range(source, offsets, index);
+            let text = source.get(content.clone()).unwrap_or("");
+            let Some(byte) = quote_markers(text).get(marker.depth - 1).copied() else {
+                continue;
+            };
+            if let Some(line) = lines.get_mut(index) {
+                line.gutters.push(AlertGutter { byte, kind: *kind });
+            }
+        }
+    }
+    lines
+}
+
+struct AlertMarker {
+    /// Byte of this alert's `>` on the marker line.
+    gt: usize,
+    /// 1-based index of that `>` among the line's quote markers.
+    depth: usize,
+}
+
+/// Exact GitHub alert marker: case-insensitive kind, nothing else on the line.
+fn alert_marker(line: &str, kind: AlertKind) -> Option<AlertMarker> {
+    let needle = kind.needle();
+    let lower = line.to_ascii_lowercase();
+    let tag = lower.find(needle)?;
+    if !line[tag + needle.len()..].trim().is_empty() {
+        return None;
+    }
+    let prefix = line[..tag].trim_end();
+    let gt = prefix.rfind('>')?;
+    if line[gt + 1..tag].chars().any(|character| character != ' ') {
+        return None;
+    }
+    let markers = quote_markers(line);
+    let depth = markers.iter().position(|byte| *byte == gt)? + 1;
+    Some(AlertMarker { gt, depth })
+}
+
+/// Byte offsets of blockquote `>` markers at the start of a line.
+fn quote_markers(line: &str) -> Vec<usize> {
+    let bytes = line.as_bytes();
+    let mut index = 0;
+    let mut spaces = 0;
+    while index < bytes.len() && bytes[index] == b' ' && spaces < 3 {
+        index += 1;
+        spaces += 1;
+    }
+    let mut markers = Vec::new();
+    loop {
+        if index >= bytes.len() || bytes[index] != b'>' {
+            break;
+        }
+        markers.push(index);
+        index += 1;
+        if index < bytes.len() && bytes[index] == b' ' {
+            index += 1;
+        }
+    }
+    markers
+}
+
+fn line_index_at(offsets: &[usize], byte: usize) -> Option<usize> {
+    if offsets.is_empty() {
+        return None;
+    }
+    Some(
+        offsets
+            .partition_point(|offset| *offset <= byte)
+            .saturating_sub(1),
+    )
 }
 
 fn kind_of_tag(tag: &Tag<'_>) -> Option<Kind> {
@@ -199,6 +411,21 @@ fn line_content_range(source: &str, offsets: &[usize], line: usize) -> Range<usi
 pub(super) struct CachedConcealment {
     revision: u64,
     lines: Arc<LineConcealments>,
+    alerts: Arc<AlertMap>,
+}
+
+pub(super) fn alert_color(theme: &Theme, kind: AlertKind) -> Color {
+    theme
+        .colors
+        .get(kind.color_key())
+        .copied()
+        .or_else(|| theme.get_style("markup.quote").and_then(|style| style.fg))
+        .or(theme.style.fg)
+        .unwrap_or(Color::Rgb {
+            r: 255,
+            g: 255,
+            b: 255,
+        })
 }
 
 impl super::Editor {
@@ -228,19 +455,100 @@ impl super::Editor {
         if cache.len() >= 8 && !cache.contains_key(&buffer.id()) {
             cache.clear();
         }
-        let cached = cache
-            .entry(buffer.id())
-            .or_insert_with(|| CachedConcealment {
+        let cached = cache.entry(buffer.id()).or_insert_with(|| {
+            let parsed = parse_concealment(&buffer.contents());
+            CachedConcealment {
                 revision: buffer.revision(),
-                lines: Arc::new(conceal_markdown(&buffer.contents())),
-            });
+                lines: Arc::new(parsed.lines),
+                alerts: Arc::new(parsed.alerts),
+            }
+        });
         if cached.revision != buffer.revision() {
+            let parsed = parse_concealment(&buffer.contents());
             *cached = CachedConcealment {
                 revision: buffer.revision(),
-                lines: Arc::new(conceal_markdown(&buffer.contents())),
+                lines: Arc::new(parsed.lines),
+                alerts: Arc::new(parsed.alerts),
             };
         }
         Some(cached.lines.clone())
+    }
+
+    fn markdown_alert_map(&self, window: &crate::window::Window) -> Option<Arc<AlertMap>> {
+        if !self.markdown_conceal_enabled(window) {
+            return None;
+        }
+        let buffer = self.buffer_manager.get(window.buffer_index)?;
+        self.markdown_line_concealments(window)?;
+        self.markdown_conceal_cache
+            .borrow()
+            .get(&buffer.id())
+            .map(|cached| cached.alerts.clone())
+    }
+
+    /// Colors alert gutters and draws a marker label over a concealed `> [!KIND]`.
+    pub(super) fn paint_markdown_alert_segment(
+        &self,
+        buffer: &mut super::render_buffer::RenderBuffer,
+        window: &crate::window::Window,
+        segment: &LineSegment,
+        line: &str,
+    ) {
+        let Some(alerts) = self.markdown_alert_map(window) else {
+            return;
+        };
+        let Some(alert) = alerts.line(segment.line) else {
+            return;
+        };
+        let x = self.window_to_terminal_x(window, self.gutter_width_for_window(window) + 1);
+        let y = self.window_to_terminal_y(window, segment.row);
+        let width = self.window_content_width(window);
+        let tab_width = self
+            .indentation_for_buffer_index(window.buffer_index)
+            .shift_width
+            .max(1);
+        for gutter in &alert.gutters {
+            if gutter.byte > line.len() {
+                continue;
+            }
+            let column = display_width_with_tabs(&line[..gutter.byte], tab_width);
+            if segment.hides_source_column(column)
+                || column < segment.start_col
+                || column >= segment.end_col
+            {
+                continue;
+            }
+            let local = segment.visual_offset + segment.visible_columns_before(column);
+            if local >= width {
+                continue;
+            }
+            let cell_x = x + local;
+            let pos = y * buffer.width + cell_x;
+            if let Some(cell) = buffer.cells.get_mut(pos) {
+                cell.style.fg = Some(alert_color(&self.theme, gutter.kind));
+            }
+        }
+        let Some(label) = alert.label else {
+            return;
+        };
+        if !segment.first_segment || label.byte > line.len() {
+            return;
+        }
+        let column = display_width_with_tabs(&line[..label.byte], tab_width);
+        if !segment.hides_source_column(column) || column < segment.start_col {
+            return;
+        }
+        let local = segment.visual_offset + segment.visible_columns_before(column);
+        if local >= width {
+            return;
+        }
+        let style = Style {
+            fg: Some(alert_color(&self.theme, label.kind)),
+            bg: self.theme.style.bg,
+            bold: true,
+            ..Style::default()
+        };
+        buffer.set_text(x + local, y, label.kind.label(), &style);
     }
 
     /// Lines whose inline syntax is shown raw so the cursor's byte is visible.
@@ -632,5 +940,202 @@ mod tests {
         assert_eq!(highlighted, "tail");
         let raw = &frame.cells[term_y * frame.width + origin + tail_col];
         assert_ne!(raw.style.bg, Some(highlight));
+    }
+
+    #[test]
+    fn alert_markers_are_concealed_and_other_quotes_stay_visible() {
+        let note = conceal_markdown("> [!NOTE]\n> body\n");
+        assert!(note.line(0).hides_byte(0));
+        assert!(note.line(0).hides_byte(2));
+        assert!(!note.line(1).hides_byte(0), "the body gutter stays a cell");
+
+        let tight = conceal_markdown(">[!tip]\n> next\n");
+        assert!(tight.line(0).hides_byte(0));
+        assert!(!tight.line(1).hides_byte(0));
+
+        let caution = conceal_markdown("> [!CaUtIoN]\n> care\n");
+        assert!(caution.line(0).hides_byte(0));
+
+        let unknown = conceal_markdown("> [!NOPE]\n> body\n");
+        assert!(
+            !unknown.line(0).hides_byte(0),
+            "an unknown kind stays a normal quote"
+        );
+
+        let trailing = conceal_markdown("> [!NOTE] extra\n");
+        assert!(!trailing.line(0).hides_byte(0));
+
+        let nested = conceal_markdown("> [!NOTE]\n> > [!WARNING]\n> > inner\n");
+        assert!(nested.line(0).hides_byte(0));
+        assert!(!nested.line(1).hides_byte(0), "the outer gutter stays");
+        assert!(
+            nested.line(1).hides_byte(2),
+            "the inner marker is concealed"
+        );
+        assert!(!nested.line(2).hides_byte(0));
+        assert!(!nested.line(2).hides_byte(2));
+
+        let fenced = conceal_markdown("```\n> [!NOTE]\n```\n");
+        assert!(!fenced.line(1).hides_byte(0));
+    }
+
+    fn content_rows(editor: &mut Editor) -> Vec<String> {
+        let mut frame = RenderBuffer::new(
+            editor.size.0 as usize,
+            editor.size.1 as usize,
+            &Style::default(),
+        );
+        editor.render(&mut frame).unwrap();
+        let window = editor.active_window_with_editor_view().unwrap();
+        let origin =
+            editor.window_to_terminal_x(&window, editor.gutter_width_for_window(&window) + 1);
+        let width = editor.window_content_width(&window);
+        let height = editor.window_content_height(&window);
+        (0..height)
+            .map(|row| {
+                let y = editor.window_to_terminal_y(&window, row);
+                frame.cells[y * frame.width + origin..y * frame.width + origin + width]
+                    .iter()
+                    .map(|cell| cell.text.as_str())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn cell_fg(editor: &mut Editor, line: usize, column: usize) -> Option<crate::color::Color> {
+        let mut frame = RenderBuffer::new(
+            editor.size.0 as usize,
+            editor.size.1 as usize,
+            &Style::default(),
+        );
+        editor.render(&mut frame).unwrap();
+        let window = editor.active_window_with_editor_view().unwrap();
+        let segment = editor
+            .layout_for_window(&window)
+            .rows
+            .iter()
+            .find(|segment| segment.line == line)
+            .unwrap()
+            .clone();
+        let y = editor.window_to_terminal_y(&window, segment.row);
+        let origin =
+            editor.window_to_terminal_x(&window, editor.gutter_width_for_window(&window) + 1);
+        let local = segment.visual_offset + segment.visible_columns_before(column);
+        frame.cells[y * frame.width + origin + local].style.fg
+    }
+
+    fn source_line(source: &str, text: &str) -> usize {
+        source
+            .lines()
+            .position(|line| line == text)
+            .unwrap_or_else(|| panic!("missing line {text}"))
+    }
+
+    #[tokio::test]
+    async fn github_alerts_render_labels_colors_and_reveal_on_the_marker() {
+        let source = "\
+intro
+> [!NOTE]
+> noted
+
+> [!TIP]
+> tipped
+
+> [!IMPORTANT]
+> important
+
+> [!WARNING]
+> warned
+
+> [!CAUTION]
+> cautioned
+
+> [!NOPE]
+> plain
+
+> [!NOTE]
+> outer
+> > [!WARNING]
+> > nested
+tail
+";
+        let note_line = source_line(source, "> [!NOTE]");
+        let body_line = source_line(source, "> noted");
+        let tip_line = source_line(source, "> [!TIP]");
+        let nope_line = source_line(source, "> [!NOPE]");
+        let nested_marker = source_line(source, "> > [!WARNING]");
+        let nested_body = source_line(source, "> > nested");
+        let mut editor = markdown_editor("notes.md", source, 80, 40);
+        editor.theme = crate::theme::parse_vscode_theme("themes/red.json").unwrap();
+        let rows = content_rows(&mut editor);
+        assert_eq!(rows[note_line], "ℹ Note");
+        assert_eq!(rows[tip_line], "✦ Tip");
+        assert_eq!(rows[source_line(source, "> [!IMPORTANT]")], "◆ Important");
+        assert_eq!(rows[source_line(source, "> [!WARNING]")], "⚠ Warning");
+        assert_eq!(rows[source_line(source, "> [!CAUTION]")], "× Caution");
+        assert!(
+            rows[nope_line].contains("[!NOPE]"),
+            "unknown kind stays visible: {}",
+            rows[nope_line]
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("[!NOTE]")),
+            "the marker stays concealed off the cursor: {rows:?}"
+        );
+        assert_eq!(rows[nested_marker], "> ⚠ Warning");
+        assert_eq!(rows[nested_body], "> > nested");
+
+        let note = alert_color(&editor.theme, AlertKind::Note);
+        let warning = alert_color(&editor.theme, AlertKind::Warning);
+        assert_eq!(
+            note, editor.theme.colors["editorInfo.foreground"],
+            "Note uses editorInfo.foreground"
+        );
+        assert_eq!(cell_fg(&mut editor, note_line, 0), Some(note));
+        assert_eq!(
+            cell_fg(&mut editor, body_line, 0),
+            Some(note),
+            "body gutter"
+        );
+        assert_eq!(
+            cell_fg(&mut editor, nested_marker, 0),
+            Some(note),
+            "outer gutter"
+        );
+        assert_eq!(
+            cell_fg(&mut editor, nested_body, 2),
+            Some(warning),
+            "inner gutter"
+        );
+
+        editor.theme = crate::theme::parse_vscode_theme("themes/github-light.json").unwrap();
+        let light_note = alert_color(&editor.theme, AlertKind::Note);
+        let quote = editor
+            .theme
+            .get_style("markup.quote")
+            .and_then(|style| style.fg);
+        assert_eq!(
+            light_note,
+            quote.unwrap(),
+            "Note falls back to markup.quote"
+        );
+        assert!(!editor.theme.colors.contains_key("editorInfo.foreground"));
+        let light_tip = alert_color(&editor.theme, AlertKind::Tip);
+        assert_eq!(light_tip, editor.theme.colors["terminal.ansiGreen"]);
+        assert_eq!(cell_fg(&mut editor, note_line, 0), Some(light_note));
+        assert_eq!(cell_fg(&mut editor, tip_line, 0), Some(light_tip));
+
+        key(&mut editor, KeyCode::Char('j')).await;
+        let revealed = content_rows(&mut editor);
+        assert!(
+            revealed[note_line].contains("[!NOTE]"),
+            "the cursor line shows the marker: {}",
+            revealed[note_line]
+        );
+        assert!(!revealed[note_line].contains('ℹ'));
+        assert_eq!(revealed[tip_line], "✦ Tip", "the next alert stays a label");
+        assert_eq!(editor.current_buffer().contents(), source);
     }
 }
