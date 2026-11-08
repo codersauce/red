@@ -15,6 +15,10 @@
 //! `u`/`ins`, `mark`, `code`, `br`), plus `strike`, `kbd`, `sub`, and `sup`.
 //! HTML blocks, code spans, and fences stay raw.
 //!
+//! `==highlight==` follows leaf's marker rules when extended marks are on:
+//! the pair must be non-empty and must not start or end with a space. Red
+//! hides the markers only. It does not pad the text the way leaf does.
+//!
 //! The buffer stays the raw document. A cursor that steps into a concealed span,
 //! or an insert, visual, search, or operator-pending edit, reveals that line so
 //! the cell under the cursor is the byte that will be changed.
@@ -142,10 +146,10 @@ struct ConcealedSource {
 /// Concealed byte ranges for every line in `source`.
 #[cfg(test)]
 fn conceal_markdown(source: &str) -> LineConcealments {
-    parse_concealment(source).lines
+    parse_concealment(source, true).lines
 }
 
-fn parse_concealment(source: &str) -> ConcealedSource {
+fn parse_concealment(source: &str, extended_marks: bool) -> ConcealedSource {
     let mut offsets = vec![0];
     offsets.extend(source.match_indices('\n').map(|(index, _)| index + 1));
     let mut hidden = vec![Vec::new(); offsets.len()];
@@ -217,7 +221,10 @@ fn parse_concealment(source: &str) -> ConcealedSource {
         }
     }
     let alert_lines = record_alerts(source, &offsets, &alerts, &mut hidden);
-    let html = record_html(source, &offsets, &protected, &mut hidden);
+    let mut html = record_html(source, &offsets, &protected, &mut hidden);
+    if extended_marks {
+        record_extended_marks(source, &offsets, &protected, &mut hidden, &mut html);
+    }
     ConcealedSource {
         lines: LineConcealments::new(hidden.into_iter().map(Concealment::new).collect()),
         alerts: AlertMap { lines: alert_lines },
@@ -504,6 +511,96 @@ fn record_html(
         lines.push(HtmlLine { spans });
     }
     HtmlMap { lines }
+}
+
+/// `==highlight==` pairs. The acceptance rules are leaf's (`markers.rs`):
+/// non-empty, no newline, no leading or trailing space. An open with no
+/// close stops the scan. Red does not insert the padding spaces leaf draws.
+fn record_extended_marks(
+    source: &str,
+    offsets: &[usize],
+    protected: &[Range<usize>],
+    hidden: &mut [Vec<Range<usize>>],
+    html: &mut HtmlMap,
+) {
+    for index in 0..offsets.len() {
+        let content = line_content_range(source, offsets, index);
+        let text = source.get(content.clone()).unwrap_or("");
+        let mut skip = protected_on_line(protected, content.clone());
+        if let Some(hidden_line) = hidden.get(index) {
+            skip.extend(hidden_line.iter().cloned());
+        }
+        let (gaps, spans) = scan_mark_line(text, &skip);
+        for gap in gaps {
+            push_gap(
+                source,
+                offsets,
+                hidden,
+                content.start + gap.start..content.start + gap.end,
+            );
+        }
+        if let Some(line) = html.lines.get_mut(index) {
+            line.spans.extend(spans);
+        }
+    }
+}
+
+struct MarkHit {
+    open_pos: usize,
+    close_rel: usize,
+}
+
+fn valid_mark_content(content: &str) -> bool {
+    !content.is_empty()
+        && !content.contains('\n')
+        && !content.starts_with(' ')
+        && !content.ends_with(' ')
+}
+
+fn find_valid_mark(text: &str, skip: &[Range<usize>], base: usize) -> Option<MarkHit> {
+    for (open_pos, _) in text.match_indices("==") {
+        let open = base + open_pos;
+        if ranges_overlap(skip, open, open + 2) {
+            continue;
+        }
+        let after = open_pos + 2;
+        let close_rel = text[after..].find("==")?;
+        if !valid_mark_content(&text[after..after + close_rel]) {
+            continue;
+        }
+        let close = base + after + close_rel;
+        if ranges_overlap(skip, open, close + 2) {
+            continue;
+        }
+        return Some(MarkHit {
+            open_pos,
+            close_rel,
+        });
+    }
+    None
+}
+
+fn scan_mark_line(text: &str, skip: &[Range<usize>]) -> (Vec<Range<usize>>, Vec<HtmlSpan>) {
+    let mut gaps = Vec::new();
+    let mut spans = Vec::new();
+    let mut rest = 0;
+    while rest < text.len() {
+        let Some(hit) = find_valid_mark(&text[rest..], skip, rest) else {
+            break;
+        };
+        let open = rest + hit.open_pos;
+        let content_start = open + 2;
+        let content_end = content_start + hit.close_rel;
+        gaps.push(open..content_start);
+        gaps.push(content_end..content_end + 2);
+        spans.push(HtmlSpan {
+            start: content_start,
+            end: content_end,
+            kind: HtmlKind::Mark,
+        });
+        rest = content_end + 2;
+    }
+    (gaps, spans)
 }
 
 fn protected_on_line(protected: &[Range<usize>], content: Range<usize>) -> Vec<Range<usize>> {
@@ -891,14 +988,20 @@ fn apply_html_styles(
 #[derive(Debug)]
 pub(super) struct CachedConcealment {
     revision: u64,
+    extended_marks: bool,
     lines: Arc<LineConcealments>,
     alerts: Arc<AlertMap>,
     html: Arc<HtmlMap>,
 }
 
-fn cache_concealment(parsed: ConcealedSource, revision: u64) -> CachedConcealment {
+fn cache_concealment(
+    parsed: ConcealedSource,
+    revision: u64,
+    extended_marks: bool,
+) -> CachedConcealment {
     CachedConcealment {
         revision,
+        extended_marks,
         lines: Arc::new(parsed.lines),
         alerts: Arc::new(parsed.alerts),
         html: Arc::new(parsed.html),
@@ -931,6 +1034,12 @@ impl super::Editor {
                 == Some("markdown")
     }
 
+    pub(super) fn markdown_extended_marks_enabled(&self, window: &crate::window::Window) -> bool {
+        window
+            .markdown_extended_marks
+            .unwrap_or(self.config.markdown_extended_marks.unwrap_or(true))
+    }
+
     pub(super) fn markdown_line_concealments(
         &self,
         window: &crate::window::Window,
@@ -942,17 +1051,18 @@ impl super::Editor {
         if buffer.byte_len() > MAX_TABLE_DOCUMENT_BYTES {
             return None;
         }
+        let extended_marks = self.markdown_extended_marks_enabled(window);
         let mut cache = self.markdown_conceal_cache.borrow_mut();
         if cache.len() >= 8 && !cache.contains_key(&buffer.id()) {
             cache.clear();
         }
         let cached = cache.entry(buffer.id()).or_insert_with(|| {
-            let parsed = parse_concealment(&buffer.contents());
-            cache_concealment(parsed, buffer.revision())
+            let parsed = parse_concealment(&buffer.contents(), extended_marks);
+            cache_concealment(parsed, buffer.revision(), extended_marks)
         });
-        if cached.revision != buffer.revision() {
-            let parsed = parse_concealment(&buffer.contents());
-            *cached = cache_concealment(parsed, buffer.revision());
+        if cached.revision != buffer.revision() || cached.extended_marks != extended_marks {
+            let parsed = parse_concealment(&buffer.contents(), extended_marks);
+            *cached = cache_concealment(parsed, buffer.revision(), extended_marks);
         }
         Some(cached.lines.clone())
     }
@@ -1143,6 +1253,31 @@ impl super::Editor {
             .line(line)
             .hides_byte(byte)
             .then_some(line..line + 1)
+    }
+
+    pub(super) fn toggle_markdown_extended_marks(&mut self) {
+        let enabled = self
+            .window_manager
+            .active_window()
+            .map(|window| {
+                window
+                    .markdown_extended_marks
+                    .unwrap_or(self.config.markdown_extended_marks.unwrap_or(true))
+            })
+            .unwrap_or(true);
+        if let Some(window) = self.window_manager.active_window_mut() {
+            window.markdown_extended_marks = Some(!enabled);
+        }
+        self.vleft = 0;
+        self.skipcol = 0;
+        self.set_legacy_message(Some(
+            if enabled {
+                "Markdown highlight marks disabled"
+            } else {
+                "Markdown highlight marks enabled"
+            }
+            .to_string(),
+        ));
     }
 
     pub(super) fn toggle_markdown_conceal(&mut self) {
@@ -1928,6 +2063,113 @@ See <span>plain</span> unknown
             .count();
         editor
             .test_execute_action(Action::ToggleMarkdownConceal)
+            .await
+            .unwrap();
+        let window = editor.active_window_with_editor_view().unwrap();
+        let raw_rows = editor
+            .layout_for_window(&window)
+            .rows
+            .iter()
+            .filter(|segment| segment.line == 0)
+            .count();
+        assert!(
+            concealed_rows < raw_rows,
+            "visible rows {concealed_rows} should be fewer than raw rows {raw_rows}"
+        );
+    }
+
+    #[test]
+    fn extended_marks_conceal_leaf_pairs_and_leave_literals() {
+        assert_eq!(
+            visible_text("before ==marked== after"),
+            "before marked after"
+        );
+        assert_eq!(visible_text("==one== ==two=="), "one two");
+        assert_eq!(visible_text("==unclosed"), "==unclosed");
+        assert_eq!(visible_text("===="), "====");
+        assert_eq!(visible_text("== text =="), "== text ==");
+        assert_eq!(
+            visible_text("x == y and ==marked== end"),
+            "x == y and marked end"
+        );
+        assert_eq!(visible_text("==héllo=="), "héllo");
+        assert_eq!(visible_text("see `==code==` here"), "see ==code== here");
+        assert!(visible_text("```\n==no==\n```\n").contains("==no=="));
+        assert_eq!(visible_text("<!-- ==x== -->"), "<!-- ==x== -->");
+        assert_eq!(line_visible("<div>\n==stay==\n</div>\n", 1), "==stay==");
+        assert_eq!(visible_text("see [a](http://x.com/==b==) end"), "see a end");
+        assert_eq!(
+            visible_text("see ==[a](http://x.com)== end"),
+            "see ==a== end"
+        );
+    }
+
+    #[tokio::test]
+    async fn extended_marks_paint_reveal_and_follow_the_setting() {
+        let source = "\
+intro
+See ==marked== here
+";
+        let marked_line = "See ==marked== here";
+        let mut editor = markdown_editor("notes.md", source, 80, 12);
+        editor.theme = crate::theme::parse_vscode_theme("themes/red.json").unwrap();
+        let line = source_line(source, marked_line);
+        let column = marked_line.find("marked").unwrap();
+        let rows = content_rows(&mut editor);
+        assert_eq!(rows[line], "See marked here");
+        let expected =
+            mark_background(&editor.theme).map(|color| paint_background(color, &editor.theme));
+        assert!(expected.is_some());
+        assert_eq!(content_cell(&mut editor, line, column).1.bg, expected);
+        let revision = editor.current_buffer().revision();
+
+        editor.config.markdown_extended_marks = Some(false);
+        let raw = content_rows(&mut editor);
+        assert_eq!(raw[line], marked_line);
+        assert_eq!(editor.current_buffer().revision(), revision);
+        editor.config.markdown_extended_marks = Some(true);
+        assert_eq!(content_rows(&mut editor)[line], "See marked here");
+
+        let mut light = markdown_editor("notes.md", source, 80, 12);
+        light.theme = crate::theme::parse_vscode_theme("themes/github-light.json").unwrap();
+        let light_bg =
+            mark_background(&light.theme).map(|color| paint_background(color, &light.theme));
+        assert_ne!(light_bg, expected);
+        assert_eq!(content_cell(&mut light, line, column).1.bg, light_bg);
+
+        editor
+            .test_execute_action(Action::ToggleMarkdownExtendedMarks)
+            .await
+            .unwrap();
+        assert_eq!(content_rows(&mut editor)[line], marked_line);
+        editor
+            .test_execute_action(Action::ToggleMarkdownExtendedMarks)
+            .await
+            .unwrap();
+        assert_eq!(content_rows(&mut editor)[line], "See marked here");
+
+        key(&mut editor, KeyCode::Char('j')).await;
+        key(&mut editor, KeyCode::Char('f')).await;
+        key(&mut editor, KeyCode::Char('=')).await;
+        let revealed = content_rows(&mut editor);
+        assert!(
+            revealed[line].contains("=="),
+            "the cursor on a marker shows the source: {}",
+            revealed[line]
+        );
+        assert_eq!(editor.current_buffer().contents(), source);
+
+        let wrapped = format!("Go {}\n", "==ab== ".repeat(12));
+        let mut editor = markdown_editor("notes.md", &wrapped, 40, 12);
+        let window = editor.active_window_with_editor_view().unwrap();
+        let concealed_rows = editor
+            .layout_for_window(&window)
+            .rows
+            .iter()
+            .filter(|segment| segment.line == 0)
+            .count();
+        editor
+            .test_execute_action(Action::ToggleMarkdownExtendedMarks)
             .await
             .unwrap();
         let window = editor.active_window_with_editor_view().unwrap();

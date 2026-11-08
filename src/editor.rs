@@ -995,6 +995,7 @@ struct RenderedViewport {
     markdown_tables: bool,
     markdown_reveal: Option<(usize, usize)>,
     markdown_conceal: bool,
+    markdown_extended_marks: bool,
     markdown_conceal_reveal: Option<(usize, usize)>,
     markdown_images: MarkdownImagesMode,
     markdown_image_reveal: Option<(usize, usize)>,
@@ -2969,6 +2970,8 @@ pub enum Action {
     ToggleMarkdownTables,
     /// Shows or hides inline Markdown syntax when measuring wrapped lines.
     ToggleMarkdownConceal,
+    /// Shows or hides `==highlight==` markers in Markdown.
+    ToggleMarkdownExtendedMarks,
     SetRelativeLineNumbers(bool),
 
     DeletePreviousChar,
@@ -3482,6 +3485,7 @@ struct LayoutCacheKey {
     markdown_tables: bool,
     markdown_reveal: Option<std::ops::Range<usize>>,
     markdown_conceal: bool,
+    markdown_extended_marks: bool,
     markdown_conceal_reveal: Option<std::ops::Range<usize>>,
     markdown_images: MarkdownImagesMode,
     markdown_image_reveal: Option<std::ops::Range<usize>>,
@@ -6538,6 +6542,8 @@ impl Editor {
                 .markdown_reveal_range(window)
                 .map(|range| (range.start, range.end)),
             markdown_conceal: self.markdown_conceal_enabled(window),
+            markdown_extended_marks: self.markdown_conceal_enabled(window)
+                && self.markdown_extended_marks_enabled(window),
             markdown_conceal_reveal: self
                 .markdown_conceal_reveal(window)
                 .map(|range| (range.start, range.end)),
@@ -7717,6 +7723,8 @@ impl Editor {
             markdown_tables: self.markdown_tables_enabled(window),
             markdown_reveal: self.markdown_reveal_range(window),
             markdown_conceal: self.markdown_conceal_enabled(window),
+            markdown_extended_marks: self.markdown_conceal_enabled(window)
+                && self.markdown_extended_marks_enabled(window),
             markdown_conceal_reveal: self.markdown_conceal_reveal(window),
             markdown_images: self.config.markdown_images,
             markdown_image_reveal: self.markdown_image_source_reveal(window),
@@ -19199,6 +19207,9 @@ impl Editor {
             if cmd == "markdown-conceal" {
                 actions.push(Action::ToggleMarkdownConceal);
             }
+            if cmd == "markdown-extended-marks" {
+                actions.push(Action::ToggleMarkdownExtendedMarks);
+            }
 
             if cmd == "statusline" {
                 actions.push(Action::OpenStatuslineManager);
@@ -24530,6 +24541,10 @@ impl Editor {
                     // Keep this arm tiny. `execute_action_inner` is already near the
                     // 2MB test-thread stack limit when a command re-enters it.
                     self.toggle_markdown_conceal();
+                    self.render(buffer)?;
+                }
+                Action::ToggleMarkdownExtendedMarks => {
+                    self.toggle_markdown_extended_marks();
                     self.render(buffer)?;
                 }
                 Action::SetWrap(wrap) => {

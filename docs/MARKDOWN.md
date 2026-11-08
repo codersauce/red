@@ -94,6 +94,15 @@ and `<kbd>` show their contents as written, including any tags inside them.
 Move onto a hidden tag, or enter Insert, Visual, or search on that line, and
 the tags come back. This follows `markdown_conceal` and has no separate switch.
 
+## Highlight marks
+
+`==highlight==` hides the markers and paints the text with the same background
+as `<mark>`. The text cannot be empty or start or end with a space, and an
+unclosed `==` stays as written. Marks inside code spans, fences, and HTML
+blocks stay as written. This is not CommonMark. Set
+`markdown_extended_marks = false` or run `:markdown-extended-marks` to leave
+every `==` visible. It follows `markdown_conceal`.
+
 ## Images
 
 A line that holds only an image becomes the picture itself in Normal mode:
@@ -183,6 +192,7 @@ pane or switching the document to another file does the same.
 | --- | --- | --- |
 | `markdown_tables` | `true` | Draw pipe tables as grids |
 | `markdown_conceal` | `true` | Hide inline markup while wrapping, including GitHub alert markers and balanced inline HTML tags |
+| `markdown_extended_marks` | `true` | Hide `==highlight==` markers and paint the text like `<mark>` |
 | `markdown_images` | `"auto"` | How to draw images: `auto`, `kitty`, `iterm2`, `sixel`, `halfblocks`, `off` |
 | `markdown_image_max_height` | `16` | Most rows one image may use |
 | `markdown_link_split_focus` | `"source"` | Pane that keeps focus after `Ctrl-w x` |

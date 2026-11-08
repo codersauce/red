@@ -24,6 +24,7 @@ const EXTRA_SCHEMA_PATHS: &[&[&str]] = &[
     &["window_borders_ascii"],
     &["markdown_tables"],
     &["markdown_conceal"],
+    &["markdown_extended_marks"],
     &["lsp", "enabled"],
     &["lsp", "format_on_save"],
     &["formatting", "on_save"],

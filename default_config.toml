@@ -39,6 +39,12 @@ markdown_tables = true
 # concealed syntax show that line's raw text. Tables keep their own grid.
 markdown_conceal = true
 
+# Conceal ==highlight== markers and paint the text like <mark>. This is not
+# CommonMark. The text must not be empty or start or end with a space, and
+# marks inside code spans or fences stay as written. `:markdown-extended-marks`
+# toggles this in the current split. It follows markdown_conceal.
+markdown_extended_marks = true
+
 # Draw standalone Markdown images inline in Normal mode, including a line whose
 # only content is an `<img>` tag (optionally wrapped in `<p>`). "auto" queries the
 # terminal (Kitty graphics, then Sixel) and falls back through Unicode
