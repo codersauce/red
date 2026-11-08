@@ -1313,12 +1313,22 @@ async fn interrupt_active_turn(
         session.pending_interrupt_turn_id = Some(turn_id.clone());
         turn_id
     };
+    send_interrupt(session_id, &turn_id, input, pending, next_id).await
+}
+
+async fn send_interrupt(
+    session_id: &str,
+    turn_id: &str,
+    input: &mut (impl AsyncWrite + Unpin),
+    pending: &mut HashMap<String, Pending>,
+    next_id: &mut u64,
+) -> Result<()> {
     let id = rpc_id(next_id);
     pending.insert(
         id.clone(),
         Pending::Interrupt {
             session_id: session_id.to_string(),
-            turn_id: turn_id.clone(),
+            turn_id: turn_id.to_string(),
         },
     );
     write_message(
@@ -2088,13 +2098,16 @@ async fn handle_response(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            let cancelled = if let Some(session) = sessions.get_mut(&session_id) {
-                session.active_turn = Some(turn_id);
-                session.cancelled.load(Ordering::Relaxed)
-            } else {
-                false
+            let Some(session) = sessions.get_mut(&session_id) else {
+                // Closed while turn/start was in flight: nothing in Red can take
+                // this turn's output or edits, so stop it.
+                if !turn_id.is_empty() {
+                    send_interrupt(&session_id, &turn_id, input, pending, next_id).await?;
+                }
+                return Ok(());
             };
-            if cancelled {
+            session.active_turn = Some(turn_id);
+            if session.cancelled.load(Ordering::Relaxed) {
                 interrupt_active_turn(&session_id, input, pending, sessions, next_id).await?;
             }
         }
@@ -3543,6 +3556,94 @@ mod tests {
             received.try_recv().is_err(),
             "a cancel confirmation would stop the next message"
         );
+    }
+
+    #[tokio::test]
+    async fn a_turn_started_after_its_session_closed_is_interrupted() {
+        let mut sessions = HashMap::from([(
+            "agent".into(),
+            Session {
+                model_info: None,
+                cwd: PathBuf::from("/workspace"),
+                active_turn: None,
+                pending_interrupt_turn_id: None,
+                cancelled: Arc::new(AtomicBool::new(false)),
+                allow_sensitive_paths: false,
+                kind: SessionKind::Agent,
+            },
+        )]);
+        let (events, mut received) = mpsc::channel(2);
+        let mut pending = HashMap::new();
+        let mut output = Vec::new();
+        let mut next_id = 0;
+
+        start_turn(
+            "agent".into(),
+            json!([{"type": "text", "text": "edit main.rs"}]),
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+        )
+        .await
+        .unwrap();
+        let turn_start: Value = serde_json::from_slice(&output).unwrap();
+        output.clear();
+        stop_session(
+            "agent".into(),
+            true,
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+        )
+        .await
+        .unwrap();
+        assert!(
+            output.is_empty(),
+            "turn/start has not returned a turn id yet"
+        );
+        assert!(matches!(
+            received.try_recv(),
+            Ok(CodexEvent::Cancelled { .. })
+        ));
+
+        handle_response(
+            json!({"id": turn_start["id"], "result": {"turn": {"id": "orphan"}}}),
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+            &AgentRuntimePolicy::default(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !output.is_empty(),
+            "Codex would keep running a turn nothing in Red can accept"
+        );
+        let interrupt: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(interrupt["method"], "turn/interrupt");
+        assert_eq!(interrupt["params"]["threadId"], "agent");
+        assert_eq!(interrupt["params"]["turnId"], "orphan");
+        output.clear();
+
+        handle_response(
+            json!({"id": interrupt["id"], "result": {}}),
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+            &AgentRuntimePolicy::default(),
+        )
+        .await
+        .unwrap();
+        assert!(received.try_recv().is_err());
+        assert!(!sessions.contains_key("agent"));
     }
 
     #[tokio::test]
