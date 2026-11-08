@@ -1,6 +1,6 @@
 ---
 title: "Red Command"
-summary: "The `red` command exposes editor startup, utility checks, shell completions, keyboard diagnostics, plugin management, language grammar checks, runtime asset operations, detach control, config overrides, and internal hidden boundaries."
+summary: "The `red` command exposes editor startup, utility checks, keyboard diagnostics, plugin management, language grammar checks, runtime asset operations, detach control, config overrides, and internal hidden boundaries."
 topics: [reference, cli, startup, plugins, language-packs]
 sources:
   - id: cli
@@ -36,7 +36,6 @@ The `red` command is the public entrypoint for opening the editor, forwarding Hu
 | `red keys [--protocol auto|legacy|kitty|xterm] [--count <N>]` | Runs the terminal keyboard diagnostic without starting the editor; it negotiates the selected protocol, prints decoded Enter, Backspace, modified shortcuts, and hidden-key summaries, and exits on `Esc`, `Ctrl-C`, or after the optional count [@cli] [@main] [@keyboard]. |
 | `red plugin ...` | Runs non-interactive external plugin package management without starting the editor [@cli] [@main]. |
 | `red language ...` | Approves or revokes native grammar trust, or checks indentation fixtures against the effective language configuration, without starting the editor [@cli] [@main]. |
-| `red completions <bash\|zsh\|fish\|powershell\|elvish>` | Prints a completion script for the `red` command and exits. A file argument is rejected, the same as other utilities [@cli] [@main]. |
 | `red --version` | Uses Clap's generated version output [@cli]. |
 
 The README and getting-started guide present `red path/to/file`, multiple files, and `red -r path/to/project src/main.rs` as ordinary editor startup examples [@readme] [@getting-started]. Directory arguments are also normal editor targets: `red .` or `red path/to/dir` opens a generated [directory buffer](../../architecture/editor/buffers-and-windows), while regular file arguments still open text buffers [@buffer] [@getting-started].
