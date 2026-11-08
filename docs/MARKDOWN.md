@@ -44,6 +44,14 @@ hidden.
 Bold, emphasis, inline code, and links are highlighted either way, including
 nested formatting, reference links, and URL or email autolinks.
 
+## HTML
+
+Raw HTML is highlighted with the bundled HTML grammar. Block tags such as
+`<details>` and `<div>`, and inline tags such as `<kbd>`, use the same tag,
+attribute, and string scopes as an `.html` file. A fenced `html` block is
+highlighted the same way, so Markdown does not need an HTML language pack.
+HTML written inside another language's fence stays that language.
+
 ## Images
 
 A line that holds only an image becomes the picture itself in Normal mode:

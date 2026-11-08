@@ -839,6 +839,7 @@ mod tests {
             "fish",
             "powershell",
             "lua",
+            "html",
         ] {
             let (language, source) = registry
                 .textobject_language(language_id)
