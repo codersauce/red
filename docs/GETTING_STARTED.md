@@ -299,7 +299,7 @@ Use Neo-tree for file operations.
 
 | Key | Action |
 | --- | --- |
-| `F1`, `:keys` | Contextual keyboard-shortcut explorer |
+| `F1`, `:keys`, `:help`, `:h` | Contextual keyboard-shortcut explorer |
 | `Space ?`, `Alt-x`, `Ctrl-Shift-p` | Command palette |
 | `Ctrl-p` | File picker |
 | `Ctrl-p`, then `>` | Switch from files to commands |
@@ -319,7 +319,11 @@ settings can be removed.
 In the file picker, append `:<line>` to a fuzzy filename query to open the
 selected file at that line. For example, `sona:123` opens `source_name.rs` at line 123.
 
-Press `F1` or click **F1 shortcuts** in an action strip to open keyboard help without closing the current pane or dialog. `Tab` switches between the current context and all Red keys; `/` searches by action or binding. `Esc` returns to exactly where you were. The **Keyboard shortcuts** command and `:keys` open the same explorer. User keymap overrides are reflected in the list.
+Press `F1` or click **F1 shortcuts** in an action strip to open keyboard help
+without closing the current pane or dialog. `Tab` switches between the current
+context and all Red keys; `/` searches by action or binding. `Esc` returns to
+exactly where you were. The **Keyboard shortcuts** command, `:keys`, `:help`, and
+`:h` open the same explorer. User keymap overrides are reflected in the list.
 
 The command palette includes descriptions, effective keymaps, and accepted
 `:Command` invocations. Pause after a configured prefix such as `Space`,

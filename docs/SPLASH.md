@@ -40,8 +40,8 @@ type   :q<Enter>             to exit
 
 The version string comes from `CARGO_PKG_VERSION`. Every keystroke above is
 verified against `default_config.toml` (`Space ?` → CommandPalette, `Ctrl-p` →
-FilePicker, `Space A` → Agent, `Space t` → ThemeBrowser). red has no `:help`;
-the command palette is the discovery surface, so it leads the list.
+FilePicker, `Space A` → Agent, `Space t` → ThemeBrowser). The command palette
+leads the list for command discovery; `:help` and `:h` open the keyboard-shortcut explorer.
 
 ## Identity notes
 

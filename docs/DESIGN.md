@@ -198,7 +198,7 @@ Three surfaces already show keys, and they do not overlap:
 - Which-key (`src/ui/keymap_hints.rs`) shows only the next key in each row
   (`f`, `s`, `d`). The pending prefix is the popup title (`Space e · keymaps`)
   and the command line. A group that continues ends with ` …`.
-- Keyboard shortcuts (`:keys`, `F1`, `Alt+/`, `src/ui/keyboard_shortcuts.rs`)
+- Keyboard shortcuts (`:keys`, `:help`, `:h`, `F1`, `Alt+/`, `src/ui/keyboard_shortcuts.rs`)
   shows the full chord in bold, then the action. The command palette shows
   the same full chord.
 - The action bar (`src/ui/action_bar.rs`) is the footer hint. The key is bold

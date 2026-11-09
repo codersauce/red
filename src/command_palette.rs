@@ -88,6 +88,8 @@ const SPECIAL_BUILTIN_COLON_COMMANDS: &[&str] = &[
     "command-palette",
     "keys",
     "keyboard-shortcuts",
+    "help",
+    "h",
     "whats-new",
     "changelog",
     "learn",
@@ -499,7 +501,7 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             "Editor",
             "Browse all effective bindings and contextual shortcuts",
             Some(":keys"),
-            &[":keyboard-shortcuts", "keybindings", "help"],
+            &[":keyboard-shortcuts", ":help", ":h", "keybindings"],
             Action::KeyboardShortcuts,
         ),
         builtin(
@@ -1890,6 +1892,17 @@ mod tests {
     #[test]
     fn palette_lists_builtin_shortcuts_and_colon_aliases() {
         let entries = entries(&default_keys(), &[]);
+
+        let help = entries
+            .iter()
+            .find(|entry| entry.id == "editor.keyboard_shortcuts")
+            .unwrap();
+        let completions = colon_completion_names(&[]);
+        for alias in ["help", "h"] {
+            assert!(help.aliases.contains(&format!(":{alias}")));
+            assert!(completions.iter().any(|name| name == alias));
+            assert!(colon_name_is_builtin(alias));
+        }
 
         let format = entries
             .iter()

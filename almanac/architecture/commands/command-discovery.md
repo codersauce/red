@@ -97,7 +97,7 @@ The panel-global allowlist currently admits command/search entry, file picker, c
 ## Keyboard-Shortcut Explorer
 
 `F1` opens contextual keyboard help above the active editor, panel, picker, or
-workspace. `:keys` and the **Keyboard shortcuts** command open the same surface;
+workspace. `:keys`, `:help`, `:h`, and the **Keyboard shortcuts** command open the same surface;
 `Space ?`, `Alt-x`, and `Ctrl-Shift-p` still open the command palette. The explorer
 does not replace the underlying dialog, so its selection and unsent input survive.
 Its global view enumerates effective keymap leaves, including nested sequences,
