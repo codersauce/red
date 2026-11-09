@@ -25215,9 +25215,14 @@ impl Editor {
                     self.render(buffer)?;
                 }
                 Action::CreateStarterConfig => {
+                    let config_exists = Config::path("config.toml").exists();
                     match crate::onboarding::create_starter_config(&Config::config_dir()) {
                         Ok(path) => {
-                            self.last_error = Some(format!("starter config: {}", path.display()))
+                            if !config_exists {
+                                self.config.auto_generated_config = true;
+                                self.show_generated_config_notice(&path);
+                            }
+                            self.last_error = Some(format!("starter config: {}", path.display()));
                         }
                         Err(error) => {
                             self.last_error = Some(format!("could not create config: {error}"))

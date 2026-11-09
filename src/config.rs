@@ -315,6 +315,9 @@ pub struct Config {
     /// Show the startup splash when red opens without file arguments.
     /// Defaults to on.
     pub splash: Option<bool>,
+    /// Show the generated-config notice. Only starter configs enable it.
+    #[serde(default)]
+    pub auto_generated_config: bool,
     /// Announce each newly installed Red release once after interactive startup.
     /// Defaults to on.
     #[serde(default)]
@@ -2189,6 +2192,7 @@ fn known_top_level_field(field: &str) -> bool {
             | "sidescroll"
             | "sidescrolloff"
             | "splash"
+            | "auto_generated_config"
             | "show_whats_new"
             | "fetch_release_notes"
             | "updates"

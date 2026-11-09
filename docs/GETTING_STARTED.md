@@ -40,6 +40,10 @@ Start or control it at any time:
 A starter configuration at `~/.config/red/config.toml` remains optional. Press
 `c` on the welcome screen to create one without overwriting existing settings.
 Embedded configuration, themes, and plugins work when the file is absent.
+Generated configs contain `auto_generated_config = true`, which shows an
+informational notice with the config path. Remove that setting or set it to
+`false`, then restart Red to hide the notice. You can also acknowledge the
+notice for the current session in Messages (`Space m`).
 
 For one launch, repeat `-c` or `--config` to override a dotted key. The value
 is TOML, or a plain string when it is not valid TOML. These flags win over

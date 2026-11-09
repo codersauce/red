@@ -349,6 +349,7 @@ async fn run_editor_inner(args: Args) -> anyhow::Result<()> {
     let recovery = loaded.recovery;
     let mut editor = Editor::new_with_preferences(lsp, loaded.config, theme, buffers, preferences)?;
     editor.enable_first_launch_welcome(first_launch && resumed_session.is_none());
+    editor.show_generated_config_notice(&config_file);
     editor.set_language_reload_source(config_file, args.config_overrides.clone());
     editor.set_config_diagnostics(diagnostics, recovery);
     if let Some(snapshot) = &resumed_session {
