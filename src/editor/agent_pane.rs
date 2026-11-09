@@ -1356,6 +1356,28 @@ mod tests {
     }
 
     #[test]
+    fn a_requeued_unsent_message_keeps_the_payload_it_was_first_sent_with() {
+        let mut pane = AgentPaneLifecycle::default();
+        pane.archived_transcript_restored(true);
+        pane.submit("next".into(), "You: old\nAgent: reply\n");
+        let first = dispatched(&pane.session_created("s1"));
+        assert!(first[0].contains("Agent: reply"), "{}", first[0]);
+        assert!(first[0].ends_with("next"));
+        pane.restore_pending("s1", "/workspace");
+        let replay = dispatched(&pane.restored("s1"));
+        assert_eq!(replay, first, "the replay must carry the same recap");
+
+        let mut pane = AgentPaneLifecycle::default();
+        pane.archived_transcript_restored(true);
+        pane.submit("next".into(), "You: old\nAgent: reply\n");
+        let first = dispatched(&pane.session_created("s1"));
+        pane.restore_pending("s1", "/workspace");
+        pane.restore_failed("s1");
+        let replay = dispatched(&pane.session_created("s2"));
+        assert_eq!(replay, first, "a new thread gets one recap, not two");
+    }
+
+    #[test]
     fn a_turn_lost_with_its_app_server_is_never_dropped_silently() {
         let mut pane = live("s1");
         pane.submit("edits files".into(), "You: earlier\n");
