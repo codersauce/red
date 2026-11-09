@@ -148,6 +148,9 @@ pub struct AgentPaneLifecycle {
     in_flight_tail: String,
     /// Recap for a retried prompt, taken from `in_flight_tail`.
     retry_tail: Option<String>,
+    /// Payload of the in-flight dispatch, so a prompt the editor never sent
+    /// goes out again as first composed, recap included.
+    in_flight_wire: String,
     /// Whether `transcript_tail` already holds the running turn's reply header.
     reply_open: bool,
     /// Thread forgotten by a reset while it was still being resumed; a late
@@ -403,6 +406,11 @@ impl AgentPaneLifecycle {
     /// is retried in a new thread; a prompt that already ran is not replayed,
     /// because its edits may have applied.
     pub fn session_lost(&mut self, unsent: bool) -> Vec<AgentPaneEffect> {
+        if unsent && self.phase() == AgentPanePhase::Restoring {
+            // A dispatch queued before the crash restore began: `restore_pending`
+            // already put its prompt back, and the thread is coming back.
+            return Vec::new();
+        }
         let running = self.is_running();
         let in_flight = self.in_flight.take();
         let (retry, ran) = if unsent {
@@ -442,10 +450,20 @@ impl AgentPaneLifecycle {
         self.switch_target = None;
         self.switch_previous_session = None;
         if self.is_running() {
+            // Without a turn id the editor never sent the prompt, so Codex never
+            // saw it: queue it again rather than call it cut off.
+            let sent = self.turn_id.is_some();
             if let Some(prompt) = self.in_flight.take() {
-                self.interrupted = Some(prompt);
+                if sent {
+                    self.interrupted = Some(prompt);
+                } else {
+                    self.transcript_tail = std::mem::take(&mut self.in_flight_tail);
+                    self.wire_overrides
+                        .insert(prompt.id.clone(), std::mem::take(&mut self.in_flight_wire));
+                    self.queue.push_front(prompt);
+                }
             }
-            self.paused = !self.queue.is_empty();
+            self.paused = !self.queue.is_empty() && (sent || self.stop_requested);
         }
         self.close_reply();
         self.session_id = Some(session_id.to_string());
@@ -711,6 +729,7 @@ impl AgentPaneLifecycle {
                     .unwrap_or_else(|| prompt.text.clone());
                 let wire_text = self.wire_text(&text);
                 self.in_flight_tail = self.transcript_tail.clone();
+                self.in_flight_wire = wire_text.clone();
                 // Mirror the pane committing the message to its transcript.
                 self.end_transcript_line();
                 self.push_transcript(&format!("You: {}\n", prompt.text));
@@ -771,12 +790,16 @@ impl AgentPaneLifecycle {
     }
 
     fn wire_text(&mut self, text: &str) -> String {
+        use crate::agent_conversation::{RECAP_FOLLOW_UP, RECAP_PREFIX};
         let retry_tail = self.retry_tail.take();
         let recap = recap_tail(retry_tail.as_ref().unwrap_or(&self.transcript_tail));
-        if !std::mem::take(&mut self.recap_pending) || recap.trim().is_empty() {
+        // A replayed payload already opens with its recap.
+        if !std::mem::take(&mut self.recap_pending)
+            || recap.trim().is_empty()
+            || text.starts_with(RECAP_PREFIX)
+        {
             return text.to_string();
         }
-        use crate::agent_conversation::{RECAP_FOLLOW_UP, RECAP_PREFIX};
         format!("{RECAP_PREFIX}\n{recap}{RECAP_FOLLOW_UP}{text}")
     }
 
@@ -1305,6 +1328,63 @@ mod tests {
         pane.restored("s1");
         let (_, effects) = pane.submit("next".into(), "");
         assert_eq!(dispatched(&effects), ["next"]);
+    }
+
+    #[test]
+    fn a_message_the_editor_never_sent_is_sent_after_a_crash_resume() {
+        let mut pane = live("s1");
+        assert_eq!(dispatched(&pane.submit("hello".into(), "").1), ["hello"]);
+        pane.restore_pending("s1", "/workspace");
+        // The editor then reaches the dispatch queued before the crash.
+        assert!(pane
+            .observe(
+                "agent:session_lost",
+                &serde_json::json!({
+                    "session_id": "s1",
+                    "prompt": "hello",
+                    "message": "No Codex app-server session is running"
+                }),
+            )
+            .is_empty());
+        let snapshot = pane.snapshot();
+        assert!(snapshot.interrupted.is_none(), "Codex never received it");
+        assert_eq!(snapshot.session_id.as_deref(), Some("s1"));
+        assert_eq!(pane.phase(), AgentPanePhase::Restoring);
+        assert_eq!(dispatched(&pane.restored("s1")), ["hello"]);
+    }
+
+    #[test]
+    fn a_stopped_message_the_editor_never_sent_waits_after_a_crash_resume() {
+        let mut pane = live("s1");
+        pane.submit("hello".into(), "");
+        pane.stop();
+        pane.restore_pending("s1", "/workspace");
+        assert!(pane.snapshot().interrupted.is_none());
+        assert!(pane.restored("s1").is_empty(), "the user asked to stop it");
+        assert_eq!(pane.snapshot().queued[0].text, "hello");
+        assert_eq!(dispatched(&pane.send_queued("")), ["hello"]);
+    }
+
+    #[test]
+    fn a_requeued_unsent_message_keeps_the_payload_it_was_first_sent_with() {
+        let mut pane = AgentPaneLifecycle::default();
+        pane.archived_transcript_restored(true);
+        pane.submit("next".into(), "You: old\nAgent: reply\n");
+        let first = dispatched(&pane.session_created("s1"));
+        assert!(first[0].contains("Agent: reply"), "{}", first[0]);
+        assert!(first[0].ends_with("next"));
+        pane.restore_pending("s1", "/workspace");
+        let replay = dispatched(&pane.restored("s1"));
+        assert_eq!(replay, first, "the replay must carry the same recap");
+
+        let mut pane = AgentPaneLifecycle::default();
+        pane.archived_transcript_restored(true);
+        pane.submit("next".into(), "You: old\nAgent: reply\n");
+        let first = dispatched(&pane.session_created("s1"));
+        pane.restore_pending("s1", "/workspace");
+        pane.restore_failed("s1");
+        let replay = dispatched(&pane.session_created("s2"));
+        assert_eq!(replay, first, "a new thread gets one recap, not two");
     }
 
     #[test]

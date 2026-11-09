@@ -596,6 +596,7 @@ enum Pending {
     },
     Interrupt {
         session_id: String,
+        turn_id: String,
     },
 }
 
@@ -1261,9 +1262,19 @@ async fn stop_session(
     sessions: &mut HashMap<String, Session>,
     next_id: &mut u64,
 ) -> Result<()> {
-    let notify_cancelled = sessions
+    // With no turn running or starting, the stop arrived after the turn ended and
+    // that turn's terminal event was reported; a confirmation would land on the
+    // next turn instead.
+    let has_turn = sessions
         .get(&session_id)
-        .is_none_or(|session| matches!(session.kind, SessionKind::Agent));
+        .is_some_and(|session| session.active_turn.is_some())
+        || pending.values().any(
+            |request| matches!(request, Pending::Turn { session_id: id } if *id == session_id),
+        );
+    let notify_cancelled = has_turn
+        && sessions
+            .get(&session_id)
+            .is_none_or(|session| matches!(session.kind, SessionKind::Agent));
     let newly_cancelled = sessions
         .get_mut(&session_id)
         .is_none_or(|session| !session.cancelled.swap(true, Ordering::Relaxed));
@@ -1302,11 +1313,22 @@ async fn interrupt_active_turn(
         session.pending_interrupt_turn_id = Some(turn_id.clone());
         turn_id
     };
+    send_interrupt(session_id, &turn_id, input, pending, next_id).await
+}
+
+async fn send_interrupt(
+    session_id: &str,
+    turn_id: &str,
+    input: &mut (impl AsyncWrite + Unpin),
+    pending: &mut HashMap<String, Pending>,
+    next_id: &mut u64,
+) -> Result<()> {
     let id = rpc_id(next_id);
     pending.insert(
         id.clone(),
         Pending::Interrupt {
             session_id: session_id.to_string(),
+            turn_id: turn_id.to_string(),
         },
     );
     write_message(
@@ -2076,13 +2098,16 @@ async fn handle_response(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            let cancelled = if let Some(session) = sessions.get_mut(&session_id) {
-                session.active_turn = Some(turn_id);
-                session.cancelled.load(Ordering::Relaxed)
-            } else {
-                false
+            let Some(session) = sessions.get_mut(&session_id) else {
+                // Closed while turn/start was in flight: nothing in Red can take
+                // this turn's output or edits, so stop it.
+                if !turn_id.is_empty() {
+                    send_interrupt(&session_id, &turn_id, input, pending, next_id).await?;
+                }
+                return Ok(());
             };
-            if cancelled {
+            session.active_turn = Some(turn_id);
+            if session.cancelled.load(Ordering::Relaxed) {
                 interrupt_active_turn(&session_id, input, pending, sessions, next_id).await?;
             }
         }
@@ -2173,21 +2198,27 @@ async fn send_pending_failure(
             unreachable!("early requests returned above")
         }
     };
-    if matches!(request, Pending::Interrupt { .. }) {
+    if let Pending::Interrupt { turn_id, .. } = request {
+        // Codex rejects interrupting a turn that already finished. That turn's
+        // terminal event was reported, so the rejection must not reach the next turn.
+        let Some(session) = sessions
+            .get_mut(session_id)
+            .filter(|session| session.active_turn.as_deref() == Some(turn_id.as_str()))
+        else {
+            return;
+        };
         // A rejected interrupt leaves the turn running: allow a retry and report
         // it without ending the turn, so queued prompts keep waiting for it.
-        if let Some(session) = sessions.get_mut(session_id) {
-            session.pending_interrupt_turn_id = None;
-            if matches!(session.kind, SessionKind::Agent) && session.active_turn.is_some() {
-                events
-                    .send(CodexEvent::CancelFailed {
-                        session_id: session_id.clone(),
-                        message: message.to_string(),
-                    })
-                    .await
-                    .ok();
-                return;
-            }
+        session.pending_interrupt_turn_id = None;
+        if matches!(session.kind, SessionKind::Agent) {
+            events
+                .send(CodexEvent::CancelFailed {
+                    session_id: session_id.clone(),
+                    message: message.to_string(),
+                })
+                .await
+                .ok();
+            return;
         }
     }
     let (event, remove_session) = sessions.get(session_id).map_or_else(
@@ -3399,6 +3430,220 @@ mod tests {
         let retry: Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(retry["method"], "turn/interrupt");
         assert_eq!(retry["params"]["turnId"], "turn");
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_rejected_after_its_turn_finished_does_not_fail_the_next_turn() {
+        let host = Arc::new(Mutex::new(InlineReadHost(Arc::new(StdMutex::new(
+            Vec::new(),
+        )))));
+        let mut sessions = HashMap::from([(
+            "agent".into(),
+            Session {
+                model_info: None,
+                cwd: PathBuf::from("/workspace"),
+                active_turn: Some("first".into()),
+                pending_interrupt_turn_id: None,
+                cancelled: Arc::new(AtomicBool::new(false)),
+                allow_sensitive_paths: false,
+                kind: SessionKind::Agent,
+            },
+        )]);
+        let (events, mut received) = mpsc::channel(8);
+        let (internal, _) = mpsc::channel(1);
+        let mut pending = HashMap::new();
+        let mut output = Vec::new();
+        let mut next_id = 0;
+
+        stop_session(
+            "agent".into(),
+            false,
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+        )
+        .await
+        .unwrap();
+        let interrupt: Value = serde_json::from_slice(&output).unwrap();
+        output.clear();
+        assert!(matches!(
+            received.try_recv(),
+            Ok(CodexEvent::Cancelled { .. })
+        ));
+
+        // Codex finishes the turn before it reads the interrupt.
+        handle_message(
+            json!({"method":"turn/completed","params":{"threadId":"agent",
+                "turn":{"id":"first","status":"completed"}}}),
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+            &AgentRuntimePolicy::default(),
+            host,
+            internal,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            received.try_recv(),
+            Ok(CodexEvent::Completed { .. })
+        ));
+        start_turn(
+            "agent".into(),
+            json!([{"type": "text", "text": "second"}]),
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+        )
+        .await
+        .unwrap();
+
+        handle_response(
+            json!({"id": interrupt["id"], "error": {"code": -32600, "message": "no active turn to interrupt"}}),
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+            &AgentRuntimePolicy::default(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            received.try_recv().is_err(),
+            "the rejection belongs to the finished turn, not to \"second\""
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_read_after_the_turn_finished_reports_nothing() {
+        let mut sessions = HashMap::from([(
+            "agent".into(),
+            Session {
+                model_info: None,
+                cwd: PathBuf::from("/workspace"),
+                active_turn: None,
+                pending_interrupt_turn_id: None,
+                cancelled: Arc::new(AtomicBool::new(false)),
+                allow_sensitive_paths: false,
+                kind: SessionKind::Agent,
+            },
+        )]);
+        let (events, mut received) = mpsc::channel(2);
+        let mut pending = HashMap::new();
+        let mut output = Vec::new();
+        let mut next_id = 0;
+
+        stop_session(
+            "agent".into(),
+            false,
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+        )
+        .await
+        .unwrap();
+        assert!(output.is_empty());
+        assert!(
+            received.try_recv().is_err(),
+            "a cancel confirmation would stop the next message"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_started_after_its_session_closed_is_interrupted() {
+        let mut sessions = HashMap::from([(
+            "agent".into(),
+            Session {
+                model_info: None,
+                cwd: PathBuf::from("/workspace"),
+                active_turn: None,
+                pending_interrupt_turn_id: None,
+                cancelled: Arc::new(AtomicBool::new(false)),
+                allow_sensitive_paths: false,
+                kind: SessionKind::Agent,
+            },
+        )]);
+        let (events, mut received) = mpsc::channel(2);
+        let mut pending = HashMap::new();
+        let mut output = Vec::new();
+        let mut next_id = 0;
+
+        start_turn(
+            "agent".into(),
+            json!([{"type": "text", "text": "edit main.rs"}]),
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+        )
+        .await
+        .unwrap();
+        let turn_start: Value = serde_json::from_slice(&output).unwrap();
+        output.clear();
+        stop_session(
+            "agent".into(),
+            true,
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+        )
+        .await
+        .unwrap();
+        assert!(
+            output.is_empty(),
+            "turn/start has not returned a turn id yet"
+        );
+        assert!(matches!(
+            received.try_recv(),
+            Ok(CodexEvent::Cancelled { .. })
+        ));
+
+        handle_response(
+            json!({"id": turn_start["id"], "result": {"turn": {"id": "orphan"}}}),
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+            &AgentRuntimePolicy::default(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !output.is_empty(),
+            "Codex would keep running a turn nothing in Red can accept"
+        );
+        let interrupt: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(interrupt["method"], "turn/interrupt");
+        assert_eq!(interrupt["params"]["threadId"], "agent");
+        assert_eq!(interrupt["params"]["turnId"], "orphan");
+        output.clear();
+
+        handle_response(
+            json!({"id": interrupt["id"], "result": {}}),
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+            &AgentRuntimePolicy::default(),
+        )
+        .await
+        .unwrap();
+        assert!(received.try_recv().is_err());
+        assert!(!sessions.contains_key("agent"));
     }
 
     #[tokio::test]
