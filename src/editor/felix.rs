@@ -1181,10 +1181,33 @@ impl Editor {
                 ),
             )
         });
-        let indentation = self.indentation_for_buffer_index(self.buffer_manager.active_index());
+        let active = self.buffer_manager.active_index();
+        let indentation = self.indentation_for_buffer_index(active);
+        // Like Helix, indent plain text with a tab when neither the document
+        // nor any language configuration says otherwise. Other unrecognized
+        // files keep Red's default, since Helix may know their language.
+        let plain_name = self.buffer_manager.get(active).is_some_and(|buffer| {
+            let name = buffer.file.as_deref().unwrap_or_default();
+            let name = std::path::Path::new(name);
+            name.extension().is_none_or(|ext| {
+                ext.eq_ignore_ascii_case("txt") || ext.eq_ignore_ascii_case("text")
+            })
+        });
+        let plain = plain_name
+            && self
+                .configured_indentation_for_buffer_index(active)
+                .is_none()
+            && self
+                .highlight_language_id_for_buffer_index(active)
+                .is_none();
         self.felix.indent.entry(id.0).or_insert_with(|| {
-            felix_core::detect_indent(text)
-                .unwrap_or_else(|| indentation.whitespace_for_columns(indentation.shift_width))
+            felix_core::detect_indent(text).unwrap_or_else(|| {
+                if plain {
+                    "\t".into()
+                } else {
+                    indentation.whitespace_for_columns(indentation.shift_width)
+                }
+            })
         });
         let mut language = FelixLanguageEdit {
             tab_width: indentation.tab_width,
@@ -3389,6 +3412,19 @@ mod tests {
     #[tokio::test]
     async fn felix_native_comments_match_reference_at_every_key() {
         replay_suite(include_str!("../../scripts/felix/fixtures/comments.json")).await;
+    }
+
+    #[tokio::test]
+    async fn plain_text_indents_with_a_tab_and_languages_keep_their_width() {
+        let (mut editor, _, _) = fixture_editor("hello\n");
+        chars(&mut editor, ">").await;
+        assert_eq!(editor.current_buffer().contents(), "\thello\n");
+        let (mut editor, _, _) = named_fixture_editor("example.py", "hello\n");
+        chars(&mut editor, ">").await;
+        assert_eq!(editor.current_buffer().contents(), "    hello\n");
+        let (mut editor, _, _) = fixture_editor("a\n  b\n");
+        chars(&mut editor, ">").await;
+        assert_eq!(editor.current_buffer().contents(), "  a\n  b\n");
     }
 
     #[tokio::test]

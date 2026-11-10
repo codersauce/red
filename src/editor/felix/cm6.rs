@@ -8,7 +8,7 @@
 use super::macros::terminal_key;
 use super::tests::fixture_editor;
 use super::*;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 fn key_events(keys: &str) -> Result<Vec<Event>, String> {
     Ok(felix_core::parse_keys(keys)?

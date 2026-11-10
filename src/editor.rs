@@ -7574,24 +7574,22 @@ impl Editor {
     }
 
     fn indentation_for_buffer_index(&self, buffer_index: usize) -> Indentation {
+        self.configured_indentation_for_buffer_index(buffer_index)
+            .unwrap_or_else(|| Indentation::new(4, 4, true))
+    }
+
+    /// Indentation configured for the buffer's language or file type, if any.
+    fn configured_indentation_for_buffer_index(&self, buffer_index: usize) -> Option<Indentation> {
         if let Some(language) = self.highlight_language_id_for_buffer_index(buffer_index) {
             if let Some(indentation) = self.indentation.get(&language) {
-                return *indentation;
+                return Some(*indentation);
             }
         }
         let file_type = self
             .buffer_manager
             .get(buffer_index)
-            .and_then(|buffer| buffer.file_type());
-
-        let Some(file_type) = file_type.as_deref() else {
-            return Indentation::new(4, 4, true);
-        };
-
-        self.indentation
-            .get(file_type)
-            .copied()
-            .unwrap_or_else(|| Indentation::new(4, 4, true))
+            .and_then(|buffer| buffer.file_type())?;
+        self.indentation.get(file_type.as_str()).copied()
     }
 
     fn tab_width_for_buffer_index(&self, buffer_index: usize) -> usize {
