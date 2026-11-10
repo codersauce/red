@@ -22,13 +22,12 @@ mod agent_edit_decision;
 mod agent_events;
 mod agent_lsp;
 pub use agent_edit_decision::AgentUnsavedChoice;
-mod agent_manager;
-mod agent_models;
+pub(crate) mod agent_manager;
+pub(crate) mod agent_models;
 pub(crate) mod agent_pane;
 mod agent_pane_host;
-#[cfg(test)]
-mod agent_payload_goldens;
-mod agent_sessions;
+pub(crate) mod agent_payloads;
+pub(crate) mod agent_sessions;
 mod buffer_actions;
 mod buffer_do;
 mod buffer_manager;
@@ -92,7 +91,6 @@ use std::{
     fmt::Write as _,
     fs,
     io::Write as _,
-    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -135,10 +133,6 @@ use crate::{
     },
     buffer::{Buffer, BufferId, ExternalFileChange, SearchMatch, SyntaxSelection},
     clipboard::{ClipboardProvider, CopyOutcome, DisabledClipboardProvider, SessionClipboard},
-    codex::{
-        start_codex, AgentRuntimePolicy, CodexBridge, CodexCommand, CodexEvent, CodexProcessSpec,
-        ToolHostAdapter,
-    },
     color::Color,
     command,
     command_completion::{self, CommandCompletionState, CompletionDirection},
@@ -272,8 +266,7 @@ const MAX_MARKDOWN_FENCE_LOOKBACK_LINES: usize = 256;
 const MAX_SEARCH_HISTORY_ENTRIES: usize = 6;
 const MAX_SEARCH_HISTORY_MATCHES_PER_ENTRY: usize = 16_384;
 const MAX_PLUGIN_VIEWPORT_LINE_CHARS: usize = 64 * 1024;
-const MAX_AGENT_FAILURE_MESSAGE_CHARS: usize = 2048;
-const AGENT_BRIDGE_CAPACITY: usize = 64;
+const AGENT_TOOL_REQUEST_CAPACITY: usize = 64;
 const PLUGIN_MANAGER_PICKER_ID: i32 = 9_101;
 const PLUGIN_MANAGER_ACTION_PICKER_ID: i32 = 9_102;
 const PLUGIN_MANAGER_INSTALL_PICKER_ID: i32 = 9_103;
@@ -1330,7 +1323,7 @@ fn plugin_inlay_hints_error(request_id: RequestId, message: &str) -> Value {
     })
 }
 
-fn plugin_json(value: Value) -> Value {
+pub(crate) fn plugin_json(value: Value) -> Value {
     match value {
         Value::Array(values) => Value::Array(values.into_iter().map(plugin_json).collect()),
         Value::Object(values) => Value::Object(
@@ -1397,158 +1390,6 @@ fn render_marked_string(marked: MarkedString) -> String {
             format!("{fence}{language}\n{value}\n{fence}")
         }
     }
-}
-
-fn agent_event_payload(event: CodexEvent) -> (&'static str, Value) {
-    match event {
-        CodexEvent::InlineContextRead { request_id, .. } => (
-            "inline_assist:context_read",
-            json!({ "request_id": request_id }),
-        ),
-        CodexEvent::InlineAnswerDelta { request_id, .. } => {
-            ("inline_assist:answer", json!({ "request_id": request_id }))
-        }
-        CodexEvent::InlineSessionCreated {
-            request_id,
-            session_id,
-        } => (
-            "inline_assist:session_created",
-            json!({ "request_id": request_id, "session_id": session_id }),
-        ),
-        CodexEvent::InlineResult {
-            request_id,
-            session_id,
-            ..
-        } => (
-            "inline_assist:result",
-            json!({ "request_id": request_id, "session_id": session_id }),
-        ),
-        CodexEvent::InlineFailed {
-            request_id,
-            session_id,
-            message,
-        } => (
-            "inline_assist:error",
-            json!({ "request_id": request_id, "session_id": session_id, "message": message }),
-        ),
-        CodexEvent::ModelRequestCompleted { .. } => {
-            unreachable!("model results use private callbacks")
-        }
-        CodexEvent::SessionListCompleted { .. } => {
-            unreachable!("session-list results use private callbacks")
-        }
-        CodexEvent::SessionPreviewCompleted { .. } => {
-            unreachable!("session-preview results use private callbacks")
-        }
-        CodexEvent::SessionModelRerouted { session_id, model } => (
-            "agent:model_rerouted",
-            json!({"session_id": session_id, "model": model}),
-        ),
-        CodexEvent::SessionModelChanged {
-            session_id,
-            model_info,
-        } => (
-            "agent:model_changed",
-            json!({ "session_id": session_id, "model_info": model_info }),
-        ),
-        CodexEvent::SessionCreated { session_id } => (
-            "agent:session_created",
-            json!({ "session_id": session_id.to_string() }),
-        ),
-        CodexEvent::CommitMessageGenerated { request_id, result } => (
-            "agent:error",
-            json!({
-                "message": format!(
-                    "commit-message generation result {request_id} escaped its private callback: {result:?}"
-                )
-            }),
-        ),
-        CodexEvent::SessionRestored { .. } => {
-            unreachable!("restored history is reconciled into a snapshot before notification")
-        }
-        CodexEvent::SessionRestoreFailed {
-            session_id,
-            message,
-        } => (
-            "agent:session_restore_failed",
-            json!({ "session_id": session_id, "message": message }),
-        ),
-        CodexEvent::Update { session_id, text } => (
-            "agent:update",
-            json!({ "session_id": session_id.to_string(), "text": text }),
-        ),
-        CodexEvent::MessageCompleted { session_id, text } => (
-            "agent:message_completed",
-            json!({ "session_id": session_id, "text": text }),
-        ),
-        CodexEvent::TurnAccepted { .. } => {
-            unreachable!("turn acceptance is not reported to plugins")
-        }
-        CodexEvent::Activity { session_id, update } => (
-            "agent:activity",
-            json!({
-                "session_id": session_id.to_string(),
-                "update": plugin_json(serde_json::to_value(update).expect("agent payloads serialize")),
-            }),
-        ),
-        CodexEvent::Completed {
-            session_id,
-            stop_reason,
-        } => (
-            "agent:completed",
-            json!({
-                "session_id": session_id.to_string(),
-                "stop_reason": stop_reason,
-            }),
-        ),
-        CodexEvent::Cancelled { session_id } => (
-            "agent:cancelled",
-            json!({ "session_id": session_id.to_string() }),
-        ),
-        CodexEvent::CancelFailed {
-            session_id,
-            message,
-        } => (
-            "agent:cancel_failed",
-            json!({ "session_id": session_id.to_string(), "message": message }),
-        ),
-        CodexEvent::PermissionRequested {
-            request_id,
-            session_id,
-            tool_call,
-            options,
-        } => (
-            "agent:permission_requested",
-            plugin_json(json!({
-                "request_id": request_id,
-                "session_id": session_id.to_string(),
-                "tool_call": tool_call,
-                "options": options,
-            })),
-        ),
-        CodexEvent::Failed {
-            session_id,
-            message,
-        } => (
-            "agent:error",
-            json!({
-                "session_id": session_id.map(|session_id| session_id.to_string()),
-                "message": message,
-            }),
-        ),
-    }
-}
-
-fn bounded_agent_failure_message(message: &str) -> String {
-    if message.chars().count() <= MAX_AGENT_FAILURE_MESSAGE_CHARS {
-        return message.to_string();
-    }
-    let mut bounded = message
-        .chars()
-        .take(MAX_AGENT_FAILURE_MESSAGE_CHARS)
-        .collect::<String>();
-    bounded.push_str("… (full details are in the Red log)");
-    bounded
 }
 
 struct AgentFilePage {
@@ -5944,7 +5785,11 @@ impl Editor {
         let lsp_coordinator = lsp_coordinator::LspCoordinator::with_buffers(&buffers);
         let buffer_manager = buffer_manager::BufferManager::with_buffers(buffers);
         let session_manager = session_manager::SessionManager::new();
-        let agent_manager = agent_manager::AgentManager::new();
+        let (tool_sender, tool_requests) = editor_tool_channel(AGENT_TOOL_REQUEST_CAPACITY);
+        let agent_manager = agent_manager::AgentManager::new(
+            crate::agent_backend::open(&config.agent, EditorToolHost::new(tool_sender)),
+            tool_requests,
+        );
         let whats_new_startup_pending = preferences.is_persistent()
             && config.show_whats_new.unwrap_or(true)
             && preferences.last_seen_version() != Some(env!("CARGO_PKG_VERSION"));
@@ -10239,9 +10084,7 @@ impl Editor {
             .as_ref()
             .and_then(|assist| assist.session_id.clone())
         {
-            if let Some(bridge) = self.agent_manager.bridge() {
-                let _ = bridge.try_send(CodexCommand::CloseSession { session_id });
-            }
+            self.agent_manager.close_session(session_id);
         }
         self.inline_assist = None;
         self.current_dialog = None;
@@ -11602,8 +11445,7 @@ impl Editor {
         self.shell_commands.cancel_all();
         // Closing the command channel starts agent shutdown immediately. Its
         // process can exit while we persist state and deactivate plugins.
-        drop(self.agent_manager.take_bridge());
-        let agent_task = self.agent_manager.take_task();
+        let agent_exit = self.agent_manager.agents_mut().detach_for_exit();
         let before_exit = perf::PerfSpan::start("shutdown:before_exit");
         let snapshot = self.editor_state_snapshot();
         if let Err(err) = self.plugin_registry.before_exit(runtime, snapshot).await {
@@ -11643,21 +11485,14 @@ impl Editor {
         self.companion_manager.lock().await.shutdown().await;
         drop(companions);
         let _agent = perf::PerfSpan::start("shutdown:agent_wait");
-        if let Some(task) = agent_task {
-            match task.await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => log!("Codex app-server shutdown failed: {error}"),
-                Err(error) => log!("Codex app-server task failed: {error}"),
-            }
+        if let Some(exit) = agent_exit {
+            exit.await;
         }
     }
 
-    fn abort_agent_bridge(&mut self) {
-        self.stop_inline_agent_outcomes("Agent session closed.");
-        drop(self.agent_manager.take_bridge());
-        if let Some(task) = self.agent_manager.take_task() {
-            task.abort();
-        }
+    /// Forgets what the editor tracked about an agent that is not running.
+    fn reset_agent_state(&mut self, reason: &str) {
+        self.stop_inline_agent_outcomes(reason);
         self.agent_manager.clear_active_sessions();
         self.agent_manager.clear_turns();
         self.agent_manager.clear_tool_requests();
@@ -11667,7 +11502,7 @@ impl Editor {
     async fn restore_agent_plugin_state(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {
         if let Some(conversation) = self.agent_manager.conversation_snapshot() {
             let adopted_age = self.take_adopted_agent_conversation_age();
-            if let Some(age) = adopted_age.filter(|_| !self.agent_manager.has_bridge()) {
+            if let Some(age) = adopted_age.filter(|_| !self.agent_manager.is_running()) {
                 // Saved by an earlier launch: resumed when the pane opens or the
                 // next message is sent, so an unused agent never starts Codex.
                 let mut payload = plugin_json(serde_json::to_value(conversation)?);
@@ -11676,7 +11511,7 @@ impl Editor {
                     .await?;
                 return Ok(());
             }
-            let event = if self.agent_manager.has_bridge() {
+            let event = if self.agent_manager.is_running() {
                 "agent:session_restored"
             } else {
                 "agent:conversation_restore_pending"
@@ -11716,79 +11551,6 @@ impl Editor {
                 serde_json::to_value(snapshot)?,
             )
             .await
-    }
-
-    async fn finish_agent_bridge(
-        &mut self,
-        runtime: &mut Runtime,
-        fallback: &str,
-    ) -> anyhow::Result<String> {
-        let result = match self.agent_manager.take_task() {
-            Some(task) => Some(task.await),
-            None => None,
-        };
-        self.stop_inline_agent_outcomes(fallback);
-        self.abandon_agent_edit_decision(None, "the Codex app-server stopped");
-        drop(self.agent_manager.take_bridge());
-        self.agent_manager.clear_active_sessions();
-        // Prompts held behind a stopping turn were never sent; return them to the
-        // pane instead of letting a dead app-server swallow them.
-        for (session_id, prompts) in self.agent_manager.take_all_queued_prompts() {
-            self.notify_agent(
-                runtime,
-                "agent:prompts_returned",
-                json!({ "session_id": session_id, "prompts": prompts }),
-            )
-            .await?;
-        }
-        self.agent_manager.clear_turns();
-        self.agent_manager.clear_tool_requests();
-        self.agent_manager.set_root(None);
-
-        let message = match result {
-            Some(Ok(Err(error))) => {
-                let details = format!("{error:#}");
-                log!("Codex app-server task failed: {details}");
-                format!("Codex app-server failed: {details}")
-            }
-            Some(Err(error)) if !error.is_cancelled() => {
-                log!("Codex app-server task failed: {error}");
-                format!("Codex app-server task failed: {error}")
-            }
-            Some(Ok(Ok(()))) | Some(Err(_)) | None => fallback.to_string(),
-        };
-        let message = bounded_agent_failure_message(&message);
-        self.fail_running_inline_jobs(&message);
-        // Every shutdown path must resolve metadata callbacks, including a
-        // request that replaces a failed bridge before the background tick.
-        for request_id in self.agent_manager.take_pending_model_requests() {
-            self.plugin_registry
-                .resolve_request(
-                    runtime,
-                    RequestId::from_raw(request_id),
-                    json!({"error": message.clone()}),
-                )
-                .await?;
-        }
-        for request_id in self.agent_manager.take_pending_session_requests() {
-            self.plugin_registry
-                .resolve_request(
-                    runtime,
-                    RequestId::from_raw(request_id),
-                    json!({"sessions": [], "error": message.clone()}),
-                )
-                .await?;
-        }
-        for request_id in self.agent_manager.take_pending_session_previews() {
-            self.plugin_registry
-                .resolve_request(
-                    runtime,
-                    RequestId::from_raw(request_id),
-                    agent_sessions::session_preview_payload(&Err(message.clone())),
-                )
-                .await?;
-        }
-        Ok(message)
     }
 
     /// Runs an agent editor tool whose follow-mode dwell has elapsed and answers it.
@@ -11932,17 +11694,17 @@ impl Editor {
         self.plugin_registry.poll_hot_reload(runtime).await;
         self.render_dirty_rpc_statusline(buffer)?;
 
-        for _ in 0..AGENT_EVENTS_PER_TICK {
-            let Some(event) = self
-                .agent_manager
-                .bridge_mut()
-                .and_then(CodexBridge::try_recv)
-            else {
+        let mut agent_events = 0;
+        while agent_events < AGENT_EVENTS_PER_TICK {
+            let Some(event) = self.agent_manager.agents_mut().poll() else {
                 break;
             };
+            agent_events += 1;
             self.handle_agent_event(buffer, runtime, event).await?;
         }
-        self.handle_agent_worker_loss(buffer, runtime).await?;
+        // A saturated pump left events behind. Plugin requests wait for the
+        // next tick so they never act on state the agent already moved past.
+        let agent_backlog = agent_events == AGENT_EVENTS_PER_TICK;
 
         self.refresh_live_inline_history(buffer, runtime).await?;
         self.persist_agent_conversation(/*force*/ false);
@@ -12121,7 +11883,7 @@ impl Editor {
         for _ in 0..PLUGIN_REQUESTS_PER_TICK {
             // Boxed so the pane driver does not grow this large future's frame.
             Box::pin(self.drain_agent_pane_effects(runtime)).await?;
-            if self.agent_manager.is_task_finished() {
+            if agent_backlog {
                 break;
             }
             let Some(req) = runtime.try_recv_request() else {
@@ -12252,12 +12014,9 @@ impl Editor {
                     )
                     .await?;
                 }
-                PluginRequest::AgentPermissionResponse {
-                    request_id,
-                    option_id,
-                } => {
-                    self.agent_permission_response(runtime, request_id, option_id)
-                        .await?;
+                PluginRequest::AgentPermissionResponse { request_id, .. } => {
+                    // Agents decline approvals themselves; there is nothing to answer.
+                    log!("Ignoring permission response {request_id}: no approval is pending");
                 }
                 PluginRequest::EditHistory { request_id, scope } => {
                     let scope = if scope.as_deref() == Some("workspace") {
@@ -37791,19 +37550,25 @@ mod test {
 
     #[test]
     fn agent_activity_payload_keeps_structured_updates_with_plugin_keys() {
-        let (name, payload) = agent_event_payload(CodexEvent::Activity {
-            session_id: ("session-1").to_string(),
-            update: crate::agent_backend::types::Activity::ToolFinished(
-                crate::agent_backend::types::ToolActivity {
-                    tool_call_id: "tool-1".into(),
-                    kind: crate::agent_backend::types::ToolKind::Read,
-                    title: "Reading main.rs".into(),
-                    full_title: "Reading /workspace/main.rs".into(),
-                    status: crate::agent_backend::types::ToolStatus::InProgress,
-                    detail: String::new(),
-                },
-            ),
-        });
+        let (name, payload) = agent_payloads::agent_event_payload(
+            &crate::agent_backend::events::Event::Turn(crate::agent_backend::events::TurnEvent {
+                session: crate::agent_backend::ids::SessionId::from_raw("session-1".to_string()),
+                turn: TurnId::mint(),
+                kind: crate::agent_backend::events::TurnEventKind::Activity(
+                    crate::agent_backend::types::Activity::ToolFinished(
+                        crate::agent_backend::types::ToolActivity {
+                            tool_call_id: "tool-1".into(),
+                            kind: crate::agent_backend::types::ToolKind::Read,
+                            title: "Reading main.rs".into(),
+                            full_title: "Reading /workspace/main.rs".into(),
+                            status: crate::agent_backend::types::ToolStatus::InProgress,
+                            detail: String::new(),
+                        },
+                    ),
+                ),
+            }),
+        )
+        .unwrap();
 
         assert_eq!(name, "agent:activity");
         assert_eq!(payload["session_id"], "session-1");
@@ -40111,9 +39876,9 @@ builtin = "rust"
         let mut core = DetachedEditorCore::new(test_editor(/*width*/ 80, /*height*/ 24))
             .await
             .unwrap();
-        let agent = AgentTestHandle::install(&mut core.editor, AGENT_EVENTS_PER_TICK + 1);
+        let agent = AgentTestHandle::install(&mut core.editor);
         for index in 0..=AGENT_EVENTS_PER_TICK {
-            agent.emit_update("session-1", &index.to_string()).await;
+            agent.emit_update("session-1", &index.to_string());
         }
 
         core.input(crate::headless::InputEvent::Key {
@@ -40124,10 +39889,17 @@ builtin = "rust"
         .await
         .unwrap();
 
-        assert_eq!(
-            AgentTestHandle::next_undelivered_update(&mut core.editor).as_deref(),
-            Some(AGENT_EVENTS_PER_TICK.to_string().as_str())
-        );
+        assert_eq!(agent.pending(), 1);
+        let Some(crate::agent_backend::events::Event::Turn(undelivered)) =
+            core.editor.agent_manager.agents_mut().poll()
+        else {
+            panic!("the undelivered event is the last update");
+        };
+        assert!(matches!(
+            undelivered.kind,
+            crate::agent_backend::events::TurnEventKind::Delta(text)
+                if text == AGENT_EVENTS_PER_TICK.to_string()
+        ));
         drain_plugin_requests();
     }
 
@@ -40176,13 +39948,14 @@ builtin = "rust"
             .await
             .unwrap();
         let event_count = AGENT_EVENTS_PER_TICK + 8;
-        let agent = AgentTestHandle::install(&mut editor, event_count + 1);
+        let agent = AgentTestHandle::install(&mut editor);
         for index in 0..event_count {
-            agent.emit_update("session-1", &index.to_string()).await;
+            agent.emit_update("session-1", &index.to_string());
         }
-        agent.emit_completed("session-1", "end_turn").await;
+        agent.emit_completed("session-1", "end_turn");
+        agent.open_session();
         editor.agent_manager.mark_session_active("session-1");
-        agent.lose(&mut editor, "fixture adapter exited").await;
+        agent.lose("Codex app-server failed: fixture adapter exited");
         let mut buffer =
             RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
         ACTION_DISPATCHER.send_request(PluginRequest::AgentNewSession {
@@ -40198,8 +39971,11 @@ builtin = "rust"
             .await
             .unwrap();
 
-        assert!(editor.agent_manager.has_bridge());
-        assert!(editor.agent_manager.is_task_finished());
+        assert_eq!(
+            agent.pending(),
+            10,
+            "the 8 updates left, the completion and the loss wait for the next tick"
+        );
         assert!(editor.agent_manager.is_session_active("session-1"));
         assert!(editor.last_error.is_none());
         assert!(matches!(
@@ -40223,8 +39999,7 @@ builtin = "rust"
             .collect::<String>();
         expected.push_str("completed,lost:Codex app-server failed: fixture adapter exited");
         assert_eq!(editor.last_error.as_deref(), Some(expected.as_str()));
-        assert!(!editor.agent_manager.has_bridge());
-        assert!(!editor.agent_manager.is_task_finished());
+        assert!(!editor.agent_manager.is_running());
         assert!(!editor.agent_manager.is_session_active("session-1"));
         drain_plugin_requests();
     }
@@ -40266,15 +40041,15 @@ builtin = "rust"
 
     #[tokio::test]
     async fn prompt_sent_during_a_cancel_runs_after_the_interrupted_turn_ends() {
-        fn prompt_text(command: Option<AgentCommand>) -> Option<String> {
-            match command? {
-                AgentCommand::Prompt { text, .. } => Some(text),
-                _ => None,
-            }
-        }
+        let prompted = |text: &str| {
+            [AgentCommand::Prompt {
+                session: "session-1".to_string(),
+                text: text.to_string(),
+            }]
+        };
         drain_plugin_requests();
         let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
-        let mut agent = AgentTestHandle::install(&mut editor, 8);
+        let agent = AgentTestHandle::install(&mut editor);
         let mut buffer =
             RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
         let mut runtime = Runtime::new();
@@ -40288,10 +40063,7 @@ builtin = "rust"
             .service_background(&mut buffer, &mut runtime)
             .await
             .unwrap();
-        assert_eq!(
-            prompt_text(agent.recv_command().await).as_deref(),
-            Some("first")
-        );
+        assert_eq!(agent.commands(), prompted("first"));
 
         ACTION_DISPATCHER.send_request(PluginRequest::AgentCancel {
             session_id: "session-1".to_string(),
@@ -40300,86 +40072,119 @@ builtin = "rust"
             .service_background(&mut buffer, &mut runtime)
             .await
             .unwrap();
-        assert!(matches!(
-            agent.recv_command().await,
-            Some(AgentCommand::Stop { .. })
-        ));
-        // The worker acknowledges the cancel before Codex finishes the turn.
-        agent.emit_cancelled("session-1").await;
+        assert_eq!(
+            agent.commands(),
+            [AgentCommand::Stop {
+                session: "session-1".to_string()
+            }]
+        );
+        // The agent acknowledges the stop before it finishes the turn.
+        agent.emit_cancelled("session-1");
         ACTION_DISPATCHER.send_request(prompt("second"));
         editor
             .service_background(&mut buffer, &mut runtime)
             .await
             .unwrap();
-        assert!(
-            agent.no_command_within(Duration::from_millis(20)).await,
+        assert_eq!(
+            agent.commands(),
+            [],
             "the follow-up must wait for the interrupted turn to end"
         );
-        // A rejected interrupt leaves the turn running, so the prompt keeps waiting.
-        agent
-            .emit_cancel_failed("session-1", "interrupt rejected")
-            .await;
+        // A rejected stop leaves the turn running, so the prompt keeps waiting.
+        agent.emit_cancel_failed("session-1", "interrupt rejected");
         editor
             .service_background(&mut buffer, &mut runtime)
             .await
             .unwrap();
-        assert!(
-            agent.no_command_within(Duration::from_millis(20)).await,
+        assert_eq!(
+            agent.commands(),
+            [],
             "a failed cancel must not release the held follow-up"
         );
         assert!(editor.agent_manager.is_session_busy("session-1"));
 
-        agent.emit_completed("session-1", "interrupted").await;
+        agent.emit_completed("session-1", "interrupted");
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert_eq!(agent.commands(), prompted("second"));
+        assert!(editor.agent_manager.is_session_active("session-1"));
+        drain_plugin_requests();
+    }
+
+    #[tokio::test]
+    async fn a_lost_session_returns_its_prompts_and_leaves_the_others_running() {
+        drain_plugin_requests();
+        let plugin_root = tempfile::tempdir().unwrap();
+        let plugin = plugin_root.path().join("session-loss-recorder.hk");
+        std::fs::write(
+            &plugin,
+            r#"
+                pub fn activate() {
+                    red::state_set("trace", "");
+                    red::on("agent:prompts_returned", returned);
+                    red::on("agent:session_lost", lost);
+                }
+
+                fn returned(event: Json) {
+                    red::state_set(
+                        "trace",
+                        red::string(red::state("trace"), "")
+                            + "returned:" + red::string(event.session_id, "") + ","
+                    );
+                }
+
+                fn lost(event: Json) {
+                    red::execute(
+                        "Print",
+                        red::string(red::state("trace"), "")
+                            + "lost:" + red::string(event.session_id, "")
+                            + ":" + red::string(event.message, "")
+                    );
+                }
+            "#,
+        )
+        .unwrap();
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let mut runtime = Runtime::new();
+        editor
+            .plugin_registry
+            .add("session_loss_recorder", plugin.to_string_lossy().as_ref());
+        editor
+            .plugin_registry
+            .initialize(&mut runtime)
+            .await
+            .unwrap();
+        let agent = AgentTestHandle::install(&mut editor);
+        editor.agent_manager.mark_session_active("doomed");
+        editor.agent_manager.begin_stopping("doomed");
+        editor.agent_manager.queue_prompt(
+            "doomed",
+            agent_manager::QueuedAgentPrompt {
+                text: "held".to_string(),
+                context: None,
+            },
+        );
+        editor.agent_manager.mark_session_active("survivor");
+        agent.lose_session("doomed", "the session crashed");
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
+
         editor
             .service_background(&mut buffer, &mut runtime)
             .await
             .unwrap();
 
         assert_eq!(
-            prompt_text(agent.recv_command().await).as_deref(),
-            Some("second")
+            editor.last_error.as_deref(),
+            Some("returned:doomed,lost:doomed:the session crashed")
         );
-        assert!(editor.agent_manager.is_session_active("session-1"));
-        drain_plugin_requests();
-    }
-
-    #[tokio::test]
-    async fn stale_permission_does_not_block_input_while_a_prompt_is_queued() {
-        drain_plugin_requests();
-        let mut core = DetachedEditorCore::new(test_editor(/*width*/ 80, /*height*/ 24))
-            .await
-            .unwrap();
-        let mut agent = AgentTestHandle::install_with_queued_prompt(
-            &mut core.editor,
-            "stalled-session",
-            "queued prompt",
-        )
-        .await;
-        agent
-            .emit_stale_permission("stale-permission", "stalled-session")
-            .await;
-
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            core.input(crate::headless::InputEvent::Key {
-                code: crate::headless::KeyCode::Character('h'),
-                modifiers: Vec::new(),
-                key_kind: crate::headless::KeyKind::Press,
-            }),
-        )
-        .await
-        .expect("a stale permission must not block editor input")
-        .unwrap();
-
-        assert!(core.editor.current_dialog.is_none());
-        assert!(matches!(
-            agent.recv_command().await,
-            Some(AgentCommand::Prompt { session, text })
-                if session == "stalled-session" && text == "queued prompt"
-        ));
-        // The denial of the stale request follows the prompt in the queue.
-        assert_eq!(agent.recv_command().await, Some(AgentCommand::Other));
-        assert!(agent.no_command_within(Duration::from_millis(20)).await);
+        assert!(editor.agent_manager.is_running());
+        assert!(!editor.agent_manager.is_session_active("doomed"));
+        assert!(editor.agent_manager.is_session_active("survivor"));
+        assert!(agent.commands().is_empty());
         drain_plugin_requests();
     }
 
@@ -42623,11 +42428,7 @@ builtin = "rust"
         let store = SessionStore::new(directory.path().join("session"));
         let latest = store.latest_path();
         editor.set_session_store(store);
-        let (release, wait) = tokio::sync::oneshot::channel();
-        editor.agent_manager.set_task(tokio::spawn(async move {
-            wait.await?;
-            Ok(())
-        }));
+        let release = AgentTestHandle::install(&mut editor).hold_exit();
         let mut runtime = Runtime::new();
 
         let (result, ()) = tokio::join!(editor.finish_interactive(&mut runtime), async {

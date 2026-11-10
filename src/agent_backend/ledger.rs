@@ -131,11 +131,18 @@ impl<B: AgentBackend> Ledger<B> {
         self.backlog.len()
     }
 
-    /// Applies the loss rule to a command result.
-    fn settle<T>(&mut self, result: Result<T, AgentError>) -> Result<T, AgentError> {
+    /// Runs a command on the backend and applies the loss rule to its result.
+    /// A `Gone` only costs the backend its worker when one was running: a
+    /// command refused because nothing was started is the caller's to report.
+    fn run<T>(
+        &mut self,
+        command: impl FnOnce(&mut B) -> Result<T, AgentError>,
+    ) -> Result<T, AgentError> {
+        let was_running = self.is_running();
+        let result = command(&mut self.inner);
         match &result {
             Ok(_) => self.lost = false,
-            Err(AgentError::Gone(message)) if !self.lost => {
+            Err(AgentError::Gone(message)) if was_running => {
                 self.lose(LostScope::Backend, message.clone());
             }
             Err(_) => {}
@@ -143,14 +150,14 @@ impl<B: AgentBackend> Ledger<B> {
         result
     }
 
-    /// Settles a query command and opens the query when it was accepted.
-    fn settle_query(
+    /// Runs a query command and opens the query when it was accepted.
+    fn run_query(
         &mut self,
         id: QueryId,
         kind: QueryKind,
-        result: Result<(), AgentError>,
+        command: impl FnOnce(&mut B) -> Result<(), AgentError>,
     ) -> Result<(), AgentError> {
-        self.settle(result)?;
+        self.run(command)?;
         self.note_use(match kind {
             QueryKind::CommitMessage => WorkerUse::Conversations,
             QueryKind::DefaultModel
@@ -273,14 +280,6 @@ impl<B: AgentBackend> Ledger<B> {
         }
         self.backlog.push_back(Event::Turn(event));
     }
-
-    fn inline(&mut self) -> Result<&mut dyn InlineAssist, AgentError> {
-        Ok(self.inner.inline_assist()?)
-    }
-
-    fn commit(&mut self) -> Result<&mut dyn CommitMessages, AgentError> {
-        Ok(self.inner.commit_messages()?)
-    }
 }
 
 impl<B: AgentBackend> AgentBackend for Ledger<B> {
@@ -301,8 +300,7 @@ impl<B: AgentBackend> AgentBackend for Ledger<B> {
     }
 
     fn ensure(&mut self, root: &Path) -> Result<(), AgentError> {
-        let result = self.inner.ensure(root);
-        self.settle(result)
+        self.run(|inner| inner.ensure(root))
     }
 
     fn root(&self) -> Option<&Path> {
@@ -310,15 +308,13 @@ impl<B: AgentBackend> AgentBackend for Ledger<B> {
     }
 
     fn new_session(&mut self, cwd: &Path, model: Option<ModelSelection>) -> Result<(), AgentError> {
-        let result = self.inner.new_session(cwd, model);
-        self.settle(result)?;
+        self.run(|inner| inner.new_session(cwd, model))?;
         self.note_session();
         Ok(())
     }
 
     fn restore(&mut self, cwd: &Path, saved: &SavedSession) -> Result<(), AgentError> {
-        let result = self.inner.restore(cwd, saved);
-        self.settle(result)?;
+        self.run(|inner| inner.restore(cwd, saved))?;
         self.note_session();
         Ok(())
     }
@@ -329,8 +325,7 @@ impl<B: AgentBackend> AgentBackend for Ledger<B> {
         turn: TurnId,
         prompt: Prompt,
     ) -> Result<(), AgentError> {
-        let result = self.inner.prompt(session, turn, prompt);
-        self.settle(result)?;
+        self.run(|inner| inner.prompt(session, turn, prompt))?;
         self.open_turn(session.clone(), turn);
         Ok(())
     }
@@ -342,8 +337,7 @@ impl<B: AgentBackend> AgentBackend for Ledger<B> {
         if !running {
             return Ok(());
         }
-        let result = self.inner.stop(session, turn);
-        self.settle(result)
+        self.run(|inner| inner.stop(session, turn))
     }
 
     fn close(&mut self, session: &SessionId) -> Result<(), AgentError> {
@@ -354,18 +348,17 @@ impl<B: AgentBackend> AgentBackend for Ledger<B> {
         {
             open.phase = Phase::Closing;
         }
-        let result = self.inner.close(session);
-        self.settle(result)
+        self.run(|inner| inner.close(session))
     }
 
     fn default_model(&mut self, id: QueryId, cwd: &Path) -> Result<(), AgentError> {
-        let result = self.inner.default_model(id, cwd);
-        self.settle_query(id, QueryKind::DefaultModel, result)
+        self.run_query(id, QueryKind::DefaultModel, |inner| {
+            inner.default_model(id, cwd)
+        })
     }
 
     fn list_models(&mut self, id: QueryId) -> Result<(), AgentError> {
-        let result = self.inner.list_models(id);
-        self.settle_query(id, QueryKind::ListModels, result)
+        self.run_query(id, QueryKind::ListModels, |inner| inner.list_models(id))
     }
 
     fn set_model(
@@ -374,13 +367,15 @@ impl<B: AgentBackend> AgentBackend for Ledger<B> {
         session: &SessionId,
         selection: ModelSelection,
     ) -> Result<(), AgentError> {
-        let result = self.inner.set_model(id, session, selection);
-        self.settle_query(id, QueryKind::SetModel, result)
+        self.run_query(id, QueryKind::SetModel, |inner| {
+            inner.set_model(id, session, selection)
+        })
     }
 
     fn list_sessions(&mut self, id: QueryId, query: SessionQuery) -> Result<(), AgentError> {
-        let result = self.inner.list_sessions(id, query);
-        self.settle_query(id, QueryKind::ListSessions, result)
+        self.run_query(id, QueryKind::ListSessions, |inner| {
+            inner.list_sessions(id, query)
+        })
     }
 
     fn preview_session(
@@ -389,8 +384,9 @@ impl<B: AgentBackend> AgentBackend for Ledger<B> {
         cwd: &Path,
         session: &SessionId,
     ) -> Result<(), AgentError> {
-        let result = self.inner.preview_session(id, cwd, session);
-        self.settle_query(id, QueryKind::PreviewSession, result)
+        self.run_query(id, QueryKind::PreviewSession, |inner| {
+            inner.preview_session(id, cwd, session)
+        })
     }
 
     fn poll(&mut self) -> Option<Event> {
@@ -439,10 +435,7 @@ impl<B: AgentBackend> InlineAssist for Ledger<B> {
         prompt: String,
         context: String,
     ) -> Result<(), AgentError> {
-        let result = self
-            .inline()
-            .and_then(|inline| inline.start(request, cwd, prompt, context));
-        self.settle(result)?;
+        self.run(|inner| inner.inline_assist()?.start(request, cwd, prompt, context))?;
         self.note_use(WorkerUse::Conversations);
         Ok(())
     }
@@ -454,10 +447,11 @@ impl<B: AgentBackend> InlineAssist for Ledger<B> {
         prompt: String,
         context: String,
     ) -> Result<(), AgentError> {
-        let result = self
-            .inline()
-            .and_then(|inline| inline.followup(request, session, prompt, context));
-        self.settle(result)?;
+        self.run(|inner| {
+            inner
+                .inline_assist()?
+                .followup(request, session, prompt, context)
+        })?;
         self.note_use(WorkerUse::Conversations);
         Ok(())
     }
@@ -465,10 +459,9 @@ impl<B: AgentBackend> InlineAssist for Ledger<B> {
 
 impl<B: AgentBackend> CommitMessages for Ledger<B> {
     fn generate(&mut self, id: QueryId, cwd: &Path, prompt: String) -> Result<(), AgentError> {
-        let result = self
-            .commit()
-            .and_then(|commit| commit.generate(id, cwd, prompt));
-        self.settle_query(id, QueryKind::CommitMessage, result)
+        self.run_query(id, QueryKind::CommitMessage, |inner| {
+            inner.commit_messages()?.generate(id, cwd, prompt)
+        })
     }
 }
 
@@ -998,6 +991,18 @@ mod tests {
             ]
         );
         assert_turn_discipline(&events);
+    }
+
+    #[test]
+    fn a_gone_command_on_a_backend_that_was_not_running_queues_no_loss() {
+        let (mut ledger, script) = ledger();
+        script.lose("boom");
+        script.fail_next(gone("No agent session is running"));
+        assert!(matches!(
+            ledger.list_models(QueryId(1)),
+            Err(AgentError::Gone(m)) if m == "No agent session is running"
+        ));
+        assert_eq!(drain(&mut ledger), vec![lost("boom", false)]);
     }
 
     #[test]

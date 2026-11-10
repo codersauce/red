@@ -1,6 +1,14 @@
 //! Editor handling of backend events: replies, inline events, session and turn events.
 
+use super::agent_payloads::{session_event_payload, turn_event_payload};
 use super::*;
+use crate::agent_backend::{
+    events::{
+        Delivery, Event, Failure, FailureCause, InlineEvent, Lost, LostScope, QueryKind, ReplyBody,
+        SessionEvent, TurnEnd, TurnEvent, TurnEventKind,
+    },
+    ids::{QueryId, SessionId},
+};
 
 impl Editor {
     /// Applies one backend event to the editor and forwards it to plugins.
@@ -8,159 +16,139 @@ impl Editor {
         &mut self,
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
-        event: CodexEvent,
+        event: Event,
     ) -> anyhow::Result<()> {
-        if matches!(event, CodexEvent::TurnAccepted { .. }) {
-            // The pane does not read acceptance yet.
-            return Ok(());
+        match event {
+            Event::Reply { id, kind, result } => self.agent_reply(runtime, id, kind, result).await,
+            Event::Inline(event) => self.handle_agent_inline_event(buffer, runtime, event).await,
+            Event::Session(event) => {
+                self.handle_agent_session_event(buffer, runtime, event)
+                    .await
+            }
+            Event::Turn(event) => self.handle_agent_turn_event(buffer, runtime, event).await,
+            Event::Lost(lost) => self.handle_agent_loss(buffer, runtime, lost).await,
         }
-        let event = match event {
-            CodexEvent::ModelRequestCompleted { request_id, result } => {
-                return self.agent_model_reply(runtime, request_id, &result).await;
+    }
+
+    /// Resolves the plugin callback a query was opened for.
+    async fn agent_reply(
+        &mut self,
+        runtime: &mut Runtime,
+        id: QueryId,
+        kind: QueryKind,
+        result: Result<ReplyBody, String>,
+    ) -> anyhow::Result<()> {
+        let payload = match result {
+            Ok(ReplyBody::Model(model)) => agent_models::model_result_payload(&Ok(model)),
+            Ok(ReplyBody::Sessions(page)) => agent_sessions::session_result_payload(&Ok(page)),
+            Ok(ReplyBody::Preview(preview)) => {
+                agent_sessions::session_preview_payload(&Ok(preview))
             }
-            CodexEvent::SessionListCompleted { request_id, result } => {
-                return self
-                    .agent_session_list_reply(runtime, request_id, &result)
-                    .await;
-            }
-            CodexEvent::SessionPreviewCompleted { request_id, result } => {
-                return self
-                    .agent_session_preview_reply(runtime, request_id, &result)
-                    .await;
-            }
-            CodexEvent::CommitMessageGenerated { request_id, result } => {
-                return self
-                    .agent_commit_message_reply(runtime, request_id, &result)
-                    .await;
-            }
-            CodexEvent::InlineContextRead {
-                request_id,
+            Ok(ReplyBody::CommitMessage(message)) => json!({ "message": message, "error": "" }),
+            Err(error) => match kind {
+                QueryKind::DefaultModel | QueryKind::ListModels | QueryKind::SetModel => {
+                    agent_models::model_result_payload(&Err(error))
+                }
+                QueryKind::ListSessions => agent_sessions::session_result_payload(&Err(error)),
+                QueryKind::PreviewSession => agent_sessions::session_preview_payload(&Err(error)),
+                QueryKind::CommitMessage => json!({ "message": "", "error": error }),
+            },
+        };
+        self.plugin_registry
+            .resolve_request(runtime, RequestId::from_raw(id.0), payload)
+            .await?;
+        Ok(())
+    }
+
+    async fn handle_agent_inline_event(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+        event: InlineEvent,
+    ) -> anyhow::Result<()> {
+        match event {
+            InlineEvent::ContextRead {
+                request,
                 description,
-            } => {
-                self.agent_inline_context_read(request_id, description);
-                return Ok(());
+            } => self.agent_inline_context_read(request, description),
+            InlineEvent::AnswerDelta { request, text } => {
+                self.agent_inline_answer_delta(request, text);
             }
-            CodexEvent::InlineAnswerDelta { request_id, text } => {
-                self.agent_inline_answer_delta(request_id, text);
-                return Ok(());
+            InlineEvent::SessionCreated { request, session } => {
+                self.agent_inline_session_created(request, session.to_string());
             }
-            CodexEvent::InlineSessionCreated {
-                request_id,
-                session_id,
-            } => {
-                self.agent_inline_session_created(request_id, session_id);
-                return Ok(());
-            }
-            CodexEvent::InlineResult {
-                request_id,
-                session_id,
+            InlineEvent::Result {
+                request,
+                session,
                 result,
             } => {
                 return self
-                    .agent_inline_result(buffer, runtime, request_id, session_id, result)
+                    .agent_inline_result(buffer, runtime, request, session.to_string(), result)
                     .await;
             }
-            CodexEvent::InlineFailed {
-                request_id,
-                session_id,
+            InlineEvent::Failed {
+                request,
+                session,
                 message,
             } => {
-                return self.agent_inline_failed(buffer, request_id, session_id, message);
+                return self.agent_inline_failed(
+                    buffer,
+                    request,
+                    session.map(|session| session.to_string()),
+                    message,
+                );
             }
-            event => event,
-        };
+        }
+        Ok(())
+    }
+
+    async fn handle_agent_session_event(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+        event: SessionEvent,
+    ) -> anyhow::Result<()> {
         match &event {
-            CodexEvent::SessionModelChanged {
-                session_id,
-                model_info,
-            } => {
+            SessionEvent::ModelChanged { session, model } => {
                 self.agent_manager
-                    .set_conversation_model(session_id, model_info.clone());
+                    .set_conversation_model(session.as_str(), model.clone());
             }
-            CodexEvent::SessionCreated { session_id } => {
+            SessionEvent::Created { session } => {
                 self.agent_manager.take_next_model();
                 let root = self
                     .agent_manager
                     .root()
                     .map(Path::to_path_buf)
                     .unwrap_or_default();
-                self.agent_manager.begin_conversation(session_id, &root);
+                self.agent_manager
+                    .begin_conversation(session.as_str(), &root);
             }
-            CodexEvent::SessionRestored { session_id, thread } => {
+            SessionEvent::Restored { session, history } => {
                 return self
-                    .agent_session_restored(runtime, session_id, thread)
+                    .agent_session_restored(runtime, session.as_str(), history)
                     .await;
             }
-            _ => {}
+            // An error for a session with no turn in flight ends that
+            // session's turn bookkeeping the way a failed turn does.
+            SessionEvent::Failed { session, message } => {
+                let failed = TurnEvent {
+                    session: session.clone(),
+                    turn: TurnId::mint(),
+                    kind: TurnEventKind::End(TurnEnd::Failed(Failure {
+                        message: message.clone(),
+                        cause: FailureCause::Agent,
+                        delivery: Delivery::Unconfirmed,
+                    })),
+                };
+                return self.handle_agent_turn_event(buffer, runtime, failed).await;
+            }
+            SessionEvent::CreateFailed { .. }
+            | SessionEvent::RestoreFailed { .. }
+            | SessionEvent::ModelRerouted { .. } => {}
         }
-        self.handle_agent_turn_event(buffer, runtime, event).await
-    }
-
-    async fn agent_model_reply(
-        &mut self,
-        runtime: &mut Runtime,
-        request_id: i64,
-        result: &Result<crate::agent_backend::types::ModelResult, String>,
-    ) -> anyhow::Result<()> {
-        self.agent_manager.finish_model_request(request_id);
-        self.plugin_registry
-            .resolve_request(
-                runtime,
-                RequestId::from_raw(request_id),
-                agent_models::model_result_payload(result),
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn agent_session_list_reply(
-        &mut self,
-        runtime: &mut Runtime,
-        request_id: i64,
-        result: &Result<crate::agent_backend::types::SessionPage, String>,
-    ) -> anyhow::Result<()> {
-        self.agent_manager.finish_session_request(request_id);
-        self.plugin_registry
-            .resolve_request(
-                runtime,
-                RequestId::from_raw(request_id),
-                agent_sessions::session_result_payload(result),
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn agent_session_preview_reply(
-        &mut self,
-        runtime: &mut Runtime,
-        request_id: i64,
-        result: &Result<crate::agent_backend::types::SessionPreview, String>,
-    ) -> anyhow::Result<()> {
-        self.agent_manager.finish_session_preview(request_id);
-        self.plugin_registry
-            .resolve_request(
-                runtime,
-                RequestId::from_raw(request_id),
-                agent_sessions::session_preview_payload(result),
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn agent_commit_message_reply(
-        &mut self,
-        runtime: &mut Runtime,
-        request_id: i64,
-        result: &Result<String, String>,
-    ) -> anyhow::Result<()> {
-        self.agent_manager.finish_commit_message(request_id);
-        let payload = match result {
-            Ok(message) => json!({ "message": message, "error": "" }),
-            Err(error) => json!({ "message": "", "error": error }),
-        };
-        self.plugin_registry
-            .resolve_request(runtime, RequestId::from_raw(request_id), payload)
-            .await?;
+        if let Some((name, payload)) = session_event_payload(&event) {
+            self.notify_agent(runtime, name, payload).await?;
+        }
         Ok(())
     }
 
@@ -191,8 +179,8 @@ impl Editor {
             if let Some(turn) = self.inline_history.turn_mut(&request_id) {
                 turn.session_id = Some(session_id);
             }
-        } else if let Some(bridge) = self.agent_manager.bridge() {
-            let _ = bridge.try_send(CodexCommand::CloseSession { session_id });
+        } else {
+            self.agent_manager.close_session(session_id);
         }
     }
 
@@ -347,11 +335,7 @@ impl Editor {
         thread: &crate::agent_backend::types::RestoredHistory,
     ) -> anyhow::Result<()> {
         if self.agent_manager.take_forgotten_conversation(session_id) {
-            if let Some(bridge) = self.agent_manager.bridge() {
-                let _ = bridge.try_send(CodexCommand::CloseSession {
-                    session_id: session_id.to_string(),
-                });
-            }
+            self.agent_manager.close_session(session_id);
             return Ok(());
         }
         let root = self
@@ -379,106 +363,88 @@ impl Editor {
         &mut self,
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
-        event: CodexEvent,
+        event: TurnEvent,
     ) -> anyhow::Result<()> {
-        match &event {
-            CodexEvent::Update { session_id, text }
-                if self.agent_manager.is_session_active(session_id) =>
-            {
+        let session_id = event.session.as_str();
+        match &event.kind {
+            // The pane does not read acceptance yet.
+            TurnEventKind::Accepted => return Ok(()),
+            // The loss that ended this turn reports it; the turn's own failure
+            // would only repeat that to the plugin and dispatch queued prompts
+            // into an agent that is gone.
+            TurnEventKind::End(TurnEnd::Failed(Failure {
+                cause: FailureCause::BackendLost,
+                ..
+            })) => return Ok(()),
+            TurnEventKind::Delta(text) if self.agent_manager.is_session_active(session_id) => {
                 self.agent_manager.record_agent_delta(session_id, text);
             }
-            CodexEvent::MessageCompleted { session_id, text }
+            TurnEventKind::MessageDone(text)
                 if self.agent_manager.is_session_active(session_id) =>
             {
                 self.agent_manager.complete_agent_message(session_id, text);
             }
             _ => {}
         }
-        match &event {
-            CodexEvent::Completed { session_id, .. } => self.finish_inline_agent_outcome(
-                session_id,
-                crate::inline_history::InlineAgentState::Completed,
-                None,
-            ),
-            CodexEvent::Cancelled { session_id } => self.finish_inline_agent_outcome(
+        match &event.kind {
+            TurnEventKind::End(TurnEnd::Completed(_) | TurnEnd::Stopped) => self
+                .finish_inline_agent_outcome(
+                    session_id,
+                    crate::inline_history::InlineAgentState::Completed,
+                    None,
+                ),
+            TurnEventKind::StopRequested => self.finish_inline_agent_outcome(
                 session_id,
                 crate::inline_history::InlineAgentState::Cancelled,
                 Some("Agent turn cancelled; any completed writes remain applied."),
             ),
-            CodexEvent::Failed {
-                session_id: Some(session_id),
-                message,
-            } => self.finish_inline_agent_outcome(
+            TurnEventKind::End(TurnEnd::Failed(failure)) => self.finish_inline_agent_outcome(
                 session_id,
                 crate::inline_history::InlineAgentState::Failed,
-                Some(message),
+                Some(&failure.message),
             ),
             _ => {}
         }
-        let ended_turn_id = match &event {
-            CodexEvent::Completed { session_id, .. }
-            | CodexEvent::Cancelled { session_id }
-            | CodexEvent::Failed {
-                session_id: Some(session_id),
-                ..
-            } => self.agent_manager.turn_id(session_id).map(str::to_string),
+        let ended_turn_id = match &event.kind {
+            TurnEventKind::End(_) | TurnEventKind::StopRequested => {
+                self.agent_manager.turn_id(session_id).map(str::to_string)
+            }
             _ => None,
         };
         let mut next_prompt = None;
-        match &event {
-            CodexEvent::Completed { session_id, .. }
-            | CodexEvent::Failed {
-                session_id: Some(session_id),
-                ..
-            } => {
+        match &event.kind {
+            TurnEventKind::End(_) => {
                 next_prompt = self
                     .agent_manager
                     .finish_turn(session_id)
-                    .map(|prompt| (session_id.clone(), prompt));
+                    .map(|prompt| (session_id.to_string(), prompt));
             }
-            CodexEvent::Cancelled { session_id } => {
+            TurnEventKind::StopRequested => {
                 self.agent_manager.mark_session_inactive(session_id);
             }
             _ => {}
         }
-        match &event {
-            CodexEvent::Update { session_id, .. }
-            | CodexEvent::MessageCompleted { session_id, .. }
-            | CodexEvent::Activity { session_id, .. }
-                if !self.agent_manager.is_session_active(session_id) =>
-            {
-                return Ok(());
-            }
-            CodexEvent::PermissionRequested {
-                request_id,
-                session_id,
-                ..
-            } if !self.agent_manager.is_session_active(session_id) => {
-                if let Some(bridge) = self.agent_manager.bridge() {
-                    let _ = bridge.try_send(CodexCommand::PermissionResponse {
-                        request_id: request_id.clone(),
-                        option_id: None,
-                    });
-                }
-                return Ok(());
-            }
-            _ => {}
+        if matches!(
+            event.kind,
+            TurnEventKind::Delta(_) | TurnEventKind::MessageDone(_) | TurnEventKind::Activity(_)
+        ) && !self.agent_manager.is_session_active(session_id)
+        {
+            return Ok(());
         }
-        let turn_elapsed_ms = match &event {
-            CodexEvent::Completed { session_id, .. } => self
+        let turn_elapsed_ms = match &event.kind {
+            TurnEventKind::End(TurnEnd::Completed(_) | TurnEnd::Stopped) => self
                 .agent_manager
                 .elapsed_turn_duration(session_id)
                 .map(|elapsed| elapsed.as_millis() as u64),
-            CodexEvent::Failed {
-                session_id: Some(session_id),
-                ..
-            } => {
+            TurnEventKind::End(TurnEnd::Failed(_)) => {
                 self.agent_manager.discard_turn(session_id);
                 None
             }
             _ => None,
         };
-        let (name, mut payload) = agent_event_payload(event);
+        let Some((name, mut payload)) = turn_event_payload(&event) else {
+            return Ok(());
+        };
         if let (Some(elapsed_ms), Some(object)) = (turn_elapsed_ms, payload.as_object_mut()) {
             object.insert("elapsed_ms".to_string(), json!(elapsed_ms));
         }
@@ -497,65 +463,141 @@ impl Editor {
         Ok(())
     }
 
-    /// Reports a backend worker that exited while no events remain to drain.
-    pub(super) async fn handle_agent_worker_loss(
+    /// The agent, or one of its sessions, ended without the editor asking. The
+    /// backend already closed everything that was open in that scope.
+    async fn handle_agent_loss(
         &mut self,
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
+        lost: Lost,
     ) -> anyhow::Result<()> {
-        if self.agent_manager.is_task_finished()
-            && self
-                .agent_manager
-                .bridge()
-                .is_none_or(|bridge| !bridge.has_pending_events())
-        {
-            let pending_commit_messages = self.agent_manager.take_pending_commit_messages();
-            let model_only_bridge = self.agent_manager.is_model_only_bridge();
-            let inline_scope = self
-                .current_dialog
-                .as_ref()
-                .and_then(|dialog| dialog.inline_assist_state())
-                .and_then(|_| {
-                    self.inline_assist
-                        .as_ref()
-                        .map(|assist| assist.scope.clone())
-                });
-            let message = self
-                .finish_agent_bridge(runtime, "Codex app-server stopped unexpectedly")
+        match lost.scope {
+            LostScope::Backend => {
+                self.handle_agent_backend_loss(buffer, runtime, lost.message, lost.had_sessions)
+                    .await
+            }
+            LostScope::Session(session) => {
+                self.handle_agent_session_loss(runtime, &session, lost.message)
+                    .await
+            }
+        }
+    }
+
+    async fn handle_agent_session_loss(
+        &mut self,
+        runtime: &mut Runtime,
+        session: &SessionId,
+        message: String,
+    ) -> anyhow::Result<()> {
+        let session_id = session.as_str();
+        self.finish_inline_agent_outcome(
+            session_id,
+            crate::inline_history::InlineAgentState::Failed,
+            Some(&message),
+        );
+        self.abandon_agent_edit_decision(Some(session_id), "the agent session stopped");
+        let prompts = self.agent_manager.end_session_turns(session_id);
+        if !prompts.is_empty() {
+            self.notify_agent(
+                runtime,
+                "agent:prompts_returned",
+                json!({ "session_id": session_id, "prompts": prompts }),
+            )
+            .await?;
+        }
+        self.notify_agent(
+            runtime,
+            "agent:session_lost",
+            json!({ "session_id": session_id, "message": message }),
+        )
+        .await
+    }
+
+    async fn handle_agent_backend_loss(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+        message: String,
+        had_sessions: bool,
+    ) -> anyhow::Result<()> {
+        let context = self.agent_manager.take_loss_context();
+        let inline_scope = self
+            .current_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.inline_assist_state())
+            .and_then(|_| {
+                self.inline_assist
+                    .as_ref()
+                    .map(|assist| assist.scope.clone())
+            });
+        let name = self.agent_manager.agents().kind().name();
+        self.stop_inline_agent_outcomes(&format!("{name} app-server stopped unexpectedly"));
+        self.abandon_agent_edit_decision(None, &format!("the {name} app-server stopped"));
+        self.agent_manager.clear_active_sessions();
+        // Prompts held behind a stopping turn were never sent; return them to the
+        // pane instead of letting a dead agent swallow them.
+        for (session_id, prompts) in self.agent_manager.take_all_queued_prompts() {
+            self.notify_agent(
+                runtime,
+                "agent:prompts_returned",
+                json!({ "session_id": session_id, "prompts": prompts }),
+            )
+            .await?;
+        }
+        self.agent_manager.clear_turns();
+        self.agent_manager.clear_tool_requests();
+        self.agent_manager.set_root(None);
+        self.fail_running_inline_jobs(&message);
+        match context {
+            Some(agent_manager::AgentLossContext::Prompt { session_id, prompt }) => {
+                self.notify_agent(
+                    runtime,
+                    "agent:session_lost",
+                    json!({
+                        "session_id": session_id,
+                        "prompt": prompt,
+                        "message": message
+                    }),
+                )
                 .await?;
-            for request_id in pending_commit_messages {
-                self.plugin_registry
-                    .resolve_request(
-                        runtime,
-                        RequestId::from_raw(request_id),
-                        json!({ "message": "", "error": message.clone() }),
-                    )
+            }
+            Some(agent_manager::AgentLossContext::NewSession) => {
+                self.notify_agent(runtime, "agent:session_lost", json!({ "message": message }))
                     .await?;
             }
-            if let Some(scope) = inline_scope {
-                if let Some(assist) = self.inline_assist.as_mut() {
-                    assist.session_id = None;
-                }
-                self.current_dialog =
-                    Some(Box::new(self.inline_assist_popup(
+            Some(agent_manager::AgentLossContext::Restore { session_id }) => {
+                self.notify_agent(
+                    runtime,
+                    "agent:session_restore_failed",
+                    json!({ "session_id": session_id, "message": message }),
+                )
+                .await?;
+            }
+            None => {
+                if let Some(scope) = inline_scope {
+                    if let Some(assist) = self.inline_assist.as_mut() {
+                        assist.session_id = None;
+                    }
+                    self.current_dialog = Some(Box::new(self.inline_assist_popup(
                         scope,
                         InlineAssistPopupState::Failed(message.clone()),
                     )));
-                self.render(buffer)?;
-            }
-            if let Some(conversation) = self.agent_manager.conversation_snapshot() {
-                self.notify_agent(
-                    runtime,
-                    "agent:conversation_restore_pending",
-                    plugin_json(serde_json::to_value(conversation)?),
-                )
-                .await?;
-                self.set_legacy_message(Some(format!(
-                    "{message}; restoring the persisted agent session"
-                )));
-            } else if !model_only_bridge {
-                self.notify_agent(runtime, "agent:session_lost", json!({ "message": message }))
+                    self.render(buffer)?;
+                }
+                if let Some(conversation) = self.agent_manager.conversation_snapshot() {
+                    self.notify_agent(
+                        runtime,
+                        "agent:conversation_restore_pending",
+                        plugin_json(serde_json::to_value(conversation)?),
+                    )
                     .await?;
+                    self.set_legacy_message(Some(format!(
+                        "{message}; restoring the persisted agent session"
+                    )));
+                } else if had_sessions {
+                    self.notify_agent(runtime, "agent:session_lost", json!({ "message": message }))
+                        .await?;
+                }
             }
         }
         Ok(())

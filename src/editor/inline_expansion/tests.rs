@@ -95,10 +95,8 @@ async fn inline_expansion_requires_review_and_applies_as_one_unsaved_undo() {
         )
         .await
         .is_err());
-    let agent = AgentTestHandle::install(&mut editor, 2);
-    agent
-        .emit_inline_result("request", "provider", result)
-        .await;
+    let agent = AgentTestHandle::install(&mut editor);
+    agent.emit_inline_result("request", "provider", result);
     editor
         .service_background(
             &mut RenderBuffer::new(100, 30, &Style::default()),

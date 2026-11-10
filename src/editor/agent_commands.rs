@@ -1,6 +1,11 @@
 //! Editor-side agent commands: every place the editor asks the backend to act.
 
 use super::*;
+use crate::agent_backend::{
+    backend::AgentError,
+    ids::{Continuity, ContractStamp, QueryId, SavedSession, SessionId},
+    types::{EditorContext, Prompt},
+};
 
 impl Editor {
     pub(super) async fn dispatch_agent_prompt(
@@ -10,13 +15,9 @@ impl Editor {
         text: String,
         context: Option<(String, String)>,
     ) -> anyhow::Result<bool> {
-        if self.agent_manager.is_task_finished() {
-            let message = self
-                .finish_agent_bridge(
-                    runtime,
-                    "Codex app-server stopped before the prompt was sent",
-                )
-                .await?;
+        if !self.agent_manager.is_running() {
+            self.reset_agent_state("Agent session closed.");
+            let message = self.agent_not_running_message();
             self.notify_agent(
                 runtime,
                 "agent:session_lost",
@@ -29,22 +30,8 @@ impl Editor {
             .await?;
             return Ok(false);
         }
-        if !self.agent_manager.has_bridge() {
-            self.abort_agent_bridge();
-            self.notify_agent(
-                runtime,
-                "agent:session_lost",
-                json!({
-                    "session_id": session_id,
-                    "prompt": text,
-                    "message": "No Codex app-server session is running"
-                }),
-            )
-            .await?;
-            return Ok(false);
-        }
         if self.agent_manager.is_session_busy(&session_id) {
-            // A cancelled turn keeps running until Codex confirms the interrupt;
+            // A cancelled turn keeps running until the agent confirms the stop;
             // holding the prompt avoids racing that turn's terminal event.
             self.agent_manager.queue_prompt(
                 session_id,
@@ -67,42 +54,50 @@ impl Editor {
         .await?;
         self.agent_manager.mark_session_active(session_id.clone());
         self.agent_manager.record_turn_start(session_id.clone());
-        let Some(bridge) = self.agent_manager.bridge() else {
-            return Ok(false);
+        let prompt = Prompt {
+            text: text.clone(),
+            context: context.map(|(uri, text)| EditorContext { uri, text }),
+            recap: None,
         };
-        let command = context.map_or_else(
-            || CodexCommand::Prompt {
-                session_id: session_id.clone(),
-                turn,
-                text: text.clone(),
-            },
-            |(uri, context)| CodexCommand::PromptWithContext {
-                session_id: session_id.clone(),
-                turn,
-                text: text.clone(),
-                uri,
-                context,
-            },
-        );
-        if bridge.send(command).await.is_err() {
-            let message = self
-                .finish_agent_bridge(runtime, "Codex app-server stopped while sending the prompt")
+        match self.agent_manager.agents_mut().prompt(
+            &SessionId::from_raw(session_id.clone()),
+            turn,
+            prompt,
+        ) {
+            Ok(()) => {}
+            // The loss that follows carries the prompt back to the plugin.
+            Err(AgentError::Gone(_)) => {
+                self.agent_manager
+                    .set_loss_context(agent_manager::AgentLossContext::Prompt {
+                        session_id,
+                        prompt: text,
+                    });
+            }
+            Err(AgentError::Unavailable(message)) => {
+                self.finish_inline_agent_outcome(
+                    &session_id,
+                    crate::inline_history::InlineAgentState::Failed,
+                    Some(&message),
+                );
+                self.agent_manager.mark_session_inactive(&session_id);
+                self.agent_manager.discard_turn(&session_id);
+                self.notify_agent(
+                    runtime,
+                    "agent:session_lost",
+                    json!({
+                        "session_id": session_id,
+                        "prompt": text,
+                        "message": message
+                    }),
+                )
                 .await?;
-            self.notify_agent(
-                runtime,
-                "agent:session_lost",
-                json!({
-                    "session_id": session_id,
-                    "prompt": text,
-                    "message": message
-                }),
-            )
-            .await?;
+            }
         }
         Ok(false)
     }
 
-    pub(super) fn ensure_agent_bridge(&mut self, cwd: &Path) -> anyhow::Result<()> {
+    /// Makes sure the agent runs in `cwd`, starting it when it is not running.
+    pub(super) fn ensure_agent(&mut self, cwd: &Path) -> anyhow::Result<()> {
         if self.config.disable_ai {
             anyhow::bail!("agent support is disabled by `disable_ai = true`");
         }
@@ -115,41 +110,28 @@ impl Editor {
                 root.display()
             );
         }
-        if self.agent_manager.has_bridge() {
+        if self.agent_manager.is_running() {
             return Ok(());
         }
-        let configured = self.config.agent.command.as_deref().unwrap_or("codex");
-        let command = crate::utils::find_executable(configured).ok_or_else(|| {
-            anyhow::anyhow!(
-                "Codex CLI was not found; install Codex, run `codex login`, and try again"
-            )
-        })?;
-        let policy = AgentRuntimePolicy::new(
-            self.config.agent.allow_sensitive_paths,
-            self.config.agent.enabled_mcp_servers.clone(),
-            self.config.agent.enabled_codex_features.clone(),
-        );
-        let mut spec = CodexProcessSpec::new(command, cwd.clone())
-            .args(self.config.agent.args.clone())
-            .policy(policy);
-        spec.environment.extend(
-            self.config
-                .agent
-                .env
-                .clone()
-                .into_iter()
-                .map(|(key, value)| (key.into(), value.into())),
-        );
-        let capacity =
-            NonZeroUsize::new(AGENT_BRIDGE_CAPACITY).expect("agent bridge capacity is non-zero");
-        let (tool_sender, tool_requests) = editor_tool_channel(AGENT_BRIDGE_CAPACITY);
-        let host = EditorToolHost::new(tool_sender);
-        let (bridge, task) = start_codex(spec, ToolHostAdapter(host), capacity)?;
+        self.agent_manager.agents_mut().ensure(&cwd)?;
         self.agent_manager.set_root(Some(cwd));
-        self.agent_manager.set_bridge(bridge);
-        self.agent_manager.set_task(task);
-        self.agent_manager.set_tool_requests(tool_requests);
         Ok(())
+    }
+
+    /// What the user hears when a command needs an agent that is not running.
+    pub(super) fn agent_not_running_message(&self) -> String {
+        format!(
+            "No {} app-server session is running",
+            self.agent_manager.agents().kind().name()
+        )
+    }
+
+    /// What the user hears when a command cannot reach a running agent.
+    fn agent_stopped_message(&self) -> String {
+        format!(
+            "{} app-server stopped",
+            self.agent_manager.agents().kind().name()
+        )
     }
 
     pub(super) async fn agent_new_session(
@@ -157,18 +139,7 @@ impl Editor {
         runtime: &mut Runtime,
         cwd: PathBuf,
     ) -> anyhow::Result<()> {
-        if self.agent_manager.is_task_finished() {
-            let model_only_bridge = self.agent_manager.is_model_only_bridge();
-            let message = self
-                .finish_agent_bridge(runtime, "Codex app-server stopped unexpectedly")
-                .await?;
-            if !model_only_bridge {
-                self.notify_agent(runtime, "agent:session_lost", json!({ "message": message }))
-                    .await?;
-            }
-        }
-        self.agent_manager.mark_conversation_requested();
-        if let Err(error) = self.ensure_agent_bridge(&cwd) {
+        if let Err(error) = self.ensure_agent(&cwd) {
             self.notify_agent(
                 runtime,
                 "agent:error",
@@ -177,25 +148,17 @@ impl Editor {
             .await?;
             return Ok(());
         }
-        let Some(bridge) = self.agent_manager.bridge() else {
-            return Ok(());
-        };
-        let command = self.agent_manager.next_model().cloned().map_or_else(
-            || CodexCommand::NewSession { cwd: cwd.clone() },
-            |selection| CodexCommand::NewSessionWithModel {
-                cwd: cwd.clone(),
-                selection,
-            },
-        );
-        if bridge.send(command).await.is_err() {
-            let message = self
-                .finish_agent_bridge(
-                    runtime,
-                    "Codex app-server stopped while starting the session",
-                )
-                .await?;
-            self.notify_agent(runtime, "agent:session_lost", json!({ "message": message }))
-                .await?;
+        let model = self.agent_manager.next_model().cloned();
+        match self.agent_manager.agents_mut().new_session(&cwd, model) {
+            Ok(()) => {}
+            Err(AgentError::Gone(_)) => {
+                self.agent_manager
+                    .set_loss_context(agent_manager::AgentLossContext::NewSession);
+            }
+            Err(AgentError::Unavailable(message)) => {
+                self.notify_agent(runtime, "agent:error", json!({ "message": message }))
+                    .await?;
+            }
         }
         Ok(())
     }
@@ -206,14 +169,15 @@ impl Editor {
         cwd: PathBuf,
         session_id: String,
     ) -> anyhow::Result<()> {
-        self.agent_manager.mark_conversation_requested();
-        if self
+        // A conversation whose tool stamp is unknown has never been seen to
+        // disagree with the current tools, so it rejoins.
+        let contract = self
             .agent_manager
             .conversation_tool_contract_version(&session_id)
-            .is_some_and(|version| {
-                version != crate::agent_conversation::AGENT_TOOL_CONTRACT_VERSION
-            })
-        {
+            .map(ContractStamp::new)
+            .or_else(|| Some(self.agent_manager.agents().contract()));
+        let saved = self.saved_session(&session_id, contract);
+        if self.agent_manager.agents().continuity(&saved) != Continuity::Rejoin {
             self.notify_agent(runtime, "agent:session_restore_failed",
                         json!({
                             "session_id": session_id,
@@ -223,48 +187,7 @@ impl Editor {
                     .await?;
             return Ok(());
         }
-        if self.agent_manager.is_task_finished() {
-            let _ = self
-                .finish_agent_bridge(runtime, "Codex app-server stopped before restoration")
-                .await?;
-        }
-        if let Err(error) = self.ensure_agent_bridge(&cwd) {
-            self.notify_agent(
-                runtime,
-                "agent:session_restore_failed",
-                json!({
-                    "session_id": session_id,
-                    "message": error.to_string()
-                }),
-            )
-            .await?;
-            return Ok(());
-        }
-        let Some(bridge) = self.agent_manager.bridge() else {
-            return Ok(());
-        };
-        if bridge
-            .send(CodexCommand::ResumeSession {
-                cwd,
-                session_id: session_id.clone(),
-            })
-            .await
-            .is_err()
-        {
-            let message = self
-                .finish_agent_bridge(
-                    runtime,
-                    "Codex app-server stopped while restoring the session",
-                )
-                .await?;
-            self.notify_agent(
-                runtime,
-                "agent:session_restore_failed",
-                json!({ "session_id": session_id, "message": message }),
-            )
-            .await?;
-        }
-        Ok(())
+        self.restore_agent_session(runtime, &cwd, &saved).await
     }
 
     pub(super) async fn agent_switch_session(
@@ -289,16 +212,37 @@ impl Editor {
                 .await?;
             return Ok(());
         }
-        self.agent_manager.mark_conversation_requested();
-        if self.agent_manager.is_task_finished() {
-            let _ = self
-                .finish_agent_bridge(
-                    runtime,
-                    "Codex app-server stopped before switching sessions",
-                )
-                .await?;
+        // Only a conversation known to run the current tools may be rejoined;
+        // anything else is forked into a fresh session.
+        let contract = if resume {
+            self.agent_manager
+                .conversation_tool_contract_version(&session_id)
+                .map(ContractStamp::new)
+        } else {
+            None
+        };
+        let saved = self.saved_session(&session_id, contract);
+        self.restore_agent_session(runtime, &cwd, &saved).await
+    }
+
+    fn saved_session(&self, session_id: &str, contract: Option<ContractStamp>) -> SavedSession {
+        SavedSession {
+            backend: self.agent_manager.agents().kind(),
+            session: SessionId::from_raw(session_id.to_string()),
+            contract,
         }
-        if let Err(error) = self.ensure_agent_bridge(&cwd) {
+    }
+
+    /// Starts the agent if needed and asks it to bring `saved` back. Failures
+    /// reach the plugin as `agent:session_restore_failed`.
+    async fn restore_agent_session(
+        &mut self,
+        runtime: &mut Runtime,
+        cwd: &Path,
+        saved: &SavedSession,
+    ) -> anyhow::Result<()> {
+        let session_id = saved.session.as_str().to_string();
+        if let Err(error) = self.ensure_agent(cwd) {
             self.notify_agent(
                 runtime,
                 "agent:session_restore_failed",
@@ -310,27 +254,20 @@ impl Editor {
             .await?;
             return Ok(());
         }
-        let Some(bridge) = self.agent_manager.bridge() else {
-            return Ok(());
-        };
-        let tool_contract_version = if resume {
-            self.agent_manager
-                .conversation_tool_contract_version(&session_id)
-        } else {
-            None
-        };
-        let command =
-            agent_sessions::session_switch_command(cwd, session_id.clone(), tool_contract_version);
-        if bridge.send(command).await.is_err() {
-            let message = self
-                .finish_agent_bridge(runtime, "Codex app-server stopped while switching sessions")
+        match self.agent_manager.agents_mut().restore(cwd, saved) {
+            Ok(()) => {}
+            Err(AgentError::Gone(_)) => {
+                self.agent_manager
+                    .set_loss_context(agent_manager::AgentLossContext::Restore { session_id });
+            }
+            Err(AgentError::Unavailable(message)) => {
+                self.notify_agent(
+                    runtime,
+                    "agent:session_restore_failed",
+                    json!({ "session_id": session_id, "message": message }),
+                )
                 .await?;
-            self.notify_agent(
-                runtime,
-                "agent:session_restore_failed",
-                json!({ "session_id": session_id, "message": message }),
-            )
-            .await?;
+            }
         }
         Ok(())
     }
@@ -342,20 +279,23 @@ impl Editor {
     ) -> anyhow::Result<()> {
         self.abandon_agent_edit_decision(Some(&session_id), "the turn was cancelled");
         self.agent_manager.begin_stopping(&session_id);
-        let Some(bridge) = self.agent_manager.bridge() else {
+        // With no live turn the stop would have nothing to interrupt, and a
+        // confirmation would land on whichever turn comes next.
+        let Some(turn) = self.agent_manager.live_turn(&session_id) else {
             return Ok(());
         };
-        if bridge
-            .send(CodexCommand::Cancel { session_id })
-            .await
+        if !self.agent_manager.is_running() {
+            return Ok(());
+        }
+        if self
+            .agent_manager
+            .agents_mut()
+            .stop(&SessionId::from_raw(session_id), turn)
             .is_err()
         {
-            self.notify_agent(
-                runtime,
-                "agent:error",
-                json!({ "message": "Codex app-server stopped" }),
-            )
-            .await?;
+            let message = self.agent_stopped_message();
+            self.notify_agent(runtime, "agent:error", json!({ "message": message }))
+                .await?;
         }
         Ok(())
     }
@@ -375,20 +315,18 @@ impl Editor {
         self.agent_manager.discard_session_queue(&session_id);
         self.agent_manager
             .update_pane(|lifecycle| lifecycle.session_closed(&session_id));
-        let Some(bridge) = self.agent_manager.bridge() else {
+        if !self.agent_manager.is_running() {
             return Ok(());
-        };
-        if bridge
-            .send(CodexCommand::CloseSession { session_id })
-            .await
+        }
+        if self
+            .agent_manager
+            .agents_mut()
+            .close(&SessionId::from_raw(session_id))
             .is_err()
         {
-            self.notify_agent(
-                runtime,
-                "agent:error",
-                json!({ "message": "Codex app-server stopped" }),
-            )
-            .await?;
+            let message = self.agent_stopped_message();
+            self.notify_agent(runtime, "agent:error", json!({ "message": message }))
+                .await?;
         }
         Ok(())
     }
@@ -403,28 +341,14 @@ impl Editor {
         recent_commits: String,
     ) -> anyhow::Result<()> {
         let prompt = commit_message_prompt(&branch, &staged_diff, &recent_commits);
-        let result = match prompt {
-            Err(error) => Err(error),
-            Ok(prompt) => {
-                if self.agent_manager.is_task_finished() {
-                    let _ = self
-                        .finish_agent_bridge(runtime, "Codex app-server stopped unexpectedly")
-                        .await?;
-                }
-                self.ensure_agent_bridge(&get_workspace_path())
-                    .and_then(|()| {
-                        let bridge = self
-                            .agent_manager
-                            .bridge()
-                            .ok_or_else(|| anyhow::anyhow!("Codex app-server did not start"))?;
-                        bridge.try_send(CodexCommand::GenerateCommitMessage {
-                            request_id: request_id.get(),
-                            cwd,
-                            prompt,
-                        })
-                    })
-            }
-        };
+        let result = prompt.and_then(|prompt| {
+            self.ensure_agent(&get_workspace_path())?;
+            self.agent_manager
+                .agents_mut()
+                .commit_messages()?
+                .generate(QueryId(request_id.get()), &cwd, prompt)?;
+            Ok(())
+        });
         if let Err(error) = result {
             self.plugin_registry
                 .resolve_request(
@@ -433,67 +357,32 @@ impl Editor {
                     json!({ "message": "", "error": error.to_string() }),
                 )
                 .await?;
-        } else {
-            self.agent_manager
-                .mark_commit_message_pending(request_id.get());
         }
         Ok(())
     }
 
-    pub(super) async fn agent_permission_response(
-        &mut self,
-        runtime: &mut Runtime,
-        request_id: String,
-        option_id: Option<String>,
-    ) -> anyhow::Result<()> {
-        let Some(bridge) = self.agent_manager.bridge() else {
-            return Ok(());
-        };
-        if bridge
-            .send(CodexCommand::PermissionResponse {
-                request_id,
-                option_id,
-            })
-            .await
-            .is_err()
-        {
-            self.notify_agent(
-                runtime,
-                "agent:error",
-                json!({ "message": "Codex app-server stopped" }),
-            )
-            .await?;
-        }
-        Ok(())
-    }
-
-    /// Sends one inline-assist turn: a fresh thread, or a follow-up on `existing_session`.
-    pub(super) async fn agent_send_inline_assist(
+    /// Sends one inline-assist turn: a fresh conversation, or a follow-up on
+    /// `existing_session`.
+    pub(super) fn agent_send_inline_assist(
         &mut self,
         request_id: &str,
-        cwd: PathBuf,
+        cwd: &Path,
         existing_session: Option<String>,
         prompt: &str,
         context: &str,
     ) -> anyhow::Result<()> {
-        let command = existing_session.map_or_else(
-            || CodexCommand::InlineAssist {
-                request_id: request_id.to_string(),
-                cwd,
-                prompt: prompt.to_string(),
-                context: context.to_string(),
-            },
-            |session_id| CodexCommand::InlineAssistFollowup {
-                request_id: request_id.to_string(),
-                session_id,
-                prompt: prompt.to_string(),
-                context: context.to_string(),
-            },
+        let inline = self.agent_manager.agents_mut().inline_assist()?;
+        let (request, prompt, context) = (
+            request_id.to_string(),
+            prompt.to_string(),
+            context.to_string(),
         );
-        if let Some(bridge) = self.agent_manager.bridge() {
-            bridge.send(command).await
-        } else {
-            Err(anyhow::anyhow!("Codex bridge is unavailable"))
+        match existing_session {
+            None => inline.start(request, cwd, prompt, context)?,
+            Some(session) => {
+                inline.followup(request, &SessionId::from_raw(session), prompt, context)?;
+            }
         }
+        Ok(())
     }
 }

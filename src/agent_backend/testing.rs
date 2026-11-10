@@ -94,6 +94,7 @@ struct Shared {
     open_turns: Vec<(SessionId, TurnId)>,
     open_session: bool,
     ledger_queued: usize,
+    exit: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
 fn lock(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
@@ -290,7 +291,11 @@ impl AgentBackend for ScriptedBackend {
         let mut shared = lock(&self.shared);
         shared.calls.push(Call::DetachForExit);
         shared.stopped = true;
-        None
+        shared.exit.take().map(|released| {
+            Box::pin(async move {
+                let _ = released.await;
+            }) as Pin<Box<dyn Future<Output = ()> + Send>>
+        })
     }
 
     fn inline_assist(&mut self) -> Result<&mut dyn InlineAssist, Missing> {
@@ -427,6 +432,14 @@ impl Script {
     /// [`open_scripted`], and takes effect at its next call.
     pub(crate) fn open_session(&self) {
         lock(&self.shared).open_session = true;
+    }
+
+    /// Makes the next `detach_for_exit` hand back a wait that ends when the
+    /// returned sender fires or is dropped, as a worker still exiting would.
+    pub(crate) fn hold_exit(&self) -> tokio::sync::oneshot::Sender<()> {
+        let (release, released) = tokio::sync::oneshot::channel();
+        lock(&self.shared).exit = Some(released);
+        release
     }
 }
 

@@ -89,10 +89,8 @@ async fn inline_context_dispatch_is_request_bound_and_does_not_move_focus() {
     assert_eq!(editor.cursor_snapshot(), cursor);
     assert!(!editor.agent_manager.has_playback_work());
     assert!(!root.join("helper.c").exists());
-    let agent = AgentTestHandle::install(&mut editor, 2);
-    agent
-        .emit_inline_context_read("request", "Read helper.c:1–1 · editor revision 0")
-        .await;
+    let agent = AgentTestHandle::install(&mut editor);
+    agent.emit_inline_context_read("request", "Read helper.c:1–1 · editor revision 0");
     editor
         .service_background(
             &mut RenderBuffer::new(100, 30, &Style::default()),

@@ -136,11 +136,9 @@ async fn inline_agent_outcome_groups_real_writes_and_survives_completion_and_rec
         "user prefix\nold\n"
     );
     assert_eq!(outcome(&editor).files[0].edits[0].transaction_ids.len(), 2);
-    let agent = AgentTestHandle::install(&mut editor, 4);
-    agent
-        .emit_message_completed("agent", "Updated both files.")
-        .await;
-    agent.emit_completed("agent", "end_turn").await;
+    let agent = AgentTestHandle::install(&mut editor);
+    agent.emit_message_completed("agent", "Updated both files.");
+    agent.emit_completed("agent", "end_turn");
     let mut frame = RenderBuffer::new(100, 30, &Style::default());
     let mut runtime = Runtime::new();
     editor

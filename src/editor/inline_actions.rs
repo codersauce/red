@@ -201,9 +201,7 @@ impl Editor {
                     return Ok(std::ops::ControlFlow::Break(false));
                 }
                 if let Some(session_id) = retired_session {
-                    if let Some(bridge) = self.agent_manager.bridge() {
-                        let _ = bridge.try_send(CodexCommand::CloseSession { session_id });
-                    }
+                    self.agent_manager.close_session(session_id);
                 }
                 let revision = self.current_buffer().revision();
                 let expected_text = self.current_buffer().text_in_range(range);
@@ -217,7 +215,7 @@ impl Editor {
                     assist.session_id.clone_from(&existing_session);
                 }
                 let cwd = get_workspace_path();
-                if let Err(error) = self.ensure_agent_bridge(&cwd) {
+                if let Err(error) = self.ensure_agent(&cwd) {
                     self.inline_history.finish(
                         &request_id,
                         InlineTurnState::Failed,
@@ -231,9 +229,13 @@ impl Editor {
                     self.render(buffer)?;
                     return Ok(std::ops::ControlFlow::Break(false));
                 }
-                let send_result = self
-                    .agent_send_inline_assist(&request_id, cwd, existing_session, prompt, &context)
-                    .await;
+                let send_result = self.agent_send_inline_assist(
+                    &request_id,
+                    &cwd,
+                    existing_session,
+                    prompt,
+                    &context,
+                );
                 if let Err(error) = send_result {
                     self.inline_history.finish(
                         &request_id,

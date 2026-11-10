@@ -1,11 +1,14 @@
 //! Editor ownership and callback routing for the Agent model picker.
 
 use super::*;
-use crate::agent_backend::types::{ModelQuery, ModelResult};
+use crate::agent_backend::{
+    ids::{QueryId, SessionId},
+    types::{ModelQuery, ModelResult},
+};
 
 /// The catalog intentionally keeps Codex's camelCase field names. Other agent
 /// notifications use `plugin_json`, which would change this public API shape.
-pub(super) fn model_result_payload(result: &Result<ModelResult, String>) -> Value {
+pub(crate) fn model_result_payload(result: &Result<ModelResult, String>) -> Value {
     match result {
         Ok(value) => {
             let mut value = serde_json::to_value(value).expect("agent payloads serialize");
@@ -56,33 +59,23 @@ impl Editor {
                 return Ok(());
             }
         }
-        if self.agent_manager.is_task_finished() {
-            let _ = self
-                .finish_agent_bridge(runtime, "Codex app-server stopped unexpectedly")
-                .await?;
-        }
-        let had_bridge = self.agent_manager.has_bridge();
-        let result = self
-            .ensure_agent_bridge(&get_workspace_path())
-            .and_then(|()| {
-                if !had_bridge {
-                    self.agent_manager.mark_model_only_bridge();
-                }
-                self.agent_manager
-                    .bridge()
-                    .ok_or_else(|| anyhow::anyhow!("Codex app-server did not start"))?
-                    .try_send(CodexCommand::ModelRequest {
-                        request_id: request_id.get(),
-                        request,
-                    })
-            });
+        let id = QueryId(request_id.get());
+        let result = self.ensure_agent(&get_workspace_path()).and_then(|()| {
+            let agents = self.agent_manager.agents_mut();
+            match request {
+                ModelQuery::ReadDefault { cwd } => agents.default_model(id, &cwd),
+                ModelQuery::List => agents.list_models(id),
+                ModelQuery::Set {
+                    session_id,
+                    selection,
+                } => agents.set_model(id, &SessionId::from_raw(session_id), selection),
+            }
+            .map_err(anyhow::Error::from)
+        });
         if let Err(error) = result {
             self.plugin_registry
                 .resolve_request(runtime, request_id, json!({"error": error.to_string()}))
                 .await?;
-        } else {
-            self.agent_manager
-                .mark_model_request_pending(request_id.get());
         }
         Ok(())
     }
@@ -91,7 +84,7 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::editor::test_agent::AgentTestHandle;
+    use crate::editor::test_agent::{AgentCommand, AgentTestHandle};
 
     #[test]
     fn model_catalog_callback_preserves_protocol_field_names() {
@@ -156,17 +149,14 @@ mod tests {
             .await
             .unwrap();
         runtime.execute_command("PreviewModel").await.unwrap();
-        let request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::AgentModelRequest { request_id, .. } => request_id,
-            _ => panic!("expected model preview request"),
-        };
-        let agent = AgentTestHandle::install(&mut editor, 1);
-        editor.agent_manager.mark_model_only_bridge();
-        editor
-            .agent_manager
-            .mark_model_request_pending(request_id.get());
-        agent.lose(&mut editor, "preview unavailable").await;
+        let agent = AgentTestHandle::install(&mut editor);
         let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(agent.commands(), [AgentCommand::DefaultModel]);
+        agent.lose("Codex app-server failed: preview unavailable");
         editor
             .service_background(&mut buffer, &mut runtime)
             .await
@@ -176,11 +166,7 @@ mod tests {
             .as_deref()
             .is_some_and(|message| message.starts_with("preview:")
                 && message.contains("preview unavailable")));
-        assert!(!editor.agent_manager.has_bridge());
-        assert!(editor
-            .agent_manager
-            .take_pending_model_requests()
-            .is_empty());
+        assert!(!editor.agent_manager.is_running());
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 

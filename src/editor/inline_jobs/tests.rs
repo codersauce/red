@@ -202,10 +202,8 @@ async fn inline_draft_close_can_edit_save_or_delete_without_losing_prior_results
 async fn inline_foreground_exact_code_result_auto_applies_as_unsaved_transaction() {
     let mut editor = editor("alpha\nbeta\n");
     start(&mut editor, "first", Some("one"), range(0, 1));
-    let agent = AgentTestHandle::install(&mut editor, 2);
-    agent
-        .emit_inline_result("one", "provider-one", result(Some("ALPHA\n")))
-        .await;
+    let agent = AgentTestHandle::install(&mut editor);
+    agent.emit_inline_result("one", "provider-one", result(Some("ALPHA\n")));
     editor
         .service_background(
             &mut RenderBuffer::new(100, 30, &Style::default()),
@@ -237,10 +235,8 @@ async fn inline_foreground_code_result_can_require_request_bound_review() {
     let mut editor = editor("alpha\nbeta\n");
     editor.config.agent.auto_apply_inline_edits = false;
     start(&mut editor, "first", Some("one"), range(0, 1));
-    let agent = AgentTestHandle::install(&mut editor, 2);
-    agent
-        .emit_inline_result("one", "provider-one", result(Some("ALPHA\n")))
-        .await;
+    let agent = AgentTestHandle::install(&mut editor);
+    agent.emit_inline_result("one", "provider-one", result(Some("ALPHA\n")));
     editor
         .service_background(
             &mut RenderBuffer::new(100, 30, &Style::default()),
@@ -290,9 +286,7 @@ async fn inline_foreground_code_result_can_require_request_bound_review() {
     assert!(editor.current_buffer().is_dirty());
 
     start(&mut editor, "second", Some("two"), range(1, 2));
-    agent
-        .emit_inline_result("two", "provider-two", result(Some("BETA\n")))
-        .await;
+    agent.emit_inline_result("two", "provider-two", result(Some("BETA\n")));
     editor
         .service_background(
             &mut RenderBuffer::new(100, 30, &Style::default()),

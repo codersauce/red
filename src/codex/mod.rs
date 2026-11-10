@@ -37,6 +37,8 @@ mod backend;
 pub(crate) mod golden_support;
 mod history;
 mod models;
+#[cfg(test)]
+mod payload_goldens;
 mod sessions;
 mod tool_error;
 mod tool_host_adapter;
@@ -246,13 +248,6 @@ pub enum CodexCommand {
         /// Red session identifier.
         session_id: String,
     },
-    /// Resolves a surfaced permission request with an exact offered choice.
-    PermissionResponse {
-        /// App-server request identifier.
-        request_id: String,
-        /// Selected option, or `None` for denial/cancellation.
-        option_id: Option<String>,
-    },
 }
 
 /// Events delivered from the Codex worker to the editor owner.
@@ -384,17 +379,6 @@ pub enum CodexEvent {
         session_id: String,
         /// User-facing failure description.
         message: String,
-    },
-    /// App-server requested a user choice that Red can safely surface.
-    PermissionRequested {
-        /// App-server request identifier.
-        request_id: String,
-        /// Owning session.
-        session_id: String,
-        /// Descriptive tool-call payload.
-        tool_call: Value,
-        /// Exact selectable options supplied by the app-server.
-        options: Value,
     },
     /// Session or worker operation failed.
     Failed {
@@ -1203,7 +1187,6 @@ async fn handle_command(
         CodexCommand::CloseSession { session_id } => {
             stop_session(session_id, true, input, events, pending, sessions, next_id).await?;
         }
-        CodexCommand::PermissionResponse { .. } => {}
     }
     Ok(())
 }

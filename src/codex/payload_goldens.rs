@@ -1,13 +1,27 @@
 //! Golden agent payloads. Each case feeds realistic Codex app-server messages
 //! through the worker's handlers and pins the JSON the plugin receives. The
 //! expected values were recorded from the untyped implementation and must not
-//! change when the payloads gain types.
+//! change when the payloads gain types. The payloads themselves are built by
+//! the editor from the interface's events, so each worker event is translated
+//! by the backend first, exactly as the editor receives it.
 
-use super::*;
+use super::{backend::test_support::translated, golden_support::Harness, CodexCommand, CodexEvent};
 use crate::agent_backend::types::{ModelQuery, ModelSelection, SessionQuery, SessionScope};
-use crate::codex::golden_support::Harness;
-use crate::codex::{CodexCommand, CodexEvent};
+use crate::editor::{
+    agent_manager::AgentManager, agent_models, agent_payloads, agent_sessions, plugin_json,
+};
+use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// The plugin notification the editor sends for a worker event.
+fn agent_event_payload(event: CodexEvent) -> (&'static str, Value) {
+    let events = translated(vec![event]);
+    let [event] = events.as_slice() else {
+        panic!("one worker event is one interface event: {events:?}");
+    };
+    agent_payloads::agent_event_payload(event).expect("the event is announced to plugins")
+}
 
 fn now() -> i64 {
     SystemTime::now()
@@ -785,7 +799,7 @@ async fn restored_conversation_snapshot_reconciles_transcript_and_annotations() 
     };
     assert_eq!(session_id, "thread-red");
 
-    let mut manager = agent_manager::AgentManager::default();
+    let mut manager = AgentManager::for_test();
     let snapshot = manager
         .reconcile_conversation(&session_id, Path::new("/workspace"), &thread)
         .cloned()

@@ -388,8 +388,6 @@ impl<H: ToolHost> CodexBackend<H> {
                 session_id: None,
                 message,
             } => Event::Session(SessionEvent::CreateFailed { message }),
-            // The worker declines approvals itself and never sends this.
-            CodexEvent::PermissionRequested { .. } => return None,
         })
     }
 }
@@ -703,35 +701,18 @@ fn bounded_failure_message(message: &str) -> String {
     bounded
 }
 
+/// What tests need to run the backend without an editor.
 #[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
+pub(super) mod test_support {
     use async_trait::async_trait;
     use serde_json::Value;
-    use tokio::{sync::oneshot, time::timeout};
 
     use super::*;
-    use crate::{
-        agent_backend::{
-            ledger::Ledger,
-            testing::assert_turn_discipline,
-            tool_host::ToolCtx,
-            types::{
-                Activity, EditorContext, ModelInfo, ModelResult, RestoredHistory, SessionPage,
-                SessionPreview, SessionScope,
-            },
-        },
-        agent_tools::EditorToolCall,
-        codex::CodexBridgeWorker,
-        inline_assist::InlineAssistResult,
-    };
-
-    const ROOT: &str = "/workspace";
+    use crate::{agent_backend::tool_host::ToolCtx, agent_tools::EditorToolCall};
 
     /// A host for tests that never call a tool.
     #[derive(Clone)]
-    struct NoHost;
+    pub(in crate::codex) struct NoHost;
 
     #[async_trait]
     impl ToolHost for NoHost {
@@ -759,6 +740,66 @@ mod tests {
             anyhow::bail!("this test has no tools")
         }
     }
+
+    /// The session a worker event belongs to when it is part of a turn.
+    fn turn_session(event: &CodexEvent) -> Option<&str> {
+        match event {
+            CodexEvent::TurnAccepted { session_id }
+            | CodexEvent::Update { session_id, .. }
+            | CodexEvent::MessageCompleted { session_id, .. }
+            | CodexEvent::Activity { session_id, .. }
+            | CodexEvent::Completed { session_id, .. }
+            | CodexEvent::Cancelled { session_id }
+            | CodexEvent::CancelFailed { session_id, .. } => Some(session_id),
+            _ => None,
+        }
+    }
+
+    /// What the backend makes of `events` as the worker reports them. Every
+    /// session counts as running a turn, so its turn events are stamped
+    /// instead of dropped as late.
+    pub(in crate::codex) fn translated(events: Vec<CodexEvent>) -> Vec<Event> {
+        let mut backend = CodexBackend::new(&AgentConfig::default(), NoHost);
+        events
+            .into_iter()
+            .filter_map(|event| {
+                if let Some(session) = turn_session(&event) {
+                    backend
+                        .live
+                        .entry(SessionId::from_raw(session.to_string()))
+                        .or_insert_with(|| LiveTurn {
+                            turn: TurnId::mint(),
+                            closing: false,
+                        });
+                }
+                backend.translate(event)
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::{sync::oneshot, time::timeout};
+
+    use super::test_support::NoHost;
+    use super::*;
+    use crate::{
+        agent_backend::{
+            ledger::Ledger,
+            testing::assert_turn_discipline,
+            types::{
+                Activity, EditorContext, ModelInfo, ModelResult, RestoredHistory, SessionPage,
+                SessionPreview, SessionScope,
+            },
+        },
+        codex::CodexBridgeWorker,
+        inline_assist::InlineAssistResult,
+    };
+
+    const ROOT: &str = "/workspace";
 
     type Ended = oneshot::Sender<anyhow::Result<()>>;
 
@@ -1314,20 +1355,6 @@ mod tests {
                 }),
             ]
         );
-    }
-
-    #[tokio::test]
-    async fn a_permission_request_is_not_reported() {
-        let mut rig = Rig::new();
-        rig.emit(CodexEvent::PermissionRequested {
-            session_id: "s1".to_string(),
-            request_id: "p1".to_string(),
-            tool_call: Value::Null,
-            options: Value::Null,
-        })
-        .await;
-        assert_eq!(rig.events(), []);
-        assert!(rig.ledger.is_running());
     }
 
     #[tokio::test]
