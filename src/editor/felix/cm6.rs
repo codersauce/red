@@ -6,7 +6,7 @@
 //! selections Helix parsed from the markup (`expected.start`). The report goes to
 //! `FELIX_CM6_REPORT`; `FELIX_CM6_BASELINE` lists the ids expected to fail.
 use super::macros::terminal_key;
-use super::tests::fixture_editor;
+use super::tests::named_fixture_editor;
 use super::*;
 use serde_json::{json, Value};
 
@@ -25,7 +25,7 @@ fn key_events(keys: &str) -> Result<Vec<Event>, String> {
 }
 
 /// Run `keys` from Helix's recorded starting state (`{"text","ranges","primary"}`).
-async fn run_case(start: &Value, keys: &str) -> Value {
+async fn run_case(start: &Value, keys: &str, file: &str) -> Value {
     let text = start["text"].as_str().unwrap_or_default().to_owned();
     let ranges: Vec<(usize, usize)> = serde_json::from_value(start["ranges"].clone()).unwrap();
     let primary = start["primary"].as_u64().unwrap() as usize;
@@ -33,7 +33,7 @@ async fn run_case(start: &Value, keys: &str) -> Value {
         Ok(events) => events,
         Err(err) => return json!({"error": format!("keys: {err}")}),
     };
-    let (mut editor, mut frame, mut runtime) = fixture_editor(&text);
+    let (mut editor, mut frame, mut runtime) = named_fixture_editor(file, &text);
     let shell_root = tempfile::tempdir().unwrap();
     editor.statusline_git_cache.working_directory = shell_root.path().into();
     let rope = ropey::Rope::from_str(&text);
@@ -72,7 +72,7 @@ async fn run_case(start: &Value, keys: &str) -> Value {
     })
 }
 
-fn run_isolated(start: Value, keys: String) -> Value {
+fn run_isolated(start: Value, keys: String, file: String) -> Value {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -80,7 +80,7 @@ fn run_isolated(start: Value, keys: String) -> Value {
                 .enable_all()
                 .build()
                 .unwrap()
-                .block_on(run_case(&start, &keys))
+                .block_on(run_case(&start, &keys, &file))
         }));
         let _ = tx.send(outcome.unwrap_or_else(|panic| {
             let message = panic
@@ -127,6 +127,7 @@ fn cm6_cases_match_helix() {
         let actual = run_isolated(
             expected["start"].clone(),
             case["keys"].as_str().unwrap().into(),
+            case["file"].as_str().unwrap_or("example.txt").into(),
         );
         let fields: Vec<&str> = if actual.get("error").is_some() {
             vec!["error"]
