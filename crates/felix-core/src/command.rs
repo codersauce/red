@@ -1880,20 +1880,40 @@ impl Session {
                                 && r.start() == text.line_to_char(first)
                                 && r.end() == text.line_to_char(last + 1)
                         });
-                    p.replace(
-                        selections.ranges(),
-                        if whole_lines {
-                            document_newline(text)
-                        } else {
-                            ""
-                        },
-                    );
                     if whole_lines {
-                        let width = document_newline(text).chars().count();
-                        for r in &mut p.ranges {
-                            r.anchor -= width;
-                            r.head -= width;
+                        // Helix deletes the lines and opens one above the next,
+                        // indented like a new line there.
+                        let newline = document_newline(text);
+                        let (mut removed, mut added) = (0, 0);
+                        p.ranges.clear();
+                        for r in selections.ranges() {
+                            let leading = text
+                                .chars_at(r.end())
+                                .take_while(|c| matches!(c, ' ' | '\t'))
+                                .count();
+                            let indent = if context
+                                .newline_indents
+                                .binary_search_by_key(&r.start(), |&(p, _)| p)
+                                .is_ok()
+                            {
+                                context.indentation_at(r.start(), 0)
+                            } else {
+                                context.indent_level_of(text.slice(r.end()..r.end() + leading))
+                            };
+                            let insert = format!("{indent}{newline}");
+                            let caret = r.start() - removed + added + indent.chars().count();
+                            p.ranges
+                                .push(Range::at(text, caret).with_bounds(caret, caret));
+                            removed += r.end() - r.start();
+                            added += insert.chars().count();
+                            p.edits.push(Edit {
+                                start: r.start(),
+                                end: r.end(),
+                                insert,
+                            });
                         }
+                    } else {
+                        p.replace(selections.ranges(), "");
                     }
                     p.history = if change {
                         History::Begin

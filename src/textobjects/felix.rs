@@ -80,8 +80,14 @@ impl SyntaxTextObjectService {
             _ => None,
         };
         if let Some(key) = object_key {
+            // Like Helix, a motion without objects to visit still applies
+            // its direction to the selection.
+            let motion = matches!(action, Structure::Motion { .. });
+            let unmoved = |selection: &Selections| {
+                Some(selection.transform(text, |r| capture_range(text, r, action, extend, &[])))
+            };
             let Some(source) = query_source(lang) else {
-                return Ok(None);
+                return Ok(if motion { unmoved(selection) } else { None });
             };
             let query = match self.felix_queries.entry(lang.into()) {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
@@ -107,7 +113,7 @@ impl SyntaxTextObjectService {
                 .iter()
                 .find_map(|kind| query.capture_index_for_name(&format!("{name}.{kind}")))
             else {
-                return Ok(None);
+                return Ok(if motion { unmoved(selection) } else { None });
             };
             let captures = capture_ranges(query, root, document.contents.as_bytes(), text, index)?;
             return Ok(Some(selection.transform(text, |r| {

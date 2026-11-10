@@ -1184,12 +1184,37 @@ impl Editor {
         language: &str,
         indentation: Indentation,
     ) -> Vec<(usize, usize)> {
-        if !matches!(key, "<enter>" | "<c-j>" | "o" | "O")
+        let text = rope.slice(..);
+        let change = matches!(key, "c" | "<a-c>")
+            && self.felix.session.mode != felix_core::Mode::Insert
+            && initial.ranges().iter().all(|r| {
+                let at_line_start = |pos| text.line_to_char(text.char_to_line(pos)) == pos;
+                r.end() > r.start() && at_line_start(r.start()) && at_line_start(r.end())
+            });
+        if !(change || matches!(key, "<enter>" | "<c-j>" | "o" | "O"))
             || rope.len_bytes() > crate::syntax_indent::MAX_BYTES
         {
             return Vec::new();
         }
-        let text = rope.slice(..);
+        if change {
+            // The new line replacing the changed lines.
+            let mut source = rope.clone();
+            for r in initial.ranges().iter().rev() {
+                source.remove(r.start()..r.end());
+                source.insert(r.start(), "\n");
+            }
+            let mut removed = 0;
+            let sites: Vec<_> = initial
+                .ranges()
+                .iter()
+                .map(|r| {
+                    let line = source.char_to_line(r.start() - removed);
+                    removed += r.end() - r.start() - 1;
+                    (r.start(), line)
+                })
+                .collect();
+            return self.felix_line_indents(&source, sites, language, indentation);
+        }
         let mut sites: Vec<_> = initial
             .ranges()
             .iter()
@@ -1207,8 +1232,19 @@ impl Editor {
         let lines: Vec<_> = sites
             .iter()
             .enumerate()
-            .map(|(i, at)| source.char_to_line(at + i + 1))
+            .map(|(i, &at)| (at, source.char_to_line(at + i + 1)))
             .collect();
+        self.felix_line_indents(&source, lines, language, indentation)
+    }
+
+    /// Syntax indentation, in columns, of each `(site, line)` in `source`.
+    fn felix_line_indents(
+        &mut self,
+        source: &ropey::Rope,
+        sites: Vec<(usize, usize)>,
+        language: &str,
+        indentation: Indentation,
+    ) -> Vec<(usize, usize)> {
         let source = source.to_string();
         let id = self.current_buffer().id();
         let revision = self.current_buffer().revision();
@@ -1220,7 +1256,6 @@ impl Editor {
         };
         sites
             .into_iter()
-            .zip(lines)
             .filter_map(|(at, line)| {
                 let syntax = self
                     .syntax_indentation
@@ -1372,10 +1407,18 @@ impl Editor {
             && self
                 .highlight_language_id_for_buffer_index(active)
                 .is_none();
+        let helix_unit = self
+            .configured_indentation_for_buffer_index(active)
+            .is_none()
+            .then(|| self.highlight_language_id_for_buffer_index(active))
+            .flatten()
+            .and_then(|language| helix_indent_unit(&language));
         self.felix.indent.entry(id.0).or_insert_with(|| {
             felix_core::detect_indent(text).unwrap_or_else(|| {
                 if plain {
                     "\t".into()
+                } else if let Some(unit) = helix_unit {
+                    unit.into()
                 } else {
                     indentation.whitespace_for_columns(indentation.shift_width)
                 }
@@ -1876,6 +1919,18 @@ impl Editor {
     }
 }
 
+/// Helix 25.07.1's default indent unit for the languages Red highlights, used
+/// when neither the document nor the configuration sets one.
+fn helix_indent_unit(language: &str) -> Option<&'static str> {
+    Some(match language {
+        "rust" | "python" | "fish" | "php" | "kotlin" | "zig" | "sql" => "    ",
+        "go" | "c-sharp" | "c_sharp" | "csharp" => "\t",
+        "markdown" | "typescript" | "tsx" | "javascript" | "json" | "toml" | "bash" | "yaml"
+        | "c" | "cpp" | "java" | "lua" | "ruby" | "html" | "css" | "nix" | "elixir" => "  ",
+        _ => return None,
+    })
+}
+
 impl Editor {
     fn felix_structural_selection(
         &mut self,
@@ -2264,7 +2319,7 @@ mod tests {
         named_fixture_editor("example.txt", text)
     }
 
-    fn named_fixture_editor(name: &str, text: &str) -> (Editor, RenderBuffer, Runtime) {
+    pub(super) fn named_fixture_editor(name: &str, text: &str) -> (Editor, RenderBuffer, Runtime) {
         let mut config =
             Config::from_user_toml_with_overrides("editing_model = 'helix'", &[]).unwrap();
         config.lsp.enabled = false;
@@ -3653,6 +3708,43 @@ mod tests {
             assert_eq!(
                 editor.current_buffer().contents(),
                 expected,
+                "{keys:?} in {text:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn helix_language_edits_match_helix() {
+        // (file, text, keys, text after, primary (anchor, head) after)
+        let cases = [
+            // Helix indents Markdown with two spaces by default.
+            ("example.md", "a\n", "<gt>", "  a\n", (2, 3)),
+            // Backspace between an auto-pair deletes both characters.
+            ("example.md", "#\n", "i(<backspace><esc>", "#\n", (0, 1)),
+            // A tree-sitter motion with nothing to visit still sets its direction.
+            ("example.md", "ab\n", "[f", "ab\n", (1, 0)),
+            ("example.md", "abc\n", "lvh[f", "abc\n", (2, 3)),
+            // Leaving an append on an opened blank line restores the selection.
+            (
+                "example.ts",
+                "a;\n\nb\n",
+                "gla<ret><esc>",
+                "a;\n\n\nb\n",
+                (1, 3),
+            ),
+        ];
+        for (file, text, keys, expected, (anchor, head)) in cases {
+            let (mut editor, _, _) = named_fixture_editor(file, text);
+            helix_keys(&mut editor, keys).await;
+            assert_eq!(
+                editor.current_buffer().contents(),
+                expected,
+                "{keys:?} in {text:?}"
+            );
+            let primary = editor.felix_active_selection().unwrap().primary();
+            assert_eq!(
+                (primary.anchor, primary.head),
+                (anchor, head),
                 "{keys:?} in {text:?}"
             );
         }

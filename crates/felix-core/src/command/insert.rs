@@ -280,29 +280,42 @@ impl Plan {
                 self.insert_pair(text, selections, key.chars().next().unwrap())
             }
             "<esc>" | "<c-c>" => {
-                if let Some(start) = ctx
+                // Helix first drops the indent of a line left blank, then
+                // restores an append selection.
+                let (start, pos) = ctx
                     .insert_origin
                     .and_then(|origin| blank_line_indent(origin, text, selections))
-                {
-                    let pos = selections.primary().cursor(text);
+                    .map_or((0, 0), |start| (start, selections.primary().cursor(text)));
+                let removed = |p: usize| {
+                    if p >= pos {
+                        p - (pos - start)
+                    } else {
+                        p.min(start)
+                    }
+                };
+                if start < pos {
                     self.edits.push(Edit {
                         start,
                         end: pos,
                         insert: String::new(),
                     });
-                    self.map_edits();
-                    self.next.restore_append = false;
-                } else if self.next.restore_append {
-                    self.set(selections.transform(text, |r| Range {
-                        anchor: r.start(),
-                        head: if r.head > r.anchor {
-                            boundary(text, r.end(), false)
-                        } else {
-                            r.end()
-                        },
-                    }));
-                    self.next.restore_append = false;
                 }
+                let restore = self.next.restore_append;
+                self.set(selections.transform(text, |r| {
+                    let head = if restore && r.head > r.anchor {
+                        boundary(text, r.end(), false)
+                    } else if restore {
+                        r.end()
+                    } else {
+                        r.head
+                    };
+                    let anchor = if restore { r.start() } else { r.anchor };
+                    Range {
+                        anchor: removed(anchor),
+                        head: removed(head),
+                    }
+                }));
+                self.next.restore_append = false;
                 self.next.mode = Mode::Normal;
                 self.history = History::Commit;
             }
@@ -363,13 +376,23 @@ impl Plan {
                         "<c-k>" => end,
                         "<c-w>" | "<a-backspace>" => motion::word(text, r, "b", 1, false).start(),
                         "<a-d>" | "<a-delete>" => motion::word(text, r, "e", 1, false).end(),
+                        "<backspace>" | "<s-backspace>" | "<c-h>" => {
+                            delete_backward(text, pos, start, ctx)
+                        }
                         _ => boundary(text, pos, forward),
                     };
                     if forward && r.head > r.anchor {
                         self.ranges[i].head = (r.head + 1).min(text.len_chars());
                         append_eol |= other == text.len_chars();
                     }
-                    let (start, end) = (pos.min(other), pos.max(other));
+                    let (mut start, mut end) = (pos.min(other), pos.max(other));
+                    if matches!(key, "<backspace>" | "<s-backspace>" | "<c-h>")
+                        && start < pos
+                        && deletes_pair(text, r, pos)
+                    {
+                        end = boundary(text, pos, true);
+                        start = start.min(pos - 1);
+                    }
                     if start < end {
                         if let Some(last) = self.edits.last_mut().filter(|e| e.end >= start) {
                             last.end = last.end.max(end);
@@ -456,4 +479,62 @@ fn blank_line_indent(
         && text.slice(..from) == origin.slice(..from)
         && text.slice(pos..) == origin.slice(from..))
     .then_some(start)
+}
+
+/// Where Helix's `delete_char_backward` starts deleting: a whole indent unit
+/// when only indentation precedes the cursor, else one grapheme.
+fn delete_backward(text: RopeSlice<'_>, pos: usize, line_start: usize, ctx: &Context<'_>) -> usize {
+    if pos == 0 {
+        return 0;
+    }
+    let fragment = text.slice(line_start..pos);
+    if pos == line_start || !fragment.chars().all(|c| c == ' ' || c == '\t') {
+        return boundary(text, pos, false);
+    }
+    if text.char(pos - 1) == '\t' {
+        return pos - 1;
+    }
+    let tab_width = ctx.tab_width.max(1);
+    let indent_width = if ctx.indent.starts_with('\t') {
+        tab_width
+    } else {
+        ctx.indent.chars().count().max(1)
+    };
+    let width: usize = fragment
+        .chars()
+        .map(|c| if c == '\t' { tab_width } else { 1 })
+        .sum();
+    let drop = match width % indent_width {
+        0 => indent_width,
+        drop => drop,
+    };
+    let spaces = fragment
+        .chars_at(fragment.len_chars())
+        .reversed()
+        .take(drop)
+        .take_while(|&c| c == ' ')
+        .count();
+    pos - spaces
+}
+
+/// Helix deletes both characters of an auto-pair when the cursor sits between
+/// them, outside of leading indentation.
+fn deletes_pair(text: RopeSlice<'_>, range: Range, pos: usize) -> bool {
+    let line_start = logical_start(text, pos);
+    if text
+        .slice(line_start..pos)
+        .chars()
+        .all(|c| c == ' ' || c == '\t')
+    {
+        return false;
+    }
+    let single = boundary(text, range.start(), true) == range.end();
+    let (Some(open), Some(close)) = (text.get_char(pos - 1), text.get_char(pos)) else {
+        return false;
+    };
+    single
+        && matches!(
+            (open, close),
+            ('(', ')') | ('{', '}') | ('[', ']') | ('\'', '\'') | ('"', '"') | ('`', '`')
+        )
 }
