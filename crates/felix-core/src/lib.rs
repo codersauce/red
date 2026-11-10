@@ -111,6 +111,24 @@ impl Range {
 
 /// Traverse extended grapheme clusters without flattening a Rope or splitting CRLF.
 pub fn boundary(text: RopeSlice<'_>, at: usize, forward: bool) -> usize {
+    let found = cursor_boundary(text, at, forward);
+    if forward {
+        return found;
+    }
+    // unicode-segmentation 1.12 can step back past several clusters inside an
+    // Indic conjunct (GB9c). Its forward boundaries are correct, so walk
+    // forward to the last boundary before `at`.
+    let mut start = found;
+    loop {
+        let next = cursor_boundary(text, start, true);
+        if next >= at || next == start {
+            return start;
+        }
+        start = next;
+    }
+}
+
+fn cursor_boundary(text: RopeSlice<'_>, at: usize, forward: bool) -> usize {
     let byte = text.char_to_byte(at);
     let mut cursor = GraphemeCursor::new(byte, text.len_bytes(), true);
     let mut index = if forward {
@@ -425,6 +443,15 @@ mod tests {
             assert_eq!(motion::match_bracket(text, 0), in_range.then_some(distance));
             assert_eq!(motion::match_bracket(text, distance), in_range.then_some(0));
         }
+    }
+
+    #[test]
+    fn previous_boundaries_stay_inside_indic_conjuncts() {
+        // "स्ते" is one cluster; earlier boundaries must not jump to the word start.
+        let rope = Rope::from_str("नमस्ते दुनिया\n");
+        let text = rope.slice(..);
+        let back: Vec<_> = (0..=7).map(|i| boundary(text, i, false)).collect();
+        assert_eq!(back, [0, 0, 1, 2, 2, 2, 2, 6]);
     }
 
     #[test]

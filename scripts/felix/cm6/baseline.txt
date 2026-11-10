@@ -1,5 +1,13 @@
 # Cases known to differ from Helix 25.07.1: `<id>  # <fields> <keys>`.
 # Regenerate with: python3 scripts/felix/cm6/run.py --update-baseline <suites>
+#
+# Accepted differences, not bugs:
+# - "%p and shell error text: Helix reports the absolute path and `sh:`;
+#   Red reports the document name and `/bin/sh:`.
+# - Devanagari conjuncts (scripts#*): unicode-segmentation 1.12 steps back
+#   past whole conjuncts, so some Helix selections start at the word start.
+#   Red corrects those boundaries.
+# - Insert-mode Ctrl-C leaves Insert in Red; Helix inserts `c`.
 backward#2743  # text,ranges "\"%p"
 backward#2779  # ranges ":5<ret>"
 backward#2784  # text "x:reflow 10<ret>"
@@ -228,37 +236,16 @@ quotes#3473  # ranges ":goto 2<ret>"
 quotes#3474  # text,ranges "!printf %{cursor_line}<ret>"
 quotes#3478  # text ":insert-output printf x<ret>"
 quotes#3479  # text,ranges ":append-output echo y<ret>"
-scripts#4444  # ranges "w"
-scripts#4446  # ranges "e"
-scripts#4447  # ranges "W"
-scripts#4449  # ranges "E"
-scripts#4452  # ranges "2e"
-scripts#4506  # ranges "miw"
-scripts#4507  # ranges "maw"
-scripts#4508  # ranges "miW"
-scripts#4523  # ranges "vw"
-scripts#4530  # text,register "v2wd"
-scripts#4561  # text,ranges,register "wyhR"
-scripts#4585  # ranges "e<C-a>"
-scripts#4587  # ranges "wb<C-x>"
-scripts#4632  # text,ranges "afoo<esc>w."
-scripts#4633  # text,ranges,register "cbar<esc>w."
-scripts#4637  # ranges "Qwq"
-scripts#4640  # text,ranges "\"ayw\"ap"
+scripts#4450  # ranges "3w"
+scripts#4561  # text,ranges "wyhR"
 scripts#4645  # text,ranges "\"%p"
-scripts#4652  # ranges "w<C-s>bb<C-o><C-i>"
-scripts#4660  # ranges "%s<space><ret>d"
-scripts#4661  # ranges "%s\\w+<ret>"
-scripts#4675  # ranges "w*N"
 scripts#4681  # ranges ":5<ret>"
 scripts#4684  # text,ranges "%<A-s>:sort -r<ret>"
 scripts#4686  # text "x:reflow 10<ret>"
 scripts#4687  # text "%:reflow 8<ret>"
 scripts#4690  # text,ranges "ifoo<esc>:earlier<ret>"
 scripts#4691  # text,ranges "ifoo<esc>u:later<ret>"
-scripts#4697  # ranges "%s\\w+<ret>"
 scripts#4708  # ranges "%s.<ret>"
-scripts#4709  # ranges "%s\\pL+<ret>"
 scripts#4736  # text,ranges "%<A-s>:sort -r -i<ret>"
 scripts#4741  # ranges ":goto 2<ret>"
 scripts#4742  # text,ranges "!printf %{cursor_line}<ret>"
