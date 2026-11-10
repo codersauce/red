@@ -1218,6 +1218,9 @@ async fn direct_app_server_lists_and_changes_conversation_models() {
         .await
         .unwrap();
     assert!(
+        matches!(next_event(&mut bridge, &mut task).await, CodexEvent::TurnAccepted { session_id } if session_id == "model-thread")
+    );
+    assert!(
         matches!(next_event(&mut bridge, &mut task).await, CodexEvent::SessionModelChanged { session_id, model_info } if session_id == "model-thread" && model_info.model == "second" && model_info.provider.as_deref() == Some("test-provider") && model_info.effort.as_deref() == Some("low"))
     );
     assert!(matches!(

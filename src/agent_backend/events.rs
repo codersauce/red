@@ -37,6 +37,13 @@ pub enum SessionEvent {
     CreateFailed {
         message: String,
     },
+    /// The agent reported an error for a conversation with no turn in flight,
+    /// such as a late failure for one the editor already closed. A failure of
+    /// a turn in flight is that turn's `End(Failed)` instead.
+    Failed {
+        session: SessionId,
+        message: String,
+    },
     /// `session` is the id to use from now on. With `Continuity::Fork` it
     /// differs from the requested one.
     Restored {

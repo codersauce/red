@@ -53,15 +53,15 @@ pub(crate) struct AgentTestHandle {
 }
 
 impl AgentTestHandle {
-    /// Installs a scripted backend whose queues hold `capacity` items.
+    /// Installs a scripted backend whose event queue holds `capacity` items.
     pub(crate) fn install(editor: &mut Editor, capacity: usize) -> Self {
         let (bridge, worker) = CodexBridge::channel(NonZeroUsize::new(capacity).unwrap());
         editor.agent_manager.set_bridge(bridge);
         Self { worker }
     }
 
-    /// Installs a backend with a one-slot command queue already occupied by a prompt.
-    pub(crate) async fn install_with_full_command_queue(
+    /// Installs a backend with a prompt already waiting in its command queue.
+    pub(crate) async fn install_with_queued_prompt(
         editor: &mut Editor,
         session: &str,
         text: &str,

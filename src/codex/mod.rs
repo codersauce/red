@@ -32,6 +32,7 @@ use tokio::{
     time::timeout,
 };
 
+mod backend;
 #[cfg(test)]
 pub(crate) mod golden_support;
 mod history;
@@ -41,6 +42,7 @@ mod tool_error;
 mod tool_host_adapter;
 mod translate;
 
+pub use backend::CodexBackend;
 pub use tool_host_adapter::ToolHostAdapter;
 
 use crate::agent_backend::ids::TurnId;
@@ -350,6 +352,12 @@ pub enum CodexEvent {
         /// Final text returned by `item/completed`.
         text: String,
     },
+    /// The app-server accepted the prompt of a turn Red started: its
+    /// `turn/start` response named the turn.
+    TurnAccepted {
+        /// Owning session.
+        session_id: String,
+    },
     /// Structured activity update for tool and reasoning presentation.
     Activity {
         /// Owning session.
@@ -397,23 +405,25 @@ pub enum CodexEvent {
     },
 }
 
-/// Editor-side bounded command sender and non-blocking event receiver.
+/// Editor-side command sender and non-blocking event receiver. Commands are
+/// never refused for lack of room, so sending one never waits.
 pub struct CodexBridge {
-    commands: mpsc::Sender<CodexCommand>,
+    commands: mpsc::UnboundedSender<CodexCommand>,
     events: mpsc::Receiver<CodexEvent>,
 }
 
-/// Worker-side bounded command receiver and event sender.
+/// Worker-side command receiver and event sender.
 pub struct CodexBridgeWorker {
-    commands: mpsc::Receiver<CodexCommand>,
+    commands: mpsc::UnboundedReceiver<CodexCommand>,
     events: mpsc::Sender<CodexEvent>,
 }
 
 impl CodexBridge {
     #[must_use]
-    /// Creates paired editor and worker endpoints with the supplied non-zero capacity.
+    /// Creates paired editor and worker endpoints. `capacity` bounds the
+    /// event channel only; the command channel is unbounded.
     pub fn channel(capacity: NonZeroUsize) -> (Self, CodexBridgeWorker) {
-        let (commands, command_rx) = mpsc::channel(capacity.get());
+        let (commands, command_rx) = mpsc::unbounded_channel();
         let (event_tx, events) = mpsc::channel(capacity.get());
         (
             Self { commands, events },
@@ -424,19 +434,18 @@ impl CodexBridge {
         )
     }
 
-    /// Sends a command with backpressure.
+    /// Sends a command. The command channel is unbounded, so this never waits.
     pub async fn send(&self, command: CodexCommand) -> Result<()> {
         self.commands
             .send(command)
-            .await
-            .context("Codex command channel is closed")
+            .map_err(|_| anyhow::anyhow!("Codex command channel is closed"))
     }
 
-    /// Attempts to send a command without waiting for channel capacity.
+    /// Sends a command without waiting.
     pub fn try_send(&self, command: CodexCommand) -> Result<()> {
         self.commands
-            .try_send(command)
-            .context("Codex command channel is unavailable")
+            .send(command)
+            .map_err(|_| anyhow::anyhow!("Codex command channel is unavailable"))
     }
 
     /// Returns the next ready worker event without blocking.
@@ -634,7 +643,8 @@ enum InternalEvent {
     },
 }
 
-/// Starts a bounded Codex app-server worker and returns its editor bridge.
+/// Starts a Codex app-server worker and returns its editor bridge. `capacity`
+/// bounds the event channel.
 pub fn start_codex(
     spec: CodexProcessSpec,
     host: impl CodexToolHost,
@@ -648,7 +658,7 @@ pub fn start_codex(
 async fn run<H: CodexToolHost>(
     spec: CodexProcessSpec,
     host: H,
-    mut commands: mpsc::Receiver<CodexCommand>,
+    mut commands: mpsc::UnboundedReceiver<CodexCommand>,
     events: mpsc::Sender<CodexEvent>,
 ) -> Result<()> {
     let policy = spec.policy.clone();
@@ -2145,7 +2155,16 @@ async fn handle_response(
                 }
                 return Ok(());
             };
+            let accepted = !turn_id.is_empty() && session.red_turn.is_some();
             session.active_turn = Some(turn_id);
+            if accepted {
+                events
+                    .send(CodexEvent::TurnAccepted {
+                        session_id: session_id.clone(),
+                    })
+                    .await
+                    .ok();
+            }
             if session.cancelled.load(Ordering::Relaxed) {
                 interrupt_active_turn(&session_id, input, pending, sessions, next_id).await?;
             }
@@ -3664,6 +3683,62 @@ mod tests {
             sessions["agent"].pending_interrupt_turn_id.as_deref(),
             Some("returned-turn")
         );
+    }
+
+    #[tokio::test]
+    async fn turn_start_response_reports_acceptance_only_for_turns_red_started() {
+        let session = |red_turn| Session {
+            model_info: None,
+            cwd: PathBuf::from("/workspace"),
+            active_turn: None,
+            red_turn,
+            pending_interrupt_turn_id: None,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            allow_sensitive_paths: false,
+            kind: SessionKind::Agent,
+        };
+        let mut sessions = HashMap::from([
+            ("red".to_string(), session(Some(TurnId::mint()))),
+            ("other".to_string(), session(None)),
+        ]);
+        let (events, mut received) = mpsc::channel(4);
+        let turn_start = |session_id: &str| Pending::Turn {
+            session_id: session_id.to_string(),
+        };
+        let mut pending = HashMap::from([
+            ("other-start".to_string(), turn_start("other")),
+            ("empty-start".to_string(), turn_start("red")),
+            ("red-start".to_string(), turn_start("red")),
+        ]);
+        let mut output = Vec::new();
+        let mut next_id = 0;
+
+        // A turn Red did not start, and a response that names no turn, are
+        // not acceptances.
+        for (request, turn) in [
+            ("other-start", "t0"),
+            ("empty-start", ""),
+            ("red-start", "t1"),
+        ] {
+            handle_response(
+                json!({"id": request, "result": {"turn": {"id": turn}}}),
+                &mut output,
+                &events,
+                &mut pending,
+                &mut sessions,
+                &mut next_id,
+                &AgentRuntimePolicy::default(),
+            )
+            .await
+            .unwrap();
+        }
+
+        assert!(matches!(
+            received.try_recv(),
+            Ok(CodexEvent::TurnAccepted { session_id }) if session_id == "red"
+        ));
+        assert!(received.try_recv().is_err());
+        assert_eq!(sessions["red"].active_turn.as_deref(), Some("t1"));
     }
 
     #[tokio::test]

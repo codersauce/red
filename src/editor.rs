@@ -1479,6 +1479,9 @@ fn agent_event_payload(event: CodexEvent) -> (&'static str, Value) {
             "agent:message_completed",
             json!({ "session_id": session_id, "text": text }),
         ),
+        CodexEvent::TurnAccepted { .. } => {
+            unreachable!("turn acceptance is not reported to plugins")
+        }
         CodexEvent::Activity { session_id, update } => (
             "agent:activity",
             json!({
@@ -12084,6 +12087,10 @@ impl Editor {
             else {
                 break;
             };
+            if matches!(event, CodexEvent::TurnAccepted { .. }) {
+                // The pane does not read acceptance yet.
+                continue;
+            }
             if let CodexEvent::ModelRequestCompleted { request_id, result } = &event {
                 self.agent_manager.finish_model_request(*request_id);
                 self.plugin_registry
@@ -41183,15 +41190,15 @@ builtin = "rust"
     }
 
     #[tokio::test]
-    async fn stale_permission_does_not_block_input_when_the_agent_command_queue_is_full() {
+    async fn stale_permission_does_not_block_input_while_a_prompt_is_queued() {
         drain_plugin_requests();
         let mut core = DetachedEditorCore::new(test_editor(/*width*/ 80, /*height*/ 24))
             .await
             .unwrap();
-        let mut agent = AgentTestHandle::install_with_full_command_queue(
+        let mut agent = AgentTestHandle::install_with_queued_prompt(
             &mut core.editor,
             "stalled-session",
-            "occupy the command queue",
+            "queued prompt",
         )
         .await;
         agent
@@ -41214,8 +41221,10 @@ builtin = "rust"
         assert!(matches!(
             agent.recv_command().await,
             Some(AgentCommand::Prompt { session, text })
-                if session == "stalled-session" && text == "occupy the command queue"
+                if session == "stalled-session" && text == "queued prompt"
         ));
+        // The denial of the stale request follows the prompt in the queue.
+        assert_eq!(agent.recv_command().await, Some(AgentCommand::Other));
         assert!(agent.no_command_within(Duration::from_millis(20)).await);
         drain_plugin_requests();
     }
