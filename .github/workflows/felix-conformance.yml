@@ -148,8 +148,9 @@ jobs:
     # Replays helix-cm6's generated key sequences against Helix 25.07.1 and Red.
     # Pull requests run the hand suite and one fuzz seed; pushes and nightly runs
     # add the other seeds. scripts/felix/cm6/baseline.txt lists known differences.
+    # Without cached Helix results, running Helix on every seed takes about 45 minutes.
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -161,7 +162,10 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/red-felix/cm6/expected-*.json
-          key: felix-cm6-${{ github.event_name == 'pull_request' && 'pr' || 'full' }}-${{ hashFiles('scripts/felix/cm6/oracle.rs', 'scripts/felix/cm6/run.py', 'scripts/felix/cm6/export.ts') }}
+          # Results are per suite. Save under a new key each run so later suites
+          # are kept, and restore the newest results for the same oracle.
+          key: felix-cm6-${{ hashFiles('scripts/felix/cm6/oracle.rs', 'scripts/felix/cm6/run.py', 'scripts/felix/cm6/export.ts') }}-${{ github.run_id }}
+          restore-keys: felix-cm6-${{ hashFiles('scripts/felix/cm6/oracle.rs', 'scripts/felix/cm6/run.py', 'scripts/felix/cm6/export.ts') }}-
       - name: Compare with Helix
         env:
           SUITES: ${{ github.event_name == 'pull_request' && 'hand fuzz:1' || 'hand fuzz:1 fuzz:2 fuzz:3 fuzz:4 fuzz:5' }}

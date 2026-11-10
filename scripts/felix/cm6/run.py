@@ -89,26 +89,35 @@ def main():
     checkout("https://github.com/helix-editor/helix", helix, HELIX_PIN)
     checkout("https://github.com/Kosyakssss/helix-cm6", cm6, CM6_PIN)
 
-    cases = []
+    # Helix's results are cached per suite, so any combination of suites reuses them.
+    cases, expected, missing = [], {}, []
+    oracle_source = (HERE / "oracle.rs").read_bytes()
     for suite in args.suites:
         out = subprocess.run(["bun", str(HERE / "export.ts"), str(cm6), suite],
                              stdout=subprocess.PIPE, check=True, text=True).stdout
-        cases += json.loads(out)
+        suite_cases = json.loads(out)
+        cases += suite_cases
+        digest = hashlib.sha256(
+            json.dumps(suite_cases, sort_keys=True).encode() + oracle_source
+        ).hexdigest()[:16]
+        name = suite.replace(":", "-")
+        path = cache / f"expected-{HELIX_PIN[:12]}-{name}-{digest}.json"
+        if path.exists():
+            expected.update(json.loads(path.read_text()))
+        else:
+            missing.append((path, suite_cases))
 
-    digest = hashlib.sha256(
-        json.dumps(cases, sort_keys=True).encode() + (HERE / "oracle.rs").read_bytes()
-    ).hexdigest()[:16]
-    expected_path = cache / f"expected-{HELIX_PIN[:12]}-{digest}.json"
-    if expected_path.exists():
-        expected = json.loads(expected_path.read_text())
-    else:
-        print(f"running Helix {HELIX_PIN[:12]} on {len(cases)} cases", file=sys.stderr)
-        unique = {(c["in"], c["keys"], c.get("lang")): c for c in cases}
+    if missing:
+        pending = [c for _, suite_cases in missing for c in suite_cases]
+        print(f"running Helix {HELIX_PIN[:12]} on {len(pending)} cases", file=sys.stderr)
+        unique = {(c["in"], c["keys"], c.get("lang")): c for c in pending}
         keyed = [{**c, "id": str(i)} for i, c in enumerate(unique.values())]
         results = run_oracle(helix, keyed, args.jobs)
         by_input = {(c["in"], c["keys"], c.get("lang")): results[c["id"]] for c in keyed}
-        expected = {c["id"]: by_input[(c["in"], c["keys"], c.get("lang"))] for c in cases}
-        expected_path.write_text(json.dumps(expected))
+        for path, suite_cases in missing:
+            found = {c["id"]: by_input[(c["in"], c["keys"], c.get("lang"))] for c in suite_cases}
+            path.write_text(json.dumps(found))
+            expected.update(found)
 
     # Language cases need Red's per-language syntax setup; run them later.
     plain = [{**c, "expected": expected[c["id"]]} for c in cases if not c.get("lang")]
