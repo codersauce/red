@@ -35,6 +35,8 @@ use tokio::{
 };
 
 mod activity;
+#[cfg(test)]
+pub(crate) mod golden_support;
 mod history;
 mod models;
 mod sessions;

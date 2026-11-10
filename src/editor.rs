@@ -24,6 +24,8 @@ mod agent_manager;
 mod agent_models;
 pub(crate) mod agent_pane;
 mod agent_pane_host;
+#[cfg(test)]
+mod agent_payload_goldens;
 mod agent_sessions;
 mod buffer_actions;
 mod buffer_do;
