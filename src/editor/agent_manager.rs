@@ -15,19 +15,6 @@ use crate::{
     agent_tools::{PendingEditorTool, PendingEditorToolResponse},
 };
 
-/// What the editor was asking for when a command found the agent gone. The loss
-/// that follows reports it the way the failed command would have.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AgentLossContext {
-    /// A prompt that never reached the agent; the plugin gets it back so it can
-    /// retry the message.
-    Prompt { session_id: String, prompt: String },
-    /// A new session that could not be requested.
-    NewSession,
-    /// A saved session that could not be rejoined or forked.
-    Restore { session_id: String },
-}
-
 /// Encapsulates the agent backend, active turn metrics, and the tool channel.
 pub struct AgentManager {
     agents: Box<dyn AgentBackend>,
@@ -43,7 +30,6 @@ pub struct AgentManager {
     turn_phases: HashMap<String, AgentTurnPhase>,
     active_turn_ids: HashMap<String, String>,
     turn_started_at: HashMap<String, Instant>,
-    loss_context: Option<AgentLossContext>,
     next_model: Option<crate::agent_backend::types::ModelSelection>,
     conversation: Option<AgentConversationSnapshot>,
     /// Bumped on every change to `conversation`, so the editor can tell when the
@@ -139,7 +125,6 @@ impl AgentManager {
             turn_phases: HashMap::new(),
             active_turn_ids: HashMap::new(),
             turn_started_at: HashMap::new(),
-            loss_context: None,
             next_model: None,
             conversation: None,
             conversation_revision: 0,
@@ -212,6 +197,12 @@ impl AgentManager {
         self.agents.is_running()
     }
 
+    /// Returns `true` while the agent's worker has ended but the editor has
+    /// not yet read its loss.
+    pub fn has_ended(&self) -> bool {
+        self.agents.has_ended()
+    }
+
     /// Closes a session the editor is done with. Nothing to close when no agent
     /// is running, and a failure to reach it is not the user's to hear about.
     pub fn close_session(&mut self, session_id: impl Into<String>) {
@@ -224,15 +215,6 @@ impl AgentManager {
     pub fn live_turn(&self, session_id: &str) -> Option<TurnId> {
         let turn = self.active_turn_ids.get(session_id)?;
         uuid::Uuid::parse_str(turn).ok().map(TurnId::from_uuid)
-    }
-
-    /// Remembers what a failed command was doing, for the loss that follows.
-    pub fn set_loss_context(&mut self, context: AgentLossContext) {
-        self.loss_context = Some(context);
-    }
-
-    pub fn take_loss_context(&mut self) -> Option<AgentLossContext> {
-        self.loss_context.take()
     }
 
     pub fn root(&self) -> Option<&Path> {

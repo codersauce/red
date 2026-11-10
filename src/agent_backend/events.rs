@@ -1,7 +1,7 @@
 //! The single event stream an agent backend produces.
 
 use super::{
-    ids::{QueryId, SessionId, TurnId},
+    ids::{BackendKind, QueryId, SessionId, TurnId},
     types::{Activity, ModelInfo, ModelResult, RestoredHistory, SessionPage, SessionPreview},
 };
 use crate::inline_assist::InlineAssistResult;
@@ -228,6 +228,13 @@ pub struct Lost {
     /// conversation was created or restored since. The ledger sets this
     /// itself.
     pub had_sessions: bool,
+}
+
+/// What a backend reports when its worker ended without saying why. An editor
+/// that was in the middle of something may put wording that fits it in place of
+/// this one.
+pub fn unexplained_loss(kind: BackendKind) -> String {
+    format!("{} app-server stopped unexpectedly", kind.name())
 }
 
 #[cfg(test)]

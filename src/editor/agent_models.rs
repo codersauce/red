@@ -1,5 +1,6 @@
 //! Editor ownership and callback routing for the Agent model picker.
 
+use super::agent_commands::query_failure;
 use super::*;
 use crate::agent_backend::{
     ids::{QueryId, SessionId},
@@ -59,7 +60,9 @@ impl Editor {
                 return Ok(());
             }
         }
+        self.settle_ended_agent(runtime).await?;
         let id = QueryId(request_id.get());
+        let kind = self.agent_manager.agents().kind();
         let result = self.ensure_agent(&get_workspace_path()).and_then(|()| {
             let agents = self.agent_manager.agents_mut();
             match request {
@@ -70,7 +73,7 @@ impl Editor {
                     selection,
                 } => agents.set_model(id, &SessionId::from_raw(session_id), selection),
             }
-            .map_err(anyhow::Error::from)
+            .map_err(|error| query_failure(kind, error))
         });
         if let Err(error) = result {
             self.plugin_registry

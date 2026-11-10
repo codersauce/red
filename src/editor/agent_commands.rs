@@ -1,11 +1,26 @@
 //! Editor-side agent commands: every place the editor asks the backend to act.
 
+use super::agent_events::{LossNotice, LossSite};
 use super::*;
 use crate::agent_backend::{
     backend::AgentError,
-    ids::{Continuity, ContractStamp, QueryId, SavedSession, SessionId},
+    ids::{BackendKind, Continuity, ContractStamp, QueryId, SavedSession, SessionId},
     types::{EditorContext, Prompt},
 };
+
+/// The words for a command the agent's channel refused. An agent that is gone
+/// is described by its channel, as it always was.
+fn channel_failure(kind: BackendKind, error: AgentError, state: &str) -> anyhow::Error {
+    match error {
+        AgentError::Gone(_) => anyhow::anyhow!("{} command channel is {state}", kind.name()),
+        other => other.into(),
+    }
+}
+
+/// The words for a query that could not be queued.
+pub(super) fn query_failure(kind: BackendKind, error: AgentError) -> anyhow::Error {
+    channel_failure(kind, error, "unavailable")
+}
 
 impl Editor {
     pub(super) async fn dispatch_agent_prompt(
@@ -15,6 +30,17 @@ impl Editor {
         text: String,
         context: Option<(String, String)>,
     ) -> anyhow::Result<bool> {
+        if self.agent_manager.agents().has_ended() {
+            let site = self.loss_site(
+                "before the prompt was sent",
+                LossNotice::Prompt {
+                    session_id,
+                    prompt: text,
+                },
+            );
+            self.settle_agent_loss(runtime, site).await?;
+            return Ok(false);
+        }
         if !self.agent_manager.is_running() {
             self.reset_agent_state("Agent session closed.");
             let message = self.agent_not_running_message();
@@ -65,13 +91,17 @@ impl Editor {
             prompt,
         ) {
             Ok(()) => {}
-            // The loss that follows carries the prompt back to the plugin.
+            // The agent ended while the prompt was being sent: it goes back to
+            // the plugin with the loss.
             Err(AgentError::Gone(_)) => {
-                self.agent_manager
-                    .set_loss_context(agent_manager::AgentLossContext::Prompt {
+                let site = self.loss_site(
+                    "while sending the prompt",
+                    LossNotice::Prompt {
                         session_id,
                         prompt: text,
-                    });
+                    },
+                );
+                self.settle_agent_loss(runtime, site).await?;
             }
             Err(AgentError::Unavailable(message)) => {
                 self.finish_inline_agent_outcome(
@@ -134,11 +164,40 @@ impl Editor {
         )
     }
 
+    /// A loss report for a command, whose fallback wording reads "<agent>
+    /// app-server stopped <when>".
+    fn loss_site(&self, when: &str, notice: LossNotice) -> LossSite {
+        LossSite {
+            fallback: format!(
+                "{} app-server stopped {when}",
+                self.agent_manager.agents().kind().name()
+            ),
+            notice,
+        }
+    }
+
+    /// Finishes off an agent whose worker already ended, without telling the
+    /// plugin, so the call that found it can start a fresh one.
+    pub(super) async fn settle_ended_agent(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {
+        let site = self.loss_site("unexpectedly", LossNotice::Silent);
+        self.settle_agent_loss(runtime, site).await?;
+        Ok(())
+    }
+
     pub(super) async fn agent_new_session(
         &mut self,
         runtime: &mut Runtime,
         cwd: PathBuf,
     ) -> anyhow::Result<()> {
+        if self.agent_manager.agents().has_ended() {
+            let site = self.loss_site(
+                "unexpectedly",
+                LossNotice::NewSession {
+                    only_with_conversations: true,
+                },
+            );
+            self.settle_agent_loss(runtime, site).await?;
+        }
         if let Err(error) = self.ensure_agent(&cwd) {
             self.notify_agent(
                 runtime,
@@ -152,8 +211,13 @@ impl Editor {
         match self.agent_manager.agents_mut().new_session(&cwd, model) {
             Ok(()) => {}
             Err(AgentError::Gone(_)) => {
-                self.agent_manager
-                    .set_loss_context(agent_manager::AgentLossContext::NewSession);
+                let site = self.loss_site(
+                    "while starting the session",
+                    LossNotice::NewSession {
+                        only_with_conversations: false,
+                    },
+                );
+                self.settle_agent_loss(runtime, site).await?;
             }
             Err(AgentError::Unavailable(message)) => {
                 self.notify_agent(runtime, "agent:error", json!({ "message": message }))
@@ -187,7 +251,13 @@ impl Editor {
                     .await?;
             return Ok(());
         }
-        self.restore_agent_session(runtime, &cwd, &saved).await
+        self.restore_agent_session(
+            runtime,
+            &cwd,
+            &saved,
+            ("before restoration", "while restoring the session"),
+        )
+        .await
     }
 
     pub(super) async fn agent_switch_session(
@@ -222,7 +292,13 @@ impl Editor {
             None
         };
         let saved = self.saved_session(&session_id, contract);
-        self.restore_agent_session(runtime, &cwd, &saved).await
+        self.restore_agent_session(
+            runtime,
+            &cwd,
+            &saved,
+            ("before switching sessions", "while switching sessions"),
+        )
+        .await
     }
 
     fn saved_session(&self, session_id: &str, contract: Option<ContractStamp>) -> SavedSession {
@@ -234,14 +310,21 @@ impl Editor {
     }
 
     /// Starts the agent if needed and asks it to bring `saved` back. Failures
-    /// reach the plugin as `agent:session_restore_failed`.
+    /// reach the plugin as `agent:session_restore_failed`. `wording` is how
+    /// the loss of an agent that ended before, or while, the request was sent
+    /// reads.
     async fn restore_agent_session(
         &mut self,
         runtime: &mut Runtime,
         cwd: &Path,
         saved: &SavedSession,
+        wording: (&str, &str),
     ) -> anyhow::Result<()> {
         let session_id = saved.session.as_str().to_string();
+        if self.agent_manager.agents().has_ended() {
+            let site = self.loss_site(wording.0, LossNotice::Silent);
+            self.settle_agent_loss(runtime, site).await?;
+        }
         if let Err(error) = self.ensure_agent(cwd) {
             self.notify_agent(
                 runtime,
@@ -257,8 +340,8 @@ impl Editor {
         match self.agent_manager.agents_mut().restore(cwd, saved) {
             Ok(()) => {}
             Err(AgentError::Gone(_)) => {
-                self.agent_manager
-                    .set_loss_context(agent_manager::AgentLossContext::Restore { session_id });
+                let site = self.loss_site(wording.1, LossNotice::Restore { session_id });
+                self.settle_agent_loss(runtime, site).await?;
             }
             Err(AgentError::Unavailable(message)) => {
                 self.notify_agent(
@@ -341,14 +424,20 @@ impl Editor {
         recent_commits: String,
     ) -> anyhow::Result<()> {
         let prompt = commit_message_prompt(&branch, &staged_diff, &recent_commits);
-        let result = prompt.and_then(|prompt| {
-            self.ensure_agent(&get_workspace_path())?;
-            self.agent_manager
-                .agents_mut()
-                .commit_messages()?
-                .generate(QueryId(request_id.get()), &cwd, prompt)?;
-            Ok(())
-        });
+        let result = match prompt {
+            Err(error) => Err(error),
+            Ok(prompt) => {
+                self.settle_ended_agent(runtime).await?;
+                let kind = self.agent_manager.agents().kind();
+                self.ensure_agent(&get_workspace_path()).and_then(|()| {
+                    self.agent_manager
+                        .agents_mut()
+                        .commit_messages()?
+                        .generate(QueryId(request_id.get()), &cwd, prompt)
+                        .map_err(|error| query_failure(kind, error))
+                })
+            }
+        };
         if let Err(error) = result {
             self.plugin_registry
                 .resolve_request(
@@ -371,6 +460,7 @@ impl Editor {
         prompt: &str,
         context: &str,
     ) -> anyhow::Result<()> {
+        let kind = self.agent_manager.agents().kind();
         let inline = self.agent_manager.agents_mut().inline_assist()?;
         let (request, prompt, context) = (
             request_id.to_string(),
@@ -378,11 +468,11 @@ impl Editor {
             context.to_string(),
         );
         match existing_session {
-            None => inline.start(request, cwd, prompt, context)?,
+            None => inline.start(request, cwd, prompt, context),
             Some(session) => {
-                inline.followup(request, &SessionId::from_raw(session), prompt, context)?;
+                inline.followup(request, &SessionId::from_raw(session), prompt, context)
             }
         }
-        Ok(())
+        .map_err(|error| channel_failure(kind, error, "closed"))
     }
 }

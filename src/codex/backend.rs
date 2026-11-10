@@ -41,8 +41,8 @@ use crate::{
     agent_backend::{
         backend::{AgentBackend, AgentError, CommitMessages, InlineAssist, Missing},
         events::{
-            Completion, Delivery, Event, Failure, FailureCause, InlineEvent, Lost, LostScope,
-            QueryKind, ReplyBody, SessionEvent, TurnEnd, TurnEvent, TurnEventKind,
+            unexplained_loss, Completion, Delivery, Event, Failure, FailureCause, InlineEvent,
+            Lost, LostScope, QueryKind, ReplyBody, SessionEvent, TurnEnd, TurnEvent, TurnEventKind,
         },
         ids::{BackendKind, Continuity, ContractStamp, QueryId, SavedSession, SessionId, TurnId},
         tool_host::ToolHost,
@@ -56,7 +56,6 @@ use crate::{
 const AGENT_BRIDGE_CAPACITY: usize = 64;
 const MAX_FAILURE_MESSAGE_CHARS: usize = 2048;
 const NOT_RUNNING: &str = "No Codex app-server session is running";
-const STOPPED_UNEXPECTEDLY: &str = "Codex app-server stopped unexpectedly";
 
 type TaskResult = Result<anyhow::Result<()>, JoinError>;
 
@@ -412,6 +411,12 @@ impl<H: ToolHost> AgentBackend for CodexBackend<H> {
         self.worker.is_some()
     }
 
+    fn has_ended(&self) -> bool {
+        self.worker
+            .as_ref()
+            .is_some_and(|worker| worker.task.is_finished())
+    }
+
     fn ensure(&mut self, root: &Path) -> Result<(), AgentError> {
         let root = root
             .absolutize()
@@ -684,7 +689,7 @@ fn lost_message(result: Option<TaskResult>) -> String {
             crate::log!("Codex app-server task failed: {error}");
             format!("Codex app-server task failed: {error}")
         }
-        Some(Ok(Ok(()))) | Some(Err(_)) | None => STOPPED_UNEXPECTEDLY.to_string(),
+        Some(Ok(Ok(()))) | Some(Err(_)) | None => unexplained_loss(BackendKind::Codex),
     };
     bounded_failure_message(&message)
 }
@@ -1810,7 +1815,7 @@ mod tests {
         drop(worker);
         assert!(matches!(
             backend.list_models(QueryId(1)),
-            Err(AgentError::Gone(message)) if message == STOPPED_UNEXPECTEDLY
+            Err(AgentError::Gone(message)) if message == unexplained_loss(BackendKind::Codex)
         ));
         assert!(!backend.is_running());
     }

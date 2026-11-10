@@ -11,6 +11,7 @@ use std::{cell::Cell, cell::RefCell, collections::HashMap};
 use super::Editor;
 use crate::{
     agent_backend::{
+        backend::AgentError,
         events::{Completion, Event, InlineEvent, TurnEnd, TurnEventKind},
         ids::{SessionId, TurnId},
         testing::{open_scripted, Call, Script},
@@ -160,6 +161,12 @@ impl AgentTestHandle {
     /// emitted is delivered.
     pub(crate) fn lose(&self, message: &str) {
         self.script.lose(message);
+    }
+
+    /// Makes the next command fail as if the agent had just ended, with
+    /// `message` as the reason it gave.
+    pub(crate) fn fail_next_gone(&self, message: &str) {
+        self.script.fail_next(AgentError::Gone(message.to_string()));
     }
 
     /// Ends one session of the backend, which keeps running.

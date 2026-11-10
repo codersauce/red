@@ -11702,10 +11702,6 @@ impl Editor {
             agent_events += 1;
             self.handle_agent_event(buffer, runtime, event).await?;
         }
-        // A saturated pump left events behind. Plugin requests wait for the
-        // next tick so they never act on state the agent already moved past.
-        let agent_backlog = agent_events == AGENT_EVENTS_PER_TICK;
-
         self.refresh_live_inline_history(buffer, runtime).await?;
         self.persist_agent_conversation(/*force*/ false);
 
@@ -11883,7 +11879,9 @@ impl Editor {
         for _ in 0..PLUGIN_REQUESTS_PER_TICK {
             // Boxed so the pane driver does not grow this large future's frame.
             Box::pin(self.drain_agent_pane_effects(runtime)).await?;
-            if agent_backlog {
+            // An agent whose end is still unread would answer requests with state
+            // it already moved past; they wait for the next tick's pump.
+            if self.agent_manager.has_ended() {
                 break;
             }
             let Some(req) = runtime.try_recv_request() else {
@@ -40001,6 +39999,210 @@ builtin = "rust"
         assert_eq!(editor.last_error.as_deref(), Some(expected.as_str()));
         assert!(!editor.agent_manager.is_running());
         assert!(!editor.agent_manager.is_session_active("session-1"));
+        drain_plugin_requests();
+    }
+
+    async fn editor_recording_agent_losses() -> (Editor, Runtime, tempfile::TempDir) {
+        drain_plugin_requests();
+        let root = tempfile::tempdir().unwrap();
+        let plugin = root.path().join("agent-loss-recorder.hk");
+        std::fs::write(
+            &plugin,
+            r#"
+                pub fn activate() {
+                    red::state_set("trace", "");
+                    red::on("agent:update", update);
+                    red::on("agent:session_lost", lost);
+                }
+
+                fn update(event: Json) {
+                    red::state_set("trace", red::string(red::state("trace"), "") + "update;");
+                }
+
+                fn lost(event: Json) {
+                    red::state_set(
+                        "trace",
+                        red::string(red::state("trace"), "")
+                            + "lost[" + red::string(event.session_id, "-")
+                            + "|" + red::string(event.prompt, "-")
+                            + "|" + red::string(event.message, "-") + "];"
+                    );
+                    red::execute("Print", red::string(red::state("trace"), ""));
+                }
+            "#,
+        )
+        .unwrap();
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let mut runtime = Runtime::new();
+        editor
+            .plugin_registry
+            .add("agent_loss_recorder", plugin.to_string_lossy().as_ref());
+        editor
+            .plugin_registry
+            .initialize(&mut runtime)
+            .await
+            .unwrap();
+        (editor, runtime, root)
+    }
+
+    /// What the plugin heard, and what the agent was asked, when a prompt
+    /// reached an agent after `setup` ran.
+    async fn prompt_after(setup: impl FnOnce(&AgentTestHandle)) -> (String, Vec<AgentCommand>) {
+        let (mut editor, mut runtime, _root) = editor_recording_agent_losses().await;
+        let agent = AgentTestHandle::install(&mut editor);
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
+        setup(&agent);
+        editor
+            .dispatch_agent_prompt(&mut runtime, "session-1".into(), "hello".into(), None)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            editor
+                .service_background(&mut buffer, &mut runtime)
+                .await
+                .unwrap();
+        }
+        assert!(!editor.agent_manager.is_running());
+        (
+            editor.last_error.clone().unwrap_or_default(),
+            agent.commands(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_prompt_to_an_agent_that_ended_unread_reports_exactly_one_loss_with_the_prompt() {
+        let unexplained = crate::agent_backend::events::unexplained_loss(
+            crate::agent_backend::ids::BackendKind::Codex,
+        );
+        let explained = "Codex app-server failed: worker died";
+
+        let (heard, commands) = prompt_after(|agent| {
+            agent.emit_update("session-1", "stale");
+            agent.lose(explained);
+        })
+        .await;
+        assert_eq!(
+            heard, "lost[session-1|hello|Codex app-server failed: worker died];",
+            "buffered events are dropped and the loss is reported once"
+        );
+        assert_eq!(commands, [], "the prompt was never sent");
+
+        let (heard, _) = prompt_after(|agent| agent.lose(&unexplained)).await;
+        assert_eq!(
+            heard,
+            "lost[session-1|hello|Codex app-server stopped before the prompt was sent];"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prompt_the_agent_refuses_because_it_just_ended_reports_exactly_one_loss() {
+        let unexplained = crate::agent_backend::events::unexplained_loss(
+            crate::agent_backend::ids::BackendKind::Codex,
+        );
+
+        let (heard, _) =
+            prompt_after(|agent| agent.fail_next_gone("Codex app-server failed: pipe closed"))
+                .await;
+        assert_eq!(
+            heard,
+            "lost[session-1|hello|Codex app-server failed: pipe closed];"
+        );
+
+        let (heard, _) = prompt_after(|agent| agent.fail_next_gone(&unexplained)).await;
+        assert_eq!(
+            heard,
+            "lost[session-1|hello|Codex app-server stopped while sending the prompt];"
+        );
+    }
+
+    async fn new_session_on_an_ended_agent(conversations: bool) -> String {
+        let (mut editor, mut runtime, root) = editor_recording_agent_losses().await;
+        let agent = AgentTestHandle::install(&mut editor);
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
+        if conversations {
+            agent.open_session();
+        }
+        agent.lose("Codex app-server failed: worker died");
+        editor
+            .agent_new_session(&mut runtime, root.path().to_path_buf())
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            editor
+                .service_background(&mut buffer, &mut runtime)
+                .await
+                .unwrap();
+        }
+        assert!(editor.agent_manager.is_running(), "a fresh agent started");
+        editor.last_error.clone().unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn a_new_session_on_an_ended_agent_reports_the_loss_only_when_conversations_ran() {
+        assert_eq!(
+            new_session_on_an_ended_agent(/*conversations*/ true).await,
+            "lost[-|-|Codex app-server failed: worker died];"
+        );
+        assert_eq!(
+            new_session_on_an_ended_agent(/*conversations*/ false).await,
+            "",
+            "a worker that only answered queries is replaced silently"
+        );
+    }
+
+    #[tokio::test]
+    async fn settling_an_ended_agent_for_a_query_tells_the_plugin_nothing() {
+        let (mut editor, mut runtime, _root) = editor_recording_agent_losses().await;
+        let agent = AgentTestHandle::install(&mut editor);
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
+        agent.open_session();
+        agent.lose("Codex app-server failed: worker died");
+
+        editor.settle_ended_agent(&mut runtime).await.unwrap();
+        for _ in 0..2 {
+            editor
+                .service_background(&mut buffer, &mut runtime)
+                .await
+                .unwrap();
+        }
+
+        assert!(editor.last_error.is_none());
+        assert!(!editor.agent_manager.is_running());
+        assert!(!editor.agent_manager.agents().has_ended());
+    }
+
+    #[tokio::test]
+    async fn a_saturated_agent_pump_does_not_defer_plugin_requests_of_a_live_agent() {
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let mut runtime = Runtime::new();
+        let agent = AgentTestHandle::install(&mut editor);
+        for index in 0..AGENT_EVENTS_PER_TICK + 8 {
+            agent.emit_update("session-2", &index.to_string());
+        }
+        ACTION_DISPATCHER.send_request(PluginRequest::AgentPrompt {
+            session_id: "session-1".to_string(),
+            text: "now".to_string(),
+        });
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
+
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert_eq!(agent.pending(), 8);
+        assert_eq!(
+            agent.commands(),
+            [AgentCommand::Prompt {
+                session: "session-1".into(),
+                text: "now".into()
+            }]
+        );
         drain_plugin_requests();
     }
 

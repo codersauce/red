@@ -166,6 +166,18 @@ impl AgentBackend for ScriptedBackend {
         !lock(&self.shared).stopped
     }
 
+    fn has_ended(&self) -> bool {
+        lock(&self.shared).inbox.iter().any(|event| {
+            matches!(
+                event,
+                Event::Lost(Lost {
+                    scope: LostScope::Backend,
+                    ..
+                })
+            )
+        })
+    }
+
     fn ensure(&mut self, root: &Path) -> Result<(), AgentError> {
         self.record(Call::Ensure(root.to_path_buf()))?;
         if let Some(current) = self.root.as_deref().filter(|current| *current != root) {
@@ -488,6 +500,10 @@ impl AgentBackend for ScriptedLedger {
 
     fn is_running(&self) -> bool {
         self.ledger.is_running()
+    }
+
+    fn has_ended(&self) -> bool {
+        self.ledger.has_ended()
     }
 
     fn ensure(&mut self, root: &Path) -> Result<(), AgentError> {

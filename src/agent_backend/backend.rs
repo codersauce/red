@@ -52,6 +52,10 @@ pub trait AgentBackend: Send {
 
     /// Whether a worker exists that has not reported `Lost`.
     fn is_running(&self) -> bool;
+    /// Whether the worker has ended while its `Lost`, and whatever events it
+    /// buffered, are still unread: a command sent now finds it gone. True from
+    /// the moment the worker ends until `poll` has returned that `Lost`.
+    fn has_ended(&self) -> bool;
     /// Starts the worker in `root` unless it already runs there. Idempotent.
     /// `Unavailable` when the agent cannot start or runs in another root.
     fn ensure(&mut self, root: &Path) -> Result<(), AgentError>;

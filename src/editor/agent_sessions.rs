@@ -1,5 +1,6 @@
 //! Editor ownership and callback routing for persisted Agent sessions.
 
+use super::agent_commands::query_failure;
 use super::*;
 use crate::agent_backend::{
     ids::{QueryId, SessionId},
@@ -35,12 +36,14 @@ impl Editor {
         request_id: RequestId,
         request: SessionQuery,
     ) -> anyhow::Result<()> {
+        self.settle_ended_agent(runtime).await?;
         let cwd = request.cwd.clone();
+        let kind = self.agent_manager.agents().kind();
         let result = self.ensure_agent(&cwd).and_then(|()| {
             self.agent_manager
                 .agents_mut()
                 .list_sessions(QueryId(request_id.get()), request)
-                .map_err(anyhow::Error::from)
+                .map_err(|error| query_failure(kind, error))
         });
         if let Err(error) = result {
             self.plugin_registry
@@ -60,6 +63,8 @@ impl Editor {
         request_id: RequestId,
         request: SessionPreviewRequest,
     ) -> anyhow::Result<()> {
+        self.settle_ended_agent(runtime).await?;
+        let kind = self.agent_manager.agents().kind();
         let result = self.ensure_agent(&request.cwd).and_then(|()| {
             self.agent_manager
                 .agents_mut()
@@ -68,7 +73,7 @@ impl Editor {
                     &request.cwd,
                     &SessionId::from_raw(request.session_id),
                 )
-                .map_err(anyhow::Error::from)
+                .map_err(|error| query_failure(kind, error))
         });
         if let Err(error) = result {
             self.plugin_registry

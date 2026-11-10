@@ -4,11 +4,40 @@ use super::agent_payloads::{session_event_payload, turn_event_payload};
 use super::*;
 use crate::agent_backend::{
     events::{
-        Delivery, Event, Failure, FailureCause, InlineEvent, Lost, LostScope, QueryKind, ReplyBody,
-        SessionEvent, TurnEnd, TurnEvent, TurnEventKind,
+        unexplained_loss, Delivery, Event, Failure, FailureCause, InlineEvent, Lost, LostScope,
+        QueryKind, ReplyBody, SessionEvent, TurnEnd, TurnEvent, TurnEventKind,
     },
-    ids::{QueryId, SessionId},
+    ids::{BackendKind, QueryId, SessionId},
 };
+
+/// How a command that found the agent's worker ended reports the loss.
+pub(super) struct LossSite {
+    /// Said in place of the agent's own reason when it gave none.
+    pub fallback: String,
+    pub notice: LossNotice,
+}
+
+/// What the plugin hears about a loss a command found.
+pub(super) enum LossNotice {
+    /// Nothing: the call goes on to start a fresh agent.
+    Silent,
+    /// A prompt that never reached the agent comes back, so it can be retried.
+    Prompt { session_id: String, prompt: String },
+    /// A new session that was never created. `only_with_conversations` keeps
+    /// the news from a worker that only ever answered queries.
+    NewSession { only_with_conversations: bool },
+    /// A saved session that could not be brought back.
+    Restore { session_id: String },
+}
+
+/// The agent's own reason for a loss, or `fallback` when it gave none.
+fn loss_reason(kind: BackendKind, reason: String, fallback: &str) -> String {
+    if reason == unexplained_loss(kind) {
+        fallback.to_string()
+    } else {
+        reason
+    }
+}
 
 impl Editor {
     /// Applies one backend event to the editor and forwards it to plugins.
@@ -513,6 +542,7 @@ impl Editor {
         .await
     }
 
+    /// The agent's worker ended while the editor was reading events.
     async fn handle_agent_backend_loss(
         &mut self,
         buffer: &mut RenderBuffer,
@@ -520,7 +550,6 @@ impl Editor {
         message: String,
         had_sessions: bool,
     ) -> anyhow::Result<()> {
-        let context = self.agent_manager.take_loss_context();
         let inline_scope = self
             .current_dialog
             .as_ref()
@@ -530,8 +559,46 @@ impl Editor {
                     .as_ref()
                     .map(|assist| assist.scope.clone())
             });
+        let unexplained = unexplained_loss(self.agent_manager.agents().kind());
+        self.clear_lost_agent(runtime, &unexplained, &message)
+            .await?;
+        if let Some(scope) = inline_scope {
+            if let Some(assist) = self.inline_assist.as_mut() {
+                assist.session_id = None;
+            }
+            self.current_dialog = Some(Box::new(
+                self.inline_assist_popup(scope, InlineAssistPopupState::Failed(message.clone())),
+            ));
+            self.render(buffer)?;
+        }
+        if let Some(conversation) = self.agent_manager.conversation_snapshot() {
+            self.notify_agent(
+                runtime,
+                "agent:conversation_restore_pending",
+                plugin_json(serde_json::to_value(conversation)?),
+            )
+            .await?;
+            self.set_legacy_message(Some(format!(
+                "{message}; restoring the persisted agent session"
+            )));
+        } else if had_sessions {
+            self.notify_agent(runtime, "agent:session_lost", json!({ "message": message }))
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Drops everything the editor tracked for an agent that is gone.
+    /// `inline_reason` is what running inline outcomes are told; `message` is
+    /// what running inline jobs are told.
+    async fn clear_lost_agent(
+        &mut self,
+        runtime: &mut Runtime,
+        inline_reason: &str,
+        message: &str,
+    ) -> anyhow::Result<()> {
         let name = self.agent_manager.agents().kind().name();
-        self.stop_inline_agent_outcomes(&format!("{name} app-server stopped unexpectedly"));
+        self.stop_inline_agent_outcomes(inline_reason);
         self.abandon_agent_edit_decision(None, &format!("the {name} app-server stopped"));
         self.agent_manager.clear_active_sessions();
         // Prompts held behind a stopping turn were never sent; return them to the
@@ -547,9 +614,70 @@ impl Editor {
         self.agent_manager.clear_turns();
         self.agent_manager.clear_tool_requests();
         self.agent_manager.set_root(None);
-        self.fail_running_inline_jobs(&message);
-        match context {
-            Some(agent_manager::AgentLossContext::Prompt { session_id, prompt }) => {
+        self.fail_running_inline_jobs(message);
+        Ok(())
+    }
+
+    /// Reads out the loss of an agent whose worker already ended, so the call
+    /// that found it reports it in its own words, the way the editor always
+    /// has: whatever the worker still had buffered is dropped, queries it had
+    /// not answered are answered with the reason, and `site` says what the
+    /// plugin hears. `false` when the worker had not ended.
+    pub(super) async fn settle_agent_loss(
+        &mut self,
+        runtime: &mut Runtime,
+        site: LossSite,
+    ) -> anyhow::Result<bool> {
+        if !self.agent_manager.agents().has_ended() {
+            return Ok(false);
+        }
+        let kind = self.agent_manager.agents().kind();
+        while let Some(event) = self.agent_manager.agents_mut().poll() {
+            match event {
+                Event::Reply {
+                    id,
+                    kind: query,
+                    result,
+                } => {
+                    let result = result.map_err(|reason| loss_reason(kind, reason, &site.fallback));
+                    self.agent_reply(runtime, id, query, result).await?;
+                }
+                Event::Lost(Lost {
+                    scope: LostScope::Backend,
+                    message,
+                    had_sessions,
+                }) => {
+                    let message = loss_reason(kind, message, &site.fallback);
+                    self.clear_lost_agent(runtime, &site.fallback, &message)
+                        .await?;
+                    self.announce_site_loss(runtime, site.notice, message, had_sessions)
+                        .await?;
+                    return Ok(true);
+                }
+                Event::Lost(Lost {
+                    scope: LostScope::Session(session),
+                    message,
+                    ..
+                }) => {
+                    self.handle_agent_session_loss(runtime, &session, message)
+                        .await?;
+                }
+                dropped => crate::log!("Dropped {dropped:?} from an agent that had ended"),
+            }
+        }
+        Ok(true)
+    }
+
+    async fn announce_site_loss(
+        &mut self,
+        runtime: &mut Runtime,
+        notice: LossNotice,
+        message: String,
+        had_sessions: bool,
+    ) -> anyhow::Result<()> {
+        match notice {
+            LossNotice::Silent => Ok(()),
+            LossNotice::Prompt { session_id, prompt } => {
                 self.notify_agent(
                     runtime,
                     "agent:session_lost",
@@ -559,47 +687,25 @@ impl Editor {
                         "message": message
                     }),
                 )
-                .await?;
+                .await
             }
-            Some(agent_manager::AgentLossContext::NewSession) => {
+            LossNotice::NewSession {
+                only_with_conversations,
+            } => {
+                if only_with_conversations && !had_sessions {
+                    return Ok(());
+                }
                 self.notify_agent(runtime, "agent:session_lost", json!({ "message": message }))
-                    .await?;
+                    .await
             }
-            Some(agent_manager::AgentLossContext::Restore { session_id }) => {
+            LossNotice::Restore { session_id } => {
                 self.notify_agent(
                     runtime,
                     "agent:session_restore_failed",
                     json!({ "session_id": session_id, "message": message }),
                 )
-                .await?;
-            }
-            None => {
-                if let Some(scope) = inline_scope {
-                    if let Some(assist) = self.inline_assist.as_mut() {
-                        assist.session_id = None;
-                    }
-                    self.current_dialog = Some(Box::new(self.inline_assist_popup(
-                        scope,
-                        InlineAssistPopupState::Failed(message.clone()),
-                    )));
-                    self.render(buffer)?;
-                }
-                if let Some(conversation) = self.agent_manager.conversation_snapshot() {
-                    self.notify_agent(
-                        runtime,
-                        "agent:conversation_restore_pending",
-                        plugin_json(serde_json::to_value(conversation)?),
-                    )
-                    .await?;
-                    self.set_legacy_message(Some(format!(
-                        "{message}; restoring the persisted agent session"
-                    )));
-                } else if had_sessions {
-                    self.notify_agent(runtime, "agent:session_lost", json!({ "message": message }))
-                        .await?;
-                }
+                .await
             }
         }
-        Ok(())
     }
 }

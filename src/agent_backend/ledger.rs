@@ -125,6 +125,22 @@ impl<B: AgentBackend> Ledger<B> {
         }
     }
 
+    /// Runs a command that asks for a conversation. Asking ends a worker's
+    /// query-only status whether or not the command succeeds, but a command
+    /// that fails on a ledger nothing had used leaves it unused.
+    fn request_conversation(
+        &mut self,
+        command: impl FnOnce(&mut B) -> Result<(), AgentError>,
+    ) -> Result<(), AgentError> {
+        let before = self.worker_use;
+        self.note_session();
+        let result = self.run(command);
+        if result.is_err() && before == WorkerUse::Idle {
+            self.worker_use = WorkerUse::Idle;
+        }
+        result
+    }
+
     /// How many events `poll` can return without asking the backend.
     #[cfg(test)]
     pub(super) fn queued(&self) -> usize {
@@ -299,6 +315,19 @@ impl<B: AgentBackend> AgentBackend for Ledger<B> {
         !self.lost && self.inner.is_running()
     }
 
+    fn has_ended(&self) -> bool {
+        self.inner.has_ended()
+            || self.backlog.iter().any(|event| {
+                matches!(
+                    event,
+                    Event::Lost(Lost {
+                        scope: LostScope::Backend,
+                        ..
+                    })
+                )
+            })
+    }
+
     fn ensure(&mut self, root: &Path) -> Result<(), AgentError> {
         self.run(|inner| inner.ensure(root))
     }
@@ -308,15 +337,11 @@ impl<B: AgentBackend> AgentBackend for Ledger<B> {
     }
 
     fn new_session(&mut self, cwd: &Path, model: Option<ModelSelection>) -> Result<(), AgentError> {
-        self.run(|inner| inner.new_session(cwd, model))?;
-        self.note_session();
-        Ok(())
+        self.request_conversation(|inner| inner.new_session(cwd, model))
     }
 
     fn restore(&mut self, cwd: &Path, saved: &SavedSession) -> Result<(), AgentError> {
-        self.run(|inner| inner.restore(cwd, saved))?;
-        self.note_session();
-        Ok(())
+        self.request_conversation(|inner| inner.restore(cwd, saved))
     }
 
     fn prompt(
@@ -950,6 +975,57 @@ mod tests {
         assert!(ledger.new_session(&PathBuf::from("/w"), None).is_err());
         script.lose("boom");
         assert_eq!(drain(&mut ledger), vec![lost("boom", false)]);
+    }
+
+    #[test]
+    fn a_refused_session_request_still_ends_a_query_started_workers_query_only_status() {
+        let (mut ledger, script) = ledger();
+        ledger.list_models(QueryId(1)).unwrap();
+        script.fail_next(AgentError::Unavailable("no".into()));
+        assert!(ledger.new_session(&PathBuf::from("/w"), None).is_err());
+        script.lose("boom");
+        assert_eq!(drain(&mut ledger).last(), Some(&lost("boom", true)));
+    }
+
+    #[test]
+    fn a_refused_restore_still_ends_a_query_started_workers_query_only_status() {
+        let (mut ledger, script) = ledger();
+        let saved = SavedSession {
+            backend: BackendKind::Codex,
+            session: session("old"),
+            contract: None,
+        };
+        ledger.list_models(QueryId(1)).unwrap();
+        script.fail_next(AgentError::Unavailable("no".into()));
+        assert!(ledger.restore(&PathBuf::from("/w"), &saved).is_err());
+        script.lose("boom");
+        assert_eq!(drain(&mut ledger).last(), Some(&lost("boom", true)));
+    }
+
+    #[test]
+    fn a_refused_session_request_on_an_unused_ledger_leaves_what_follows_query_only() {
+        let (mut ledger, script) = ledger();
+        script.fail_next(AgentError::Unavailable("no".into()));
+        assert!(ledger.new_session(&PathBuf::from("/w"), None).is_err());
+        ledger.list_models(QueryId(1)).unwrap();
+        script.lose("boom");
+        assert_eq!(drain(&mut ledger).last(), Some(&lost("boom", false)));
+    }
+
+    #[test]
+    fn a_loss_has_ended_the_ledger_until_it_has_been_read() {
+        let (mut ledger, script) = ledger();
+        let session = session("s1");
+        start_turn(&mut ledger, &session);
+        assert!(!ledger.has_ended());
+
+        script.lose("boom");
+        assert!(ledger.has_ended());
+        let first = ledger.poll().expect("the open turn fails first");
+        assert!(!matches!(first, Event::Lost(_)));
+        assert!(ledger.has_ended(), "the loss itself is still unread");
+        assert_eq!(ledger.poll(), Some(lost("boom", false)));
+        assert!(!ledger.has_ended());
     }
 
     #[test]
