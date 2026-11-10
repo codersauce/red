@@ -143,3 +143,33 @@ jobs:
         with:
           name: felix-conformance
           path: evidence/
+
+  cm6-cases:
+    # Replays helix-cm6's generated key sequences against Helix 25.07.1 and Red.
+    # Pull requests run the hand suite and one fuzz seed; pushes and nightly runs
+    # add the other seeds. scripts/felix/cm6/baseline.txt lists known differences.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - uses: Swatinem/rust-cache@v2
+      - name: Restore Helix results
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/red-felix/cm6/expected-*.json
+          key: felix-cm6-${{ github.event_name == 'pull_request' && 'pr' || 'full' }}-${{ hashFiles('scripts/felix/cm6/oracle.rs', 'scripts/felix/cm6/run.py', 'scripts/felix/cm6/export.ts') }}
+      - name: Compare with Helix
+        env:
+          SUITES: ${{ github.event_name == 'pull_request' && 'hand fuzz:1' || 'hand fuzz:1 fuzz:2 fuzz:3 fuzz:4 fuzz:5' }}
+        run: |
+          mkdir -p evidence
+          python3 scripts/felix/cm6/run.py --report evidence/cm6-report.json $SUITES
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: felix-cm6
+          path: evidence/

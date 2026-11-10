@@ -246,7 +246,7 @@ mod jumps;
 mod macro_key;
 mod macros;
 pub use macro_key::{MacroCode, MacroKey, NamedKey};
-pub use macros::{MacroRecorder, MacroReplay};
+pub use macros::{MacroRecorder, MacroReplay, parse_keys};
 mod motion;
 pub use jumps::Jumps;
 pub use motion::cell_width;

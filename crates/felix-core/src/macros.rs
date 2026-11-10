@@ -103,7 +103,8 @@ impl MacroReplay {
     }
 }
 
-fn parse_keys(mut notation: &str) -> Result<Vec<crate::MacroKey>, String> {
+/// Parse Helix key notation such as `ifoo<esc><A-s>` into keys.
+pub fn parse_keys(mut notation: &str) -> Result<Vec<crate::MacroKey>, String> {
     let mut keys = Vec::new();
     while let Some(ch) = notation.chars().next() {
         let key = match ch {

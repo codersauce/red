@@ -22,7 +22,7 @@ macro_rules! terminal_keys {
             }
         }
 
-        fn terminal_key(key: MacroKey) -> KeyEvent {
+        pub(super) fn terminal_key(key: MacroKey) -> KeyEvent {
             let mut modifiers = KeyModifiers::NONE;
             modifiers.set(KeyModifiers::SHIFT, key.shift);
             modifiers.set(KeyModifiers::CONTROL, key.control);

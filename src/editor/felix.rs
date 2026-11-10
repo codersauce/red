@@ -1,5 +1,7 @@
 //! Red adapter for document-window Felix sessions.
 
+#[cfg(test)]
+mod cm6;
 mod macros;
 mod native;
 mod navigation;
@@ -2047,7 +2049,7 @@ mod tests {
     use super::*;
     use serde_json::{json, Value};
 
-    fn fixture_editor(text: &str) -> (Editor, RenderBuffer, Runtime) {
+    pub(super) fn fixture_editor(text: &str) -> (Editor, RenderBuffer, Runtime) {
         named_fixture_editor("example.txt", text)
     }
 
