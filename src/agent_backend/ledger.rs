@@ -20,8 +20,12 @@ use super::{
 /// - open turns: inserted when `prompt` succeeds, removed on `End`, so even a
 ///   prompt that died in the command queue gets a closing event;
 /// - open queries: inserted by each query call, removed on `Reply`;
-/// - whether any conversation was created or restored since the worker
-///   started, which becomes `Lost.had_sessions`.
+/// - what the current worker was started for, which becomes
+///   `Lost.had_sessions`: false only when a model or session query started it
+///   and no conversation was created or restored since. Inline assist and
+///   commit-message generation count as conversations, but a query-started
+///   worker that later serves them stays query-only, as the editor has always
+///   treated it.
 ///
 /// `poll` applies these rules:
 /// 1. A turn event for a turn that is not open is late or bogus and is dropped.
@@ -49,7 +53,7 @@ pub struct Ledger<B: AgentBackend> {
     inner: B,
     turns: Vec<OpenTurn>,
     queries: Vec<(QueryId, QueryKind)>,
-    had_sessions: bool,
+    worker_use: WorkerUse,
     lost: bool,
     backlog: VecDeque<Event>,
 }
@@ -68,6 +72,20 @@ enum Phase {
     Closing,
 }
 
+/// What the current worker is known to have been used for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkerUse {
+    /// No worker has served a command since the ledger was built, lost its
+    /// worker, or was shut down.
+    Idle,
+    /// A model or session query started the worker, and no conversation was
+    /// created or restored since.
+    QueriesOnly,
+    /// Something other than a plain query started the worker, or a
+    /// conversation was created or restored on it.
+    Conversations,
+}
+
 impl<B: AgentBackend> Ledger<B> {
     /// Wraps `inner`.
     pub fn new(inner: B) -> Self {
@@ -75,7 +93,7 @@ impl<B: AgentBackend> Ledger<B> {
             inner,
             turns: Vec::new(),
             queries: Vec::new(),
-            had_sessions: false,
+            worker_use: WorkerUse::Idle,
             lost: false,
             backlog: VecDeque::new(),
         }
@@ -93,10 +111,18 @@ impl<B: AgentBackend> Ledger<B> {
         }
     }
 
-    /// Notes that a conversation exists, the way a successful `new_session`
-    /// or `restore` does.
+    /// Notes that a conversation was created or restored on the worker, which
+    /// stops it being query-only.
     pub(super) fn note_session(&mut self) {
-        self.had_sessions = true;
+        self.worker_use = WorkerUse::Conversations;
+    }
+
+    /// Notes what a command that succeeded used the worker for. Only the
+    /// first one counts: it is what started the worker.
+    fn note_use(&mut self, wanted: WorkerUse) {
+        if self.worker_use == WorkerUse::Idle {
+            self.worker_use = wanted;
+        }
     }
 
     /// How many events `poll` can return without asking the backend.
@@ -125,13 +151,21 @@ impl<B: AgentBackend> Ledger<B> {
         result: Result<(), AgentError>,
     ) -> Result<(), AgentError> {
         self.settle(result)?;
+        self.note_use(match kind {
+            QueryKind::CommitMessage => WorkerUse::Conversations,
+            QueryKind::DefaultModel
+            | QueryKind::ListModels
+            | QueryKind::SetModel
+            | QueryKind::ListSessions
+            | QueryKind::PreviewSession => WorkerUse::QueriesOnly,
+        });
         self.queries.push((id, kind));
         Ok(())
     }
 
     /// Queues the closing events for a loss, then the loss itself.
     fn lose(&mut self, scope: LostScope, message: String) {
-        let had_sessions = self.had_sessions;
+        let had_sessions = self.worker_use == WorkerUse::Conversations;
         let ended = match &scope {
             LostScope::Backend => std::mem::take(&mut self.turns),
             LostScope::Session(session) => {
@@ -164,7 +198,7 @@ impl<B: AgentBackend> Ledger<B> {
                     result: Err(message.clone()),
                 });
             }
-            self.had_sessions = false;
+            self.worker_use = WorkerUse::Idle;
             self.lost = true;
         }
         self.backlog.push_back(Event::Lost(Lost {
@@ -374,7 +408,7 @@ impl<B: AgentBackend> AgentBackend for Ledger<B> {
         self.turns.clear();
         self.queries.clear();
         self.backlog.clear();
-        self.had_sessions = false;
+        self.worker_use = WorkerUse::Idle;
         self.lost = false;
     }
 
@@ -408,7 +442,9 @@ impl<B: AgentBackend> InlineAssist for Ledger<B> {
         let result = self
             .inline()
             .and_then(|inline| inline.start(request, cwd, prompt, context));
-        self.settle(result)
+        self.settle(result)?;
+        self.note_use(WorkerUse::Conversations);
+        Ok(())
     }
 
     fn followup(
@@ -421,7 +457,9 @@ impl<B: AgentBackend> InlineAssist for Ledger<B> {
         let result = self
             .inline()
             .and_then(|inline| inline.followup(request, session, prompt, context));
-        self.settle(result)
+        self.settle(result)?;
+        self.note_use(WorkerUse::Conversations);
+        Ok(())
     }
 }
 
@@ -741,15 +779,132 @@ mod tests {
     #[test]
     fn a_worker_that_only_served_queries_reports_no_sessions_lost() {
         let (mut ledger, script) = ledger();
+        let cwd = PathBuf::from("/w");
         ledger.list_models(QueryId(1)).unwrap();
+        ledger.default_model(QueryId(2), &cwd).unwrap();
+        ledger
+            .set_model(
+                QueryId(3),
+                &session("s1"),
+                ModelSelection {
+                    model: "m".into(),
+                    effort: None,
+                },
+            )
+            .unwrap();
+        ledger
+            .list_sessions(
+                QueryId(4),
+                SessionQuery {
+                    cwd: cwd.clone(),
+                    scope: crate::agent_backend::types::SessionScope::All,
+                    query: String::new(),
+                    exclude_session_id: None,
+                    search_contents: false,
+                },
+            )
+            .unwrap();
+        ledger
+            .preview_session(QueryId(5), &cwd, &session("s1"))
+            .unwrap();
+        script.lose("boom");
+        let events = drain(&mut ledger);
+        assert_eq!(events.last(), Some(&lost("boom", false)));
+        assert_eq!(events.len(), 6);
+    }
+
+    #[test]
+    fn a_worker_started_by_an_inline_start_is_not_query_only() {
+        let (mut ledger, script) = ledger();
+        ledger
+            .inline_assist()
+            .expect("offered")
+            .start("r".into(), &PathBuf::from("/w"), "p".into(), "c".into())
+            .unwrap();
+        script.lose("boom");
+        assert_eq!(drain(&mut ledger), vec![lost("boom", true)]);
+    }
+
+    #[test]
+    fn a_worker_started_by_an_inline_followup_is_not_query_only() {
+        let (mut ledger, script) = ledger();
+        ledger
+            .inline_assist()
+            .expect("offered")
+            .followup("r".into(), &session("s1"), "p".into(), "c".into())
+            .unwrap();
+        script.lose("boom");
+        assert_eq!(drain(&mut ledger), vec![lost("boom", true)]);
+    }
+
+    #[test]
+    fn a_worker_started_by_a_commit_message_is_not_query_only() {
+        let (mut ledger, script) = ledger();
+        ledger
+            .commit_messages()
+            .expect("offered")
+            .generate(QueryId(1), &PathBuf::from("/w"), "p".into())
+            .unwrap();
         script.lose("boom");
         assert_eq!(
             drain(&mut ledger),
             vec![
-                query_failed(1, QueryKind::ListModels, "boom"),
-                lost("boom", false)
+                query_failed(1, QueryKind::CommitMessage, "boom"),
+                lost("boom", true)
             ]
         );
+    }
+
+    #[test]
+    fn inline_assist_and_commit_messages_do_not_end_a_query_started_workers_query_only_status() {
+        let cwd = PathBuf::from("/w");
+        let (mut ledger, script) = ledger();
+        ledger.list_models(QueryId(1)).unwrap();
+        ledger
+            .inline_assist()
+            .expect("offered")
+            .start("r".into(), &cwd, "p".into(), "c".into())
+            .unwrap();
+        ledger
+            .commit_messages()
+            .expect("offered")
+            .generate(QueryId(2), &cwd, "p".into())
+            .unwrap();
+        ledger.list_models(QueryId(3)).unwrap();
+        script.lose("boom");
+        assert_eq!(drain(&mut ledger).last(), Some(&lost("boom", false)));
+    }
+
+    #[test]
+    fn a_new_session_ends_a_query_started_workers_query_only_status() {
+        let (mut ledger, script) = ledger();
+        ledger.list_models(QueryId(1)).unwrap();
+        ledger.new_session(&PathBuf::from("/w"), None).unwrap();
+        script.lose("boom");
+        assert_eq!(drain(&mut ledger).last(), Some(&lost("boom", true)));
+    }
+
+    #[test]
+    fn a_restore_ends_a_query_started_workers_query_only_status() {
+        let (mut ledger, script) = ledger();
+        let saved = SavedSession {
+            backend: BackendKind::Codex,
+            session: session("old"),
+            contract: None,
+        };
+        ledger.list_models(QueryId(1)).unwrap();
+        ledger.restore(&PathBuf::from("/w"), &saved).unwrap();
+        script.lose("boom");
+        assert_eq!(drain(&mut ledger).last(), Some(&lost("boom", true)));
+    }
+
+    #[test]
+    fn a_query_to_a_worker_with_conversations_does_not_make_it_query_only() {
+        let (mut ledger, script) = ledger();
+        ledger.new_session(&PathBuf::from("/w"), None).unwrap();
+        ledger.list_models(QueryId(1)).unwrap();
+        script.lose("boom");
+        assert_eq!(drain(&mut ledger).last(), Some(&lost("boom", true)));
     }
 
     #[test]
@@ -928,7 +1083,7 @@ mod tests {
             drain(&mut ledger),
             vec![
                 query_failed(4, QueryKind::CommitMessage, "boom"),
-                lost("boom", false)
+                lost("boom", true)
             ]
         );
     }

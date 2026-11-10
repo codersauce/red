@@ -216,9 +216,10 @@ pub struct Lost {
     pub scope: LostScope,
     /// User-facing description of what happened.
     pub message: String,
-    /// Whether the backend ever created or restored a conversation since it
-    /// started. When false, only queries used it and the editor has no
-    /// conversation to report as lost. The ledger sets this itself.
+    /// Whether the editor should report the loss as a lost conversation. False
+    /// only when the worker was started by a model or session query and no
+    /// conversation was created or restored since. The ledger sets this
+    /// itself.
     pub had_sessions: bool,
 }
 
