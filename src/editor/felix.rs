@@ -115,6 +115,8 @@ pub(super) struct FelixHost {
     pub(super) primary_clipboard: Vec<String>,
     before: Option<Selections>,
     history: HashMap<(BufferId, String), (Selections, Selections)>,
+    /// Document text when the current Insert session began or was checkpointed.
+    insert_origin: Option<(BufferId, ropey::Rope)>,
 }
 
 /// Filter keys edit the live document. An accepted item belongs to the original request.
@@ -1145,6 +1147,12 @@ impl Editor {
             viewport_start: display_offset(viewport_line, self.skipcol),
             scrolloff: self.config.scrolloff.unwrap_or(5),
             visual_lines: visual_rows.then_some(&layout),
+            insert_origin: self
+                .felix
+                .insert_origin
+                .as_ref()
+                .filter(|(doc, _)| *doc == self.current_buffer().id())
+                .map(|(_, origin)| origin.slice(..)),
         };
         if replay {
             self.felix.session.replay_key(text, initial, key, &context)
@@ -1497,6 +1505,11 @@ impl Editor {
         };
         if plan.next.mode != felix_core::Mode::Insert {
             self.snippet_session = None;
+            self.felix.insert_origin = None;
+        } else if self.felix.session.mode != felix_core::Mode::Insert {
+            self.felix.insert_origin = Some((id.0, rope.clone()));
+        } else if matches!(plan.history, History::Checkpoint | History::InsertPaste) {
+            self.felix.insert_origin = Some((id.0, after.clone()));
         }
         self.felix.session = plan.next;
         if let Some((line, col)) = viewport {
@@ -3430,6 +3443,35 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(editor.current_buffer().contents(), "x-Ci()\n");
+    }
+
+    #[tokio::test]
+    async fn leaving_an_opened_blank_line_restores_its_indent_like_helix() {
+        // Helix removes the whitespace of a line that the Insert session only opened.
+        let cases = [
+            ("\tindented\nnext\n", "o<esc>", "\tindented\n\nnext\n"),
+            ("\tindented\nnext\n", "o<esc>u", "\tindented\nnext\n"),
+            ("one\n\tindented\n", "jO<esc>", "one\n\n\tindented\n"),
+            // An insertion at the start or end of the document is not restored.
+            ("\tindented\n", "O<esc>", "\t\n\tindented\n"),
+            ("\tlast", "o<esc>", "\tlast\n\t"),
+            // Typed text keeps the indentation, rounded to whole indent units.
+            ("\t x\n", "oz<esc>", "\t x\n\tz\n"),
+        ];
+        for (text, keys, expected) in cases {
+            let (mut editor, _, _) = fixture_editor(text);
+            for key in felix_core::parse_keys(keys).unwrap() {
+                editor
+                    .test_execute_event(Event::Key(super::macros::terminal_key(key)))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                editor.current_buffer().contents(),
+                expected,
+                "{keys:?} in {text:?}"
+            );
+        }
     }
 
     #[tokio::test]

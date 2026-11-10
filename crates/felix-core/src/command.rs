@@ -217,6 +217,10 @@ pub struct Context<'a> {
     pub viewport_start: usize,
     pub scrolloff: usize,
     pub visual_lines: Option<&'a dyn VisualLines>,
+    /// Text when the current Insert session began or was last checkpointed.
+    /// Leaving Insert removes a blank line's indentation when the session only
+    /// inserted that line, as Helix's `try_restore_indent` does.
+    pub insert_origin: Option<RopeSlice<'a>>,
 }
 
 impl Default for Context<'_> {
@@ -233,11 +237,28 @@ impl Default for Context<'_> {
             viewport_start: 0,
             scrolloff: 5,
             visual_lines: None,
+            insert_origin: None,
         }
     }
 }
 
 impl Context<'_> {
+    /// Helix's indentation fallback: whole indent units in `leading`, written
+    /// with this document's unit.
+    fn indent_level_of(&self, leading: RopeSlice<'_>) -> String {
+        let tab = self.tab_width.max(1);
+        let columns = leading.chars().fold(0, |col, ch| match ch {
+            '\t' => col + tab - col % tab,
+            _ => col + 1,
+        });
+        let width = if self.indent == "\t" {
+            tab
+        } else {
+            self.indent.chars().count().max(1)
+        };
+        self.indent.repeat(columns / width)
+    }
+
     fn indentation_at(&self, pos: usize, fallback_columns: usize) -> String {
         let columns = self
             .newline_indents

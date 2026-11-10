@@ -162,16 +162,15 @@ impl Plan {
                 .count();
             let indent = if let Some(token) = ctx.comment_at(text, previous + leading) {
                 format!("{}{token} ", text.slice(previous..previous + leading))
-            } else if at_top {
-                String::new()
-            } else if ctx
-                .newline_indents
-                .binary_search_by_key(&pos, |&(p, _)| p)
-                .is_ok()
+            } else if !at_top
+                && ctx
+                    .newline_indents
+                    .binary_search_by_key(&pos, |&(p, _)| p)
+                    .is_ok()
             {
                 ctx.indentation_at(pos, 0)
             } else {
-                text.slice(previous..previous + leading).to_string()
+                ctx.indent_level_of(text.slice(previous..previous + leading))
             };
             let unit = if at_top {
                 format!("{indent}{newline}")

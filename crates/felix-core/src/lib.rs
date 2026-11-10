@@ -326,6 +326,14 @@ impl Selections {
 
 /// Infer the document indentation unit from increases between nonblank lines.
 /// The host caches the result at open, before editing changes the sample.
+/// Helix's `char_is_whitespace`, which excludes line endings.
+fn helix_whitespace(c: char) -> bool {
+    matches!(
+        c,
+        '\t' | ' ' | '\u{a0}' | '\u{180e}' | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}'
+    ) || ('\u{2000}'..='\u{200b}').contains(&c)
+}
+
 pub fn detect_indent(text: RopeSlice<'_>) -> Option<String> {
     let mut counts = [0usize; 17];
     let mut previous = (' ', 0);
@@ -341,7 +349,19 @@ pub fn detect_indent(text: RopeSlice<'_>) -> Option<String> {
             continue;
         }
         let leading = line.chars().take(257).take_while(|&c| c == first).count();
-        if leading > 256 || line.chars().all(char::is_whitespace) {
+        // Like Helix, a line is blank when its leading whitespace reaches a line
+        // ending; whitespace at the end of the document still counts.
+        let blank = line
+            .chars()
+            .skip(leading)
+            .find(|&c| !helix_whitespace(c))
+            .is_some_and(|c| {
+                matches!(
+                    c,
+                    '\n' | '\r' | '\u{b}' | '\u{c}' | '\u{85}' | '\u{2028}' | '\u{2029}'
+                )
+            });
+        if leading > 256 || blank {
             continue;
         }
         if (previous.0 == first || previous.1 == 0) && leading > previous.1 {

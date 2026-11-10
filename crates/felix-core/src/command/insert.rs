@@ -280,7 +280,19 @@ impl Plan {
                 self.insert_pair(text, selections, key.chars().next().unwrap())
             }
             "<esc>" | "<c-c>" => {
-                if self.next.restore_append {
+                if let Some(start) = ctx
+                    .insert_origin
+                    .and_then(|origin| blank_line_indent(origin, text, selections))
+                {
+                    let pos = selections.primary().cursor(text);
+                    self.edits.push(Edit {
+                        start,
+                        end: pos,
+                        insert: String::new(),
+                    });
+                    self.map_edits();
+                    self.next.restore_append = false;
+                } else if self.next.restore_append {
                     self.set(selections.transform(text, |r| Range {
                         anchor: r.start(),
                         head: if r.head > r.anchor {
@@ -412,4 +424,36 @@ fn modified_char(key: &str) -> Option<char> {
     let mut chars = inner.chars();
     let ch = chars.next()?;
     chars.next().is_none().then_some(ch)
+}
+
+/// Start of the whitespace to remove when an Insert session inserted only a
+/// line ending followed by whitespace, ending at the cursor at a line end.
+fn blank_line_indent(
+    origin: RopeSlice<'_>,
+    text: RopeSlice<'_>,
+    selections: &Selections,
+) -> Option<usize> {
+    let [range] = selections.ranges() else {
+        return None;
+    };
+    let pos = range.cursor(text);
+    let line = text.char_to_line(pos);
+    let start = text.line_to_char(line);
+    if line == 0 || pos != logical_end(text, start) {
+        return None;
+    }
+    if !text.slice(start..pos).chars().all(|c| c.is_whitespace()) {
+        return None;
+    }
+    // The inserted line ending is the previous line's terminator.
+    let newline = start - logical_end(text, text.line_to_char(line - 1));
+    let inserted = newline + (pos - start);
+    let from = start - newline;
+    // Helix matches a single insertion with unchanged text on both sides.
+    (from > 0
+        && pos < text.len_chars()
+        && text.len_chars() == origin.len_chars() + inserted
+        && text.slice(..from) == origin.slice(..from)
+        && text.slice(pos..) == origin.slice(from..))
+    .then_some(start)
 }
