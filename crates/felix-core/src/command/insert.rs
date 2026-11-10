@@ -268,6 +268,13 @@ impl Plan {
         key: &str,
         ctx: &Context<'_>,
     ) {
+        // Helix inserts the character of an unbound modified key, auto-pairs included.
+        let key = match modified_char(key) {
+            Some(ch @ ('(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'' | '`')) => {
+                return self.insert_pair(text, selections, ch);
+            }
+            _ => key,
+        };
         match key {
             "(" | ")" | "[" | "]" | "{" | "}" | "\"" | "'" | "`" => {
                 self.insert_pair(text, selections, key.chars().next().unwrap())
@@ -379,7 +386,10 @@ impl Plan {
                     let insert = match key {
                         "<tab>" | "<backtab>" => ctx.indent.into(),
                         _ if key.chars().count() == 1 => key.into(),
-                        _ => return,
+                        _ => match modified_char(key) {
+                            Some(ch) => ch.to_string(),
+                            None => return,
+                        },
                     };
                     self.edits.push(Edit {
                         start: pos,
@@ -391,4 +401,15 @@ impl Plan {
             }
         }
     }
+}
+
+/// The character of a `<c-x>` or `<a-x>` token.
+fn modified_char(key: &str) -> Option<char> {
+    let inner = key
+        .strip_prefix("<c-")
+        .or_else(|| key.strip_prefix("<a-"))?
+        .strip_suffix('>')?;
+    let mut chars = inner.chars();
+    let ch = chars.next()?;
+    chars.next().is_none().then_some(ch)
 }

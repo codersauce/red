@@ -3415,6 +3415,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unbound_modified_keys_insert_their_character_in_insert_mode() {
+        let (mut editor, _, _) = fixture_editor("x\n");
+        chars(&mut editor, "a").await;
+        for (code, modifiers) in [
+            (KeyCode::Char('-'), KeyModifiers::ALT),
+            (KeyCode::Char('C'), KeyModifiers::ALT | KeyModifiers::SHIFT),
+            (KeyCode::Char('i'), KeyModifiers::CONTROL),
+            (KeyCode::Char('('), KeyModifiers::ALT),
+        ] {
+            editor
+                .test_execute_event(Event::Key(KeyEvent::new(code, modifiers)))
+                .await
+                .unwrap();
+        }
+        assert_eq!(editor.current_buffer().contents(), "x-Ci()\n");
+    }
+
+    #[tokio::test]
     async fn plain_text_indents_with_a_tab_and_languages_keep_their_width() {
         let (mut editor, _, _) = fixture_editor("hello\n");
         chars(&mut editor, ">").await;
