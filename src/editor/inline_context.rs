@@ -104,7 +104,7 @@ impl Editor {
             unreachable!("inline dispatcher requires an inline call")
         };
         let snapshot =
-            self.snapshot_inline_context(&pending.request.session_id, &request_id, &call);
+            self.snapshot_inline_context(pending.request.session_id.as_str(), &request_id, &call);
         tokio::spawn(async move {
             let result = match snapshot {
                 Ok(snapshot) => snapshot.execute(call).await,

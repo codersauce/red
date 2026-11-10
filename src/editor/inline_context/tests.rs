@@ -74,7 +74,8 @@ async fn inline_context_dispatch_is_request_bound_and_does_not_move_focus() {
     let (response, receive) = tokio::sync::oneshot::channel();
     editor.dispatch_inline_context_request(PendingEditorTool {
         request: EditorToolRequest {
-            session_id: "provider".into(),
+            session_id: crate::agent_backend::ids::SessionId::from_raw("provider".to_string()),
+            turn: None,
             call: EditorToolCall::InlineContext {
                 request_id: "request".into(),
                 call: call.clone(),

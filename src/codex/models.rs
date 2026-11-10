@@ -372,6 +372,7 @@ mod tests {
             }),
             cwd: PathBuf::from("/workspace"),
             active_turn: Some("turn-1".into()),
+            red_turn: None,
             pending_interrupt_turn_id: None,
             cancelled: Arc::new(AtomicBool::new(false)),
             allow_sensitive_paths: false,

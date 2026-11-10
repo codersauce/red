@@ -9,15 +9,27 @@ struct NoHost;
 
 #[async_trait]
 impl CodexToolHost for NoHost {
-    async fn read_file(&mut self, _: &str, _: &str, _: usize, _: usize) -> Result<Value> {
+    async fn read_file(
+        &mut self,
+        _: &CodexToolCtx<'_>,
+        _: &str,
+        _: usize,
+        _: usize,
+    ) -> Result<Value> {
         unreachable!("golden support never runs tools")
     }
 
-    async fn write_file(&mut self, _: &str, _: &str, _: u64, _: String) -> Result<Value> {
+    async fn write_file(
+        &mut self,
+        _: &CodexToolCtx<'_>,
+        _: &str,
+        _: u64,
+        _: String,
+    ) -> Result<Value> {
         unreachable!("golden support never runs tools")
     }
 
-    async fn editor_tool(&mut self, _: EditorToolRequest) -> Result<Value> {
+    async fn editor_tool(&mut self, _: &CodexToolCtx<'_>, _: EditorToolCall) -> Result<Value> {
         unreachable!("golden support never runs tools")
     }
 }
@@ -69,6 +81,7 @@ impl Harness {
                 }),
                 cwd: PathBuf::from(cwd),
                 active_turn: active_turn.map(str::to_string),
+                red_turn: None,
                 pending_interrupt_turn_id: None,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 allow_sensitive_paths: false,

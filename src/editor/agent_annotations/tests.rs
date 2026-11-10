@@ -35,7 +35,8 @@ fn fixture(root: &std::path::Path) -> Editor {
 
 fn request(call: EditorToolCall) -> EditorToolRequest {
     EditorToolRequest {
-        session_id: "agent".into(),
+        session_id: crate::agent_backend::ids::SessionId::from_raw("agent".to_string()),
+        turn: None,
         call,
     }
 }

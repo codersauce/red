@@ -77,7 +77,8 @@ async fn write(editor: &mut Editor, session: &str, path: &str, content: &str) ->
         .map_or(0, |index| editor.buffer_manager[index].revision());
     editor
         .test_run_agent_editor_tool(EditorToolRequest {
-            session_id: session.into(),
+            session_id: crate::agent_backend::ids::SessionId::from_raw(session.to_string()),
+            turn: None,
             call: EditorToolCall::WriteFile {
                 path: path.into(),
                 expected_revision: revision,

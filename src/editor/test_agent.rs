@@ -70,6 +70,7 @@ impl AgentTestHandle {
         bridge
             .send(CodexCommand::Prompt {
                 session_id: session.to_string(),
+                turn: crate::agent_backend::ids::TurnId::mint(),
                 text: text.to_string(),
             })
             .await
@@ -81,7 +82,9 @@ impl AgentTestHandle {
     /// Next command the editor sent, or `None` once the backend was disconnected.
     pub(crate) async fn recv_command(&mut self) -> Option<AgentCommand> {
         Some(match self.worker.recv().await? {
-            CodexCommand::Prompt { session_id, text }
+            CodexCommand::Prompt {
+                session_id, text, ..
+            }
             | CodexCommand::PromptWithContext {
                 session_id, text, ..
             } => AgentCommand::Prompt {

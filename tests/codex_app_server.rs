@@ -7,10 +7,11 @@ use std::{
 };
 
 use async_trait::async_trait;
+use red::agent_backend::ids::TurnId;
 use red::agent_backend::types::RestoredItem;
 use red::{
-    agent_tools::EditorToolRequest,
-    codex::{start_codex, CodexCommand, CodexEvent, CodexProcessSpec, CodexToolHost},
+    agent_tools::EditorToolCall,
+    codex::{start_codex, CodexCommand, CodexEvent, CodexProcessSpec, CodexToolCtx, CodexToolHost},
 };
 use serde_json::{json, Value};
 
@@ -25,7 +26,7 @@ struct RecordingHost {
 impl CodexToolHost for RecordingHost {
     async fn read_file(
         &mut self,
-        _: &str,
+        _: &CodexToolCtx<'_>,
         path: &str,
         _: usize,
         _: usize,
@@ -35,7 +36,7 @@ impl CodexToolHost for RecordingHost {
 
     async fn write_file(
         &mut self,
-        _: &str,
+        _: &CodexToolCtx<'_>,
         path: &str,
         _expected_revision: u64,
         content: String,
@@ -47,7 +48,11 @@ impl CodexToolHost for RecordingHost {
         Ok(json!({}))
     }
 
-    async fn editor_tool(&mut self, _: EditorToolRequest) -> anyhow::Result<Value> {
+    async fn editor_tool(
+        &mut self,
+        _: &CodexToolCtx<'_>,
+        _: EditorToolCall,
+    ) -> anyhow::Result<Value> {
         Ok(json!({}))
     }
 }
@@ -811,6 +816,7 @@ async fn direct_app_server_streams_and_routes_writes_to_the_host() {
     bridge
         .send(CodexCommand::PromptWithContext {
             session_id,
+            turn: TurnId::mint(),
             text: "update the file".to_string(),
             uri: "red-buffer://active".to_string(),
             context: "unsaved editor text".to_string(),
@@ -1193,6 +1199,7 @@ async fn direct_app_server_lists_and_changes_conversation_models() {
     bridge
         .send(CodexCommand::Prompt {
             session_id: "model-thread".into(),
+            turn: TurnId::mint(),
             text: "keep working".into(),
         })
         .await

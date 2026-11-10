@@ -38,14 +38,18 @@ mod history;
 mod models;
 mod sessions;
 mod tool_error;
+mod tool_host_adapter;
 mod translate;
 
+pub use tool_host_adapter::ToolHostAdapter;
+
+use crate::agent_backend::ids::TurnId;
 use crate::agent_backend::types::{
     Activity, ModelInfo, ModelQuery, ModelResult, ModelSelection, RestoredHistory, SessionPage,
     SessionPreview, SessionQuery,
 };
 use crate::agent_backend::workspace::TOOL_CONTENT_BYTES;
-use crate::agent_tools::{editor_tool_schemas, EditorToolCall, EditorToolRequest};
+use crate::agent_tools::{editor_tool_schemas, EditorToolCall};
 use crate::config::AgentCodexFeature;
 use crate::inline_assist::InlineAssistResult;
 use crate::inline_context::InlineContextCall;
@@ -212,6 +216,8 @@ pub enum CodexCommand {
     Prompt {
         /// Red session identifier.
         session_id: String,
+        /// Red's id for the turn this prompt starts.
+        turn: TurnId,
         /// User prompt.
         text: String,
     },
@@ -219,6 +225,8 @@ pub enum CodexCommand {
     PromptWithContext {
         /// Red session identifier.
         session_id: String,
+        /// Red's id for the turn this prompt starts.
+        turn: TurnId,
         /// User prompt.
         text: String,
         /// Active document URI.
@@ -458,13 +466,22 @@ impl CodexBridgeWorker {
     }
 }
 
+/// Which agent call is asking for an editor operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodexToolCtx<'a> {
+    /// Red session identifier.
+    pub session_id: &'a str,
+    /// The Red turn that issued the call; `None` for inline and commit-message sessions.
+    pub turn: Option<TurnId>,
+}
+
 #[async_trait]
 /// Editor operations exposed to bounded Codex dynamic tools.
 pub trait CodexToolHost: Send + 'static {
     /// Reads authoritative visible contents for one session.
     async fn read_file(
         &mut self,
-        session_id: &str,
+        ctx: &CodexToolCtx<'_>,
         path: &str,
         start_line: usize,
         line_count: usize,
@@ -472,13 +489,13 @@ pub trait CodexToolHost: Send + 'static {
     /// Replaces complete contents through the editor and persists them.
     async fn write_file(
         &mut self,
-        session_id: &str,
+        ctx: &CodexToolCtx<'_>,
         path: &str,
         expected_revision: u64,
         content: String,
     ) -> Result<Value>;
     /// Dispatches an editor-owned semantic tool request.
-    async fn editor_tool(&mut self, request: EditorToolRequest) -> Result<Value>;
+    async fn editor_tool(&mut self, ctx: &CodexToolCtx<'_>, call: EditorToolCall) -> Result<Value>;
 }
 
 #[derive(Debug)]
@@ -486,6 +503,8 @@ struct Session {
     model_info: Option<ModelInfo>,
     cwd: PathBuf,
     active_turn: Option<String>,
+    /// Red's id for the turn behind `active_turn`.
+    red_turn: Option<TurnId>,
     pending_interrupt_turn_id: Option<String>,
     cancelled: Arc<AtomicBool>,
     allow_sensitive_paths: bool,
@@ -1060,6 +1079,7 @@ async fn handle_command(
             }
             start_turn(
                 session_id,
+                None,
                 inline_input(&prompt, &context),
                 input,
                 events,
@@ -1122,9 +1142,14 @@ async fn handle_command(
             )
             .await?;
         }
-        CodexCommand::Prompt { session_id, text } => {
+        CodexCommand::Prompt {
+            session_id,
+            turn,
+            text,
+        } => {
             start_turn(
                 session_id,
+                Some(turn),
                 json!([{"type": "text", "text": text}]),
                 input,
                 events,
@@ -1136,12 +1161,14 @@ async fn handle_command(
         }
         CodexCommand::PromptWithContext {
             session_id,
+            turn,
             text,
             uri,
             context,
         } => {
             start_turn(
                 session_id,
+                Some(turn),
                 json!([
                     {"type": "text", "text": text},
                     {
@@ -1192,8 +1219,10 @@ async fn start_thread_request(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_turn(
     session_id: String,
+    turn: Option<TurnId>,
     input_items: Value,
     input: &mut (impl AsyncWrite + Unpin),
     events: &mpsc::Sender<CodexEvent>,
@@ -1224,6 +1253,7 @@ async fn start_turn(
             .ok();
         return Ok(());
     }
+    session.red_turn = turn;
     session.cancelled.store(false, Ordering::Relaxed);
     session.pending_interrupt_turn_id = None;
     if let SessionKind::Inline { result, .. } = &mut session.kind {
@@ -1522,6 +1552,7 @@ async fn handle_message<H: CodexToolHost>(
             if let Some(session) = sessions.get_mut(&session_id) {
                 if session.active_turn.as_deref() == Some(turn_id) {
                     session.active_turn = None;
+                    session.red_turn = None;
                     session.pending_interrupt_turn_id = None;
                     completed_event = Some(match &mut session.kind {
                         SessionKind::Agent => CodexEvent::Completed {
@@ -1959,6 +1990,7 @@ async fn handle_response(
                         model_info: translate::model_info(&message["result"]),
                         cwd,
                         active_turn: None,
+                        red_turn: None,
                         pending_interrupt_turn_id: None,
                         cancelled: Arc::new(AtomicBool::new(false)),
                         allow_sensitive_paths: policy.allow_sensitive_paths,
@@ -2058,6 +2090,7 @@ async fn handle_response(
                             .ok();
                         start_turn(
                             session_id,
+                            None,
                             turn_input.expect("inline launch stores turn input"),
                             input,
                             events,
@@ -2070,6 +2103,7 @@ async fn handle_response(
                     None => {
                         start_turn(
                             session_id,
+                            None,
                             turn_input.expect("commit-message launch stores turn input"),
                             input,
                             events,
@@ -2314,6 +2348,7 @@ async fn handle_tool_call<H: CodexToolHost>(
         return send_tool_error(input, id, &tool, &error_context, "inactive Codex turn").await;
     }
     let allow_sensitive_paths = session.allow_sensitive_paths;
+    let turn = session.red_turn;
     let inline_call = if let SessionKind::Inline {
         request_id,
         result: pending_result,
@@ -2375,15 +2410,16 @@ async fn handle_tool_call<H: CodexToolHost>(
     };
     tokio::spawn(async move {
         let started_at = Instant::now();
+        let ctx = CodexToolCtx {
+            session_id: &session_id,
+            turn,
+        };
         let result = timeout(tool_timeout, async {
             if let Some(call) = inline_call {
                 return host
                     .lock()
                     .await
-                    .editor_tool(EditorToolRequest {
-                        session_id: session_id.clone(),
-                        call,
-                    })
+                    .editor_tool(&ctx, call)
                     .await;
             }
             match tool.as_str() {
@@ -2456,7 +2492,7 @@ async fn handle_tool_call<H: CodexToolHost>(
                     let page = host
                         .lock()
                         .await
-                        .read_file(&session_id, path, start_line, line_count)
+                        .read_file(&ctx, path, start_line, line_count)
                         .await?;
                     if let Some(expected_revision) = expected_revision {
                         anyhow::ensure!(
@@ -2475,7 +2511,7 @@ async fn handle_tool_call<H: CodexToolHost>(
                     let content = required_string(&arguments, "content")?.to_string();
                     host.lock()
                         .await
-                        .write_file(&session_id, path, expected_revision, content)
+                        .write_file(&ctx, path, expected_revision, content)
                         .await
                 }
                 "get_editor_state"
@@ -2494,10 +2530,7 @@ async fn handle_tool_call<H: CodexToolHost>(
                     let call = EditorToolCall::parse(&tool, arguments)?;
                     host.lock()
                         .await
-                        .editor_tool(EditorToolRequest {
-                            session_id: session_id.clone(),
-                            call,
-                        })
+                        .editor_tool(&ctx, call)
                         .await
                 }
                 _ => anyhow::bail!("unsupported Codex dynamic tool"),
@@ -2968,6 +3001,8 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use super::*;
+    use crate::agent_backend::ids::SessionId;
+    use crate::agent_tools::EditorToolRequest;
 
     struct InlineReadHost(Arc<StdMutex<Vec<EditorToolRequest>>>);
 
@@ -2997,14 +3032,34 @@ mod tests {
 
     #[async_trait]
     impl CodexToolHost for InlineReadHost {
-        async fn read_file(&mut self, _: &str, _: &str, _: usize, _: usize) -> Result<Value> {
+        async fn read_file(
+            &mut self,
+            _: &CodexToolCtx<'_>,
+            _: &str,
+            _: usize,
+            _: usize,
+        ) -> Result<Value> {
             anyhow::bail!("regular read must not run")
         }
-        async fn write_file(&mut self, _: &str, _: &str, _: u64, _: String) -> Result<Value> {
+        async fn write_file(
+            &mut self,
+            _: &CodexToolCtx<'_>,
+            _: &str,
+            _: u64,
+            _: String,
+        ) -> Result<Value> {
             anyhow::bail!("write must not run")
         }
-        async fn editor_tool(&mut self, request: EditorToolRequest) -> Result<Value> {
-            self.0.lock().unwrap().push(request);
+        async fn editor_tool(
+            &mut self,
+            ctx: &CodexToolCtx<'_>,
+            call: EditorToolCall,
+        ) -> Result<Value> {
+            self.0.lock().unwrap().push(EditorToolRequest {
+                session_id: SessionId::from_raw(ctx.session_id.to_string()),
+                turn: ctx.turn,
+                call,
+            });
             Ok(json!({"path":"main.c","source":"editor","revision":9,"content":"unsaved"}))
         }
     }
@@ -3015,7 +3070,7 @@ mod tests {
     impl CodexToolHost for RevisionReadHost {
         async fn read_file(
             &mut self,
-            _: &str,
+            _: &CodexToolCtx<'_>,
             _: &str,
             start_line: usize,
             _: usize,
@@ -3028,11 +3083,17 @@ mod tests {
             }))
         }
 
-        async fn write_file(&mut self, _: &str, _: &str, _: u64, _: String) -> Result<Value> {
+        async fn write_file(
+            &mut self,
+            _: &CodexToolCtx<'_>,
+            _: &str,
+            _: u64,
+            _: String,
+        ) -> Result<Value> {
             anyhow::bail!("write must not run")
         }
 
-        async fn editor_tool(&mut self, _: EditorToolRequest) -> Result<Value> {
+        async fn editor_tool(&mut self, _: &CodexToolCtx<'_>, _: EditorToolCall) -> Result<Value> {
             anyhow::bail!("editor tool must not run")
         }
     }
@@ -3048,6 +3109,7 @@ mod tests {
                 model_info: None,
                 cwd: PathBuf::from("/workspace"),
                 active_turn: Some("turn".into()),
+                red_turn: None,
                 pending_interrupt_turn_id: None,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 allow_sensitive_paths: false,
@@ -3098,6 +3160,7 @@ mod tests {
                 model_info: None,
                 cwd: PathBuf::from("/workspace"),
                 active_turn: Some("turn".into()),
+                red_turn: None,
                 pending_interrupt_turn_id: None,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 allow_sensitive_paths: false,
@@ -3111,6 +3174,7 @@ mod tests {
 
         start_turn(
             "agent".into(),
+            None,
             json!([{"type": "text", "text": "follow-up"}]),
             &mut output,
             &events,
@@ -3195,6 +3259,7 @@ mod tests {
                 model_info: None,
                 cwd: PathBuf::from("/workspace"),
                 active_turn: Some("first".into()),
+                red_turn: None,
                 pending_interrupt_turn_id: None,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 allow_sensitive_paths: false,
@@ -3246,6 +3311,7 @@ mod tests {
         ));
         start_turn(
             "agent".into(),
+            None,
             json!([{"type": "text", "text": "second"}]),
             &mut output,
             &events,
@@ -3281,6 +3347,7 @@ mod tests {
                 model_info: None,
                 cwd: PathBuf::from("/workspace"),
                 active_turn: None,
+                red_turn: None,
                 pending_interrupt_turn_id: None,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 allow_sensitive_paths: false,
@@ -3318,6 +3385,7 @@ mod tests {
                 model_info: None,
                 cwd: PathBuf::from("/workspace"),
                 active_turn: None,
+                red_turn: None,
                 pending_interrupt_turn_id: None,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 allow_sensitive_paths: false,
@@ -3331,6 +3399,7 @@ mod tests {
 
         start_turn(
             "agent".into(),
+            None,
             json!([{"type": "text", "text": "edit main.rs"}]),
             &mut output,
             &events,
@@ -3439,6 +3508,7 @@ mod tests {
                 model_info: None,
                 cwd: PathBuf::from("/workspace"),
                 active_turn: Some("turn".into()),
+                red_turn: None,
                 pending_interrupt_turn_id: None,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 allow_sensitive_paths: false,
@@ -3537,6 +3607,7 @@ mod tests {
                 model_info: None,
                 cwd: PathBuf::from("/workspace"),
                 active_turn: None,
+                red_turn: None,
                 pending_interrupt_turn_id: None,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 allow_sensitive_paths: false,
@@ -3605,6 +3676,7 @@ mod tests {
                 model_info: None,
                 cwd: PathBuf::from("/workspace"),
                 active_turn: Some("turn".into()),
+                red_turn: None,
                 pending_interrupt_turn_id: None,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 allow_sensitive_paths: false,
@@ -3786,6 +3858,7 @@ mod tests {
 
     #[tokio::test]
     async fn directory_tool_routes_through_the_editor_owner() {
+        let turn = TurnId::mint();
         let calls = Arc::new(StdMutex::new(Vec::new()));
         let host = Arc::new(Mutex::new(InlineReadHost(Arc::clone(&calls))));
         let mut sessions = HashMap::from([(
@@ -3794,6 +3867,7 @@ mod tests {
                 model_info: None,
                 cwd: PathBuf::from("/workspace"),
                 active_turn: Some("turn".into()),
+                red_turn: Some(turn),
                 pending_interrupt_turn_id: None,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 allow_sensitive_paths: false,
@@ -3817,7 +3891,8 @@ mod tests {
         assert_eq!(
             calls.lock().unwrap()[0],
             EditorToolRequest {
-                session_id: "agent".to_string(),
+                session_id: SessionId::from_raw("agent".to_string()),
+                turn: Some(turn),
                 call: EditorToolCall::CreateDirectory {
                     path: "go/examples".to_string()
                 },
@@ -3835,6 +3910,7 @@ mod tests {
                 model_info: None,
                 cwd: PathBuf::from("/workspace"),
                 active_turn: Some("turn".into()),
+                red_turn: None,
                 pending_interrupt_turn_id: None,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 allow_sensitive_paths: false,
@@ -3931,6 +4007,7 @@ mod tests {
                 model_info: None,
                 cwd: PathBuf::from("/workspace"),
                 active_turn: Some("turn".into()),
+                red_turn: None,
                 pending_interrupt_turn_id: None,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 allow_sensitive_paths: false,
@@ -4202,6 +4279,7 @@ mod tests {
                 model_info: None,
                 cwd: PathBuf::from("/workspace"),
                 active_turn: None,
+                red_turn: None,
                 pending_interrupt_turn_id: None,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 allow_sensitive_paths: false,

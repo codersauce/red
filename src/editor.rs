@@ -125,6 +125,7 @@ use unicode_segmentation::UnicodeSegmentation;
 pub use render_buffer::RenderBuffer;
 
 use crate::{
+    agent_backend::ids::TurnId,
     agent_tools::{
         apply_text_edits, editor_tool_channel, utf16_byte_offset, EditorActionName,
         EditorOpenTarget, EditorSelectionKind, EditorToolCall, EditorToolHost, EditorToolRequest,
@@ -134,6 +135,7 @@ use crate::{
     clipboard::{ClipboardProvider, CopyOutcome, DisabledClipboardProvider, SessionClipboard},
     codex::{
         start_codex, AgentRuntimePolicy, CodexBridge, CodexCommand, CodexEvent, CodexProcessSpec,
+        ToolHostAdapter,
     },
     color::Color,
     command,
@@ -10911,7 +10913,8 @@ impl Editor {
         runtime: &mut Runtime,
     ) -> anyhow::Result<Value> {
         anyhow::ensure!(
-            self.agent_manager.is_session_active(&request.session_id),
+            self.agent_manager
+                .is_session_active(request.session_id.as_str()),
             "editor tool references an inactive session"
         );
         let root = self
@@ -10997,7 +11000,7 @@ impl Editor {
                 let path = resolve_path(&path)?;
                 ensure_agent_writable_path(&root, &path)?;
                 self.apply_agent_contents(
-                    &request.session_id,
+                    request.session_id.as_str(),
                     &path,
                     expected_revision,
                     content,
@@ -11038,11 +11041,11 @@ impl Editor {
                 );
                 let turn_id = self
                     .agent_manager
-                    .turn_id(&request.session_id)
+                    .turn_id(request.session_id.as_str())
                     .ok_or_else(|| anyhow::anyhow!("Agent annotation has no active turn"))?
                     .to_string();
                 let result = self.add_agent_annotations(
-                    &request.session_id,
+                    request.session_id.as_str(),
                     &turn_id,
                     &path.to_string_lossy(),
                     expected_revision,
@@ -11181,7 +11184,7 @@ impl Editor {
                 );
                 let contents = apply_text_edits(&self.current_buffer().contents(), &edits)?;
                 self.apply_agent_contents(
-                    &request.session_id,
+                    request.session_id.as_str(),
                     &path,
                     expected_revision,
                     contents,
@@ -11425,7 +11428,8 @@ impl Editor {
             );
             return Ok(false);
         }
-        let turn_id = uuid::Uuid::new_v4().to_string();
+        let turn = TurnId::mint();
+        let turn_id = turn.to_string();
         self.begin_inline_agent_outcome(&session_id, &turn_id, &text)?;
         self.agent_manager
             .set_turn_id(session_id.clone(), turn_id.clone());
@@ -11445,10 +11449,12 @@ impl Editor {
         let command = context.map_or_else(
             || CodexCommand::Prompt {
                 session_id: session_id.clone(),
+                turn,
                 text: text.clone(),
             },
             |(uri, context)| CodexCommand::PromptWithContext {
                 session_id: session_id.clone(),
+                turn,
                 text: text.clone(),
                 uri,
                 context,
@@ -11794,7 +11800,7 @@ impl Editor {
             NonZeroUsize::new(AGENT_BRIDGE_CAPACITY).expect("agent bridge capacity is non-zero");
         let (tool_sender, tool_requests) = editor_tool_channel(AGENT_BRIDGE_CAPACITY);
         let host = EditorToolHost::new(tool_sender);
-        let (bridge, task) = start_codex(spec, host, capacity)?;
+        let (bridge, task) = start_codex(spec, ToolHostAdapter(host), capacity)?;
         self.agent_manager.set_root(Some(cwd));
         self.agent_manager.set_bridge(bridge);
         self.agent_manager.set_task(task);
@@ -35543,7 +35549,7 @@ impl Editor {
         request: EditorToolRequest,
     ) -> anyhow::Result<Value> {
         self.agent_manager
-            .mark_session_active(request.session_id.clone());
+            .mark_session_active(request.session_id.as_str().to_string());
         let mut render_buffer = RenderBuffer::new(
             self.size.0 as usize,
             self.size.1 as usize,
@@ -37463,7 +37469,8 @@ mod test {
         let buffer_id = editor.current_buffer().id();
         let before = editor.current_buffer().contents();
         let request = EditorToolRequest {
-            session_id: "directories".to_string(),
+            session_id: crate::agent_backend::ids::SessionId::from_raw("directories".to_string()),
+            turn: None,
             call: EditorToolCall::CreateDirectory {
                 path: "go/examples".to_string(),
             },
@@ -37505,7 +37512,8 @@ mod test {
         editor.test_set_agent_root(root.path());
         let buffers = editor.buffer_manager.len();
         let request = |call| EditorToolRequest {
-            session_id: "protected".to_string(),
+            session_id: crate::agent_backend::ids::SessionId::from_raw("protected".to_string()),
+            turn: None,
             call,
         };
         for path in [
@@ -37562,7 +37570,10 @@ mod test {
         ] {
             let result = editor
                 .test_run_agent_editor_tool(EditorToolRequest {
-                    session_id: "directories".to_string(),
+                    session_id: crate::agent_backend::ids::SessionId::from_raw(
+                        "directories".to_string(),
+                    ),
+                    turn: None,
                     call: EditorToolCall::CreateDirectory {
                         path: path.to_string(),
                     },
@@ -37582,7 +37593,8 @@ mod test {
         let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
         editor.test_set_agent_root(root.path());
         let request = |call| EditorToolRequest {
-            session_id: "directories".to_string(),
+            session_id: crate::agent_backend::ids::SessionId::from_raw("directories".to_string()),
+            turn: None,
             call,
         };
         let read = editor
@@ -37666,7 +37678,10 @@ mod test {
             .unwrap()]);
         editor.test_set_agent_root(root.path());
         let request = |call| EditorToolRequest {
-            session_id: "external-change".to_string(),
+            session_id: crate::agent_backend::ids::SessionId::from_raw(
+                "external-change".to_string(),
+            ),
+            turn: None,
             call,
         };
 
@@ -37721,7 +37736,8 @@ mod test {
         let buffers = editor.buffer_manager.len();
         let active = editor.current_buffer().id();
         let request = |call| EditorToolRequest {
-            session_id: "disk-read".to_string(),
+            session_id: crate::agent_backend::ids::SessionId::from_raw("disk-read".to_string()),
+            turn: None,
             call,
         };
         let read = |line_count| {
@@ -37787,7 +37803,8 @@ mod test {
             .await
             .unwrap();
         let request = |call| EditorToolRequest {
-            session_id: "minimal-hunks".to_string(),
+            session_id: crate::agent_backend::ids::SessionId::from_raw("minimal-hunks".to_string()),
+            turn: None,
             call,
         };
         let read = editor
@@ -37871,7 +37888,10 @@ mod test {
         sender
             .send(crate::agent_tools::PendingEditorTool {
                 request: EditorToolRequest {
-                    session_id: "session-1".to_string(),
+                    session_id: crate::agent_backend::ids::SessionId::from_raw(
+                        "session-1".to_string(),
+                    ),
+                    turn: None,
                     call: EditorToolCall::ApplyEdits {
                         path: "document.rs".to_string(),
                         expected_revision: editor.current_buffer().revision(),
@@ -38072,7 +38092,8 @@ mod test {
             .agent_manager
             .record_user_message("session-1", "turn-1", "Rename line ten\nplease");
         let request = |call| EditorToolRequest {
-            session_id: "session-1".to_string(),
+            session_id: crate::agent_backend::ids::SessionId::from_raw("session-1".to_string()),
+            turn: None,
             call,
         };
         let read = editor
@@ -38298,7 +38319,8 @@ mod test {
         let mut editor = test_editor(/*width*/ 100, /*height*/ 30);
         editor.test_set_agent_root(root.path());
         let request = |call| EditorToolRequest {
-            session_id: "big".to_string(),
+            session_id: crate::agent_backend::ids::SessionId::from_raw("big".to_string()),
+            turn: None,
             call,
         };
         let read = editor
@@ -38355,7 +38377,10 @@ mod test {
             .unwrap()]);
         editor.test_set_agent_root(root.path());
         let request = |call| EditorToolRequest {
-            session_id: "unsaved-human-edit".to_string(),
+            session_id: crate::agent_backend::ids::SessionId::from_raw(
+                "unsaved-human-edit".to_string(),
+            ),
+            turn: None,
             call,
         };
         let read = editor
@@ -38406,7 +38431,8 @@ mod test {
             .unwrap()]);
         editor.test_set_agent_root(root.path());
         let request = |start_line, line_count| EditorToolRequest {
-            session_id: "paged-read".to_string(),
+            session_id: crate::agent_backend::ids::SessionId::from_raw("paged-read".to_string()),
+            turn: None,
             call: EditorToolCall::ReadFile {
                 path: "main.rs".to_string(),
                 start_line,
@@ -38465,7 +38491,10 @@ mod test {
         sender
             .send(crate::agent_tools::PendingEditorTool {
                 request: EditorToolRequest {
-                    session_id: "session-1".to_string(),
+                    session_id: crate::agent_backend::ids::SessionId::from_raw(
+                        "session-1".to_string(),
+                    ),
+                    turn: None,
                     call: EditorToolCall::ReadFile {
                         path: "second.rs".to_string(),
                         start_line: 1,
@@ -38487,7 +38516,10 @@ mod test {
         sender
             .send(crate::agent_tools::PendingEditorTool {
                 request: EditorToolRequest {
-                    session_id: "session-1".to_string(),
+                    session_id: crate::agent_backend::ids::SessionId::from_raw(
+                        "session-1".to_string(),
+                    ),
+                    turn: None,
                     call: EditorToolCall::ReadFile {
                         path: "long.rs".to_string(),
                         start_line: 1,
@@ -38513,7 +38545,10 @@ mod test {
         sender
             .send(crate::agent_tools::PendingEditorTool {
                 request: EditorToolRequest {
-                    session_id: "session-1".to_string(),
+                    session_id: crate::agent_backend::ids::SessionId::from_raw(
+                        "session-1".to_string(),
+                    ),
+                    turn: None,
                     call: EditorToolCall::OpenFile {
                         path: "second.rs".to_string(),
                         line: 0,
@@ -38558,7 +38593,10 @@ mod test {
         let delay = editor
             .prepare_agent_follow_step(
                 &EditorToolRequest {
-                    session_id: "session-1".to_string(),
+                    session_id: crate::agent_backend::ids::SessionId::from_raw(
+                        "session-1".to_string(),
+                    ),
+                    turn: None,
                     call: EditorToolCall::ApplyEdits {
                         path: "second.rs".to_string(),
                         expected_revision: 0,

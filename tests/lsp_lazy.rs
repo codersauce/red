@@ -915,8 +915,14 @@ async fn server_workspace_unopened_and_resource_edits_fail_closed_without_mutati
 }
 
 // Structured agent LSP tools share the same editor and transport fixtures.
+use red::agent_backend::ids::SessionId;
 use red::agent_tools::{EditorPosition, EditorToolCall, EditorToolRequest, LspDiagnosticScope};
 use serde_json::{json, Value};
+
+/// Builds a session id the way a persisted snapshot would.
+fn session(id: &str) -> SessionId {
+    serde_json::from_value(Value::String(id.to_string())).unwrap()
+}
 
 fn agent_lsp_fixture(root: &Path, capabilities: Value) -> (Editor, RecordingLsp) {
     let lsp = RecordingLsp::with_workspace_root(root).with_capabilities(capabilities);
@@ -945,7 +951,8 @@ fn agent_lsp_fixture(root: &Path, capabilities: Value) -> (Editor, RecordingLsp)
 
 fn agent_request(call: EditorToolCall) -> EditorToolRequest {
     EditorToolRequest {
-        session_id: "agent-lsp".into(),
+        session_id: session("agent-lsp"),
+        turn: None,
         call,
     }
 }
@@ -1227,7 +1234,8 @@ async fn agent_lsp_preview_rechecks_unopened_disk_targets_and_session_ownership(
     };
     let error = editor
         .test_run_agent_editor_tool(EditorToolRequest {
-            session_id: "another-session".into(),
+            session_id: session("another-session"),
+            turn: None,
             call: call.clone(),
         })
         .await
