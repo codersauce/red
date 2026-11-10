@@ -2,8 +2,9 @@
 //! externally generated key-sequence cases. `run.sh` copies it into a pinned
 //! Helix checkout as `helix-term/tests/felix_oracle.rs`.
 //!
-//! Input (`FELIX_ORACLE_IN`): `[{"id", "in", "keys", "lang"?}]`, where `in` uses
-//! Helix selection markup (`#[a|]#`, `#(b|)#`).
+//! Input (`FELIX_ORACLE_IN`): `[{"id", "in", "keys", "lang"?, "file"?}]`, where
+//! `in` uses Helix selection markup (`#[a|]#`, `#(b|)#`) and `file` names the
+//! opened document (`example.txt` by default).
 //! Output (`FELIX_ORACLE_OUT`): `[{"id", "start", "text", "ranges", "primary",
 //! "mode", "register", "out"} | {"id", "error"}]`, where `start` holds the text
 //! and selections before the keys.
@@ -71,7 +72,7 @@ fn lang_loader(name: &str) -> helix_core::syntax::Loader {
     helix_core::syntax::Loader::new(config.try_into().unwrap()).unwrap()
 }
 
-async fn run_case(input: &str, keys: &str, lang: Option<&str>) -> Value {
+async fn run_case(input: &str, keys: &str, lang: Option<&str>, file: &str) -> Value {
     let (text, selection) = test::print(input);
     // Open the text as a file, like a user would: no undo step for the initial
     // content and the same document name Red's runner uses.
@@ -79,7 +80,7 @@ async fn run_case(input: &str, keys: &str, lang: Option<&str>) -> Value {
         Ok(dir) => dir,
         Err(err) => return json!({ "error": err.to_string() }),
     };
-    let path = dir.path().join("example.txt");
+    let path = dir.path().join(file);
     if let Err(err) = std::fs::write(&path, &text) {
         return json!({ "error": err.to_string() });
     }
@@ -151,6 +152,7 @@ async fn felix_oracle() -> anyhow::Result<()> {
         let input = case["in"].as_str().unwrap_or_default().to_string();
         let keys = case["keys"].as_str().unwrap_or_default().to_string();
         let lang = case["lang"].as_str().map(str::to_string);
+        let file = case["file"].as_str().unwrap_or("example.txt").to_string();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -158,7 +160,7 @@ async fn felix_oracle() -> anyhow::Result<()> {
                     .enable_all()
                     .build()
                     .unwrap()
-                    .block_on(run_case(&input, &keys, lang.as_deref()))
+                    .block_on(run_case(&input, &keys, lang.as_deref(), &file))
             }));
             let _ = tx.send(outcome.unwrap_or_else(|_| json!({ "error": "panic" })));
         });

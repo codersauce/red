@@ -21,6 +21,16 @@ from pathlib import Path
 
 HELIX_PIN = "a05c151bb6e8e9c65ec390b0ae2afe7a5efd619b"  # 25.07.1
 CM6_PIN = "21dd29d9d9b57c9b728ff28df7f7d009534fdfcb"
+# Languages with a built-in grammar in Red, and the file each case opens.
+LANGUAGE_FILES = {
+    "markdown": "example.md",
+    "rust": "example.rs",
+    "typescript": "example.ts",
+    "json": "example.json",
+    "toml": "example.toml",
+    "bash": "example.sh",
+}
+HELIX_GRAMMARS = ["markdown", "markdown_inline", "rust", "typescript", "json", "toml", "bash"]
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
 
@@ -35,6 +45,19 @@ def checkout(url, path, rev):
     if subprocess.run(["git", "-C", str(path), "cat-file", "-e", f"{rev}^{{commit}}"]).returncode:
         sh("git", "-C", str(path), "fetch", "-q", url, rev)
     sh("git", "-C", str(path), "checkout", "-q", "--detach", rev)
+
+
+def build_grammars(helix, cache):
+    """Fetch and build only the grammars the language cases use."""
+    config = cache / "hx-config"
+    (config / "helix").mkdir(parents=True, exist_ok=True)
+    (config / "helix/languages.toml").write_text(
+        f"use-grammars = {{ only = {json.dumps(HELIX_GRAMMARS)} }}\n")
+    env = {**os.environ, "XDG_CONFIG_HOME": str(config), "HELIX_RUNTIME": str(helix / "runtime"),
+           "RUSTUP_TOOLCHAIN": "stable"}
+    for action in ("fetch", "build"):
+        sh("cargo", "run", "-q", "--release", "--locked", "-p", "helix-term", "--bin", "hx",
+           "--", "--grammar", action, cwd=helix, env=env)
 
 
 def oracle_binary(helix):
@@ -95,32 +118,42 @@ def main():
     for suite in args.suites:
         out = subprocess.run(["bun", str(HERE / "export.ts"), str(cm6), suite],
                              stdout=subprocess.PIPE, check=True, text=True).stdout
-        suite_cases = json.loads(out)
-        cases += suite_cases
+        suite_cases = []
+        for case in json.loads(out):
+            lang = case.get("lang")
+            if lang is None:
+                suite_cases.append(case)
+            elif lang in LANGUAGE_FILES:
+                suite_cases.append({**case, "file": LANGUAGE_FILES[lang]})
         digest = hashlib.sha256(
             json.dumps(suite_cases, sort_keys=True).encode() + oracle_source
         ).hexdigest()[:16]
         name = suite.replace(":", "-")
         path = cache / f"expected-{HELIX_PIN[:12]}-{name}-{digest}.json"
+        # Ids are unique within a suite only (the hand suite has a `code` sample).
+        prefix = "" if suite == "hand" or suite.startswith("fuzz") else f"{suite}:"
+        cases += [{**c, "id": prefix + c["id"]} for c in suite_cases]
         if path.exists():
-            expected.update(json.loads(path.read_text()))
+            found = json.loads(path.read_text())
+            expected.update({prefix + k: v for k, v in found.items()})
         else:
-            missing.append((path, suite_cases))
+            missing.append((path, suite_cases, prefix))
 
     if missing:
-        pending = [c for _, suite_cases in missing for c in suite_cases]
+        pending = [c for _, suite_cases, _ in missing for c in suite_cases]
+        if any(c.get("lang") for c in pending):
+            build_grammars(helix, cache)
         print(f"running Helix {HELIX_PIN[:12]} on {len(pending)} cases", file=sys.stderr)
         unique = {(c["in"], c["keys"], c.get("lang")): c for c in pending}
         keyed = [{**c, "id": str(i)} for i, c in enumerate(unique.values())]
         results = run_oracle(helix, keyed, args.jobs)
         by_input = {(c["in"], c["keys"], c.get("lang")): results[c["id"]] for c in keyed}
-        for path, suite_cases in missing:
+        for path, suite_cases, prefix in missing:
             found = {c["id"]: by_input[(c["in"], c["keys"], c.get("lang"))] for c in suite_cases}
             path.write_text(json.dumps(found))
-            expected.update(found)
+            expected.update({prefix + k: v for k, v in found.items()})
 
-    # Language cases need Red's per-language syntax setup; run them later.
-    plain = [{**c, "expected": expected[c["id"]]} for c in cases if not c.get("lang")]
+    plain = [{**c, "expected": expected[c["id"]]} for c in cases]
     work = Path(tempfile.mkdtemp(prefix="felix-cm6-"))
     cases_path, report_path = work / "cases.json", args.report or work / "report.json"
     cases_path.write_text(json.dumps(plain))

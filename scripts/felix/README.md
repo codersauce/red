@@ -140,13 +140,13 @@ The tutor regressions replay a single-digit selection, counted and multi-selecti
 
 ## helix-cm6 key-sequence cases
 
-[helix-cm6](https://github.com/Kosyakssss/helix-cm6) generates thousands of short Helix key sequences: a hand-written suite of about 280 sequences on 16 sample texts, and seeded fuzz suites. `scripts/felix/cm6/run.py` exports those cases from a pinned helix-cm6 checkout at run time, so none of its files are committed here. It runs each case in Helix 25.07.1 through `cm6/oracle.rs`, a Helix integration test that opens the text as `example.txt`, sets the selections and records the final text, directed selections, primary index, mode and `"` register. Red then replays each case through its document input path in `src/editor/felix/cm6.rs` and compares the same fields.
+[helix-cm6](https://github.com/Kosyakssss/helix-cm6) generates thousands of short Helix key sequences: a hand-written suite of about 280 sequences on 16 sample texts, seeded fuzz suites, and the language suites `md` (Markdown) and `code` (Rust, TypeScript, JSON, TOML and Bash samples). `scripts/felix/cm6/run.py` exports those cases from a pinned helix-cm6 checkout at run time, so none of its files are committed here. It runs each case in Helix 25.07.1 through `cm6/oracle.rs`, a Helix integration test that opens the text as `example.txt` (or `example.md`, `example.rs` and so on for language cases, with only those grammars built), sets the selections and records the final text, directed selections, primary index, mode and `"` register. Red then replays each case through its document input path in `src/editor/felix/cm6.rs` and compares the same fields.
 
 ```sh
 python3 scripts/felix/cm6/run.py hand fuzz:1            # what pull requests run
-python3 scripts/felix/cm6/run.py hand fuzz:1 fuzz:2 fuzz:3 fuzz:4 fuzz:5
+python3 scripts/felix/cm6/run.py hand fuzz:1 fuzz:2 fuzz:3 fuzz:4 fuzz:5 md code   # nightly and pushes
 python3 scripts/felix/cm6/run.py --no-baseline --report report.json hand
-python3 scripts/felix/cm6/run.py --update-baseline hand fuzz:1 fuzz:2 fuzz:3 fuzz:4 fuzz:5
+python3 scripts/felix/cm6/run.py --update-baseline hand fuzz:1 fuzz:2 fuzz:3 fuzz:4 fuzz:5 md code
 ```
 
-The runner needs Git, Cargo and Bun. It clones both pinned repositories into `~/.cache/red-felix/cm6` and caches Helix's results there per case set. [baseline.txt](cm6/baseline.txt) lists the cases known to differ. The run fails when a case outside it differs, or when a listed case starts passing, so remove fixed cases with `--update-baseline`. The language-specific `md` and `code` suites can be exported but are not replayed yet.
+The runner needs Git, Cargo and Bun. It clones both pinned repositories into `~/.cache/red-felix/cm6` and caches Helix's results there per case set. [baseline.txt](cm6/baseline.txt) lists the cases known to differ. The run fails when a case outside it differs, or when a listed case starts passing, so remove fixed cases with `--update-baseline`. Language cases use the languages Red has a grammar for; cases in other languages are left out.
