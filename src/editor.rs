@@ -11769,7 +11769,7 @@ impl Editor {
             return Ok(());
         }
         let configured = self.config.agent.command.as_deref().unwrap_or("codex");
-        let command = crate::codex::find_executable(configured).ok_or_else(|| {
+        let command = crate::utils::find_executable(configured).ok_or_else(|| {
             anyhow::anyhow!(
                 "Codex CLI was not found; install Codex, run `codex login`, and try again"
             )

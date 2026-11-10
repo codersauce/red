@@ -18,8 +18,6 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::{fs::File, io::Read as _, path::Component};
-
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use ignore::WalkBuilder;
@@ -46,6 +44,7 @@ use crate::agent_backend::types::{
     Activity, ModelInfo, ModelQuery, ModelResult, ModelSelection, RestoredHistory, SessionPage,
     SessionPreview, SessionQuery,
 };
+use crate::agent_backend::workspace::TOOL_CONTENT_BYTES;
 use crate::agent_tools::{editor_tool_schemas, EditorToolCall, EditorToolRequest};
 use crate::config::AgentCodexFeature;
 use crate::inline_assist::InlineAssistResult;
@@ -55,7 +54,6 @@ const APP_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// JSON-RPC error code Red reports for a frame it discarded as too large.
 const FRAME_TOO_LARGE_CODE: i64 = -32099;
 const STDERR_TAIL_BYTES: usize = 32 * 1024;
-const TOOL_CONTENT_BYTES: usize = 960 * 1024;
 const MAX_FILES: usize = 4096;
 #[cfg(unix)]
 const MAX_MATCHES: usize = 200;
@@ -2561,7 +2559,7 @@ fn list_file_paths(
     cancelled: &AtomicBool,
     allow_sensitive_paths: bool,
 ) -> Result<FilePaths> {
-    validate_workspace_root(root)?;
+    crate::agent_backend::workspace::validate_workspace_root(root)?;
     let mut files = Vec::new();
     let mut entries = 0_usize;
     let started = Instant::now();
@@ -2622,7 +2620,9 @@ fn search_files(
             if cancelled.load(Ordering::Relaxed) {
                 anyhow::bail!("Codex turn was cancelled");
             }
-            let Some((content, bytes)) = read_workspace_file(root, &relative)? else {
+            let Some((content, bytes)) =
+                crate::agent_backend::workspace::read_workspace_file(root, &relative)?
+            else {
                 continue;
             };
             searched = searched.saturating_add(bytes);
@@ -2648,208 +2648,6 @@ fn search_files(
         }
         Ok(json!({"matches": matches, "truncated": truncated}))
     }
-}
-
-pub(crate) fn validate_workspace_root(root: &Path) -> Result<()> {
-    anyhow::ensure!(root.is_absolute(), "workspace root must be absolute");
-    let inspected = physical_workspace_root(root);
-    for ancestor in inspected.ancestors() {
-        let metadata =
-            std::fs::symlink_metadata(ancestor).context("failed to inspect workspace root")?;
-        anyhow::ensure!(
-            !metadata.file_type().is_symlink(),
-            "workspace root cannot contain a symlink"
-        );
-    }
-    anyhow::ensure!(
-        std::fs::symlink_metadata(inspected)?.is_dir(),
-        "workspace root must be a directory"
-    );
-    Ok(())
-}
-
-pub(crate) fn physical_workspace_root(root: &Path) -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        for (alias, target) in [
-            (Path::new("/var"), Path::new("/private/var")),
-            (Path::new("/tmp"), Path::new("/private/tmp")),
-            (Path::new("/etc"), Path::new("/private/etc")),
-        ] {
-            if let Ok(suffix) = root.strip_prefix(alias) {
-                return target.join(suffix);
-            }
-        }
-    }
-    root.to_path_buf()
-}
-
-#[cfg(unix)]
-fn open_workspace_directory(root: &Path) -> Result<File> {
-    use std::os::fd::{AsRawFd, FromRawFd};
-
-    use nix::{
-        fcntl::{openat, OFlag},
-        sys::stat::Mode,
-    };
-
-    let inspected = physical_workspace_root(root);
-    let descriptor = openat(
-        None,
-        Path::new("/"),
-        OFlag::O_RDONLY
-            | OFlag::O_CLOEXEC
-            | OFlag::O_DIRECTORY
-            | OFlag::O_NOFOLLOW
-            | OFlag::O_NONBLOCK,
-        Mode::empty(),
-    )
-    .context("failed to safely open filesystem root")?;
-    // SAFETY: `openat` returned a new descriptor and `File` becomes its sole owner.
-    let mut directory = unsafe { File::from_raw_fd(descriptor) };
-    for component in inspected.components() {
-        let name = match component {
-            Component::RootDir | Component::CurDir => continue,
-            Component::Normal(name) => name,
-            Component::ParentDir | Component::Prefix(_) => {
-                anyhow::bail!("workspace root contains a non-normal path component");
-            }
-        };
-        let descriptor = openat(
-            Some(directory.as_raw_fd()),
-            name,
-            OFlag::O_RDONLY
-                | OFlag::O_CLOEXEC
-                | OFlag::O_DIRECTORY
-                | OFlag::O_NOFOLLOW
-                | OFlag::O_NONBLOCK,
-            Mode::empty(),
-        )
-        .context("failed to safely open workspace root component")?;
-        // SAFETY: `openat` returned a new descriptor and `File` becomes its sole owner.
-        directory = unsafe { File::from_raw_fd(descriptor) };
-    }
-    Ok(directory)
-}
-
-#[cfg(unix)]
-fn open_workspace_file_at(directory: &File, relative: &Path) -> Result<Option<File>> {
-    use std::os::fd::{AsRawFd, FromRawFd};
-
-    use nix::{
-        fcntl::{openat, OFlag},
-        sys::stat::Mode,
-    };
-
-    let mut components = relative.components().peekable();
-    let mut opened_directory: Option<File> = None;
-    while let Some(component) = components.next() {
-        let Component::Normal(name) = component else {
-            anyhow::bail!("workspace walker returned a non-normal path");
-        };
-        let final_component = components.peek().is_none();
-        let mut flags = OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK;
-        if !final_component {
-            flags |= OFlag::O_DIRECTORY;
-        }
-        let parent = opened_directory.as_ref().unwrap_or(directory);
-        let descriptor = match openat(Some(parent.as_raw_fd()), name, flags, Mode::empty()) {
-            Ok(descriptor) => descriptor,
-            Err(_) => return Ok(None),
-        };
-        // SAFETY: `openat` returned a new descriptor and `File` becomes its sole owner.
-        let file = unsafe { File::from_raw_fd(descriptor) };
-        if final_component {
-            return Ok(Some(file));
-        }
-        opened_directory = Some(file);
-    }
-    Ok(None)
-}
-
-#[cfg(unix)]
-fn open_workspace_file(root: &Path, relative: &Path) -> Result<Option<File>> {
-    open_workspace_file_at(&open_workspace_directory(root)?, relative)
-}
-
-#[cfg(unix)]
-fn read_workspace_file(root: &Path, relative: &str) -> Result<Option<(String, u64)>> {
-    let Some(file) = open_workspace_file(root, Path::new(relative))? else {
-        return Ok(None);
-    };
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() > TOOL_CONTENT_BYTES as u64 {
-        return Ok(None);
-    }
-    let mut bytes = Vec::new();
-    file.take(TOOL_CONTENT_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > TOOL_CONTENT_BYTES {
-        return Ok(None);
-    }
-    let byte_count = bytes.len() as u64;
-    let Ok(content) = String::from_utf8(bytes) else {
-        return Ok(None);
-    };
-    Ok(Some((content, byte_count)))
-}
-
-/// Read through the same no-symlink descriptor walk used by workspace search.
-pub(crate) fn read_inline_workspace_file(
-    root: &Path,
-    relative: &str,
-    limit: usize,
-) -> Result<Option<String>> {
-    #[cfg(unix)]
-    {
-        validate_workspace_root(root)?;
-        let Some(file) = open_workspace_file(root, Path::new(relative))? else {
-            return Ok(None);
-        };
-        read_inline_workspace_handle(file, limit)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (root, relative, limit);
-        anyhow::bail!("safe on-disk inline context reads are unavailable on this platform")
-    }
-}
-
-/// A validated directory handle that confines every search read with `openat`.
-#[cfg(unix)]
-pub(crate) struct InlineWorkspaceReader {
-    directory: File,
-}
-
-#[cfg(unix)]
-impl InlineWorkspaceReader {
-    pub(crate) fn new(root: &Path) -> Result<Self> {
-        validate_workspace_root(root)?;
-        Ok(Self {
-            directory: open_workspace_directory(root)?,
-        })
-    }
-
-    pub(crate) fn read(&self, relative: &str, limit: usize) -> Result<Option<String>> {
-        let Some(file) = open_workspace_file_at(&self.directory, Path::new(relative))? else {
-            return Ok(None);
-        };
-        read_inline_workspace_handle(file, limit)
-    }
-}
-
-#[cfg(unix)]
-fn read_inline_workspace_handle(file: File, limit: usize) -> Result<Option<String>> {
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() > limit as u64 {
-        return Ok(None);
-    }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
-    if bytes.len() > limit || bytes.contains(&0) {
-        return Ok(None);
-    }
-    Ok(String::from_utf8(bytes).ok())
 }
 
 fn restricted_config(response: &Value, policy: &AgentRuntimePolicy) -> Option<Value> {
@@ -3165,62 +2963,9 @@ fn required_string<'a>(arguments: &'a Value, name: &str) -> Result<&'a str> {
         .with_context(|| format!("missing string argument {name}"))
 }
 
-#[must_use]
-pub fn find_executable(command: &str) -> Option<PathBuf> {
-    let command = Path::new(command);
-    if command.components().count() > 1 {
-        return is_executable(command).then(|| command.to_path_buf());
-    }
-    std::env::var_os("PATH").and_then(|path| {
-        std::env::split_paths(&path).find_map(|directory| find_in_directory(&directory, command))
-    })
-}
-
-#[cfg(not(windows))]
-fn find_in_directory(directory: &Path, command: &Path) -> Option<PathBuf> {
-    let candidate = directory.join(command);
-    is_executable(&candidate).then_some(candidate)
-}
-
-#[cfg(windows)]
-fn find_in_directory(directory: &Path, command: &Path) -> Option<PathBuf> {
-    let candidate = directory.join(command);
-    if is_executable(&candidate) {
-        return Some(candidate);
-    }
-    if candidate.extension().is_some() {
-        return None;
-    }
-    std::env::var("PATHEXT")
-        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
-        .split(';')
-        .filter(|extension| !extension.is_empty())
-        .map(|extension| directory.join(format!("{}{}", command.to_string_lossy(), extension)))
-        .find(|path| is_executable(path))
-}
-
-fn is_executable(path: &Path) -> bool {
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
-
 #[cfg(all(test, unix))]
 mod tests {
-    use std::os::unix::fs::{symlink, PermissionsExt as _};
+    use std::os::unix::fs::symlink;
 
     use super::*;
 
@@ -4315,16 +4060,6 @@ mod tests {
         let error = search_files(&root, "needle", &AtomicBool::new(false), false).unwrap_err();
 
         assert!(error.to_string().contains("symlink"));
-    }
-
-    #[test]
-    fn executable_discovery_rejects_non_executable_files() {
-        let directory = tempfile::tempdir().unwrap();
-        let command = directory.path().join("codex");
-        std::fs::write(&command, "not executable").unwrap();
-        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o644)).unwrap();
-
-        assert!(find_executable(command.to_str().unwrap()).is_none());
     }
 
     #[test]
