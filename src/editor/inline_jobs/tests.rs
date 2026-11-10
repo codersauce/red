@@ -1,4 +1,5 @@
 use super::*;
+use crate::editor::test_agent::AgentTestHandle;
 use crate::{inline_assist::InlineCommentInput, lsp::LspManager};
 
 fn editor(text: &str) -> Editor {
@@ -201,16 +202,10 @@ async fn inline_draft_close_can_edit_save_or_delete_without_losing_prior_results
 async fn inline_foreground_exact_code_result_auto_applies_as_unsaved_transaction() {
     let mut editor = editor("alpha\nbeta\n");
     start(&mut editor, "first", Some("one"), range(0, 1));
-    let (bridge, worker) = CodexBridge::channel(std::num::NonZeroUsize::new(2).unwrap());
-    editor.agent_manager.set_bridge(bridge);
-    worker
-        .send(CodexEvent::InlineResult {
-            request_id: "one".into(),
-            session_id: "provider-one".into(),
-            result: result(Some("ALPHA\n")),
-        })
-        .await
-        .unwrap();
+    let agent = AgentTestHandle::install(&mut editor, 2);
+    agent
+        .emit_inline_result("one", "provider-one", result(Some("ALPHA\n")))
+        .await;
     editor
         .service_background(
             &mut RenderBuffer::new(100, 30, &Style::default()),
@@ -242,16 +237,10 @@ async fn inline_foreground_code_result_can_require_request_bound_review() {
     let mut editor = editor("alpha\nbeta\n");
     editor.config.agent.auto_apply_inline_edits = false;
     start(&mut editor, "first", Some("one"), range(0, 1));
-    let (bridge, worker) = CodexBridge::channel(std::num::NonZeroUsize::new(2).unwrap());
-    editor.agent_manager.set_bridge(bridge);
-    worker
-        .send(CodexEvent::InlineResult {
-            request_id: "one".into(),
-            session_id: "provider-one".into(),
-            result: result(Some("ALPHA\n")),
-        })
-        .await
-        .unwrap();
+    let agent = AgentTestHandle::install(&mut editor, 2);
+    agent
+        .emit_inline_result("one", "provider-one", result(Some("ALPHA\n")))
+        .await;
     editor
         .service_background(
             &mut RenderBuffer::new(100, 30, &Style::default()),
@@ -301,14 +290,9 @@ async fn inline_foreground_code_result_can_require_request_bound_review() {
     assert!(editor.current_buffer().is_dirty());
 
     start(&mut editor, "second", Some("two"), range(1, 2));
-    worker
-        .send(CodexEvent::InlineResult {
-            request_id: "two".into(),
-            session_id: "provider-two".into(),
-            result: result(Some("BETA\n")),
-        })
-        .await
-        .unwrap();
+    agent
+        .emit_inline_result("two", "provider-two", result(Some("BETA\n")))
+        .await;
     editor
         .service_background(
             &mut RenderBuffer::new(100, 30, &Style::default()),

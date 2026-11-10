@@ -1,4 +1,5 @@
 use super::*;
+use crate::editor::test_agent::{AgentCommand, AgentTestHandle};
 use crate::{
     inline_assist::InlineCommentInput,
     inline_history::{InlineConversation, InlineHistoryTurn},
@@ -353,9 +354,7 @@ async fn changed_source_is_disclosed_and_detached_source_offers_agent() {
 #[tokio::test]
 async fn ask_agent_opens_the_composer_without_sending_or_creating_history() {
     let (mut editor, id) = fixture();
-    let (bridge, mut worker) =
-        crate::codex::CodexBridge::channel(std::num::NonZeroUsize::new(2).unwrap());
-    editor.agent_manager.set_bridge(bridge);
+    let mut agent = AgentTestHandle::install(&mut editor, 2);
     let mut runtime = Runtime::new();
     runtime
         .load_plugin("agent", include_str!("../../../plugins/agent.hk"))
@@ -381,25 +380,13 @@ async fn ask_agent_opens_the_composer_without_sending_or_creating_history() {
     let staged = editor.staged_inline_agent_handoff.as_ref().unwrap();
     assert!(editor.inline_history.turn(&staged.request_id).is_none());
     assert_eq!(editor.inline_history.conversations.len(), 1);
-    assert!(matches!(
-        worker.recv().await,
-        Some(crate::codex::CodexCommand::ModelRequest {
-            request: crate::agent_backend::types::ModelQuery::List,
-            ..
-        })
-    ));
-    assert!(matches!(
-        worker.recv().await,
-        Some(crate::codex::CodexCommand::ModelRequest {
-            request: crate::agent_backend::types::ModelQuery::ReadDefault { .. },
-            ..
-        })
-    ));
+    assert_eq!(agent.recv_command().await, Some(AgentCommand::ListModels));
+    assert_eq!(agent.recv_command().await, Some(AgentCommand::DefaultModel));
     assert!(editor.agent_manager.conversation_snapshot().is_none());
     assert!(!editor.agent_manager.has_active_sessions());
-    drop(editor.agent_manager.take_bridge());
+    AgentTestHandle::disconnect(&mut editor);
     assert!(
-        worker.recv().await.is_none(),
+        agent.recv_command().await.is_none(),
         "opening the composer must not start a thread or turn"
     );
 }

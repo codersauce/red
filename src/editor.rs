@@ -76,6 +76,8 @@ mod session_manager;
 mod shell_command;
 mod signature_help;
 mod snippet;
+#[cfg(test)]
+mod test_agent;
 mod update;
 mod workspace_search;
 
@@ -35941,6 +35943,7 @@ impl Editor {
 
 #[cfg(test)]
 mod test {
+    use super::test_agent::{AgentCommand, AgentTestHandle};
     use super::*;
     use crate::lsp::DiagnosticSeverity;
     use std::path::{Path, PathBuf};
@@ -40909,18 +40912,10 @@ builtin = "rust"
         let mut core = DetachedEditorCore::new(test_editor(/*width*/ 80, /*height*/ 24))
             .await
             .unwrap();
-        let capacity = NonZeroUsize::new(AGENT_EVENTS_PER_TICK + 1).unwrap();
-        let (bridge, worker) = CodexBridge::channel(capacity);
+        let agent = AgentTestHandle::install(&mut core.editor, AGENT_EVENTS_PER_TICK + 1);
         for index in 0..=AGENT_EVENTS_PER_TICK {
-            worker
-                .send(CodexEvent::Update {
-                    session_id: ("session-1").to_string(),
-                    text: index.to_string(),
-                })
-                .await
-                .unwrap();
+            agent.emit_update("session-1", &index.to_string()).await;
         }
-        core.editor.agent_manager.set_bridge(bridge);
 
         core.input(crate::headless::InputEvent::Key {
             code: crate::headless::KeyCode::Character('l'),
@@ -40930,13 +40925,10 @@ builtin = "rust"
         .await
         .unwrap();
 
-        assert!(matches!(
-            core.editor
-                .agent_manager
-                .bridge_mut()
-                .and_then(CodexBridge::try_recv),
-            Some(CodexEvent::Update { text, .. }) if text == AGENT_EVENTS_PER_TICK.to_string()
-        ));
+        assert_eq!(
+            AgentTestHandle::next_undelivered_update(&mut core.editor).as_deref(),
+            Some(AGENT_EVENTS_PER_TICK.to_string().as_str())
+        );
         drain_plugin_requests();
     }
 
@@ -40985,33 +40977,13 @@ builtin = "rust"
             .await
             .unwrap();
         let event_count = AGENT_EVENTS_PER_TICK + 8;
-        let capacity = NonZeroUsize::new(event_count + 1).unwrap();
-        let (bridge, worker) = CodexBridge::channel(capacity);
+        let agent = AgentTestHandle::install(&mut editor, event_count + 1);
         for index in 0..event_count {
-            worker
-                .send(CodexEvent::Update {
-                    session_id: ("session-1").to_string(),
-                    text: index.to_string(),
-                })
-                .await
-                .unwrap();
+            agent.emit_update("session-1", &index.to_string()).await;
         }
-        worker
-            .send(CodexEvent::Completed {
-                session_id: ("session-1").to_string(),
-                stop_reason: "end_turn".to_string(),
-            })
-            .await
-            .unwrap();
-        drop(worker);
-        editor.agent_manager.set_bridge(bridge);
+        agent.emit_completed("session-1", "end_turn").await;
         editor.agent_manager.mark_session_active("session-1");
-        editor.agent_manager.set_task(tokio::spawn(async move {
-            anyhow::bail!("fixture adapter exited")
-        }));
-        while !editor.agent_manager.is_task_finished() {
-            tokio::task::yield_now().await;
-        }
+        agent.lose(&mut editor, "fixture adapter exited").await;
         let mut buffer =
             RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
         ACTION_DISPATCHER.send_request(PluginRequest::AgentNewSession {
@@ -41095,17 +41067,15 @@ builtin = "rust"
 
     #[tokio::test]
     async fn prompt_sent_during_a_cancel_runs_after_the_interrupted_turn_ends() {
-        fn prompt_text(command: Option<CodexCommand>) -> Option<String> {
+        fn prompt_text(command: Option<AgentCommand>) -> Option<String> {
             match command? {
-                CodexCommand::Prompt { text, .. }
-                | CodexCommand::PromptWithContext { text, .. } => Some(text),
+                AgentCommand::Prompt { text, .. } => Some(text),
                 _ => None,
             }
         }
         drain_plugin_requests();
         let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
-        let (bridge, mut worker) = CodexBridge::channel(NonZeroUsize::new(8).unwrap());
-        editor.agent_manager.set_bridge(bridge);
+        let mut agent = AgentTestHandle::install(&mut editor, 8);
         let mut buffer =
             RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
         let mut runtime = Runtime::new();
@@ -41119,7 +41089,10 @@ builtin = "rust"
             .service_background(&mut buffer, &mut runtime)
             .await
             .unwrap();
-        assert_eq!(prompt_text(worker.recv().await).as_deref(), Some("first"));
+        assert_eq!(
+            prompt_text(agent.recv_command().await).as_deref(),
+            Some("first")
+        );
 
         ACTION_DISPATCHER.send_request(PluginRequest::AgentCancel {
             session_id: "session-1".to_string(),
@@ -41129,60 +41102,44 @@ builtin = "rust"
             .await
             .unwrap();
         assert!(matches!(
-            worker.recv().await,
-            Some(CodexCommand::Cancel { .. })
+            agent.recv_command().await,
+            Some(AgentCommand::Stop { .. })
         ));
         // The worker acknowledges the cancel before Codex finishes the turn.
-        worker
-            .send(CodexEvent::Cancelled {
-                session_id: "session-1".to_string(),
-            })
-            .await
-            .unwrap();
+        agent.emit_cancelled("session-1").await;
         ACTION_DISPATCHER.send_request(prompt("second"));
         editor
             .service_background(&mut buffer, &mut runtime)
             .await
             .unwrap();
         assert!(
-            tokio::time::timeout(Duration::from_millis(20), worker.recv())
-                .await
-                .is_err(),
+            agent.no_command_within(Duration::from_millis(20)).await,
             "the follow-up must wait for the interrupted turn to end"
         );
         // A rejected interrupt leaves the turn running, so the prompt keeps waiting.
-        worker
-            .send(CodexEvent::CancelFailed {
-                session_id: "session-1".to_string(),
-                message: "interrupt rejected".to_string(),
-            })
-            .await
-            .unwrap();
+        agent
+            .emit_cancel_failed("session-1", "interrupt rejected")
+            .await;
         editor
             .service_background(&mut buffer, &mut runtime)
             .await
             .unwrap();
         assert!(
-            tokio::time::timeout(Duration::from_millis(20), worker.recv())
-                .await
-                .is_err(),
+            agent.no_command_within(Duration::from_millis(20)).await,
             "a failed cancel must not release the held follow-up"
         );
         assert!(editor.agent_manager.is_session_busy("session-1"));
 
-        worker
-            .send(CodexEvent::Completed {
-                session_id: "session-1".to_string(),
-                stop_reason: "interrupted".to_string(),
-            })
-            .await
-            .unwrap();
+        agent.emit_completed("session-1", "interrupted").await;
         editor
             .service_background(&mut buffer, &mut runtime)
             .await
             .unwrap();
 
-        assert_eq!(prompt_text(worker.recv().await).as_deref(), Some("second"));
+        assert_eq!(
+            prompt_text(agent.recv_command().await).as_deref(),
+            Some("second")
+        );
         assert!(editor.agent_manager.is_session_active("session-1"));
         drain_plugin_requests();
     }
@@ -41193,24 +41150,15 @@ builtin = "rust"
         let mut core = DetachedEditorCore::new(test_editor(/*width*/ 80, /*height*/ 24))
             .await
             .unwrap();
-        let (bridge, mut worker) = CodexBridge::channel(NonZeroUsize::new(1).unwrap());
-        bridge
-            .send(CodexCommand::Prompt {
-                session_id: ("stalled-session").to_string(),
-                text: "occupy the command queue".to_string(),
-            })
-            .await
-            .unwrap();
-        worker
-            .send(CodexEvent::PermissionRequested {
-                request_id: "stale-permission".to_string(),
-                session_id: ("stalled-session").to_string(),
-                tool_call: json!({ "tool_call_id": "stale-tool" }),
-                options: json!([]),
-            })
-            .await
-            .unwrap();
-        core.editor.agent_manager.set_bridge(bridge);
+        let mut agent = AgentTestHandle::install_with_full_command_queue(
+            &mut core.editor,
+            "stalled-session",
+            "occupy the command queue",
+        )
+        .await;
+        agent
+            .emit_stale_permission("stale-permission", "stalled-session")
+            .await;
 
         tokio::time::timeout(
             Duration::from_secs(1),
@@ -41226,16 +41174,11 @@ builtin = "rust"
 
         assert!(core.editor.current_dialog.is_none());
         assert!(matches!(
-            worker.recv().await,
-            Some(CodexCommand::Prompt { session_id, text })
-                if session_id.as_str() == "stalled-session"
-                    && text == "occupy the command queue"
+            agent.recv_command().await,
+            Some(AgentCommand::Prompt { session, text })
+                if session == "stalled-session" && text == "occupy the command queue"
         ));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), worker.recv())
-                .await
-                .is_err()
-        );
+        assert!(agent.no_command_within(Duration::from_millis(20)).await);
         drain_plugin_requests();
     }
 

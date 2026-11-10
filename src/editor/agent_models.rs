@@ -91,6 +91,7 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::editor::test_agent::AgentTestHandle;
 
     #[test]
     fn model_catalog_callback_preserves_protocol_field_names() {
@@ -159,19 +160,12 @@ mod tests {
             PluginRequest::AgentModelRequest { request_id, .. } => request_id,
             _ => panic!("expected model preview request"),
         };
-        let (bridge, worker) = CodexBridge::channel(NonZeroUsize::new(1).unwrap());
-        drop(worker);
-        editor.agent_manager.set_bridge(bridge);
+        let agent = AgentTestHandle::install(&mut editor, 1);
         editor.agent_manager.mark_model_only_bridge();
         editor
             .agent_manager
             .mark_model_request_pending(request_id.get());
-        editor
-            .agent_manager
-            .set_task(tokio::spawn(async { anyhow::bail!("preview unavailable") }));
-        while !editor.agent_manager.is_task_finished() {
-            tokio::task::yield_now().await;
-        }
+        agent.lose(&mut editor, "preview unavailable").await;
         let mut buffer = RenderBuffer::new(80, 24, &Style::default());
         editor
             .service_background(&mut buffer, &mut runtime)

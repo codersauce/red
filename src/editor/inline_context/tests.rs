@@ -1,4 +1,5 @@
 use super::*;
+use crate::editor::test_agent::AgentTestHandle;
 use crate::{agent_tools::EditorToolRequest, lsp::LspManager};
 
 #[tokio::test]
@@ -87,15 +88,10 @@ async fn inline_context_dispatch_is_request_bound_and_does_not_move_focus() {
     assert_eq!(editor.cursor_snapshot(), cursor);
     assert!(!editor.agent_manager.has_playback_work());
     assert!(!root.join("helper.c").exists());
-    let (bridge, worker) = CodexBridge::channel(std::num::NonZeroUsize::new(2).unwrap());
-    editor.agent_manager.set_bridge(bridge);
-    worker
-        .send(CodexEvent::InlineContextRead {
-            request_id: "request".into(),
-            description: "Read helper.c:1–1 · editor revision 0".into(),
-        })
-        .await
-        .unwrap();
+    let agent = AgentTestHandle::install(&mut editor, 2);
+    agent
+        .emit_inline_context_read("request", "Read helper.c:1–1 · editor revision 0")
+        .await;
     editor
         .service_background(
             &mut RenderBuffer::new(100, 30, &Style::default()),

@@ -124,23 +124,32 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::editor::test_agent::SessionRestore;
 
     #[test]
     fn browser_resumes_only_sessions_with_a_known_compatible_tool_catalog() {
         for version in [None, Some(0)] {
-            assert!(matches!(
-                session_switch_command(PathBuf::from("/workspace"), "old".into(), version),
-                CodexCommand::ContinueSession { session_id, .. } if session_id == "old"
-            ));
+            assert_eq!(
+                SessionRestore::of(session_switch_command(
+                    PathBuf::from("/workspace"),
+                    "old".into(),
+                    version
+                )),
+                SessionRestore::Fork {
+                    session: "old".into()
+                }
+            );
         }
-        assert!(matches!(
-            session_switch_command(
+        assert_eq!(
+            SessionRestore::of(session_switch_command(
                 PathBuf::from("/workspace"),
                 "compatible".into(),
                 Some(crate::agent_conversation::AGENT_TOOL_CONTRACT_VERSION),
-            ),
-            CodexCommand::ResumeSession { session_id, .. } if session_id == "compatible"
-        ));
+            )),
+            SessionRestore::Rejoin {
+                session: "compatible".into()
+            }
+        );
     }
 
     #[test]

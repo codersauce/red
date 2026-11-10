@@ -1,4 +1,5 @@
 use super::*;
+use crate::editor::test_agent::AgentTestHandle;
 use crate::{agent_tools::EditorToolCall, lsp::LspManager};
 
 fn fixture(root: &Path) -> Editor {
@@ -134,22 +135,11 @@ async fn inline_agent_outcome_groups_real_writes_and_survives_completion_and_rec
         "user prefix\nold\n"
     );
     assert_eq!(outcome(&editor).files[0].edits[0].transaction_ids.len(), 2);
-    let (bridge, worker) = CodexBridge::channel(std::num::NonZeroUsize::new(4).unwrap());
-    editor.agent_manager.set_bridge(bridge);
-    worker
-        .send(CodexEvent::MessageCompleted {
-            session_id: "agent".into(),
-            text: "Updated both files.".into(),
-        })
-        .await
-        .unwrap();
-    worker
-        .send(CodexEvent::Completed {
-            session_id: "agent".into(),
-            stop_reason: "end_turn".into(),
-        })
-        .await
-        .unwrap();
+    let agent = AgentTestHandle::install(&mut editor, 4);
+    agent
+        .emit_message_completed("agent", "Updated both files.")
+        .await;
+    agent.emit_completed("agent", "end_turn").await;
     let mut frame = RenderBuffer::new(100, 30, &Style::default());
     let mut runtime = Runtime::new();
     editor
