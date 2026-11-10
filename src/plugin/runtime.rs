@@ -12404,6 +12404,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bundled_agent_plugin_prefers_session_id_over_thread_id_on_restore() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+
+        core_notify(&mut runtime, "agent:conversation_restore_pending", serde_json::json!({
+                    "session_id": "neutral-id",
+                    "thread_id": "legacy-id",
+                    "cwd": "/workspace",
+                    "items": [
+                        {"id": "user-1", "turn_id": "turn-1", "role": "user", "text": "Earlier question"}
+                    ]
+                })).await;
+        let mut resumed = None;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            if let PluginRequest::AgentResumeSession { session_id, .. } = request {
+                resumed = Some(session_id);
+            }
+        }
+        assert_eq!(resumed.as_deref(), Some("neutral-id"));
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_plugin_reads_neutral_activity_fields_without_session_update() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:session_created",
+            serde_json::json!({ "session_id": "session-neutral" }),
+        )
+        .await;
+        drain_requests();
+        let state = |runtime: &Runtime| {
+            let inner = runtime.inner.lock().unwrap();
+            value_to_json(inner.host.policy().typed_states.get("agent").unwrap())
+        };
+
+        core_notify(
+            &mut runtime,
+            "agent:activity",
+            serde_json::json!({
+                "session_id": "session-neutral",
+                "update": {
+                    "activity": "tool", "phase": "started",
+                    "tool_call_id": "tool-1", "title": "Reading a.rs", "status": "in_progress",
+                },
+            }),
+        )
+        .await;
+        let current = state(&runtime);
+        assert_eq!(current["activity_rows"][0]["title"], "Reading a.rs");
+        assert_eq!(current["activity_rows"][0]["status"], "in_progress");
+        drain_requests();
+
+        core_notify(
+            &mut runtime,
+            "agent:activity",
+            serde_json::json!({
+                "session_id": "session-neutral",
+                "update": {
+                    "activity": "tool", "phase": "finished",
+                    "tool_call_id": "tool-1", "status": "completed",
+                },
+            }),
+        )
+        .await;
+        assert_eq!(state(&runtime)["activity_rows"][0]["status"], "completed");
+    }
+
+    #[tokio::test]
     async fn bundled_agent_plugin_restores_the_bound_codex_thread_and_keeps_input_open() {
         drain_requests();
         let mut runtime = Runtime::new();

@@ -11505,7 +11505,7 @@ impl Editor {
             if let Some(age) = adopted_age.filter(|_| !self.agent_manager.is_running()) {
                 // Saved by an earlier launch: resumed when the pane opens or the
                 // next message is sent, so an unused agent never starts Codex.
-                let mut payload = plugin_json(serde_json::to_value(conversation)?);
+                let mut payload = agent_payloads::conversation_payload(conversation)?;
                 payload["age"] = Value::String(age);
                 self.notify_agent(runtime, "agent:conversation_resumable", payload)
                     .await?;
@@ -11519,7 +11519,7 @@ impl Editor {
             self.notify_agent(
                 runtime,
                 event,
-                plugin_json(serde_json::to_value(conversation)?),
+                agent_payloads::conversation_payload(conversation)?,
             )
             .await?;
             return Ok(());

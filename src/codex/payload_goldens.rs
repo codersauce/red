@@ -7,9 +7,7 @@
 
 use super::{backend::test_support::translated, golden_support::Harness, CodexCommand, CodexEvent};
 use crate::agent_backend::types::{ModelQuery, ModelSelection, SessionQuery, SessionScope};
-use crate::editor::{
-    agent_manager::AgentManager, agent_models, agent_payloads, agent_sessions, plugin_json,
-};
+use crate::editor::{agent_manager::AgentManager, agent_models, agent_payloads, agent_sessions};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -21,6 +19,17 @@ fn agent_event_payload(event: CodexEvent) -> (&'static str, Value) {
         panic!("one worker event is one interface event: {events:?}");
     };
     agent_payloads::agent_event_payload(event).expect("the event is announced to plugins")
+}
+
+/// Removes keys a payload gained after its golden was recorded, failing if one
+/// is absent. What remains must equal the recorded golden, so every older key
+/// keeps its older value.
+fn without_added_keys(mut payload: Value, added: &[&str]) -> Value {
+    let object = payload.as_object_mut().expect("payload is an object");
+    for key in added {
+        assert!(object.remove(*key).is_some(), "payload lacks `{key}`");
+    }
+    payload
 }
 
 fn now() -> i64 {
@@ -805,8 +814,10 @@ async fn restored_conversation_snapshot_reconciles_transcript_and_annotations() 
         .cloned()
         .unwrap();
 
+    let payload = agent_payloads::conversation_payload(snapshot).unwrap();
+    assert_eq!(payload["session_id"], payload["thread_id"]);
     assert_eq!(
-        plugin_json(serde_json::to_value(snapshot).unwrap()),
+        without_added_keys(payload, &["session_id"]),
         json!({
             "thread_id": "thread-red",
             "cwd": "/workspace",
@@ -1129,6 +1140,44 @@ async fn agent_activity_payloads_cover_every_shape_the_worker_emits() {
         .events()
         .into_iter()
         .map(agent_event_payload)
+        .collect::<Vec<_>>();
+    let neutral = payloads
+        .iter()
+        .filter(|(name, _)| *name == "agent:activity")
+        .map(|(_, payload)| {
+            (
+                payload["update"]["activity"].as_str().unwrap().to_string(),
+                payload["update"]["phase"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        neutral,
+        [
+            ("thought", "updated"),
+            ("tool", "started"),
+            ("tool", "finished"),
+            ("tool", "finished"),
+            ("tool", "started"),
+            ("tool", "started"),
+            ("tool", "started"),
+            ("tool", "finished"),
+            ("tool", "finished"),
+            ("tool", "finished"),
+            ("tool", "started"),
+            ("tool", "started"),
+        ]
+        .map(|(activity, phase)| (activity.to_string(), phase.to_string()))
+    );
+    let payloads = payloads
+        .into_iter()
+        .map(|(name, mut payload)| {
+            if name == "agent:activity" {
+                payload["update"] =
+                    without_added_keys(payload["update"].take(), &["activity", "phase"]);
+            }
+            (name, payload)
+        })
         .collect::<Vec<_>>();
     assert_eq!(
         payloads,

@@ -642,6 +642,16 @@ impl AgentPaneLifecycle {
                 .to_string()
         };
         let session_id = text("session_id");
+        // Restore events name the conversation by `session_id`; `thread_id`
+        // alone is an older payload.
+        let restored_session = || {
+            let id = text("session_id");
+            if id.is_empty() {
+                text("thread_id")
+            } else {
+                id
+            }
+        };
         let turn_id = payload
             .get("turn_id")
             .and_then(serde_json::Value::as_str)
@@ -690,11 +700,11 @@ impl AgentPaneLifecycle {
             // A prompt in the payload never reached Codex and is safe to retry.
             "agent:session_lost" => self.session_lost(!text("prompt").is_empty()),
             "agent:conversation_restore_pending" => {
-                self.restore_pending(&text("thread_id"), &text("cwd"))
+                self.restore_pending(&restored_session(), &text("cwd"))
             }
-            "agent:session_restored" => self.restored(&text("thread_id")),
+            "agent:session_restored" => self.restored(&restored_session()),
             "agent:conversation_resumable" => {
-                self.resumable(&text("thread_id"), &text("cwd"));
+                self.resumable(&restored_session(), &text("cwd"));
                 Vec::new()
             }
             "agent:session_restore_failed" => self.restore_failed(&session_id),

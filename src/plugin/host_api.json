@@ -1,5 +1,5 @@
 {
-  "version": "0.22.0",
+  "version": "0.23.0",
   "calls": [
     { "name": "PublishIssue", "kind": "execute", "signature": "(key: String, message: String, remedy: String)", "introduced": "0.21.0" },
     { "name": "ResolveIssue", "kind": "execute", "signature": "(key: String)", "introduced": "0.21.0" },

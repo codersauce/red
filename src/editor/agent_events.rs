@@ -1,6 +1,6 @@
 //! Editor handling of backend events: replies, inline events, session and turn events.
 
-use super::agent_payloads::{session_event_payload, turn_event_payload};
+use super::agent_payloads::{conversation_payload, session_event_payload, turn_event_payload};
 use super::*;
 use crate::agent_backend::{
     events::{
@@ -381,7 +381,7 @@ impl Editor {
             self.notify_agent(
                 runtime,
                 "agent:session_restored",
-                plugin_json(serde_json::to_value(conversation)?),
+                conversation_payload(conversation)?,
             )
             .await?;
         }
@@ -575,7 +575,7 @@ impl Editor {
             self.notify_agent(
                 runtime,
                 "agent:conversation_restore_pending",
-                plugin_json(serde_json::to_value(conversation)?),
+                conversation_payload(conversation)?,
             )
             .await?;
             self.set_legacy_message(Some(format!(
