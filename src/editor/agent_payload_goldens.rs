@@ -4,11 +4,9 @@
 //! change when the payloads gain types.
 
 use super::*;
+use crate::agent_backend::types::{ModelQuery, ModelSelection, SessionQuery, SessionScope};
 use crate::codex::golden_support::Harness;
-use crate::codex::{
-    AgentModelSelection, AgentSessionListRequest, AgentSessionScope, CodexCommand, CodexEvent,
-    ModelRequest,
-};
+use crate::codex::{CodexCommand, CodexEvent};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn now() -> i64 {
@@ -67,7 +65,7 @@ fn codex_model(model: &str, display: &str, default: bool, effort: &str) -> Value
     })
 }
 
-fn model_request(request_id: i64, request: ModelRequest) -> CodexCommand {
+fn model_request(request_id: i64, request: ModelQuery) -> CodexCommand {
     CodexCommand::ModelRequest {
         request_id,
         request,
@@ -81,7 +79,7 @@ async fn model_catalog_payload_merges_pages_and_drops_hidden_and_duplicates() {
     let mut hidden = codex_model("secret", "Secret", false, "low");
     hidden["hidden"] = json!(true);
     let mut harness = Harness::new();
-    harness.command(model_request(1, ModelRequest::List)).await;
+    harness.command(model_request(1, ModelQuery::List)).await;
     harness
         .serve(|method, params| {
             assert_eq!(method, "model/list");
@@ -103,7 +101,7 @@ async fn request(harness: &mut Harness, request_id: i64) {
     harness
         .command(model_request(
             request_id,
-            ModelRequest::ReadDefault {
+            ModelQuery::ReadDefault {
                 cwd: PathBuf::from("/workspace"),
             },
         ))
@@ -195,9 +193,9 @@ async fn model_selection_payload_reports_the_confirmed_server_settings() {
     let select = |model: &str, effort: Option<&str>| {
         model_request(
             9,
-            ModelRequest::Set {
+            ModelQuery::Set {
                 session_id: "thread-1".into(),
-                selection: AgentModelSelection {
+                selection: ModelSelection {
                     model: model.into(),
                     effort: effort.map(str::to_string),
                 },
@@ -223,9 +221,9 @@ async fn model_selection_payload_reports_the_confirmed_server_settings() {
     harness
         .command(model_request(
             10,
-            ModelRequest::Set {
+            ModelQuery::Set {
                 session_id: "missing".into(),
-                selection: AgentModelSelection {
+                selection: ModelSelection {
                     model: "second".into(),
                     effort: None,
                 },
@@ -276,10 +274,10 @@ async fn model_selection_payload_reports_the_confirmed_server_settings() {
     );
 }
 
-fn list_request(scope: AgentSessionScope, query: &str, contents: bool) -> CodexCommand {
+fn list_request(scope: SessionScope, query: &str, contents: bool) -> CodexCommand {
     CodexCommand::SessionList {
         request_id: 3,
-        request: AgentSessionListRequest {
+        request: SessionQuery {
             cwd: PathBuf::from("/workspace"),
             scope,
             query: query.into(),
@@ -361,7 +359,7 @@ async fn red_session_list_payload_labels_groups_and_orders_threads() {
     ];
     let mut harness = Harness::new();
     harness
-        .command(list_request(AgentSessionScope::Red, "", false))
+        .command(list_request(SessionScope::Red, "", false))
         .await;
     harness
         .serve(|method, params| {
@@ -424,7 +422,7 @@ async fn workspace_session_search_payload_adds_text_snippets() {
     ];
     let mut harness = Harness::new();
     harness
-        .command(list_request(AgentSessionScope::Workspace, "needle", true))
+        .command(list_request(SessionScope::Workspace, "needle", true))
         .await;
     harness
         .serve(|method, params| match method {
@@ -471,19 +469,19 @@ async fn session_list_payload_reports_failures_and_partial_results() {
     let now = now();
     let mut harness = Harness::new();
     harness
-        .command(list_request(AgentSessionScope::All, "", false))
+        .command(list_request(SessionScope::All, "", false))
         .await;
     harness
         .serve(|_, _| json!({"error": {"code": -32000, "message": "state database is locked"}}))
         .await;
     harness
-        .command(list_request(AgentSessionScope::All, "", false))
+        .command(list_request(SessionScope::All, "", false))
         .await;
     harness
         .serve(|_, _| json!({"result": {"nextCursor": null}}))
         .await;
     harness
-        .command(list_request(AgentSessionScope::All, "", false))
+        .command(list_request(SessionScope::All, "", false))
         .await;
     harness
         .serve(|_, params| {

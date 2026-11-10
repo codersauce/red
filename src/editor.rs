@@ -1457,10 +1457,9 @@ fn agent_event_payload(event: CodexEvent) -> (&'static str, Value) {
                 )
             }),
         ),
-        CodexEvent::SessionRestored { session_id, thread } => (
-            "agent:session_restored",
-            json!({ "session_id": session_id, "thread": plugin_json(thread) }),
-        ),
+        CodexEvent::SessionRestored { .. } => {
+            unreachable!("restored history is reconciled into a snapshot before notification")
+        }
         CodexEvent::SessionRestoreFailed {
             session_id,
             message,
@@ -1478,7 +1477,10 @@ fn agent_event_payload(event: CodexEvent) -> (&'static str, Value) {
         ),
         CodexEvent::Activity { session_id, update } => (
             "agent:activity",
-            json!({ "session_id": session_id.to_string(), "update": plugin_json(update) }),
+            json!({
+                "session_id": session_id.to_string(),
+                "update": plugin_json(serde_json::to_value(update).expect("agent payloads serialize")),
+            }),
         ),
         CodexEvent::Completed {
             session_id,
@@ -1860,15 +1862,15 @@ pub enum PluginRequest {
     Action(Action),
     AgentModelRequest {
         request_id: RequestId,
-        request: crate::codex::ModelRequest,
+        request: crate::agent_backend::types::ModelQuery,
     },
     AgentSessionRequest {
         request_id: RequestId,
-        request: crate::codex::AgentSessionListRequest,
+        request: crate::agent_backend::types::SessionQuery,
     },
     AgentSessionPreview {
         request_id: RequestId,
-        request: crate::codex::AgentSessionPreviewRequest,
+        request: crate::agent_backend::types::SessionPreviewRequest,
     },
     SetTextPanelHeaderDetail {
         id: String,
@@ -38586,20 +38588,26 @@ mod test {
     }
 
     #[test]
-    fn agent_activity_payload_keeps_structured_updates_and_normalizes_keys() {
+    fn agent_activity_payload_keeps_structured_updates_with_plugin_keys() {
         let (name, payload) = agent_event_payload(CodexEvent::Activity {
             session_id: ("session-1").to_string(),
-            update: json!({
-                "sessionUpdate": "tool_call_update",
-                "toolCallId": "tool-1",
-                "status": "in_progress"
-            }),
+            update: crate::agent_backend::types::Activity::ToolFinished(
+                crate::agent_backend::types::ToolActivity {
+                    tool_call_id: "tool-1".into(),
+                    kind: crate::agent_backend::types::ToolKind::Read,
+                    title: "Reading main.rs".into(),
+                    full_title: "Reading /workspace/main.rs".into(),
+                    status: crate::agent_backend::types::ToolStatus::InProgress,
+                    detail: String::new(),
+                },
+            ),
         });
 
         assert_eq!(name, "agent:activity");
         assert_eq!(payload["session_id"], "session-1");
         assert_eq!(payload["update"]["session_update"], "tool_call_update");
         assert_eq!(payload["update"]["tool_call_id"], "tool-1");
+        assert_eq!(payload["update"]["status"], "in_progress");
     }
 
     #[tokio::test]

@@ -62,7 +62,7 @@ impl Harness {
         self.sessions.insert(
             id.to_string(),
             Session {
-                model_info: model.map(|(model, effort)| AgentModelInfo {
+                model_info: model.map(|(model, effort)| ModelInfo {
                     model: model.to_string(),
                     provider: None,
                     effort: Some(effort.to_string()),

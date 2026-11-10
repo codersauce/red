@@ -1,59 +1,10 @@
 //! Model discovery and conversation-scoped settings. These requests never alter
 //! the user's on-disk configuration or Red's tool and permission restrictions.
 
+use super::translate;
 use super::*;
-use serde::{Deserialize, Serialize};
+use crate::agent_backend::types::{ModelOption, ModelResult};
 use std::collections::HashSet;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgentModelSelection {
-    pub model: String,
-    #[serde(default)]
-    pub effort: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgentModelInfo {
-    pub model: String,
-    #[serde(default)]
-    pub provider: Option<String>,
-    #[serde(default)]
-    pub effort: Option<String>,
-}
-
-impl AgentModelInfo {
-    pub(super) fn from_response(value: &Value) -> Option<Self> {
-        let model = value.get("model")?.as_str()?.trim();
-        if model.is_empty() {
-            return None;
-        }
-        Some(Self {
-            model: model.to_string(),
-            provider: value
-                .get("modelProvider")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            effort: value
-                .get("reasoningEffort")
-                .or_else(|| value.get("effort"))
-                .and_then(Value::as_str)
-                .map(str::to_string),
-        })
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum ModelRequest {
-    /// Resolve a workspace's new-conversation defaults without creating a thread.
-    ReadDefault {
-        cwd: PathBuf,
-    },
-    List,
-    Set {
-        session_id: String,
-        selection: AgentModelSelection,
-    },
-}
 
 pub(super) enum ModelListPurpose {
     Catalog,
@@ -70,14 +21,14 @@ pub(super) enum PendingModelRequest {
     List {
         request_id: i64,
         purpose: ModelListPurpose,
-        models: Vec<Value>,
+        models: Vec<ModelOption>,
         cursors: HashSet<String>,
     },
     Set {
         request_id: i64,
         session_id: String,
-        selection: AgentModelSelection,
-        previous: Option<AgentModelInfo>,
+        selection: ModelSelection,
+        previous: Option<ModelInfo>,
     },
 }
 
@@ -91,18 +42,10 @@ impl PendingModelRequest {
     }
 }
 
-fn nonempty_string(value: &Value) -> Option<String> {
-    value
-        .as_str()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-}
-
 async fn complete(
     events: &mpsc::Sender<CodexEvent>,
     request_id: i64,
-    result: std::result::Result<Value, String>,
+    result: std::result::Result<ModelResult, String>,
 ) {
     events
         .send(CodexEvent::ModelRequestCompleted { request_id, result })
@@ -124,7 +67,7 @@ async fn list_page(
 
 pub(super) async fn handle_command(
     request_id: i64,
-    request: ModelRequest,
+    request: ModelQuery,
     input: &mut (impl AsyncWrite + Unpin),
     events: &mpsc::Sender<CodexEvent>,
     pending: &mut HashMap<String, Pending>,
@@ -132,7 +75,7 @@ pub(super) async fn handle_command(
     next_id: &mut u64,
 ) -> Result<()> {
     match request {
-        ModelRequest::ReadDefault { cwd } => {
+        ModelQuery::ReadDefault { cwd } => {
             let id = rpc_id(next_id);
             pending.insert(
                 id.clone(),
@@ -140,7 +83,7 @@ pub(super) async fn handle_command(
             );
             write_message(input, &json!({"id": id, "method": "config/read", "params": {"includeLayers": false, "cwd": cwd}})).await?;
         }
-        ModelRequest::List => {
+        ModelQuery::List => {
             list_page(
                 PendingModelRequest::List {
                     request_id,
@@ -155,7 +98,7 @@ pub(super) async fn handle_command(
             )
             .await?
         }
-        ModelRequest::Set {
+        ModelQuery::Set {
             session_id,
             selection,
         } => {
@@ -234,15 +177,18 @@ pub(super) async fn handle_response(
                 .await;
                 return Ok(());
             };
-            let provider = nonempty_string(&config["model_provider"]);
-            let effort = nonempty_string(&config["model_reasoning_effort"]);
-            if let Some(model) = nonempty_string(&config["model"]) {
-                let info = AgentModelInfo {
+            let translate::ConfiguredModel {
+                model,
+                provider,
+                effort,
+            } = translate::configured_model(config);
+            if let Some(model) = model {
+                let info = ModelInfo {
                     model,
                     provider,
                     effort,
                 };
-                complete(events, request_id, Ok(json!({"model_info": info}))).await;
+                complete(events, request_id, Ok(ModelResult::Default(info))).await;
             } else {
                 list_page(
                     PendingModelRequest::List {
@@ -276,7 +222,9 @@ pub(super) async fn handle_response(
             complete(
                 events,
                 request_id,
-                Ok(json!({"accepted": true, "model_info": confirmed})),
+                Ok(ModelResult::Selected {
+                    confirmed: confirmed.cloned(),
+                }),
             )
             .await
         }
@@ -295,17 +243,9 @@ pub(super) async fn handle_response(
                 .await;
                 return Ok(());
             };
-            for model in page {
-                if model["hidden"].as_bool() == Some(true) {
-                    continue;
-                }
-                if let Some(id) = model["model"].as_str().filter(|id| !id.is_empty()) {
-                    if !models
-                        .iter()
-                        .any(|entry| entry["model"].as_str() == Some(id))
-                    {
-                        models.push(model.clone());
-                    }
+            for model in page.iter().filter_map(translate::model_option) {
+                if !models.iter().any(|entry| entry.model == model.model) {
+                    models.push(model);
                 }
             }
             if let Some(cursor) = message
@@ -340,15 +280,17 @@ pub(super) async fn handle_response(
                 }
             } else {
                 let result = match purpose {
-                    ModelListPurpose::Catalog => Ok(json!({"models": models})),
+                    ModelListPurpose::Catalog => Ok(ModelResult::Catalog(models)),
                     ModelListPurpose::Default { provider, effort } => models
                         .iter()
-                        .find(|model| model["isDefault"].as_bool() == Some(true))
-                        .map(|model| json!({"model_info": AgentModelInfo {
-                            model: model["model"].as_str().unwrap_or_default().to_string(),
-                            provider,
-                            effort: effort.or_else(|| nonempty_string(&model["defaultReasoningEffort"])),
-                        }}))
+                        .find(|model| model.is_default == Some(true))
+                        .map(|model| {
+                            ModelResult::Default(ModelInfo {
+                                model: model.model.clone(),
+                                provider,
+                                effort: effort.or_else(|| translate::catalog_default_effort(model)),
+                            })
+                        })
                         .ok_or_else(|| "Codex did not return a default model".to_string()),
                 };
                 complete(events, request_id, result).await;
@@ -372,7 +314,7 @@ pub(super) async fn settings_updated(
     else {
         return;
     };
-    let Some(model_info) = AgentModelInfo::from_response(&params["threadSettings"]) else {
+    let Some(model_info) = translate::model_info(&params["threadSettings"]) else {
         return;
     };
     if session.model_info.as_ref() == Some(&model_info) {
@@ -423,7 +365,7 @@ mod tests {
 
     fn session(model: &str, effort: &str, kind: SessionKind) -> Session {
         Session {
-            model_info: Some(AgentModelInfo {
+            model_info: Some(ModelInfo {
                 model: model.into(),
                 provider: None,
                 effort: Some(effort.into()),
@@ -435,30 +377,6 @@ mod tests {
             allow_sensitive_paths: false,
             kind,
         }
-    }
-
-    #[test]
-    fn model_metadata_tolerates_missing_and_optional_fields() {
-        assert_eq!(AgentModelInfo::from_response(&json!({})), None);
-        assert_eq!(AgentModelInfo::from_response(&json!({"model":""})), None);
-        let info =
-            AgentModelInfo::from_response(&json!({"model":"custom", "reasoningEffort":null}))
-                .unwrap();
-        assert_eq!(
-            info,
-            AgentModelInfo {
-                model: "custom".into(),
-                provider: None,
-                effort: None
-            }
-        );
-        assert_eq!(
-            AgentModelInfo::from_response(&json!({"model":"custom", "effort":"high"}))
-                .unwrap()
-                .effort
-                .as_deref(),
-            Some("high")
-        );
     }
 
     #[tokio::test]
@@ -503,7 +421,7 @@ mod tests {
             PendingModelRequest::Set {
                 request_id: 8,
                 session_id: "thread-1".into(),
-                selection: AgentModelSelection {
+                selection: ModelSelection {
                     model: "second".into(),
                     effort: Some("high".into()),
                 },
@@ -519,7 +437,7 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            matches!(received.recv().await, Some(CodexEvent::ModelRequestCompleted { result: Ok(value), .. }) if value["model_info"]["effort"] == "low")
+            matches!(received.recv().await, Some(CodexEvent::ModelRequestCompleted { result: Ok(ModelResult::Selected { confirmed: Some(info) }), .. }) if info.effort.as_deref() == Some("low"))
         );
     }
 

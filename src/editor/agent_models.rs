@@ -1,14 +1,14 @@
 //! Editor ownership and callback routing for the Agent model picker.
 
 use super::*;
-use crate::codex::ModelRequest;
+use crate::agent_backend::types::{ModelQuery, ModelResult};
 
 /// The catalog intentionally keeps Codex's camelCase field names. Other agent
 /// notifications use `plugin_json`, which would change this public API shape.
-pub(super) fn model_result_payload(result: &Result<Value, String>) -> Value {
+pub(super) fn model_result_payload(result: &Result<ModelResult, String>) -> Value {
     match result {
         Ok(value) => {
-            let mut value = value.clone();
+            let mut value = serde_json::to_value(value).expect("agent payloads serialize");
             value["error"] = json!("");
             value
         }
@@ -21,9 +21,9 @@ impl Editor {
         &mut self,
         runtime: &mut Runtime,
         request_id: RequestId,
-        request: ModelRequest,
+        request: ModelQuery,
     ) -> anyhow::Result<()> {
-        if let ModelRequest::Set {
+        if let ModelQuery::Set {
             session_id,
             selection,
         } = &request
@@ -94,9 +94,23 @@ mod tests {
 
     #[test]
     fn model_catalog_callback_preserves_protocol_field_names() {
-        let payload = model_result_payload(&Ok(
-            json!({"models":[{"model":"test","displayName":"Test","supportedReasoningEfforts":[{"reasoningEffort":"high"}]}]}),
-        ));
+        let payload = model_result_payload(&Ok(ModelResult::Catalog(vec![
+            crate::agent_backend::types::ModelOption {
+                model: "test".into(),
+                display_name: Some("Test".into()),
+                description: None,
+                is_default: None,
+                default_reasoning_effort: None,
+                supported_reasoning_efforts: Some(vec![
+                    crate::agent_backend::types::EffortOption {
+                        reasoning_effort: "high".into(),
+                        description: None,
+                        extra: Default::default(),
+                    },
+                ]),
+                extra: Default::default(),
+            },
+        ])));
         assert_eq!(payload["models"][0]["displayName"], "Test");
         assert_eq!(
             payload["models"][0]["supportedReasoningEfforts"][0]["reasoningEffort"],

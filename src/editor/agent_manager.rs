@@ -32,7 +32,7 @@ pub struct AgentManager {
     pending_session_requests: HashSet<i64>,
     pending_session_preview_requests: HashSet<i64>,
     model_only_bridge: bool,
-    next_model: Option<crate::codex::AgentModelSelection>,
+    next_model: Option<crate::agent_backend::types::ModelSelection>,
     conversation: Option<AgentConversationSnapshot>,
     /// Bumped on every change to `conversation`, so the editor can tell when the
     /// saved copy is out of date without comparing transcripts.
@@ -440,22 +440,22 @@ impl AgentManager {
         self.model_only_bridge
     }
 
-    pub fn set_next_model(&mut self, selection: crate::codex::AgentModelSelection) {
+    pub fn set_next_model(&mut self, selection: crate::agent_backend::types::ModelSelection) {
         self.next_model = Some(selection);
     }
 
-    pub fn next_model(&self) -> Option<&crate::codex::AgentModelSelection> {
+    pub fn next_model(&self) -> Option<&crate::agent_backend::types::ModelSelection> {
         self.next_model.as_ref()
     }
 
-    pub fn take_next_model(&mut self) -> Option<crate::codex::AgentModelSelection> {
+    pub fn take_next_model(&mut self) -> Option<crate::agent_backend::types::ModelSelection> {
         self.next_model.take()
     }
 
     pub fn set_conversation_model(
         &mut self,
         session_id: &str,
-        model_info: crate::codex::AgentModelInfo,
+        model_info: crate::agent_backend::types::ModelInfo,
     ) {
         if let Some(conversation) = self
             .conversation_mut()
@@ -485,7 +485,7 @@ impl AgentManager {
         &mut self,
         thread_id: &str,
         cwd: &Path,
-        thread: &serde_json::Value,
+        thread: &crate::agent_backend::types::RestoredHistory,
     ) -> Option<&AgentConversationSnapshot> {
         let cached = self
             .conversation
