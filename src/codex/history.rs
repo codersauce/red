@@ -4,6 +4,7 @@
 //! Red never asks for a whole thread in one response. It pages the newest turns
 //! with `thread/turns/list` and stops once it has as much as the pane keeps.
 
+use super::translate;
 use super::*;
 
 /// Turns per page when only the messages are needed.
@@ -27,7 +28,7 @@ pub(super) enum HistoryPurpose {
     /// A thread rejoined with `excludeTurns`; its model is announced after the
     /// transcript, as for every other restoration.
     Resume {
-        model_info: Option<AgentModelInfo>,
+        model_info: Option<ModelInfo>,
     },
     Continue {
         cwd: PathBuf,
@@ -231,7 +232,7 @@ async fn finish(
             let result = match failure {
                 Some(message) => Err(message),
                 None => {
-                    sessions::session_preview(&session_id, &json!({"result": {"thread": thread}}))
+                    translate::session_preview(&session_id, &json!({"result": {"thread": thread}}))
                 }
             };
             events
@@ -272,7 +273,7 @@ async fn finish(
             events
                 .send(CodexEvent::SessionRestored {
                     session_id: session_id.clone(),
-                    thread,
+                    thread: translate::restored_history(&thread),
                 })
                 .await
                 .ok();

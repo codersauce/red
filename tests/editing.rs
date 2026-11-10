@@ -5,6 +5,7 @@ use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use red::{
+    agent_backend::ids::SessionId,
     agent_tools::{
         EditorActionName, EditorOpenTarget, EditorPosition, EditorSelectionKind, EditorTextEdit,
         EditorToolCall, EditorToolRequest,
@@ -34,6 +35,11 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+/// Builds a session id the way a persisted snapshot would.
+fn session(id: &str) -> SessionId {
+    serde_json::from_value(serde_json::Value::String(id.to_string())).unwrap()
+}
 
 static COMMAND_COMPLETION_CWD_LOCK: Mutex<()> = Mutex::new(());
 
@@ -397,7 +403,8 @@ async fn agent_editor_tools_navigate_select_and_apply_saved_unicode_edits() {
     let opened = harness
         .editor
         .test_run_agent_editor_tool(EditorToolRequest {
-            session_id: "session-1".to_string(),
+            session_id: session("session-1"),
+            turn: None,
             call: EditorToolCall::OpenFile {
                 path: "second.rs".to_string(),
                 line: 0,
@@ -414,7 +421,8 @@ async fn agent_editor_tools_navigate_select_and_apply_saved_unicode_edits() {
     let selected = harness
         .editor
         .test_run_agent_editor_tool(EditorToolRequest {
-            session_id: "session-1".to_string(),
+            session_id: session("session-1"),
+            turn: None,
             call: EditorToolCall::SelectText {
                 path: "second.rs".to_string(),
                 start: EditorPosition {
@@ -439,7 +447,8 @@ async fn agent_editor_tools_navigate_select_and_apply_saved_unicode_edits() {
     let applied = harness
         .editor
         .test_run_agent_editor_tool(EditorToolRequest {
-            session_id: "session-1".to_string(),
+            session_id: session("session-1"),
+            turn: None,
             call: EditorToolCall::ApplyEdits {
                 path: "second.rs".to_string(),
                 expected_revision: revision,
@@ -471,7 +480,8 @@ async fn agent_editor_tools_navigate_select_and_apply_saved_unicode_edits() {
     let created = harness
         .editor
         .test_run_agent_editor_tool(EditorToolRequest {
-            session_id: "session-1".to_string(),
+            session_id: session("session-1"),
+            turn: None,
             call: EditorToolCall::WriteFile {
                 path: "created.rs".to_string(),
                 expected_revision: 0,
@@ -490,7 +500,8 @@ async fn agent_editor_tools_navigate_select_and_apply_saved_unicode_edits() {
     let moved = harness
         .editor
         .test_run_agent_editor_tool(EditorToolRequest {
-            session_id: "session-1".to_string(),
+            session_id: session("session-1"),
+            turn: None,
             call: EditorToolCall::RunEditorAction {
                 action: EditorActionName::PreviousBuffer,
             },
@@ -501,7 +512,8 @@ async fn agent_editor_tools_navigate_select_and_apply_saved_unicode_edits() {
     let moved = harness
         .editor
         .test_run_agent_editor_tool(EditorToolRequest {
-            session_id: "session-1".to_string(),
+            session_id: session("session-1"),
+            turn: None,
             call: EditorToolCall::RunEditorAction {
                 action: EditorActionName::PreviousBuffer,
             },
@@ -526,7 +538,8 @@ async fn agent_editor_tools_reject_workspace_escape_and_stale_edits() {
     let escaped = harness
         .editor
         .test_run_agent_editor_tool(EditorToolRequest {
-            session_id: "session-1".to_string(),
+            session_id: session("session-1"),
+            turn: None,
             call: EditorToolCall::OpenFile {
                 path: "../outside.rs".to_string(),
                 line: 0,
@@ -541,7 +554,8 @@ async fn agent_editor_tools_reject_workspace_escape_and_stale_edits() {
     let stale = harness
         .editor
         .test_run_agent_editor_tool(EditorToolRequest {
-            session_id: "session-1".to_string(),
+            session_id: session("session-1"),
+            turn: None,
             call: EditorToolCall::ApplyEdits {
                 path: "main.rs".to_string(),
                 expected_revision: 999,
@@ -569,7 +583,8 @@ async fn agent_editor_tools_reject_workspace_escape_and_stale_edits() {
     let blocked = harness
         .editor
         .test_run_agent_editor_tool(EditorToolRequest {
-            session_id: "session-1".to_string(),
+            session_id: session("session-1"),
+            turn: None,
             call: EditorToolCall::OpenFile {
                 path: ".env".to_string(),
                 line: 0,
@@ -613,7 +628,8 @@ async fn agent_editor_navigation_preserves_a_focused_conversation_composer() {
     let state = harness
         .editor
         .test_run_agent_editor_tool(EditorToolRequest {
-            session_id: "session-1".to_string(),
+            session_id: session("session-1"),
+            turn: None,
             call: EditorToolCall::OpenFile {
                 path: "second.rs".to_string(),
                 line: 0,

@@ -154,8 +154,8 @@ pub(crate) fn resolve_path_with_policy(
     path: &str,
     allow_sensitive_paths: bool,
 ) -> Result<(PathBuf, String)> {
-    crate::codex::validate_workspace_root(root)?;
-    let physical = crate::codex::physical_workspace_root(Path::new(path));
+    crate::agent_backend::workspace::validate_workspace_root(root)?;
+    let physical = crate::agent_backend::workspace::physical_workspace_root(Path::new(path));
     let full = crate::editor::resolve_agent_tool_path_with_policy(
         root,
         physical.to_str().context("file path is not UTF-8")?,
@@ -215,7 +215,11 @@ impl InlineContextSnapshot {
     fn read(&self, path: &str) -> Result<(String, FileText)> {
         let (_, relative) = resolve_path_with_policy(&self.root, path, self.allow_sensitive_paths)?;
         let text = self.file_text(&relative, || {
-            crate::codex::read_inline_workspace_file(&self.root, &relative, MAX_FILE_BYTES)
+            crate::agent_backend::workspace::read_inline_workspace_file(
+                &self.root,
+                &relative,
+                MAX_FILE_BYTES,
+            )
         })?;
         Ok((relative, text))
     }
@@ -250,7 +254,7 @@ impl InlineContextSnapshot {
     }
 
     fn files(&self) -> Result<(BTreeSet<String>, bool)> {
-        crate::codex::validate_workspace_root(&self.root)?;
+        crate::agent_backend::workspace::validate_workspace_root(&self.root)?;
         let started = Instant::now();
         let mut files = BTreeSet::new();
         let mut truncated = false;
@@ -320,7 +324,8 @@ impl InlineContextSnapshot {
                 );
                 let (files, mut truncated) = self.files()?;
                 #[cfg(unix)]
-                let reader = crate::codex::InlineWorkspaceReader::new(&self.root)?;
+                let reader =
+                    crate::agent_backend::workspace::InlineWorkspaceReader::new(&self.root)?;
                 let started = Instant::now();
                 let mut files = files.into_iter().collect::<Vec<_>>();
                 files.sort_by_key(|path| !self.visible.contains_key(path));

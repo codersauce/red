@@ -129,7 +129,7 @@ impl Editor {
             return None;
         }
         self.agent_edit_decisions
-            .remembered(&request.session_id, &path, buffer.save_generation())
+            .remembered(request.session_id.as_str(), &path, buffer.save_generation())
             .is_none()
             .then_some(path)
     }
@@ -234,7 +234,7 @@ impl Editor {
             let generation = buffer.save_generation();
             self.agent_edit_decisions.choices.insert(
                 (
-                    pending.tool.request.session_id.clone(),
+                    pending.tool.request.session_id.as_str().to_string(),
                     pending.path.clone(),
                 ),
                 (choice, generation),
@@ -291,7 +291,7 @@ impl Editor {
             self.agent_edit_decisions
                 .pending
                 .as_ref()
-                .is_some_and(|pending| pending.tool.request.session_id != session_id)
+                .is_some_and(|pending| pending.tool.request.session_id.as_str() != session_id)
         }) {
             return;
         }

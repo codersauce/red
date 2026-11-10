@@ -1,14 +1,18 @@
 //! Editor ownership and callback routing for the Agent model picker.
 
+use super::agent_commands::query_failure;
 use super::*;
-use crate::codex::ModelRequest;
+use crate::agent_backend::{
+    ids::{QueryId, SessionId},
+    types::{ModelQuery, ModelResult},
+};
 
 /// The catalog intentionally keeps Codex's camelCase field names. Other agent
 /// notifications use `plugin_json`, which would change this public API shape.
-pub(super) fn model_result_payload(result: &Result<Value, String>) -> Value {
+pub(crate) fn model_result_payload(result: &Result<ModelResult, String>) -> Value {
     match result {
         Ok(value) => {
-            let mut value = value.clone();
+            let mut value = serde_json::to_value(value).expect("agent payloads serialize");
             value["error"] = json!("");
             value
         }
@@ -21,9 +25,9 @@ impl Editor {
         &mut self,
         runtime: &mut Runtime,
         request_id: RequestId,
-        request: ModelRequest,
+        request: ModelQuery,
     ) -> anyhow::Result<()> {
-        if let ModelRequest::Set {
+        if let ModelQuery::Set {
             session_id,
             selection,
         } = &request
@@ -56,33 +60,25 @@ impl Editor {
                 return Ok(());
             }
         }
-        if self.agent_manager.is_task_finished() {
-            let _ = self
-                .finish_agent_bridge(runtime, "Codex app-server stopped unexpectedly")
-                .await?;
-        }
-        let had_bridge = self.agent_manager.has_bridge();
-        let result = self
-            .ensure_agent_bridge(&get_workspace_path())
-            .and_then(|()| {
-                if !had_bridge {
-                    self.agent_manager.mark_model_only_bridge();
-                }
-                self.agent_manager
-                    .bridge()
-                    .ok_or_else(|| anyhow::anyhow!("Codex app-server did not start"))?
-                    .try_send(CodexCommand::ModelRequest {
-                        request_id: request_id.get(),
-                        request,
-                    })
-            });
+        self.settle_ended_agent(runtime).await?;
+        let id = QueryId(request_id.get());
+        let kind = self.agent_manager.agents().kind();
+        let result = self.ensure_agent(&get_workspace_path()).and_then(|()| {
+            let agents = self.agent_manager.agents_mut();
+            match request {
+                ModelQuery::ReadDefault { cwd } => agents.default_model(id, &cwd),
+                ModelQuery::List => agents.list_models(id),
+                ModelQuery::Set {
+                    session_id,
+                    selection,
+                } => agents.set_model(id, &SessionId::from_raw(session_id), selection),
+            }
+            .map_err(|error| query_failure(kind, error))
+        });
         if let Err(error) = result {
             self.plugin_registry
                 .resolve_request(runtime, request_id, json!({"error": error.to_string()}))
                 .await?;
-        } else {
-            self.agent_manager
-                .mark_model_request_pending(request_id.get());
         }
         Ok(())
     }
@@ -91,12 +87,27 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::editor::test_agent::{AgentCommand, AgentTestHandle};
 
     #[test]
     fn model_catalog_callback_preserves_protocol_field_names() {
-        let payload = model_result_payload(&Ok(
-            json!({"models":[{"model":"test","displayName":"Test","supportedReasoningEfforts":[{"reasoningEffort":"high"}]}]}),
-        ));
+        let payload = model_result_payload(&Ok(ModelResult::Catalog(vec![
+            crate::agent_backend::types::ModelOption {
+                model: "test".into(),
+                display_name: Some("Test".into()),
+                description: None,
+                is_default: None,
+                default_reasoning_effort: None,
+                supported_reasoning_efforts: Some(vec![
+                    crate::agent_backend::types::EffortOption {
+                        reasoning_effort: "high".into(),
+                        description: None,
+                        extra: Default::default(),
+                    },
+                ]),
+                extra: Default::default(),
+            },
+        ])));
         assert_eq!(payload["models"][0]["displayName"], "Test");
         assert_eq!(
             payload["models"][0]["supportedReasoningEfforts"][0]["reasoningEffort"],
@@ -141,24 +152,14 @@ mod tests {
             .await
             .unwrap();
         runtime.execute_command("PreviewModel").await.unwrap();
-        let request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::AgentModelRequest { request_id, .. } => request_id,
-            _ => panic!("expected model preview request"),
-        };
-        let (bridge, worker) = CodexBridge::channel(NonZeroUsize::new(1).unwrap());
-        drop(worker);
-        editor.agent_manager.set_bridge(bridge);
-        editor.agent_manager.mark_model_only_bridge();
-        editor
-            .agent_manager
-            .mark_model_request_pending(request_id.get());
-        editor
-            .agent_manager
-            .set_task(tokio::spawn(async { anyhow::bail!("preview unavailable") }));
-        while !editor.agent_manager.is_task_finished() {
-            tokio::task::yield_now().await;
-        }
+        let agent = AgentTestHandle::install(&mut editor);
         let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(agent.commands(), [AgentCommand::DefaultModel]);
+        agent.lose("Codex app-server failed: preview unavailable");
         editor
             .service_background(&mut buffer, &mut runtime)
             .await
@@ -168,11 +169,7 @@ mod tests {
             .as_deref()
             .is_some_and(|message| message.starts_with("preview:")
                 && message.contains("preview unavailable")));
-        assert!(!editor.agent_manager.has_bridge());
-        assert!(editor
-            .agent_manager
-            .take_pending_model_requests()
-            .is_empty());
+        assert!(!editor.agent_manager.is_running());
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 

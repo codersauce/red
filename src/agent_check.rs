@@ -6,7 +6,6 @@ use serde::Serialize;
 
 use crate::{
     cli_style::{paint, BOLD_GREEN, BOLD_RED, DIM, GREEN, YELLOW},
-    codex,
     config::Config,
 };
 
@@ -88,7 +87,7 @@ impl AgentCheckReport {
 #[must_use]
 /// Resolves a configured executable without launching or installing it.
 pub fn find_executable_on_path(command: &str) -> Option<PathBuf> {
-    codex::find_executable(command)
+    crate::utils::find_executable(command)
 }
 
 #[must_use]
@@ -115,7 +114,7 @@ pub fn run(config: &Config) -> AgentCheckReport {
         };
     }
 
-    let executable = codex::find_executable(&command);
+    let executable = crate::utils::find_executable(&command);
     let installed_version = executable.as_ref().and_then(|executable| {
         std::process::Command::new(executable)
             .arg("--version")

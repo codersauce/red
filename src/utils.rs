@@ -157,6 +157,59 @@ pub fn get_workspace_uri() -> String {
     format!("file://{}", get_workspace_path().display()).replace("\\", "/")
 }
 
+#[must_use]
+pub fn find_executable(command: &str) -> Option<PathBuf> {
+    let command = Path::new(command);
+    if command.components().count() > 1 {
+        return is_executable(command).then(|| command.to_path_buf());
+    }
+    std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path).find_map(|directory| find_in_directory(&directory, command))
+    })
+}
+
+#[cfg(not(windows))]
+fn find_in_directory(directory: &Path, command: &Path) -> Option<PathBuf> {
+    let candidate = directory.join(command);
+    is_executable(&candidate).then_some(candidate)
+}
+
+#[cfg(windows)]
+fn find_in_directory(directory: &Path, command: &Path) -> Option<PathBuf> {
+    let candidate = directory.join(command);
+    if is_executable(&candidate) {
+        return Some(candidate);
+    }
+    if candidate.extension().is_some() {
+        return None;
+    }
+    std::env::var("PATHEXT")
+        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
+        .split(';')
+        .filter(|extension| !extension.is_empty())
+        .map(|extension| directory.join(format!("{}{}", command.to_string_lossy(), extension)))
+        .find(|path| is_executable(path))
+}
+
+fn is_executable(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,5 +353,20 @@ mod tests {
         let home = PathBuf::from("/tmp/red-home");
 
         assert!(expand_user_path_with_home("~other/config.toml", &home).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_discovery_rejects_non_executable_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let command = directory.path().join("codex");
+        std::fs::write(&command, "not executable").unwrap();
+        std::fs::set_permissions(&command, {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::Permissions::from_mode(0o644)
+        })
+        .unwrap();
+
+        assert!(find_executable(command.to_str().unwrap()).is_none());
     }
 }

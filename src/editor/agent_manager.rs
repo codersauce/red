@@ -1,4 +1,4 @@
-//! Agent manager sub-controller for Codex AI app-server integration and tool channels.
+//! Agent manager sub-controller for the agent backend and the editor's tool channel.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -7,18 +7,21 @@ use std::{
 };
 
 use crate::{
+    agent_backend::{
+        backend::AgentBackend,
+        ids::{SessionId, TurnId},
+    },
     agent_conversation::{AgentAnnotationRecord, AgentConversationSnapshot},
     agent_tools::{PendingEditorTool, PendingEditorToolResponse},
-    codex::CodexBridge,
 };
 
-/// Encapsulates background AI agent task state, active turn metrics, and tool channels.
-#[derive(Default)]
+/// Encapsulates the agent backend, active turn metrics, and the tool channel.
 pub struct AgentManager {
-    bridge: Option<CodexBridge>,
-    task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
+    agents: Box<dyn AgentBackend>,
     root: Option<PathBuf>,
-    tool_requests: Option<tokio::sync::mpsc::Receiver<PendingEditorTool>>,
+    /// Tool calls from the agent, for the editor's whole lifetime. A lost agent
+    /// leaves it open: the next one reuses it through the same tool host.
+    tool_requests: tokio::sync::mpsc::Receiver<PendingEditorTool>,
     playback_tool: Option<PendingEditorTool>,
     playback_ready_at: Option<Instant>,
     playback_response: Option<PendingEditorToolResponse>,
@@ -27,12 +30,7 @@ pub struct AgentManager {
     turn_phases: HashMap<String, AgentTurnPhase>,
     active_turn_ids: HashMap<String, String>,
     turn_started_at: HashMap<String, Instant>,
-    pending_commit_messages: HashSet<i64>,
-    pending_model_requests: HashSet<i64>,
-    pending_session_requests: HashSet<i64>,
-    pending_session_preview_requests: HashSet<i64>,
-    model_only_bridge: bool,
-    next_model: Option<crate::codex::AgentModelSelection>,
+    next_model: Option<crate::agent_backend::types::ModelSelection>,
     conversation: Option<AgentConversationSnapshot>,
     /// Bumped on every change to `conversation`, so the editor can tell when the
     /// saved copy is out of date without comparing transcripts.
@@ -111,9 +109,50 @@ pub struct QueuedAgentPrompt {
 }
 
 impl AgentManager {
-    /// Creates a new, empty AgentManager instance.
-    pub fn new() -> Self {
-        Self::default()
+    /// Creates a manager over `agents`, whose tool calls arrive on `tool_requests`.
+    pub fn new(
+        agents: Box<dyn AgentBackend>,
+        tool_requests: tokio::sync::mpsc::Receiver<PendingEditorTool>,
+    ) -> Self {
+        Self {
+            agents,
+            root: None,
+            tool_requests,
+            playback_tool: None,
+            playback_ready_at: None,
+            playback_response: None,
+            playback_response_ready_at: None,
+            turn_phases: HashMap::new(),
+            active_turn_ids: HashMap::new(),
+            turn_started_at: HashMap::new(),
+            next_model: None,
+            conversation: None,
+            conversation_revision: 0,
+            forgotten_conversations: HashSet::new(),
+            queued_prompts: HashMap::new(),
+            pane: super::agent_pane::AgentPaneLifecycle::default(),
+            pane_effects: Vec::new(),
+            published_pane: None,
+        }
+    }
+
+    /// A manager over a scripted backend that nothing drives, for unit tests.
+    #[cfg(test)]
+    pub fn for_test() -> Self {
+        let (agents, _script) = crate::agent_backend::testing::open_scripted();
+        Self::new(agents, tokio::sync::mpsc::channel(1).1)
+    }
+
+    /// Swaps the backend, so tests can script it.
+    #[cfg(test)]
+    pub fn replace_agents(&mut self, agents: Box<dyn AgentBackend>) {
+        self.agents = agents;
+    }
+
+    /// Swaps the channel editor tool calls arrive on, so tests can send some.
+    #[cfg(test)]
+    pub fn set_tool_requests(&mut self, requests: tokio::sync::mpsc::Receiver<PendingEditorTool>) {
+        self.tool_requests = requests;
     }
 
     /// Applies a pane transition and keeps its effects for the next drain.
@@ -143,40 +182,39 @@ impl AgentManager {
         Some(snapshot)
     }
 
-    /// Returns `true` if a Codex bridge connection is currently attached.
-    pub fn has_bridge(&self) -> bool {
-        self.bridge.is_some()
+    /// The agent backend, for questions that do not change it.
+    pub fn agents(&self) -> &dyn AgentBackend {
+        &*self.agents
     }
 
-    pub fn bridge(&self) -> Option<&CodexBridge> {
-        self.bridge.as_ref()
+    /// The agent backend, for commands.
+    pub fn agents_mut(&mut self) -> &mut dyn AgentBackend {
+        &mut *self.agents
     }
 
-    pub fn bridge_mut(&mut self) -> Option<&mut CodexBridge> {
-        self.bridge.as_mut()
+    /// Returns `true` while the agent backend has a live agent.
+    pub fn is_running(&self) -> bool {
+        self.agents.is_running()
     }
 
-    pub fn set_bridge(&mut self, bridge: CodexBridge) {
-        self.model_only_bridge = false;
-        self.bridge = Some(bridge);
+    /// Returns `true` while the agent's worker has ended but the editor has
+    /// not yet read its loss.
+    pub fn has_ended(&self) -> bool {
+        self.agents.has_ended()
     }
 
-    pub fn take_bridge(&mut self) -> Option<CodexBridge> {
-        self.bridge.take()
+    /// Closes a session the editor is done with. Nothing to close when no agent
+    /// is running, and a failure to reach it is not the user's to hear about.
+    pub fn close_session(&mut self, session_id: impl Into<String>) {
+        if self.agents.is_running() {
+            let _ = self.agents.close(&SessionId::from_raw(session_id.into()));
+        }
     }
 
-    pub fn is_task_finished(&self) -> bool {
-        self.task
-            .as_ref()
-            .is_some_and(tokio::task::JoinHandle::is_finished)
-    }
-
-    pub fn set_task(&mut self, task: tokio::task::JoinHandle<anyhow::Result<()>>) {
-        self.task = Some(task);
-    }
-
-    pub fn take_task(&mut self) -> Option<tokio::task::JoinHandle<anyhow::Result<()>>> {
-        self.task.take()
+    /// The turn the editor started for a session and has not seen end.
+    pub fn live_turn(&self, session_id: &str) -> Option<TurnId> {
+        let turn = self.active_turn_ids.get(session_id)?;
+        uuid::Uuid::parse_str(turn).ok().map(TurnId::from_uuid)
     }
 
     pub fn root(&self) -> Option<&Path> {
@@ -187,12 +225,12 @@ impl AgentManager {
         self.root = root;
     }
 
-    pub fn set_tool_requests(&mut self, requests: tokio::sync::mpsc::Receiver<PendingEditorTool>) {
-        self.tool_requests = Some(requests);
-    }
-
+    /// Answers every tool call still waiting and drops the staged playback, for
+    /// an agent that is gone: nothing is left to use the results.
     pub fn clear_tool_requests(&mut self) {
-        self.tool_requests = None;
+        while let Ok(pending) = self.tool_requests.try_recv() {
+            let _ = pending.response.send(Err("the agent stopped".to_string()));
+        }
         self.playback_tool = None;
         self.playback_ready_at = None;
         self.playback_response = None;
@@ -200,9 +238,7 @@ impl AgentManager {
     }
 
     pub fn try_recv_tool_request(&mut self) -> Option<PendingEditorTool> {
-        self.tool_requests
-            .as_mut()
-            .and_then(|requests| requests.try_recv().ok())
+        self.tool_requests.try_recv().ok()
     }
 
     pub fn has_playback_work(&self) -> bool {
@@ -335,6 +371,18 @@ impl AgentManager {
             .map_or(0, |queue| queue.len())
     }
 
+    /// Ends everything a lost session had in flight and returns the prompts it
+    /// never received, so the pane can hand them back.
+    pub fn end_session_turns(&mut self, session_id: &str) -> Vec<String> {
+        self.turn_phases.remove(session_id);
+        self.active_turn_ids.remove(session_id);
+        self.turn_started_at.remove(session_id);
+        self.queued_prompts
+            .remove(session_id)
+            .map(|queue| queue.into_iter().map(|prompt| prompt.text).collect())
+            .unwrap_or_default()
+    }
+
     /// Takes every unsent prompt so a lost bridge can hand them back to the pane.
     pub fn take_all_queued_prompts(&mut self) -> Vec<(String, Vec<String>)> {
         let mut returned = self
@@ -380,82 +428,22 @@ impl AgentManager {
         self.turn_started_at.clear();
     }
 
-    pub fn mark_commit_message_pending(&mut self, request_id: i64) {
-        self.pending_commit_messages.insert(request_id);
-    }
-
-    pub fn finish_commit_message(&mut self, request_id: i64) {
-        self.pending_commit_messages.remove(&request_id);
-    }
-
-    pub fn take_pending_commit_messages(&mut self) -> Vec<i64> {
-        self.pending_commit_messages.drain().collect()
-    }
-
-    pub fn mark_model_request_pending(&mut self, request_id: i64) {
-        self.pending_model_requests.insert(request_id);
-    }
-
-    pub fn finish_model_request(&mut self, request_id: i64) {
-        self.pending_model_requests.remove(&request_id);
-    }
-
-    pub fn take_pending_model_requests(&mut self) -> Vec<i64> {
-        self.pending_model_requests.drain().collect()
-    }
-
-    pub fn mark_session_request_pending(&mut self, request_id: i64) {
-        self.pending_session_requests.insert(request_id);
-    }
-
-    pub fn finish_session_request(&mut self, request_id: i64) {
-        self.pending_session_requests.remove(&request_id);
-    }
-
-    pub fn take_pending_session_requests(&mut self) -> Vec<i64> {
-        self.pending_session_requests.drain().collect()
-    }
-
-    pub fn mark_session_preview_pending(&mut self, request_id: i64) {
-        self.pending_session_preview_requests.insert(request_id);
-    }
-
-    pub fn finish_session_preview(&mut self, request_id: i64) {
-        self.pending_session_preview_requests.remove(&request_id);
-    }
-
-    pub fn take_pending_session_previews(&mut self) -> Vec<i64> {
-        self.pending_session_preview_requests.drain().collect()
-    }
-
-    pub fn mark_model_only_bridge(&mut self) {
-        self.model_only_bridge = true;
-    }
-
-    pub fn mark_conversation_requested(&mut self) {
-        self.model_only_bridge = false;
-    }
-
-    pub fn is_model_only_bridge(&self) -> bool {
-        self.model_only_bridge
-    }
-
-    pub fn set_next_model(&mut self, selection: crate::codex::AgentModelSelection) {
+    pub fn set_next_model(&mut self, selection: crate::agent_backend::types::ModelSelection) {
         self.next_model = Some(selection);
     }
 
-    pub fn next_model(&self) -> Option<&crate::codex::AgentModelSelection> {
+    pub fn next_model(&self) -> Option<&crate::agent_backend::types::ModelSelection> {
         self.next_model.as_ref()
     }
 
-    pub fn take_next_model(&mut self) -> Option<crate::codex::AgentModelSelection> {
+    pub fn take_next_model(&mut self) -> Option<crate::agent_backend::types::ModelSelection> {
         self.next_model.take()
     }
 
     pub fn set_conversation_model(
         &mut self,
         session_id: &str,
-        model_info: crate::codex::AgentModelInfo,
+        model_info: crate::agent_backend::types::ModelInfo,
     ) {
         if let Some(conversation) = self
             .conversation_mut()
@@ -485,7 +473,7 @@ impl AgentManager {
         &mut self,
         thread_id: &str,
         cwd: &Path,
-        thread: &serde_json::Value,
+        thread: &crate::agent_backend::types::RestoredHistory,
     ) -> Option<&AgentConversationSnapshot> {
         let cached = self
             .conversation
@@ -611,7 +599,7 @@ mod tests {
 
     #[test]
     fn owns_session_and_turn_lifecycle() {
-        let mut manager = AgentManager::new();
+        let mut manager = AgentManager::for_test();
         manager.begin_conversation("session-1", Path::new("/workspace"));
         manager.mark_session_active("session-1");
         manager.set_turn_id("session-1", "turn-1");
@@ -636,7 +624,7 @@ mod tests {
 
     #[test]
     fn retained_conversations_expose_their_tool_contract_version() {
-        let mut manager = AgentManager::new();
+        let mut manager = AgentManager::for_test();
         manager.begin_conversation("current", Path::new("/workspace"));
         assert_eq!(
             manager.conversation_tool_contract_version("current"),
@@ -651,8 +639,8 @@ mod tests {
     }
 
     #[test]
-    fn a_lost_bridge_returns_prompts_held_behind_a_stopping_turn() {
-        let mut manager = AgentManager::new();
+    fn a_lost_agent_returns_prompts_held_behind_a_stopping_turn() {
+        let mut manager = AgentManager::for_test();
         manager.mark_session_active("session-1");
         manager.begin_stopping("session-1");
         for text in ["first", "second"] {
@@ -680,7 +668,7 @@ mod tests {
 
     #[tokio::test]
     async fn holds_completed_edits_until_the_follow_deadline() {
-        let mut manager = AgentManager::new();
+        let mut manager = AgentManager::for_test();
         let (response, received) = tokio::sync::oneshot::channel();
         let now = Instant::now();
         manager.stage_playback_response(
@@ -699,5 +687,55 @@ mod tests {
         completed.response.send(completed.result).unwrap();
         assert_eq!(received.await.unwrap().unwrap()["saved"], true);
         assert!(!manager.has_playback_work());
+    }
+}
+
+#[cfg(test)]
+mod turn_and_tool_tests {
+    use super::AgentManager;
+    use crate::{
+        agent_backend::ids::{SessionId, TurnId},
+        agent_tools::{EditorToolCall, EditorToolRequest, PendingEditorTool},
+    };
+
+    #[test]
+    fn only_a_turn_the_editor_minted_can_be_stopped() {
+        let mut manager = AgentManager::for_test();
+        assert_eq!(manager.live_turn("session-1"), None);
+        manager.set_turn_id("session-1", "turn-1");
+        assert_eq!(manager.live_turn("session-1"), None);
+        let turn = TurnId::mint();
+        manager.set_turn_id("session-1", turn.to_string());
+        assert_eq!(manager.live_turn("session-1"), Some(turn));
+        manager.finish_turn("session-1");
+        assert_eq!(manager.live_turn("session-1"), None);
+    }
+
+    #[tokio::test]
+    async fn a_lost_agent_gets_its_waiting_tool_calls_answered() {
+        let (agents, _script) = crate::agent_backend::testing::open_scripted();
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        let mut manager = AgentManager::new(agents, receiver);
+        let (response, answer) = tokio::sync::oneshot::channel();
+        sender
+            .send(PendingEditorTool {
+                request: EditorToolRequest {
+                    session_id: SessionId::from_raw("session-1".to_string()),
+                    turn: None,
+                    call: EditorToolCall::ReadFile {
+                        path: "a.rs".to_string(),
+                        start_line: 1,
+                        line_count: 1,
+                    },
+                },
+                response,
+            })
+            .await
+            .unwrap();
+
+        manager.clear_tool_requests();
+
+        assert_eq!(answer.await.unwrap(), Err("the agent stopped".to_string()));
+        assert!(manager.try_recv_tool_request().is_none());
     }
 }

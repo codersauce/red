@@ -16,15 +16,18 @@
 //! model.
 
 mod agent_annotations;
+mod agent_commands;
 mod agent_continuity;
 mod agent_edit_decision;
+mod agent_events;
 mod agent_lsp;
 pub use agent_edit_decision::AgentUnsavedChoice;
-mod agent_manager;
-mod agent_models;
+pub(crate) mod agent_manager;
+pub(crate) mod agent_models;
 pub(crate) mod agent_pane;
 mod agent_pane_host;
-mod agent_sessions;
+pub(crate) mod agent_payloads;
+pub(crate) mod agent_sessions;
 mod buffer_actions;
 mod buffer_do;
 mod buffer_manager;
@@ -74,6 +77,8 @@ mod session_manager;
 mod shell_command;
 mod signature_help;
 mod snippet;
+#[cfg(test)]
+mod test_agent;
 mod update;
 mod workspace_search;
 
@@ -86,7 +91,6 @@ use std::{
     fmt::Write as _,
     fs,
     io::Write as _,
-    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -121,6 +125,7 @@ use unicode_segmentation::UnicodeSegmentation;
 pub use render_buffer::RenderBuffer;
 
 use crate::{
+    agent_backend::ids::TurnId,
     agent_tools::{
         apply_text_edits, editor_tool_channel, utf16_byte_offset, EditorActionName,
         EditorOpenTarget, EditorSelectionKind, EditorToolCall, EditorToolHost, EditorToolRequest,
@@ -128,9 +133,6 @@ use crate::{
     },
     buffer::{Buffer, BufferId, ExternalFileChange, SearchMatch, SyntaxSelection},
     clipboard::{ClipboardProvider, CopyOutcome, DisabledClipboardProvider, SessionClipboard},
-    codex::{
-        start_codex, AgentRuntimePolicy, CodexBridge, CodexCommand, CodexEvent, CodexProcessSpec,
-    },
     color::Color,
     command,
     command_completion::{self, CommandCompletionState, CompletionDirection},
@@ -264,8 +266,7 @@ const MAX_MARKDOWN_FENCE_LOOKBACK_LINES: usize = 256;
 const MAX_SEARCH_HISTORY_ENTRIES: usize = 6;
 const MAX_SEARCH_HISTORY_MATCHES_PER_ENTRY: usize = 16_384;
 const MAX_PLUGIN_VIEWPORT_LINE_CHARS: usize = 64 * 1024;
-const MAX_AGENT_FAILURE_MESSAGE_CHARS: usize = 2048;
-const AGENT_BRIDGE_CAPACITY: usize = 64;
+const AGENT_TOOL_REQUEST_CAPACITY: usize = 64;
 const PLUGIN_MANAGER_PICKER_ID: i32 = 9_101;
 const PLUGIN_MANAGER_ACTION_PICKER_ID: i32 = 9_102;
 const PLUGIN_MANAGER_INSTALL_PICKER_ID: i32 = 9_103;
@@ -1322,7 +1323,7 @@ fn plugin_inlay_hints_error(request_id: RequestId, message: &str) -> Value {
     })
 }
 
-fn plugin_json(value: Value) -> Value {
+pub(crate) fn plugin_json(value: Value) -> Value {
     match value {
         Value::Array(values) => Value::Array(values.into_iter().map(plugin_json).collect()),
         Value::Object(values) => Value::Object(
@@ -1389,153 +1390,6 @@ fn render_marked_string(marked: MarkedString) -> String {
             format!("{fence}{language}\n{value}\n{fence}")
         }
     }
-}
-
-fn agent_event_payload(event: CodexEvent) -> (&'static str, Value) {
-    match event {
-        CodexEvent::InlineContextRead { request_id, .. } => (
-            "inline_assist:context_read",
-            json!({ "request_id": request_id }),
-        ),
-        CodexEvent::InlineAnswerDelta { request_id, .. } => {
-            ("inline_assist:answer", json!({ "request_id": request_id }))
-        }
-        CodexEvent::InlineSessionCreated {
-            request_id,
-            session_id,
-        } => (
-            "inline_assist:session_created",
-            json!({ "request_id": request_id, "session_id": session_id }),
-        ),
-        CodexEvent::InlineResult {
-            request_id,
-            session_id,
-            ..
-        } => (
-            "inline_assist:result",
-            json!({ "request_id": request_id, "session_id": session_id }),
-        ),
-        CodexEvent::InlineFailed {
-            request_id,
-            session_id,
-            message,
-        } => (
-            "inline_assist:error",
-            json!({ "request_id": request_id, "session_id": session_id, "message": message }),
-        ),
-        CodexEvent::ModelRequestCompleted { .. } => {
-            unreachable!("model results use private callbacks")
-        }
-        CodexEvent::SessionListCompleted { .. } => {
-            unreachable!("session-list results use private callbacks")
-        }
-        CodexEvent::SessionPreviewCompleted { .. } => {
-            unreachable!("session-preview results use private callbacks")
-        }
-        CodexEvent::SessionModelRerouted { session_id, model } => (
-            "agent:model_rerouted",
-            json!({"session_id": session_id, "model": model}),
-        ),
-        CodexEvent::SessionModelChanged {
-            session_id,
-            model_info,
-        } => (
-            "agent:model_changed",
-            json!({ "session_id": session_id, "model_info": model_info }),
-        ),
-        CodexEvent::SessionCreated { session_id } => (
-            "agent:session_created",
-            json!({ "session_id": session_id.to_string() }),
-        ),
-        CodexEvent::CommitMessageGenerated { request_id, result } => (
-            "agent:error",
-            json!({
-                "message": format!(
-                    "commit-message generation result {request_id} escaped its private callback: {result:?}"
-                )
-            }),
-        ),
-        CodexEvent::SessionRestored { session_id, thread } => (
-            "agent:session_restored",
-            json!({ "session_id": session_id, "thread": plugin_json(thread) }),
-        ),
-        CodexEvent::SessionRestoreFailed {
-            session_id,
-            message,
-        } => (
-            "agent:session_restore_failed",
-            json!({ "session_id": session_id, "message": message }),
-        ),
-        CodexEvent::Update { session_id, text } => (
-            "agent:update",
-            json!({ "session_id": session_id.to_string(), "text": text }),
-        ),
-        CodexEvent::MessageCompleted { session_id, text } => (
-            "agent:message_completed",
-            json!({ "session_id": session_id, "text": text }),
-        ),
-        CodexEvent::Activity { session_id, update } => (
-            "agent:activity",
-            json!({ "session_id": session_id.to_string(), "update": plugin_json(update) }),
-        ),
-        CodexEvent::Completed {
-            session_id,
-            stop_reason,
-        } => (
-            "agent:completed",
-            json!({
-                "session_id": session_id.to_string(),
-                "stop_reason": stop_reason,
-            }),
-        ),
-        CodexEvent::Cancelled { session_id } => (
-            "agent:cancelled",
-            json!({ "session_id": session_id.to_string() }),
-        ),
-        CodexEvent::CancelFailed {
-            session_id,
-            message,
-        } => (
-            "agent:cancel_failed",
-            json!({ "session_id": session_id.to_string(), "message": message }),
-        ),
-        CodexEvent::PermissionRequested {
-            request_id,
-            session_id,
-            tool_call,
-            options,
-        } => (
-            "agent:permission_requested",
-            plugin_json(json!({
-                "request_id": request_id,
-                "session_id": session_id.to_string(),
-                "tool_call": tool_call,
-                "options": options,
-            })),
-        ),
-        CodexEvent::Failed {
-            session_id,
-            message,
-        } => (
-            "agent:error",
-            json!({
-                "session_id": session_id.map(|session_id| session_id.to_string()),
-                "message": message,
-            }),
-        ),
-    }
-}
-
-fn bounded_agent_failure_message(message: &str) -> String {
-    if message.chars().count() <= MAX_AGENT_FAILURE_MESSAGE_CHARS {
-        return message.to_string();
-    }
-    let mut bounded = message
-        .chars()
-        .take(MAX_AGENT_FAILURE_MESSAGE_CHARS)
-        .collect::<String>();
-    bounded.push_str("… (full details are in the Red log)");
-    bounded
 }
 
 struct AgentFilePage {
@@ -1858,15 +1712,15 @@ pub enum PluginRequest {
     Action(Action),
     AgentModelRequest {
         request_id: RequestId,
-        request: crate::codex::ModelRequest,
+        request: crate::agent_backend::types::ModelQuery,
     },
     AgentSessionRequest {
         request_id: RequestId,
-        request: crate::codex::AgentSessionListRequest,
+        request: crate::agent_backend::types::SessionQuery,
     },
     AgentSessionPreview {
         request_id: RequestId,
-        request: crate::codex::AgentSessionPreviewRequest,
+        request: crate::agent_backend::types::SessionPreviewRequest,
     },
     SetTextPanelHeaderDetail {
         id: String,
@@ -5931,7 +5785,11 @@ impl Editor {
         let lsp_coordinator = lsp_coordinator::LspCoordinator::with_buffers(&buffers);
         let buffer_manager = buffer_manager::BufferManager::with_buffers(buffers);
         let session_manager = session_manager::SessionManager::new();
-        let agent_manager = agent_manager::AgentManager::new();
+        let (tool_sender, tool_requests) = editor_tool_channel(AGENT_TOOL_REQUEST_CAPACITY);
+        let agent_manager = agent_manager::AgentManager::new(
+            crate::agent_backend::open(&config.agent, EditorToolHost::new(tool_sender)),
+            tool_requests,
+        );
         let whats_new_startup_pending = preferences.is_persistent()
             && config.show_whats_new.unwrap_or(true)
             && preferences.last_seen_version() != Some(env!("CARGO_PKG_VERSION"));
@@ -10226,9 +10084,7 @@ impl Editor {
             .as_ref()
             .and_then(|assist| assist.session_id.clone())
         {
-            if let Some(bridge) = self.agent_manager.bridge() {
-                let _ = bridge.try_send(CodexCommand::CloseSession { session_id });
-            }
+            self.agent_manager.close_session(session_id);
         }
         self.inline_assist = None;
         self.current_dialog = None;
@@ -10905,7 +10761,8 @@ impl Editor {
         runtime: &mut Runtime,
     ) -> anyhow::Result<Value> {
         anyhow::ensure!(
-            self.agent_manager.is_session_active(&request.session_id),
+            self.agent_manager
+                .is_session_active(request.session_id.as_str()),
             "editor tool references an inactive session"
         );
         let root = self
@@ -10991,7 +10848,7 @@ impl Editor {
                 let path = resolve_path(&path)?;
                 ensure_agent_writable_path(&root, &path)?;
                 self.apply_agent_contents(
-                    &request.session_id,
+                    request.session_id.as_str(),
                     &path,
                     expected_revision,
                     content,
@@ -11032,11 +10889,11 @@ impl Editor {
                 );
                 let turn_id = self
                     .agent_manager
-                    .turn_id(&request.session_id)
+                    .turn_id(request.session_id.as_str())
                     .ok_or_else(|| anyhow::anyhow!("Agent annotation has no active turn"))?
                     .to_string();
                 let result = self.add_agent_annotations(
-                    &request.session_id,
+                    request.session_id.as_str(),
                     &turn_id,
                     &path.to_string_lossy(),
                     expected_revision,
@@ -11175,7 +11032,7 @@ impl Editor {
                 );
                 let contents = apply_text_edits(&self.current_buffer().contents(), &edits)?;
                 self.apply_agent_contents(
-                    &request.session_id,
+                    request.session_id.as_str(),
                     &path,
                     expected_revision,
                     contents,
@@ -11368,102 +11225,6 @@ impl Editor {
         }
         self.render(render_buffer)?;
         Ok(delay)
-    }
-
-    async fn dispatch_agent_prompt(
-        &mut self,
-        runtime: &mut Runtime,
-        session_id: String,
-        text: String,
-        context: Option<(String, String)>,
-    ) -> anyhow::Result<bool> {
-        if self.agent_manager.is_task_finished() {
-            let message = self
-                .finish_agent_bridge(
-                    runtime,
-                    "Codex app-server stopped before the prompt was sent",
-                )
-                .await?;
-            self.notify_agent(
-                runtime,
-                "agent:session_lost",
-                json!({
-                    "session_id": session_id,
-                    "prompt": text,
-                    "message": message
-                }),
-            )
-            .await?;
-            return Ok(false);
-        }
-        if !self.agent_manager.has_bridge() {
-            self.abort_agent_bridge();
-            self.notify_agent(
-                runtime,
-                "agent:session_lost",
-                json!({
-                    "session_id": session_id,
-                    "prompt": text,
-                    "message": "No Codex app-server session is running"
-                }),
-            )
-            .await?;
-            return Ok(false);
-        }
-        if self.agent_manager.is_session_busy(&session_id) {
-            // A cancelled turn keeps running until Codex confirms the interrupt;
-            // holding the prompt avoids racing that turn's terminal event.
-            self.agent_manager.queue_prompt(
-                session_id,
-                agent_manager::QueuedAgentPrompt { text, context },
-            );
-            return Ok(false);
-        }
-        let turn_id = uuid::Uuid::new_v4().to_string();
-        self.begin_inline_agent_outcome(&session_id, &turn_id, &text)?;
-        self.agent_manager
-            .set_turn_id(session_id.clone(), turn_id.clone());
-        self.agent_manager
-            .record_user_message(&session_id, &turn_id, &text);
-        self.notify_agent(
-            runtime,
-            "agent:turn_started",
-            json!({ "session_id": session_id, "turn_id": turn_id }),
-        )
-        .await?;
-        self.agent_manager.mark_session_active(session_id.clone());
-        self.agent_manager.record_turn_start(session_id.clone());
-        let Some(bridge) = self.agent_manager.bridge() else {
-            return Ok(false);
-        };
-        let command = context.map_or_else(
-            || CodexCommand::Prompt {
-                session_id: session_id.clone(),
-                text: text.clone(),
-            },
-            |(uri, context)| CodexCommand::PromptWithContext {
-                session_id: session_id.clone(),
-                text: text.clone(),
-                uri,
-                context,
-            },
-        );
-        if bridge.send(command).await.is_err() {
-            let message = self
-                .finish_agent_bridge(runtime, "Codex app-server stopped while sending the prompt")
-                .await?;
-            self.notify_agent(
-                runtime,
-                "agent:session_lost",
-                json!({
-                    "session_id": session_id,
-                    "prompt": text,
-                    "message": message
-                }),
-            )
-            .await?;
-        }
-        Ok(false)
     }
 
     /// Starts the main editor loop
@@ -11684,8 +11445,7 @@ impl Editor {
         self.shell_commands.cancel_all();
         // Closing the command channel starts agent shutdown immediately. Its
         // process can exit while we persist state and deactivate plugins.
-        drop(self.agent_manager.take_bridge());
-        let agent_task = self.agent_manager.take_task();
+        let agent_exit = self.agent_manager.agents_mut().detach_for_exit();
         let before_exit = perf::PerfSpan::start("shutdown:before_exit");
         let snapshot = self.editor_state_snapshot();
         if let Err(err) = self.plugin_registry.before_exit(runtime, snapshot).await {
@@ -11725,81 +11485,24 @@ impl Editor {
         self.companion_manager.lock().await.shutdown().await;
         drop(companions);
         let _agent = perf::PerfSpan::start("shutdown:agent_wait");
-        if let Some(task) = agent_task {
-            match task.await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => log!("Codex app-server shutdown failed: {error}"),
-                Err(error) => log!("Codex app-server task failed: {error}"),
-            }
+        if let Some(exit) = agent_exit {
+            exit.await;
         }
     }
 
-    fn abort_agent_bridge(&mut self) {
-        self.stop_inline_agent_outcomes("Agent session closed.");
-        drop(self.agent_manager.take_bridge());
-        if let Some(task) = self.agent_manager.take_task() {
-            task.abort();
-        }
+    /// Forgets what the editor tracked about an agent that is not running.
+    fn reset_agent_state(&mut self, reason: &str) {
+        self.stop_inline_agent_outcomes(reason);
         self.agent_manager.clear_active_sessions();
         self.agent_manager.clear_turns();
         self.agent_manager.clear_tool_requests();
         self.agent_manager.set_root(None);
     }
 
-    fn ensure_agent_bridge(&mut self, cwd: &Path) -> anyhow::Result<()> {
-        if self.config.disable_ai {
-            anyhow::bail!("agent support is disabled by `disable_ai = true`");
-        }
-        let cwd = cwd.absolutize()?.into_owned();
-        if let Some(root) = self.agent_manager.root() {
-            anyhow::ensure!(
-                root == cwd,
-                "Codex session root `{}` does not match the active agent workspace `{}`",
-                cwd.display(),
-                root.display()
-            );
-        }
-        if self.agent_manager.has_bridge() {
-            return Ok(());
-        }
-        let configured = self.config.agent.command.as_deref().unwrap_or("codex");
-        let command = crate::codex::find_executable(configured).ok_or_else(|| {
-            anyhow::anyhow!(
-                "Codex CLI was not found; install Codex, run `codex login`, and try again"
-            )
-        })?;
-        let policy = AgentRuntimePolicy::new(
-            self.config.agent.allow_sensitive_paths,
-            self.config.agent.enabled_mcp_servers.clone(),
-            self.config.agent.enabled_codex_features.clone(),
-        );
-        let mut spec = CodexProcessSpec::new(command, cwd.clone())
-            .args(self.config.agent.args.clone())
-            .policy(policy);
-        spec.environment.extend(
-            self.config
-                .agent
-                .env
-                .clone()
-                .into_iter()
-                .map(|(key, value)| (key.into(), value.into())),
-        );
-        let capacity =
-            NonZeroUsize::new(AGENT_BRIDGE_CAPACITY).expect("agent bridge capacity is non-zero");
-        let (tool_sender, tool_requests) = editor_tool_channel(AGENT_BRIDGE_CAPACITY);
-        let host = EditorToolHost::new(tool_sender);
-        let (bridge, task) = start_codex(spec, host, capacity)?;
-        self.agent_manager.set_root(Some(cwd));
-        self.agent_manager.set_bridge(bridge);
-        self.agent_manager.set_task(task);
-        self.agent_manager.set_tool_requests(tool_requests);
-        Ok(())
-    }
-
     async fn restore_agent_plugin_state(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {
         if let Some(conversation) = self.agent_manager.conversation_snapshot() {
             let adopted_age = self.take_adopted_agent_conversation_age();
-            if let Some(age) = adopted_age.filter(|_| !self.agent_manager.has_bridge()) {
+            if let Some(age) = adopted_age.filter(|_| !self.agent_manager.is_running()) {
                 // Saved by an earlier launch: resumed when the pane opens or the
                 // next message is sent, so an unused agent never starts Codex.
                 let mut payload = plugin_json(serde_json::to_value(conversation)?);
@@ -11808,7 +11511,7 @@ impl Editor {
                     .await?;
                 return Ok(());
             }
-            let event = if self.agent_manager.has_bridge() {
+            let event = if self.agent_manager.is_running() {
                 "agent:session_restored"
             } else {
                 "agent:conversation_restore_pending"
@@ -11848,79 +11551,6 @@ impl Editor {
                 serde_json::to_value(snapshot)?,
             )
             .await
-    }
-
-    async fn finish_agent_bridge(
-        &mut self,
-        runtime: &mut Runtime,
-        fallback: &str,
-    ) -> anyhow::Result<String> {
-        let result = match self.agent_manager.take_task() {
-            Some(task) => Some(task.await),
-            None => None,
-        };
-        self.stop_inline_agent_outcomes(fallback);
-        self.abandon_agent_edit_decision(None, "the Codex app-server stopped");
-        drop(self.agent_manager.take_bridge());
-        self.agent_manager.clear_active_sessions();
-        // Prompts held behind a stopping turn were never sent; return them to the
-        // pane instead of letting a dead app-server swallow them.
-        for (session_id, prompts) in self.agent_manager.take_all_queued_prompts() {
-            self.notify_agent(
-                runtime,
-                "agent:prompts_returned",
-                json!({ "session_id": session_id, "prompts": prompts }),
-            )
-            .await?;
-        }
-        self.agent_manager.clear_turns();
-        self.agent_manager.clear_tool_requests();
-        self.agent_manager.set_root(None);
-
-        let message = match result {
-            Some(Ok(Err(error))) => {
-                let details = format!("{error:#}");
-                log!("Codex app-server task failed: {details}");
-                format!("Codex app-server failed: {details}")
-            }
-            Some(Err(error)) if !error.is_cancelled() => {
-                log!("Codex app-server task failed: {error}");
-                format!("Codex app-server task failed: {error}")
-            }
-            Some(Ok(Ok(()))) | Some(Err(_)) | None => fallback.to_string(),
-        };
-        let message = bounded_agent_failure_message(&message);
-        self.fail_running_inline_jobs(&message);
-        // Every shutdown path must resolve metadata callbacks, including a
-        // request that replaces a failed bridge before the background tick.
-        for request_id in self.agent_manager.take_pending_model_requests() {
-            self.plugin_registry
-                .resolve_request(
-                    runtime,
-                    RequestId::from_raw(request_id),
-                    json!({"error": message.clone()}),
-                )
-                .await?;
-        }
-        for request_id in self.agent_manager.take_pending_session_requests() {
-            self.plugin_registry
-                .resolve_request(
-                    runtime,
-                    RequestId::from_raw(request_id),
-                    json!({"sessions": [], "error": message.clone()}),
-                )
-                .await?;
-        }
-        for request_id in self.agent_manager.take_pending_session_previews() {
-            self.plugin_registry
-                .resolve_request(
-                    runtime,
-                    RequestId::from_raw(request_id),
-                    agent_sessions::session_preview_payload(&Err(message.clone())),
-                )
-                .await?;
-        }
-        Ok(message)
     }
 
     /// Runs an agent editor tool whose follow-mode dwell has elapsed and answers it.
@@ -12064,457 +11694,14 @@ impl Editor {
         self.plugin_registry.poll_hot_reload(runtime).await;
         self.render_dirty_rpc_statusline(buffer)?;
 
-        for _ in 0..AGENT_EVENTS_PER_TICK {
-            let Some(event) = self
-                .agent_manager
-                .bridge_mut()
-                .and_then(CodexBridge::try_recv)
-            else {
+        let mut agent_events = 0;
+        while agent_events < AGENT_EVENTS_PER_TICK {
+            let Some(event) = self.agent_manager.agents_mut().poll() else {
                 break;
             };
-            if let CodexEvent::ModelRequestCompleted { request_id, result } = &event {
-                self.agent_manager.finish_model_request(*request_id);
-                self.plugin_registry
-                    .resolve_request(
-                        runtime,
-                        RequestId::from_raw(*request_id),
-                        agent_models::model_result_payload(result),
-                    )
-                    .await?;
-                continue;
-            }
-            if let CodexEvent::SessionListCompleted { request_id, result } = &event {
-                self.agent_manager.finish_session_request(*request_id);
-                self.plugin_registry
-                    .resolve_request(
-                        runtime,
-                        RequestId::from_raw(*request_id),
-                        agent_sessions::session_result_payload(result),
-                    )
-                    .await?;
-                continue;
-            }
-            if let CodexEvent::SessionPreviewCompleted { request_id, result } = &event {
-                self.agent_manager.finish_session_preview(*request_id);
-                self.plugin_registry
-                    .resolve_request(
-                        runtime,
-                        RequestId::from_raw(*request_id),
-                        agent_sessions::session_preview_payload(result),
-                    )
-                    .await?;
-                continue;
-            }
-            if let CodexEvent::CommitMessageGenerated { request_id, result } = &event {
-                self.agent_manager.finish_commit_message(*request_id);
-                let payload = match result {
-                    Ok(message) => json!({ "message": message, "error": "" }),
-                    Err(error) => json!({ "message": "", "error": error }),
-                };
-                self.plugin_registry
-                    .resolve_request(runtime, RequestId::from_raw(*request_id), payload)
-                    .await?;
-                continue;
-            }
-            let event = match event {
-                CodexEvent::InlineContextRead {
-                    request_id,
-                    description,
-                } => {
-                    if let Some(turn) = self.inline_history.turn_mut(&request_id) {
-                        if turn.context_reads.len() < 12
-                            && !turn.context_reads.contains(&description)
-                        {
-                            turn.context_reads.push(description);
-                        }
-                    }
-                    self.mark_inline_history_dirty();
-                    continue;
-                }
-                CodexEvent::InlineAnswerDelta { request_id, text } => {
-                    self.inline_history.append_answer(&request_id, &text);
-                    self.mark_inline_history_dirty();
-                    continue;
-                }
-                CodexEvent::InlineSessionCreated {
-                    request_id,
-                    session_id,
-                } => {
-                    let pending = self
-                        .inline_history
-                        .turn(&request_id)
-                        .is_some_and(|turn| turn.state == InlineTurnState::Pending);
-                    if let Some(assist) = self
-                        .inline_request_session_mut(&request_id)
-                        .filter(|_| pending)
-                    {
-                        assist.session_id = Some(session_id.clone());
-                        if let Some(turn) = self.inline_history.turn_mut(&request_id) {
-                            turn.session_id = Some(session_id);
-                        }
-                    } else if let Some(bridge) = self.agent_manager.bridge() {
-                        let _ = bridge.try_send(CodexCommand::CloseSession { session_id });
-                    }
-                    continue;
-                }
-                CodexEvent::InlineResult {
-                    request_id,
-                    session_id,
-                    result,
-                } => {
-                    // A duplicate or late provider event must never apply a
-                    // result after its request has already finished.
-                    if !self
-                        .inline_history
-                        .turn(&request_id)
-                        .is_some_and(|turn| turn.state == InlineTurnState::Pending)
-                    {
-                        continue;
-                    }
-                    let foreground =
-                        self.inline_assist.as_ref().is_some_and(|assist| {
-                            assist.request_id.as_deref() == Some(&request_id)
-                        }) && self
-                            .current_dialog
-                            .as_ref()
-                            .and_then(|dialog| dialog.inline_assist_state())
-                            .is_some();
-                    let changes_text = self
-                        .inline_history
-                        .turn(&request_id)
-                        .is_some_and(|turn| result.changes_text(&turn.before));
-                    if foreground
-                        && changes_text
-                        && result.expanded_scope.is_none()
-                        && self.config.agent.auto_apply_inline_edits
-                        && self
-                            .apply_inline_result(&request_id, &session_id, &result, buffer, runtime)
-                            .await
-                            .is_ok()
-                    {
-                        continue;
-                    }
-                    if result.expanded_scope.is_some() || changes_text {
-                        self.stage_background_inline_result(&request_id, &session_id, result);
-                        if foreground {
-                            if let Some(scope) = self
-                                .inline_assist
-                                .as_ref()
-                                .map(|assist| assist.scope.clone())
-                            {
-                                self.current_dialog = Some(Box::new(self.inline_assist_popup(
-                                    scope,
-                                    self.inline_assist_result_state(),
-                                )));
-                            }
-                        }
-                        self.render(buffer)?;
-                        continue;
-                    }
-                    if !foreground {
-                        if self
-                            .inline_assist
-                            .as_ref()
-                            .is_some_and(|assist| assist.request_id.as_deref() == Some(&request_id))
-                        {
-                            self.park_inline_assist();
-                        }
-                        self.stage_background_inline_result(&request_id, &session_id, result);
-                        self.render(buffer)?;
-                        continue;
-                    }
-                    if let Err(error) = self
-                        .apply_inline_result(&request_id, &session_id, &result, buffer, runtime)
-                        .await
-                    {
-                        if let Some(turn) =
-                            self.inline_history.turn_mut(&request_id).filter(|turn| {
-                                matches!(
-                                    turn.state,
-                                    InlineTurnState::Pending | InlineTurnState::Ready
-                                )
-                            })
-                        {
-                            turn.result = Some(result);
-                            turn.session_id = Some(session_id);
-                        }
-                        self.inline_history.finish(
-                            &request_id,
-                            InlineTurnState::Rejected,
-                            Some(error.to_string()),
-                        );
-                        self.sync_inline_activity();
-                        if let Some(scope) = self.inline_assist.as_ref().and_then(|assist| {
-                            (assist.request_id.as_deref() == Some(request_id.as_str()))
-                                .then(|| assist.scope.clone())
-                        }) {
-                            self.current_dialog = Some(Box::new(self.inline_assist_popup(
-                                scope,
-                                InlineAssistPopupState::Failed(error.to_string()),
-                            )));
-                            self.render(buffer)?;
-                        }
-                    }
-                    continue;
-                }
-                CodexEvent::InlineFailed {
-                    request_id,
-                    session_id,
-                    message,
-                } => {
-                    let request_id = request_id.or_else(|| {
-                        session_id
-                            .as_deref()
-                            .and_then(|provider| self.inline_request_for_provider(provider))
-                    });
-                    if !request_id
-                        .as_deref()
-                        .and_then(|request| self.inline_history.turn(request))
-                        .is_some_and(|turn| turn.state == InlineTurnState::Pending)
-                    {
-                        continue;
-                    }
-                    let scope = self.inline_assist.as_ref().and_then(|assist| {
-                        (assist.request_id == request_id
-                            && self
-                                .current_dialog
-                                .as_ref()
-                                .and_then(|dialog| dialog.inline_assist_state())
-                                .is_some())
-                        .then(|| assist.scope.clone())
-                    });
-                    if let Some(request) = request_id {
-                        self.record_inline_failure(&request, &message);
-                    }
-                    if let Some(scope) = scope {
-                        self.current_dialog =
-                            Some(Box::new(self.inline_assist_popup(
-                                scope,
-                                InlineAssistPopupState::Failed(message),
-                            )));
-                        self.render(buffer)?;
-                    } else {
-                        self.render(buffer)?;
-                    }
-                    continue;
-                }
-                event => event,
-            };
-            match &event {
-                CodexEvent::SessionModelChanged {
-                    session_id,
-                    model_info,
-                } => {
-                    self.agent_manager
-                        .set_conversation_model(session_id, model_info.clone());
-                }
-                CodexEvent::SessionCreated { session_id } => {
-                    self.agent_manager.take_next_model();
-                    let root = self
-                        .agent_manager
-                        .root()
-                        .map(Path::to_path_buf)
-                        .unwrap_or_default();
-                    self.agent_manager.begin_conversation(session_id, &root);
-                }
-                CodexEvent::SessionRestored { session_id, thread } => {
-                    if self.agent_manager.take_forgotten_conversation(session_id) {
-                        if let Some(bridge) = self.agent_manager.bridge() {
-                            let _ = bridge.try_send(CodexCommand::CloseSession {
-                                session_id: session_id.clone(),
-                            });
-                        }
-                        continue;
-                    }
-                    let root = self
-                        .agent_manager
-                        .root()
-                        .map(Path::to_path_buf)
-                        .unwrap_or_default();
-                    let conversation = self
-                        .agent_manager
-                        .reconcile_conversation(session_id, &root, thread)
-                        .cloned();
-                    if let Some(conversation) = conversation {
-                        self.restore_agent_annotations();
-                        self.notify_agent(
-                            runtime,
-                            "agent:session_restored",
-                            plugin_json(serde_json::to_value(conversation)?),
-                        )
-                        .await?;
-                    }
-                    continue;
-                }
-                CodexEvent::Update { session_id, text }
-                    if self.agent_manager.is_session_active(session_id) =>
-                {
-                    self.agent_manager.record_agent_delta(session_id, text);
-                }
-                CodexEvent::MessageCompleted { session_id, text }
-                    if self.agent_manager.is_session_active(session_id) =>
-                {
-                    self.agent_manager.complete_agent_message(session_id, text);
-                }
-                _ => {}
-            }
-            match &event {
-                CodexEvent::Completed { session_id, .. } => self.finish_inline_agent_outcome(
-                    session_id,
-                    crate::inline_history::InlineAgentState::Completed,
-                    None,
-                ),
-                CodexEvent::Cancelled { session_id } => self.finish_inline_agent_outcome(
-                    session_id,
-                    crate::inline_history::InlineAgentState::Cancelled,
-                    Some("Agent turn cancelled; any completed writes remain applied."),
-                ),
-                CodexEvent::Failed {
-                    session_id: Some(session_id),
-                    message,
-                } => self.finish_inline_agent_outcome(
-                    session_id,
-                    crate::inline_history::InlineAgentState::Failed,
-                    Some(message),
-                ),
-                _ => {}
-            }
-            let ended_turn_id = match &event {
-                CodexEvent::Completed { session_id, .. }
-                | CodexEvent::Cancelled { session_id }
-                | CodexEvent::Failed {
-                    session_id: Some(session_id),
-                    ..
-                } => self.agent_manager.turn_id(session_id).map(str::to_string),
-                _ => None,
-            };
-            let mut next_prompt = None;
-            match &event {
-                CodexEvent::Completed { session_id, .. }
-                | CodexEvent::Failed {
-                    session_id: Some(session_id),
-                    ..
-                } => {
-                    next_prompt = self
-                        .agent_manager
-                        .finish_turn(session_id)
-                        .map(|prompt| (session_id.clone(), prompt));
-                }
-                CodexEvent::Cancelled { session_id } => {
-                    self.agent_manager.mark_session_inactive(session_id);
-                }
-                _ => {}
-            }
-            match &event {
-                CodexEvent::Update { session_id, .. }
-                | CodexEvent::MessageCompleted { session_id, .. }
-                | CodexEvent::Activity { session_id, .. }
-                    if !self.agent_manager.is_session_active(session_id) =>
-                {
-                    continue;
-                }
-                CodexEvent::PermissionRequested {
-                    request_id,
-                    session_id,
-                    ..
-                } if !self.agent_manager.is_session_active(session_id) => {
-                    if let Some(bridge) = self.agent_manager.bridge() {
-                        let _ = bridge.try_send(CodexCommand::PermissionResponse {
-                            request_id: request_id.clone(),
-                            option_id: None,
-                        });
-                    }
-                    continue;
-                }
-                _ => {}
-            }
-            let turn_elapsed_ms = match &event {
-                CodexEvent::Completed { session_id, .. } => self
-                    .agent_manager
-                    .elapsed_turn_duration(session_id)
-                    .map(|elapsed| elapsed.as_millis() as u64),
-                CodexEvent::Failed {
-                    session_id: Some(session_id),
-                    ..
-                } => {
-                    self.agent_manager.discard_turn(session_id);
-                    None
-                }
-                _ => None,
-            };
-            let (name, mut payload) = agent_event_payload(event);
-            if let (Some(elapsed_ms), Some(object)) = (turn_elapsed_ms, payload.as_object_mut()) {
-                object.insert("elapsed_ms".to_string(), json!(elapsed_ms));
-            }
-            if let (Some(turn_id), Some(object)) = (ended_turn_id, payload.as_object_mut()) {
-                object.insert("turn_id".to_string(), json!(turn_id));
-            }
-            self.notify_agent(runtime, name, payload).await?;
-            if let Some((session_id, prompt)) = next_prompt {
-                if self
-                    .dispatch_agent_prompt(runtime, session_id, prompt.text, prompt.context)
-                    .await?
-                {
-                    self.render(buffer)?;
-                }
-            }
+            agent_events += 1;
+            self.handle_agent_event(buffer, runtime, event).await?;
         }
-        if self.agent_manager.is_task_finished()
-            && self
-                .agent_manager
-                .bridge()
-                .is_none_or(|bridge| !bridge.has_pending_events())
-        {
-            let pending_commit_messages = self.agent_manager.take_pending_commit_messages();
-            let model_only_bridge = self.agent_manager.is_model_only_bridge();
-            let inline_scope = self
-                .current_dialog
-                .as_ref()
-                .and_then(|dialog| dialog.inline_assist_state())
-                .and_then(|_| {
-                    self.inline_assist
-                        .as_ref()
-                        .map(|assist| assist.scope.clone())
-                });
-            let message = self
-                .finish_agent_bridge(runtime, "Codex app-server stopped unexpectedly")
-                .await?;
-            for request_id in pending_commit_messages {
-                self.plugin_registry
-                    .resolve_request(
-                        runtime,
-                        RequestId::from_raw(request_id),
-                        json!({ "message": "", "error": message.clone() }),
-                    )
-                    .await?;
-            }
-            if let Some(scope) = inline_scope {
-                if let Some(assist) = self.inline_assist.as_mut() {
-                    assist.session_id = None;
-                }
-                self.current_dialog =
-                    Some(Box::new(self.inline_assist_popup(
-                        scope,
-                        InlineAssistPopupState::Failed(message.clone()),
-                    )));
-                self.render(buffer)?;
-            }
-            if let Some(conversation) = self.agent_manager.conversation_snapshot() {
-                self.notify_agent(
-                    runtime,
-                    "agent:conversation_restore_pending",
-                    plugin_json(serde_json::to_value(conversation)?),
-                )
-                .await?;
-                self.set_legacy_message(Some(format!(
-                    "{message}; restoring the persisted agent session"
-                )));
-            } else if !model_only_bridge {
-                self.notify_agent(runtime, "agent:session_lost", json!({ "message": message }))
-                    .await?;
-            }
-        }
-
         self.refresh_live_inline_history(buffer, runtime).await?;
         self.persist_agent_conversation(/*force*/ false);
 
@@ -12692,7 +11879,9 @@ impl Editor {
         for _ in 0..PLUGIN_REQUESTS_PER_TICK {
             // Boxed so the pane driver does not grow this large future's frame.
             Box::pin(self.drain_agent_pane_effects(runtime)).await?;
-            if self.agent_manager.is_task_finished() {
+            // An agent whose end is still unread would answer requests with state
+            // it already moved past; they wait for the next tick's pump.
+            if self.agent_manager.has_ended() {
                 break;
             }
             let Some(req) = runtime.try_recv_request() else {
@@ -12731,187 +11920,18 @@ impl Editor {
                     needs_render |= self.panel_manager.set_text_panel_header_detail(&id, detail);
                 }
                 PluginRequest::AgentNewSession { cwd } => {
-                    if self.agent_manager.is_task_finished() {
-                        let model_only_bridge = self.agent_manager.is_model_only_bridge();
-                        let message = self
-                            .finish_agent_bridge(runtime, "Codex app-server stopped unexpectedly")
-                            .await?;
-                        if !model_only_bridge {
-                            self.notify_agent(
-                                runtime,
-                                "agent:session_lost",
-                                json!({ "message": message }),
-                            )
-                            .await?;
-                        }
-                    }
-                    self.agent_manager.mark_conversation_requested();
-                    if let Err(error) = self.ensure_agent_bridge(&cwd) {
-                        self.notify_agent(
-                            runtime,
-                            "agent:error",
-                            json!({ "message": error.to_string() }),
-                        )
-                        .await?;
-                        continue;
-                    }
-                    let Some(bridge) = self.agent_manager.bridge() else {
-                        continue;
-                    };
-                    let command = self.agent_manager.next_model().cloned().map_or_else(
-                        || CodexCommand::NewSession { cwd: cwd.clone() },
-                        |selection| CodexCommand::NewSessionWithModel {
-                            cwd: cwd.clone(),
-                            selection,
-                        },
-                    );
-                    if bridge.send(command).await.is_err() {
-                        let message = self
-                            .finish_agent_bridge(
-                                runtime,
-                                "Codex app-server stopped while starting the session",
-                            )
-                            .await?;
-                        self.notify_agent(
-                            runtime,
-                            "agent:session_lost",
-                            json!({ "message": message }),
-                        )
-                        .await?;
-                    }
+                    self.agent_new_session(runtime, cwd).await?;
                 }
                 PluginRequest::AgentResumeSession { cwd, session_id } => {
-                    self.agent_manager.mark_conversation_requested();
-                    if self
-                        .agent_manager
-                        .conversation_tool_contract_version(&session_id)
-                        .is_some_and(|version| {
-                            version != crate::agent_conversation::AGENT_TOOL_CONTRACT_VERSION
-                        })
-                    {
-                        self.notify_agent(runtime, "agent:session_restore_failed",
-                                json!({
-                                    "session_id": session_id,
-                                    "message": "Agent tools changed after this conversation was saved; the transcript remains available and the next message will start a compatible session"
-                                }),
-                            )
-                            .await?;
-                        continue;
-                    }
-                    if self.agent_manager.is_task_finished() {
-                        let _ = self
-                            .finish_agent_bridge(
-                                runtime,
-                                "Codex app-server stopped before restoration",
-                            )
-                            .await?;
-                    }
-                    if let Err(error) = self.ensure_agent_bridge(&cwd) {
-                        self.notify_agent(
-                            runtime,
-                            "agent:session_restore_failed",
-                            json!({
-                                "session_id": session_id,
-                                "message": error.to_string()
-                            }),
-                        )
-                        .await?;
-                        continue;
-                    }
-                    let Some(bridge) = self.agent_manager.bridge() else {
-                        continue;
-                    };
-                    if bridge
-                        .send(CodexCommand::ResumeSession {
-                            cwd,
-                            session_id: session_id.clone(),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        let message = self
-                            .finish_agent_bridge(
-                                runtime,
-                                "Codex app-server stopped while restoring the session",
-                            )
-                            .await?;
-                        self.notify_agent(
-                            runtime,
-                            "agent:session_restore_failed",
-                            json!({ "session_id": session_id, "message": message }),
-                        )
-                        .await?;
-                    }
+                    self.agent_resume_session(runtime, cwd, session_id).await?;
                 }
                 PluginRequest::AgentSwitchSession {
                     cwd,
                     session_id,
                     resume,
                 } => {
-                    let accepted = self
-                        .agent_manager
-                        .update_pane(|lifecycle| lifecycle.switch_pending(&session_id));
-                    if !accepted {
-                        self.notify_agent(
-                            runtime,
-                            "agent:session_restore_failed",
-                            json!({
-                                "session_id": session_id,
-                                "message": "The Agent conversation is busy, has held follow-ups, or is already selected"
-                            }),
-                        )
+                    self.agent_switch_session(runtime, cwd, session_id, resume)
                         .await?;
-                        continue;
-                    }
-                    self.agent_manager.mark_conversation_requested();
-                    if self.agent_manager.is_task_finished() {
-                        let _ = self
-                            .finish_agent_bridge(
-                                runtime,
-                                "Codex app-server stopped before switching sessions",
-                            )
-                            .await?;
-                    }
-                    if let Err(error) = self.ensure_agent_bridge(&cwd) {
-                        self.notify_agent(
-                            runtime,
-                            "agent:session_restore_failed",
-                            json!({
-                                "session_id": session_id,
-                                "message": error.to_string()
-                            }),
-                        )
-                        .await?;
-                        continue;
-                    }
-                    let Some(bridge) = self.agent_manager.bridge() else {
-                        continue;
-                    };
-                    let tool_contract_version = if resume {
-                        self.agent_manager
-                            .conversation_tool_contract_version(&session_id)
-                    } else {
-                        None
-                    };
-                    let command = agent_sessions::session_switch_command(
-                        cwd,
-                        session_id.clone(),
-                        tool_contract_version,
-                    );
-                    if bridge.send(command).await.is_err() {
-                        let message = self
-                            .finish_agent_bridge(
-                                runtime,
-                                "Codex app-server stopped while switching sessions",
-                            )
-                            .await?;
-                        self.notify_agent(
-                            runtime,
-                            "agent:session_restore_failed",
-                            json!({ "session_id": session_id, "message": message }),
-                        )
-                        .await?;
-                    }
                 }
                 PluginRequest::AgentPrompt { session_id, text } => {
                     let context = self.agent_context_payload();
@@ -12944,53 +11964,10 @@ impl Editor {
                     self.handle_agent_pane_request(request);
                 }
                 PluginRequest::AgentCancel { session_id } => {
-                    self.abandon_agent_edit_decision(Some(&session_id), "the turn was cancelled");
-                    self.agent_manager.begin_stopping(&session_id);
-                    let Some(bridge) = self.agent_manager.bridge() else {
-                        continue;
-                    };
-                    if bridge
-                        .send(CodexCommand::Cancel { session_id })
-                        .await
-                        .is_err()
-                    {
-                        self.notify_agent(
-                            runtime,
-                            "agent:error",
-                            json!({ "message": "Codex app-server stopped" }),
-                        )
-                        .await?;
-                    }
+                    self.agent_cancel(runtime, session_id).await?;
                 }
                 PluginRequest::AgentCloseSession { session_id } => {
-                    self.abandon_agent_edit_decision(
-                        Some(&session_id),
-                        "the conversation was closed",
-                    );
-                    self.finish_inline_agent_outcome(
-                        &session_id,
-                        crate::inline_history::InlineAgentState::Cancelled,
-                        Some("Agent session closed."),
-                    );
-                    self.agent_manager.mark_session_inactive(&session_id);
-                    self.agent_manager.discard_session_queue(&session_id);
-                    self.agent_manager
-                        .update_pane(|lifecycle| lifecycle.session_closed(&session_id));
-                    let Some(bridge) = self.agent_manager.bridge() else {
-                        continue;
-                    };
-                    if bridge
-                        .send(CodexCommand::CloseSession { session_id })
-                        .await
-                        .is_err()
-                    {
-                        self.notify_agent(
-                            runtime,
-                            "agent:error",
-                            json!({ "message": "Codex app-server stopped" }),
-                        )
-                        .await?;
-                    }
+                    self.agent_close_session(runtime, session_id).await?;
                 }
                 PluginRequest::AgentArchiveSession { session_id } => {
                     self.abandon_agent_edit_decision(
@@ -13025,66 +12002,19 @@ impl Editor {
                     staged_diff,
                     recent_commits,
                 } => {
-                    let prompt = commit_message_prompt(&branch, &staged_diff, &recent_commits);
-                    let result = match prompt {
-                        Err(error) => Err(error),
-                        Ok(prompt) => {
-                            if self.agent_manager.is_task_finished() {
-                                let _ = self
-                                    .finish_agent_bridge(
-                                        runtime,
-                                        "Codex app-server stopped unexpectedly",
-                                    )
-                                    .await?;
-                            }
-                            self.ensure_agent_bridge(&get_workspace_path())
-                                .and_then(|()| {
-                                    let bridge = self.agent_manager.bridge().ok_or_else(|| {
-                                        anyhow::anyhow!("Codex app-server did not start")
-                                    })?;
-                                    bridge.try_send(CodexCommand::GenerateCommitMessage {
-                                        request_id: request_id.get(),
-                                        cwd,
-                                        prompt,
-                                    })
-                                })
-                        }
-                    };
-                    if let Err(error) = result {
-                        self.plugin_registry
-                            .resolve_request(
-                                runtime,
-                                request_id,
-                                json!({ "message": "", "error": error.to_string() }),
-                            )
-                            .await?;
-                    } else {
-                        self.agent_manager
-                            .mark_commit_message_pending(request_id.get());
-                    }
+                    self.agent_generate_commit_message(
+                        runtime,
+                        request_id,
+                        cwd,
+                        branch,
+                        staged_diff,
+                        recent_commits,
+                    )
+                    .await?;
                 }
-                PluginRequest::AgentPermissionResponse {
-                    request_id,
-                    option_id,
-                } => {
-                    let Some(bridge) = self.agent_manager.bridge() else {
-                        continue;
-                    };
-                    if bridge
-                        .send(CodexCommand::PermissionResponse {
-                            request_id,
-                            option_id,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        self.notify_agent(
-                            runtime,
-                            "agent:error",
-                            json!({ "message": "Codex app-server stopped" }),
-                        )
-                        .await?;
-                    }
+                PluginRequest::AgentPermissionResponse { request_id, .. } => {
+                    // Agents decline approvals themselves; there is nothing to answer.
+                    log!("Ignoring permission response {request_id}: no approval is pending");
                 }
                 PluginRequest::EditHistory { request_id, scope } => {
                     let scope = if scope.as_deref() == Some("workspace") {
@@ -35537,7 +34467,7 @@ impl Editor {
         request: EditorToolRequest,
     ) -> anyhow::Result<Value> {
         self.agent_manager
-            .mark_session_active(request.session_id.clone());
+            .mark_session_active(request.session_id.as_str().to_string());
         let mut render_buffer = RenderBuffer::new(
             self.size.0 as usize,
             self.size.1 as usize,
@@ -35937,6 +34867,7 @@ impl Editor {
 
 #[cfg(test)]
 mod test {
+    use super::test_agent::{AgentCommand, AgentTestHandle};
     use super::*;
     use crate::lsp::DiagnosticSeverity;
     use std::path::{Path, PathBuf};
@@ -37456,7 +36387,8 @@ mod test {
         let buffer_id = editor.current_buffer().id();
         let before = editor.current_buffer().contents();
         let request = EditorToolRequest {
-            session_id: "directories".to_string(),
+            session_id: crate::agent_backend::ids::SessionId::from_raw("directories".to_string()),
+            turn: None,
             call: EditorToolCall::CreateDirectory {
                 path: "go/examples".to_string(),
             },
@@ -37498,7 +36430,8 @@ mod test {
         editor.test_set_agent_root(root.path());
         let buffers = editor.buffer_manager.len();
         let request = |call| EditorToolRequest {
-            session_id: "protected".to_string(),
+            session_id: crate::agent_backend::ids::SessionId::from_raw("protected".to_string()),
+            turn: None,
             call,
         };
         for path in [
@@ -37555,7 +36488,10 @@ mod test {
         ] {
             let result = editor
                 .test_run_agent_editor_tool(EditorToolRequest {
-                    session_id: "directories".to_string(),
+                    session_id: crate::agent_backend::ids::SessionId::from_raw(
+                        "directories".to_string(),
+                    ),
+                    turn: None,
                     call: EditorToolCall::CreateDirectory {
                         path: path.to_string(),
                     },
@@ -37575,7 +36511,8 @@ mod test {
         let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
         editor.test_set_agent_root(root.path());
         let request = |call| EditorToolRequest {
-            session_id: "directories".to_string(),
+            session_id: crate::agent_backend::ids::SessionId::from_raw("directories".to_string()),
+            turn: None,
             call,
         };
         let read = editor
@@ -37659,7 +36596,10 @@ mod test {
             .unwrap()]);
         editor.test_set_agent_root(root.path());
         let request = |call| EditorToolRequest {
-            session_id: "external-change".to_string(),
+            session_id: crate::agent_backend::ids::SessionId::from_raw(
+                "external-change".to_string(),
+            ),
+            turn: None,
             call,
         };
 
@@ -37714,7 +36654,8 @@ mod test {
         let buffers = editor.buffer_manager.len();
         let active = editor.current_buffer().id();
         let request = |call| EditorToolRequest {
-            session_id: "disk-read".to_string(),
+            session_id: crate::agent_backend::ids::SessionId::from_raw("disk-read".to_string()),
+            turn: None,
             call,
         };
         let read = |line_count| {
@@ -37780,7 +36721,8 @@ mod test {
             .await
             .unwrap();
         let request = |call| EditorToolRequest {
-            session_id: "minimal-hunks".to_string(),
+            session_id: crate::agent_backend::ids::SessionId::from_raw("minimal-hunks".to_string()),
+            turn: None,
             call,
         };
         let read = editor
@@ -37864,7 +36806,10 @@ mod test {
         sender
             .send(crate::agent_tools::PendingEditorTool {
                 request: EditorToolRequest {
-                    session_id: "session-1".to_string(),
+                    session_id: crate::agent_backend::ids::SessionId::from_raw(
+                        "session-1".to_string(),
+                    ),
+                    turn: None,
                     call: EditorToolCall::ApplyEdits {
                         path: "document.rs".to_string(),
                         expected_revision: editor.current_buffer().revision(),
@@ -38065,7 +37010,8 @@ mod test {
             .agent_manager
             .record_user_message("session-1", "turn-1", "Rename line ten\nplease");
         let request = |call| EditorToolRequest {
-            session_id: "session-1".to_string(),
+            session_id: crate::agent_backend::ids::SessionId::from_raw("session-1".to_string()),
+            turn: None,
             call,
         };
         let read = editor
@@ -38291,7 +37237,8 @@ mod test {
         let mut editor = test_editor(/*width*/ 100, /*height*/ 30);
         editor.test_set_agent_root(root.path());
         let request = |call| EditorToolRequest {
-            session_id: "big".to_string(),
+            session_id: crate::agent_backend::ids::SessionId::from_raw("big".to_string()),
+            turn: None,
             call,
         };
         let read = editor
@@ -38348,7 +37295,10 @@ mod test {
             .unwrap()]);
         editor.test_set_agent_root(root.path());
         let request = |call| EditorToolRequest {
-            session_id: "unsaved-human-edit".to_string(),
+            session_id: crate::agent_backend::ids::SessionId::from_raw(
+                "unsaved-human-edit".to_string(),
+            ),
+            turn: None,
             call,
         };
         let read = editor
@@ -38399,7 +37349,8 @@ mod test {
             .unwrap()]);
         editor.test_set_agent_root(root.path());
         let request = |start_line, line_count| EditorToolRequest {
-            session_id: "paged-read".to_string(),
+            session_id: crate::agent_backend::ids::SessionId::from_raw("paged-read".to_string()),
+            turn: None,
             call: EditorToolCall::ReadFile {
                 path: "main.rs".to_string(),
                 start_line,
@@ -38458,7 +37409,10 @@ mod test {
         sender
             .send(crate::agent_tools::PendingEditorTool {
                 request: EditorToolRequest {
-                    session_id: "session-1".to_string(),
+                    session_id: crate::agent_backend::ids::SessionId::from_raw(
+                        "session-1".to_string(),
+                    ),
+                    turn: None,
                     call: EditorToolCall::ReadFile {
                         path: "second.rs".to_string(),
                         start_line: 1,
@@ -38480,7 +37434,10 @@ mod test {
         sender
             .send(crate::agent_tools::PendingEditorTool {
                 request: EditorToolRequest {
-                    session_id: "session-1".to_string(),
+                    session_id: crate::agent_backend::ids::SessionId::from_raw(
+                        "session-1".to_string(),
+                    ),
+                    turn: None,
                     call: EditorToolCall::ReadFile {
                         path: "long.rs".to_string(),
                         start_line: 1,
@@ -38506,7 +37463,10 @@ mod test {
         sender
             .send(crate::agent_tools::PendingEditorTool {
                 request: EditorToolRequest {
-                    session_id: "session-1".to_string(),
+                    session_id: crate::agent_backend::ids::SessionId::from_raw(
+                        "session-1".to_string(),
+                    ),
+                    turn: None,
                     call: EditorToolCall::OpenFile {
                         path: "second.rs".to_string(),
                         line: 0,
@@ -38551,7 +37511,10 @@ mod test {
         let delay = editor
             .prepare_agent_follow_step(
                 &EditorToolRequest {
-                    session_id: "session-1".to_string(),
+                    session_id: crate::agent_backend::ids::SessionId::from_raw(
+                        "session-1".to_string(),
+                    ),
+                    turn: None,
                     call: EditorToolCall::ApplyEdits {
                         path: "second.rs".to_string(),
                         expected_revision: 0,
@@ -38584,20 +37547,32 @@ mod test {
     }
 
     #[test]
-    fn agent_activity_payload_keeps_structured_updates_and_normalizes_keys() {
-        let (name, payload) = agent_event_payload(CodexEvent::Activity {
-            session_id: ("session-1").to_string(),
-            update: json!({
-                "sessionUpdate": "tool_call_update",
-                "toolCallId": "tool-1",
-                "status": "in_progress"
+    fn agent_activity_payload_keeps_structured_updates_with_plugin_keys() {
+        let (name, payload) = agent_payloads::agent_event_payload(
+            &crate::agent_backend::events::Event::Turn(crate::agent_backend::events::TurnEvent {
+                session: crate::agent_backend::ids::SessionId::from_raw("session-1".to_string()),
+                turn: TurnId::mint(),
+                kind: crate::agent_backend::events::TurnEventKind::Activity(
+                    crate::agent_backend::types::Activity::ToolFinished(
+                        crate::agent_backend::types::ToolActivity {
+                            tool_call_id: "tool-1".into(),
+                            kind: crate::agent_backend::types::ToolKind::Read,
+                            title: "Reading main.rs".into(),
+                            full_title: "Reading /workspace/main.rs".into(),
+                            status: crate::agent_backend::types::ToolStatus::InProgress,
+                            detail: String::new(),
+                        },
+                    ),
+                ),
             }),
-        });
+        )
+        .unwrap();
 
         assert_eq!(name, "agent:activity");
         assert_eq!(payload["session_id"], "session-1");
         assert_eq!(payload["update"]["session_update"], "tool_call_update");
         assert_eq!(payload["update"]["tool_call_id"], "tool-1");
+        assert_eq!(payload["update"]["status"], "in_progress");
     }
 
     #[tokio::test]
@@ -40899,18 +39874,10 @@ builtin = "rust"
         let mut core = DetachedEditorCore::new(test_editor(/*width*/ 80, /*height*/ 24))
             .await
             .unwrap();
-        let capacity = NonZeroUsize::new(AGENT_EVENTS_PER_TICK + 1).unwrap();
-        let (bridge, worker) = CodexBridge::channel(capacity);
+        let agent = AgentTestHandle::install(&mut core.editor);
         for index in 0..=AGENT_EVENTS_PER_TICK {
-            worker
-                .send(CodexEvent::Update {
-                    session_id: ("session-1").to_string(),
-                    text: index.to_string(),
-                })
-                .await
-                .unwrap();
+            agent.emit_update("session-1", &index.to_string());
         }
-        core.editor.agent_manager.set_bridge(bridge);
 
         core.input(crate::headless::InputEvent::Key {
             code: crate::headless::KeyCode::Character('l'),
@@ -40920,12 +39887,16 @@ builtin = "rust"
         .await
         .unwrap();
 
+        assert_eq!(agent.pending(), 1);
+        let Some(crate::agent_backend::events::Event::Turn(undelivered)) =
+            core.editor.agent_manager.agents_mut().poll()
+        else {
+            panic!("the undelivered event is the last update");
+        };
         assert!(matches!(
-            core.editor
-                .agent_manager
-                .bridge_mut()
-                .and_then(CodexBridge::try_recv),
-            Some(CodexEvent::Update { text, .. }) if text == AGENT_EVENTS_PER_TICK.to_string()
+            undelivered.kind,
+            crate::agent_backend::events::TurnEventKind::Delta(text)
+                if text == AGENT_EVENTS_PER_TICK.to_string()
         ));
         drain_plugin_requests();
     }
@@ -40975,33 +39946,14 @@ builtin = "rust"
             .await
             .unwrap();
         let event_count = AGENT_EVENTS_PER_TICK + 8;
-        let capacity = NonZeroUsize::new(event_count + 1).unwrap();
-        let (bridge, worker) = CodexBridge::channel(capacity);
+        let agent = AgentTestHandle::install(&mut editor);
         for index in 0..event_count {
-            worker
-                .send(CodexEvent::Update {
-                    session_id: ("session-1").to_string(),
-                    text: index.to_string(),
-                })
-                .await
-                .unwrap();
+            agent.emit_update("session-1", &index.to_string());
         }
-        worker
-            .send(CodexEvent::Completed {
-                session_id: ("session-1").to_string(),
-                stop_reason: "end_turn".to_string(),
-            })
-            .await
-            .unwrap();
-        drop(worker);
-        editor.agent_manager.set_bridge(bridge);
+        agent.emit_completed("session-1", "end_turn");
+        agent.open_session();
         editor.agent_manager.mark_session_active("session-1");
-        editor.agent_manager.set_task(tokio::spawn(async move {
-            anyhow::bail!("fixture adapter exited")
-        }));
-        while !editor.agent_manager.is_task_finished() {
-            tokio::task::yield_now().await;
-        }
+        agent.lose("Codex app-server failed: fixture adapter exited");
         let mut buffer =
             RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
         ACTION_DISPATCHER.send_request(PluginRequest::AgentNewSession {
@@ -41017,8 +39969,11 @@ builtin = "rust"
             .await
             .unwrap();
 
-        assert!(editor.agent_manager.has_bridge());
-        assert!(editor.agent_manager.is_task_finished());
+        assert_eq!(
+            agent.pending(),
+            10,
+            "the 8 updates left, the completion and the loss wait for the next tick"
+        );
         assert!(editor.agent_manager.is_session_active("session-1"));
         assert!(editor.last_error.is_none());
         assert!(matches!(
@@ -41042,9 +39997,212 @@ builtin = "rust"
             .collect::<String>();
         expected.push_str("completed,lost:Codex app-server failed: fixture adapter exited");
         assert_eq!(editor.last_error.as_deref(), Some(expected.as_str()));
-        assert!(!editor.agent_manager.has_bridge());
-        assert!(!editor.agent_manager.is_task_finished());
+        assert!(!editor.agent_manager.is_running());
         assert!(!editor.agent_manager.is_session_active("session-1"));
+        drain_plugin_requests();
+    }
+
+    async fn editor_recording_agent_losses() -> (Editor, Runtime, tempfile::TempDir) {
+        drain_plugin_requests();
+        let root = tempfile::tempdir().unwrap();
+        let plugin = root.path().join("agent-loss-recorder.hk");
+        std::fs::write(
+            &plugin,
+            r#"
+                pub fn activate() {
+                    red::state_set("trace", "");
+                    red::on("agent:update", update);
+                    red::on("agent:session_lost", lost);
+                }
+
+                fn update(event: Json) {
+                    red::state_set("trace", red::string(red::state("trace"), "") + "update;");
+                }
+
+                fn lost(event: Json) {
+                    red::state_set(
+                        "trace",
+                        red::string(red::state("trace"), "")
+                            + "lost[" + red::string(event.session_id, "-")
+                            + "|" + red::string(event.prompt, "-")
+                            + "|" + red::string(event.message, "-") + "];"
+                    );
+                    red::execute("Print", red::string(red::state("trace"), ""));
+                }
+            "#,
+        )
+        .unwrap();
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let mut runtime = Runtime::new();
+        editor
+            .plugin_registry
+            .add("agent_loss_recorder", plugin.to_string_lossy().as_ref());
+        editor
+            .plugin_registry
+            .initialize(&mut runtime)
+            .await
+            .unwrap();
+        (editor, runtime, root)
+    }
+
+    /// What the plugin heard, and what the agent was asked, when a prompt
+    /// reached an agent after `setup` ran.
+    async fn prompt_after(setup: impl FnOnce(&AgentTestHandle)) -> (String, Vec<AgentCommand>) {
+        let (mut editor, mut runtime, _root) = editor_recording_agent_losses().await;
+        let agent = AgentTestHandle::install(&mut editor);
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
+        setup(&agent);
+        editor
+            .dispatch_agent_prompt(&mut runtime, "session-1".into(), "hello".into(), None)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            editor
+                .service_background(&mut buffer, &mut runtime)
+                .await
+                .unwrap();
+        }
+        assert!(!editor.agent_manager.is_running());
+        (
+            editor.last_error.clone().unwrap_or_default(),
+            agent.commands(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_prompt_to_an_agent_that_ended_unread_reports_exactly_one_loss_with_the_prompt() {
+        let unexplained = crate::agent_backend::events::unexplained_loss(
+            crate::agent_backend::ids::BackendKind::Codex,
+        );
+        let explained = "Codex app-server failed: worker died";
+
+        let (heard, commands) = prompt_after(|agent| {
+            agent.emit_update("session-1", "stale");
+            agent.lose(explained);
+        })
+        .await;
+        assert_eq!(
+            heard, "lost[session-1|hello|Codex app-server failed: worker died];",
+            "buffered events are dropped and the loss is reported once"
+        );
+        assert_eq!(commands, [], "the prompt was never sent");
+
+        let (heard, _) = prompt_after(|agent| agent.lose(&unexplained)).await;
+        assert_eq!(
+            heard,
+            "lost[session-1|hello|Codex app-server stopped before the prompt was sent];"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prompt_the_agent_refuses_because_it_just_ended_reports_exactly_one_loss() {
+        let unexplained = crate::agent_backend::events::unexplained_loss(
+            crate::agent_backend::ids::BackendKind::Codex,
+        );
+
+        let (heard, _) =
+            prompt_after(|agent| agent.fail_next_gone("Codex app-server failed: pipe closed"))
+                .await;
+        assert_eq!(
+            heard,
+            "lost[session-1|hello|Codex app-server failed: pipe closed];"
+        );
+
+        let (heard, _) = prompt_after(|agent| agent.fail_next_gone(&unexplained)).await;
+        assert_eq!(
+            heard,
+            "lost[session-1|hello|Codex app-server stopped while sending the prompt];"
+        );
+    }
+
+    async fn new_session_on_an_ended_agent(conversations: bool) -> String {
+        let (mut editor, mut runtime, root) = editor_recording_agent_losses().await;
+        let agent = AgentTestHandle::install(&mut editor);
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
+        if conversations {
+            agent.open_session();
+        }
+        agent.lose("Codex app-server failed: worker died");
+        editor
+            .agent_new_session(&mut runtime, root.path().to_path_buf())
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            editor
+                .service_background(&mut buffer, &mut runtime)
+                .await
+                .unwrap();
+        }
+        assert!(editor.agent_manager.is_running(), "a fresh agent started");
+        editor.last_error.clone().unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn a_new_session_on_an_ended_agent_reports_the_loss_only_when_conversations_ran() {
+        assert_eq!(
+            new_session_on_an_ended_agent(/*conversations*/ true).await,
+            "lost[-|-|Codex app-server failed: worker died];"
+        );
+        assert_eq!(
+            new_session_on_an_ended_agent(/*conversations*/ false).await,
+            "",
+            "a worker that only answered queries is replaced silently"
+        );
+    }
+
+    #[tokio::test]
+    async fn settling_an_ended_agent_for_a_query_tells_the_plugin_nothing() {
+        let (mut editor, mut runtime, _root) = editor_recording_agent_losses().await;
+        let agent = AgentTestHandle::install(&mut editor);
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
+        agent.open_session();
+        agent.lose("Codex app-server failed: worker died");
+
+        editor.settle_ended_agent(&mut runtime).await.unwrap();
+        for _ in 0..2 {
+            editor
+                .service_background(&mut buffer, &mut runtime)
+                .await
+                .unwrap();
+        }
+
+        assert!(editor.last_error.is_none());
+        assert!(!editor.agent_manager.is_running());
+        assert!(!editor.agent_manager.agents().has_ended());
+    }
+
+    #[tokio::test]
+    async fn a_saturated_agent_pump_does_not_defer_plugin_requests_of_a_live_agent() {
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let mut runtime = Runtime::new();
+        let agent = AgentTestHandle::install(&mut editor);
+        for index in 0..AGENT_EVENTS_PER_TICK + 8 {
+            agent.emit_update("session-2", &index.to_string());
+        }
+        ACTION_DISPATCHER.send_request(PluginRequest::AgentPrompt {
+            session_id: "session-1".to_string(),
+            text: "now".to_string(),
+        });
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
+
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert_eq!(agent.pending(), 8);
+        assert_eq!(
+            agent.commands(),
+            [AgentCommand::Prompt {
+                session: "session-1".into(),
+                text: "now".into()
+            }]
+        );
         drain_plugin_requests();
     }
 
@@ -41085,17 +40243,15 @@ builtin = "rust"
 
     #[tokio::test]
     async fn prompt_sent_during_a_cancel_runs_after_the_interrupted_turn_ends() {
-        fn prompt_text(command: Option<CodexCommand>) -> Option<String> {
-            match command? {
-                CodexCommand::Prompt { text, .. }
-                | CodexCommand::PromptWithContext { text, .. } => Some(text),
-                _ => None,
-            }
-        }
+        let prompted = |text: &str| {
+            [AgentCommand::Prompt {
+                session: "session-1".to_string(),
+                text: text.to_string(),
+            }]
+        };
         drain_plugin_requests();
         let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
-        let (bridge, mut worker) = CodexBridge::channel(NonZeroUsize::new(8).unwrap());
-        editor.agent_manager.set_bridge(bridge);
+        let agent = AgentTestHandle::install(&mut editor);
         let mut buffer =
             RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
         let mut runtime = Runtime::new();
@@ -41109,7 +40265,7 @@ builtin = "rust"
             .service_background(&mut buffer, &mut runtime)
             .await
             .unwrap();
-        assert_eq!(prompt_text(worker.recv().await).as_deref(), Some("first"));
+        assert_eq!(agent.commands(), prompted("first"));
 
         ACTION_DISPATCHER.send_request(PluginRequest::AgentCancel {
             session_id: "session-1".to_string(),
@@ -41118,114 +40274,119 @@ builtin = "rust"
             .service_background(&mut buffer, &mut runtime)
             .await
             .unwrap();
-        assert!(matches!(
-            worker.recv().await,
-            Some(CodexCommand::Cancel { .. })
-        ));
-        // The worker acknowledges the cancel before Codex finishes the turn.
-        worker
-            .send(CodexEvent::Cancelled {
-                session_id: "session-1".to_string(),
-            })
-            .await
-            .unwrap();
+        assert_eq!(
+            agent.commands(),
+            [AgentCommand::Stop {
+                session: "session-1".to_string()
+            }]
+        );
+        // The agent acknowledges the stop before it finishes the turn.
+        agent.emit_cancelled("session-1");
         ACTION_DISPATCHER.send_request(prompt("second"));
         editor
             .service_background(&mut buffer, &mut runtime)
             .await
             .unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), worker.recv())
-                .await
-                .is_err(),
+        assert_eq!(
+            agent.commands(),
+            [],
             "the follow-up must wait for the interrupted turn to end"
         );
-        // A rejected interrupt leaves the turn running, so the prompt keeps waiting.
-        worker
-            .send(CodexEvent::CancelFailed {
-                session_id: "session-1".to_string(),
-                message: "interrupt rejected".to_string(),
-            })
-            .await
-            .unwrap();
+        // A rejected stop leaves the turn running, so the prompt keeps waiting.
+        agent.emit_cancel_failed("session-1", "interrupt rejected");
         editor
             .service_background(&mut buffer, &mut runtime)
             .await
             .unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), worker.recv())
-                .await
-                .is_err(),
+        assert_eq!(
+            agent.commands(),
+            [],
             "a failed cancel must not release the held follow-up"
         );
         assert!(editor.agent_manager.is_session_busy("session-1"));
 
-        worker
-            .send(CodexEvent::Completed {
-                session_id: "session-1".to_string(),
-                stop_reason: "interrupted".to_string(),
-            })
-            .await
-            .unwrap();
+        agent.emit_completed("session-1", "interrupted");
         editor
             .service_background(&mut buffer, &mut runtime)
             .await
             .unwrap();
 
-        assert_eq!(prompt_text(worker.recv().await).as_deref(), Some("second"));
+        assert_eq!(agent.commands(), prompted("second"));
         assert!(editor.agent_manager.is_session_active("session-1"));
         drain_plugin_requests();
     }
 
     #[tokio::test]
-    async fn stale_permission_does_not_block_input_when_the_agent_command_queue_is_full() {
+    async fn a_lost_session_returns_its_prompts_and_leaves_the_others_running() {
         drain_plugin_requests();
-        let mut core = DetachedEditorCore::new(test_editor(/*width*/ 80, /*height*/ 24))
-            .await
-            .unwrap();
-        let (bridge, mut worker) = CodexBridge::channel(NonZeroUsize::new(1).unwrap());
-        bridge
-            .send(CodexCommand::Prompt {
-                session_id: ("stalled-session").to_string(),
-                text: "occupy the command queue".to_string(),
-            })
-            .await
-            .unwrap();
-        worker
-            .send(CodexEvent::PermissionRequested {
-                request_id: "stale-permission".to_string(),
-                session_id: ("stalled-session").to_string(),
-                tool_call: json!({ "tool_call_id": "stale-tool" }),
-                options: json!([]),
-            })
-            .await
-            .unwrap();
-        core.editor.agent_manager.set_bridge(bridge);
+        let plugin_root = tempfile::tempdir().unwrap();
+        let plugin = plugin_root.path().join("session-loss-recorder.hk");
+        std::fs::write(
+            &plugin,
+            r#"
+                pub fn activate() {
+                    red::state_set("trace", "");
+                    red::on("agent:prompts_returned", returned);
+                    red::on("agent:session_lost", lost);
+                }
 
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            core.input(crate::headless::InputEvent::Key {
-                code: crate::headless::KeyCode::Character('h'),
-                modifiers: Vec::new(),
-                key_kind: crate::headless::KeyKind::Press,
-            }),
+                fn returned(event: Json) {
+                    red::state_set(
+                        "trace",
+                        red::string(red::state("trace"), "")
+                            + "returned:" + red::string(event.session_id, "") + ","
+                    );
+                }
+
+                fn lost(event: Json) {
+                    red::execute(
+                        "Print",
+                        red::string(red::state("trace"), "")
+                            + "lost:" + red::string(event.session_id, "")
+                            + ":" + red::string(event.message, "")
+                    );
+                }
+            "#,
         )
-        .await
-        .expect("a stale permission must not block editor input")
         .unwrap();
-
-        assert!(core.editor.current_dialog.is_none());
-        assert!(matches!(
-            worker.recv().await,
-            Some(CodexCommand::Prompt { session_id, text })
-                if session_id.as_str() == "stalled-session"
-                    && text == "occupy the command queue"
-        ));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), worker.recv())
-                .await
-                .is_err()
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let mut runtime = Runtime::new();
+        editor
+            .plugin_registry
+            .add("session_loss_recorder", plugin.to_string_lossy().as_ref());
+        editor
+            .plugin_registry
+            .initialize(&mut runtime)
+            .await
+            .unwrap();
+        let agent = AgentTestHandle::install(&mut editor);
+        editor.agent_manager.mark_session_active("doomed");
+        editor.agent_manager.begin_stopping("doomed");
+        editor.agent_manager.queue_prompt(
+            "doomed",
+            agent_manager::QueuedAgentPrompt {
+                text: "held".to_string(),
+                context: None,
+            },
         );
+        editor.agent_manager.mark_session_active("survivor");
+        agent.lose_session("doomed", "the session crashed");
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
+
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            editor.last_error.as_deref(),
+            Some("returned:doomed,lost:doomed:the session crashed")
+        );
+        assert!(editor.agent_manager.is_running());
+        assert!(!editor.agent_manager.is_session_active("doomed"));
+        assert!(editor.agent_manager.is_session_active("survivor"));
+        assert!(agent.commands().is_empty());
         drain_plugin_requests();
     }
 
@@ -43469,11 +42630,7 @@ builtin = "rust"
         let store = SessionStore::new(directory.path().join("session"));
         let latest = store.latest_path();
         editor.set_session_store(store);
-        let (release, wait) = tokio::sync::oneshot::channel();
-        editor.agent_manager.set_task(tokio::spawn(async move {
-            wait.await?;
-            Ok(())
-        }));
+        let release = AgentTestHandle::install(&mut editor).hold_exit();
         let mut runtime = Runtime::new();
 
         let (result, ()) = tokio::join!(editor.finish_interactive(&mut runtime), async {

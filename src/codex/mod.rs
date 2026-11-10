@@ -18,8 +18,6 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::{fs::File, io::Read as _, path::Component};
-
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use ignore::WalkBuilder;
@@ -34,15 +32,28 @@ use tokio::{
     time::timeout,
 };
 
-mod activity;
+mod backend;
+#[cfg(test)]
+pub(crate) mod golden_support;
 mod history;
 mod models;
+#[cfg(test)]
+mod payload_goldens;
 mod sessions;
 mod tool_error;
-pub use models::{AgentModelInfo, AgentModelSelection, ModelRequest};
-pub use sessions::{AgentSessionListRequest, AgentSessionPreviewRequest, AgentSessionScope};
+mod tool_host_adapter;
+mod translate;
 
-use crate::agent_tools::{editor_tool_schemas, EditorToolCall, EditorToolRequest};
+pub use backend::CodexBackend;
+pub use tool_host_adapter::ToolHostAdapter;
+
+use crate::agent_backend::ids::TurnId;
+use crate::agent_backend::types::{
+    Activity, ModelInfo, ModelQuery, ModelResult, ModelSelection, RestoredHistory, SessionPage,
+    SessionPreview, SessionQuery,
+};
+use crate::agent_backend::workspace::TOOL_CONTENT_BYTES;
+use crate::agent_tools::{editor_tool_schemas, EditorToolCall};
 use crate::config::AgentCodexFeature;
 use crate::inline_assist::InlineAssistResult;
 use crate::inline_context::InlineContextCall;
@@ -51,7 +62,6 @@ const APP_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// JSON-RPC error code Red reports for a frame it discarded as too large.
 const FRAME_TOO_LARGE_CODE: i64 = -32099;
 const STDERR_TAIL_BYTES: usize = 32 * 1024;
-const TOOL_CONTENT_BYTES: usize = 960 * 1024;
 const MAX_FILES: usize = 4096;
 #[cfg(unix)]
 const MAX_MATCHES: usize = 200;
@@ -142,19 +152,19 @@ pub enum CodexCommand {
     /// Queries the model catalog or updates one conversation's next-turn settings.
     ModelRequest {
         request_id: i64,
-        request: ModelRequest,
+        request: ModelQuery,
     },
     /// Lists persisted interactive Codex conversations without creating a thread.
     SessionList {
         request_id: i64,
-        request: AgentSessionListRequest,
+        request: SessionQuery,
     },
     /// Reads the latest persisted exchange without resuming or mutating a thread.
     SessionPreview { request_id: i64, session_id: String },
     /// Starts a conversation with an explicitly selected model.
     NewSessionWithModel {
         cwd: PathBuf,
-        selection: AgentModelSelection,
+        selection: ModelSelection,
     },
     /// Starts an isolated, ephemeral inline-edit thread and immediately submits a request.
     InlineAssist {
@@ -210,6 +220,8 @@ pub enum CodexCommand {
     Prompt {
         /// Red session identifier.
         session_id: String,
+        /// Red's id for the turn this prompt starts.
+        turn: TurnId,
         /// User prompt.
         text: String,
     },
@@ -217,6 +229,8 @@ pub enum CodexCommand {
     PromptWithContext {
         /// Red session identifier.
         session_id: String,
+        /// Red's id for the turn this prompt starts.
+        turn: TurnId,
         /// User prompt.
         text: String,
         /// Active document URI.
@@ -234,13 +248,6 @@ pub enum CodexCommand {
         /// Red session identifier.
         session_id: String,
     },
-    /// Resolves a surfaced permission request with an exact offered choice.
-    PermissionResponse {
-        /// App-server request identifier.
-        request_id: String,
-        /// Selected option, or `None` for denial/cancellation.
-        option_id: Option<String>,
-    },
 }
 
 /// Events delivered from the Codex worker to the editor owner.
@@ -249,24 +256,24 @@ pub enum CodexEvent {
     /// Result for a private plugin model request.
     ModelRequestCompleted {
         request_id: i64,
-        result: std::result::Result<Value, String>,
+        result: std::result::Result<ModelResult, String>,
     },
     /// Result for Red's private persisted-session picker request.
     SessionListCompleted {
         request_id: i64,
-        result: std::result::Result<Value, String>,
+        result: std::result::Result<SessionPage, String>,
     },
     /// Side-effect-free latest-exchange preview for the session picker.
     SessionPreviewCompleted {
         request_id: i64,
-        result: std::result::Result<Value, String>,
+        result: std::result::Result<SessionPreview, String>,
     },
     /// A running turn was routed to a different model without changing its next-turn settings.
     SessionModelRerouted { session_id: String, model: String },
     /// Authoritative next-turn settings for a user-visible conversation.
     SessionModelChanged {
         session_id: String,
-        model_info: AgentModelInfo,
+        model_info: ModelInfo,
     },
     /// User-visible prose from an inline turn, retained separately from its result.
     InlineAnswerDelta { request_id: String, text: String },
@@ -316,8 +323,8 @@ pub enum CodexEvent {
     SessionRestored {
         /// Codex thread identifier.
         session_id: String,
-        /// Thread payload returned by `thread/resume`.
-        thread: Value,
+        /// Model-visible history of the rejoined thread.
+        thread: RestoredHistory,
     },
     /// A persisted thread could not be rejoined.
     SessionRestoreFailed {
@@ -340,12 +347,18 @@ pub enum CodexEvent {
         /// Final text returned by `item/completed`.
         text: String,
     },
+    /// The app-server accepted the prompt of a turn Red started: its
+    /// `turn/start` response named the turn.
+    TurnAccepted {
+        /// Owning session.
+        session_id: String,
+    },
     /// Structured activity update for tool and reasoning presentation.
     Activity {
         /// Owning session.
         session_id: String,
-        /// Bounded app-server update payload.
-        update: Value,
+        /// Bounded, human-readable progress for one step of the turn.
+        update: Activity,
     },
     /// Active turn reached a terminal success state.
     Completed {
@@ -367,17 +380,6 @@ pub enum CodexEvent {
         /// User-facing failure description.
         message: String,
     },
-    /// App-server requested a user choice that Red can safely surface.
-    PermissionRequested {
-        /// App-server request identifier.
-        request_id: String,
-        /// Owning session.
-        session_id: String,
-        /// Descriptive tool-call payload.
-        tool_call: Value,
-        /// Exact selectable options supplied by the app-server.
-        options: Value,
-    },
     /// Session or worker operation failed.
     Failed {
         /// Owning session when the failure can be attributed.
@@ -387,23 +389,25 @@ pub enum CodexEvent {
     },
 }
 
-/// Editor-side bounded command sender and non-blocking event receiver.
+/// Editor-side command sender and non-blocking event receiver. Commands are
+/// never refused for lack of room, so sending one never waits.
 pub struct CodexBridge {
-    commands: mpsc::Sender<CodexCommand>,
+    commands: mpsc::UnboundedSender<CodexCommand>,
     events: mpsc::Receiver<CodexEvent>,
 }
 
-/// Worker-side bounded command receiver and event sender.
+/// Worker-side command receiver and event sender.
 pub struct CodexBridgeWorker {
-    commands: mpsc::Receiver<CodexCommand>,
+    commands: mpsc::UnboundedReceiver<CodexCommand>,
     events: mpsc::Sender<CodexEvent>,
 }
 
 impl CodexBridge {
     #[must_use]
-    /// Creates paired editor and worker endpoints with the supplied non-zero capacity.
+    /// Creates paired editor and worker endpoints. `capacity` bounds the
+    /// event channel only; the command channel is unbounded.
     pub fn channel(capacity: NonZeroUsize) -> (Self, CodexBridgeWorker) {
-        let (commands, command_rx) = mpsc::channel(capacity.get());
+        let (commands, command_rx) = mpsc::unbounded_channel();
         let (event_tx, events) = mpsc::channel(capacity.get());
         (
             Self { commands, events },
@@ -414,19 +418,18 @@ impl CodexBridge {
         )
     }
 
-    /// Sends a command with backpressure.
+    /// Sends a command. The command channel is unbounded, so this never waits.
     pub async fn send(&self, command: CodexCommand) -> Result<()> {
         self.commands
             .send(command)
-            .await
-            .context("Codex command channel is closed")
+            .map_err(|_| anyhow::anyhow!("Codex command channel is closed"))
     }
 
-    /// Attempts to send a command without waiting for channel capacity.
+    /// Sends a command without waiting.
     pub fn try_send(&self, command: CodexCommand) -> Result<()> {
         self.commands
-            .try_send(command)
-            .context("Codex command channel is unavailable")
+            .send(command)
+            .map_err(|_| anyhow::anyhow!("Codex command channel is unavailable"))
     }
 
     /// Returns the next ready worker event without blocking.
@@ -456,13 +459,22 @@ impl CodexBridgeWorker {
     }
 }
 
+/// Which agent call is asking for an editor operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodexToolCtx<'a> {
+    /// Red session identifier.
+    pub session_id: &'a str,
+    /// The Red turn that issued the call; `None` for inline and commit-message sessions.
+    pub turn: Option<TurnId>,
+}
+
 #[async_trait]
 /// Editor operations exposed to bounded Codex dynamic tools.
 pub trait CodexToolHost: Send + 'static {
     /// Reads authoritative visible contents for one session.
     async fn read_file(
         &mut self,
-        session_id: &str,
+        ctx: &CodexToolCtx<'_>,
         path: &str,
         start_line: usize,
         line_count: usize,
@@ -470,20 +482,22 @@ pub trait CodexToolHost: Send + 'static {
     /// Replaces complete contents through the editor and persists them.
     async fn write_file(
         &mut self,
-        session_id: &str,
+        ctx: &CodexToolCtx<'_>,
         path: &str,
         expected_revision: u64,
         content: String,
     ) -> Result<Value>;
     /// Dispatches an editor-owned semantic tool request.
-    async fn editor_tool(&mut self, request: EditorToolRequest) -> Result<Value>;
+    async fn editor_tool(&mut self, ctx: &CodexToolCtx<'_>, call: EditorToolCall) -> Result<Value>;
 }
 
 #[derive(Debug)]
 struct Session {
-    model_info: Option<AgentModelInfo>,
+    model_info: Option<ModelInfo>,
     cwd: PathBuf,
     active_turn: Option<String>,
+    /// Red's id for the turn behind `active_turn`.
+    red_turn: Option<TurnId>,
     pending_interrupt_turn_id: Option<String>,
     cancelled: Arc<AtomicBool>,
     allow_sensitive_paths: bool,
@@ -508,7 +522,7 @@ enum SessionKind {
 #[derive(Debug)]
 enum ThreadRequest {
     Agent {
-        selection: Option<AgentModelSelection>,
+        selection: Option<ModelSelection>,
         cwd: PathBuf,
         launch: SessionLaunch,
     },
@@ -579,7 +593,7 @@ enum Pending {
         source_session_id: String,
         session_id: String,
         source_thread: Value,
-        model_info: Option<AgentModelInfo>,
+        model_info: Option<ModelInfo>,
     },
     Config {
         request: ThreadRequest,
@@ -613,7 +627,8 @@ enum InternalEvent {
     },
 }
 
-/// Starts a bounded Codex app-server worker and returns its editor bridge.
+/// Starts a Codex app-server worker and returns its editor bridge. `capacity`
+/// bounds the event channel.
 pub fn start_codex(
     spec: CodexProcessSpec,
     host: impl CodexToolHost,
@@ -627,7 +642,7 @@ pub fn start_codex(
 async fn run<H: CodexToolHost>(
     spec: CodexProcessSpec,
     host: H,
-    mut commands: mpsc::Receiver<CodexCommand>,
+    mut commands: mpsc::UnboundedReceiver<CodexCommand>,
     events: mpsc::Sender<CodexEvent>,
 ) -> Result<()> {
     let policy = spec.policy.clone();
@@ -1058,6 +1073,7 @@ async fn handle_command(
             }
             start_turn(
                 session_id,
+                None,
                 inline_input(&prompt, &context),
                 input,
                 events,
@@ -1120,9 +1136,14 @@ async fn handle_command(
             )
             .await?;
         }
-        CodexCommand::Prompt { session_id, text } => {
+        CodexCommand::Prompt {
+            session_id,
+            turn,
+            text,
+        } => {
             start_turn(
                 session_id,
+                Some(turn),
                 json!([{"type": "text", "text": text}]),
                 input,
                 events,
@@ -1134,12 +1155,14 @@ async fn handle_command(
         }
         CodexCommand::PromptWithContext {
             session_id,
+            turn,
             text,
             uri,
             context,
         } => {
             start_turn(
                 session_id,
+                Some(turn),
                 json!([
                     {"type": "text", "text": text},
                     {
@@ -1164,7 +1187,6 @@ async fn handle_command(
         CodexCommand::CloseSession { session_id } => {
             stop_session(session_id, true, input, events, pending, sessions, next_id).await?;
         }
-        CodexCommand::PermissionResponse { .. } => {}
     }
     Ok(())
 }
@@ -1190,8 +1212,10 @@ async fn start_thread_request(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_turn(
     session_id: String,
+    turn: Option<TurnId>,
     input_items: Value,
     input: &mut (impl AsyncWrite + Unpin),
     events: &mpsc::Sender<CodexEvent>,
@@ -1222,6 +1246,7 @@ async fn start_turn(
             .ok();
         return Ok(());
     }
+    session.red_turn = turn;
     session.cancelled.store(false, Ordering::Relaxed);
     session.pending_interrupt_turn_id = None;
     if let SessionKind::Inline { result, .. } = &mut session.kind {
@@ -1420,7 +1445,7 @@ async fn handle_message<H: CodexToolHost>(
                 && matches!(session.kind, SessionKind::Agent)
         }) {
             if let Some(update) =
-                activity::item_update(&params["item"], method == "item/completed", &session.cwd)
+                translate::activity(&params["item"], method == "item/completed", &session.cwd)
             {
                 events
                     .send(CodexEvent::Activity {
@@ -1520,6 +1545,7 @@ async fn handle_message<H: CodexToolHost>(
             if let Some(session) = sessions.get_mut(&session_id) {
                 if session.active_turn.as_deref() == Some(turn_id) {
                     session.active_turn = None;
+                    session.red_turn = None;
                     session.pending_interrupt_turn_id = None;
                     completed_event = Some(match &mut session.kind {
                         SessionKind::Agent => CodexEvent::Completed {
@@ -1627,7 +1653,7 @@ async fn handle_response(
         session_id,
     } = request
     {
-        let result = sessions::session_preview(&session_id, &message);
+        let result = translate::session_preview(&session_id, &message);
         events
             .send(CodexEvent::SessionPreviewCompleted { request_id, result })
             .await
@@ -1707,7 +1733,7 @@ async fn handle_response(
         events
             .send(CodexEvent::SessionRestored {
                 session_id: session_id.clone(),
-                thread: source_thread,
+                thread: translate::restored_history(&source_thread),
             })
             .await
             .ok();
@@ -1954,9 +1980,10 @@ async fn handle_response(
                 sessions.insert(
                     session_id.clone(),
                     Session {
-                        model_info: AgentModelInfo::from_response(&message["result"]),
+                        model_info: translate::model_info(&message["result"]),
                         cwd,
                         active_turn: None,
+                        red_turn: None,
                         pending_interrupt_turn_id: None,
                         cancelled: Arc::new(AtomicBool::new(false)),
                         allow_sensitive_paths: policy.allow_sensitive_paths,
@@ -1992,7 +2019,10 @@ async fn handle_response(
                             .is_some_and(|turns| !turns.is_empty())
                         {
                             events
-                                .send(CodexEvent::SessionRestored { session_id, thread })
+                                .send(CodexEvent::SessionRestored {
+                                    session_id,
+                                    thread: translate::restored_history(&thread),
+                                })
                                 .await
                                 .ok();
                         } else {
@@ -2016,7 +2046,7 @@ async fn handle_response(
                             events
                                 .send(CodexEvent::SessionRestored {
                                     session_id,
-                                    thread: source_thread,
+                                    thread: translate::restored_history(&source_thread),
                                 })
                                 .await
                                 .ok();
@@ -2053,6 +2083,7 @@ async fn handle_response(
                             .ok();
                         start_turn(
                             session_id,
+                            None,
                             turn_input.expect("inline launch stores turn input"),
                             input,
                             events,
@@ -2065,6 +2096,7 @@ async fn handle_response(
                     None => {
                         start_turn(
                             session_id,
+                            None,
                             turn_input.expect("commit-message launch stores turn input"),
                             input,
                             events,
@@ -2106,7 +2138,16 @@ async fn handle_response(
                 }
                 return Ok(());
             };
+            let accepted = !turn_id.is_empty() && session.red_turn.is_some();
             session.active_turn = Some(turn_id);
+            if accepted {
+                events
+                    .send(CodexEvent::TurnAccepted {
+                        session_id: session_id.clone(),
+                    })
+                    .await
+                    .ok();
+            }
             if session.cancelled.load(Ordering::Relaxed) {
                 interrupt_active_turn(&session_id, input, pending, sessions, next_id).await?;
             }
@@ -2309,6 +2350,7 @@ async fn handle_tool_call<H: CodexToolHost>(
         return send_tool_error(input, id, &tool, &error_context, "inactive Codex turn").await;
     }
     let allow_sensitive_paths = session.allow_sensitive_paths;
+    let turn = session.red_turn;
     let inline_call = if let SessionKind::Inline {
         request_id,
         result: pending_result,
@@ -2370,15 +2412,16 @@ async fn handle_tool_call<H: CodexToolHost>(
     };
     tokio::spawn(async move {
         let started_at = Instant::now();
+        let ctx = CodexToolCtx {
+            session_id: &session_id,
+            turn,
+        };
         let result = timeout(tool_timeout, async {
             if let Some(call) = inline_call {
                 return host
                     .lock()
                     .await
-                    .editor_tool(EditorToolRequest {
-                        session_id: session_id.clone(),
-                        call,
-                    })
+                    .editor_tool(&ctx, call)
                     .await;
             }
             match tool.as_str() {
@@ -2451,7 +2494,7 @@ async fn handle_tool_call<H: CodexToolHost>(
                     let page = host
                         .lock()
                         .await
-                        .read_file(&session_id, path, start_line, line_count)
+                        .read_file(&ctx, path, start_line, line_count)
                         .await?;
                     if let Some(expected_revision) = expected_revision {
                         anyhow::ensure!(
@@ -2470,7 +2513,7 @@ async fn handle_tool_call<H: CodexToolHost>(
                     let content = required_string(&arguments, "content")?.to_string();
                     host.lock()
                         .await
-                        .write_file(&session_id, path, expected_revision, content)
+                        .write_file(&ctx, path, expected_revision, content)
                         .await
                 }
                 "get_editor_state"
@@ -2489,10 +2532,7 @@ async fn handle_tool_call<H: CodexToolHost>(
                     let call = EditorToolCall::parse(&tool, arguments)?;
                     host.lock()
                         .await
-                        .editor_tool(EditorToolRequest {
-                            session_id: session_id.clone(),
-                            call,
-                        })
+                        .editor_tool(&ctx, call)
                         .await
                 }
                 _ => anyhow::bail!("unsupported Codex dynamic tool"),
@@ -2554,7 +2594,7 @@ fn list_file_paths(
     cancelled: &AtomicBool,
     allow_sensitive_paths: bool,
 ) -> Result<FilePaths> {
-    validate_workspace_root(root)?;
+    crate::agent_backend::workspace::validate_workspace_root(root)?;
     let mut files = Vec::new();
     let mut entries = 0_usize;
     let started = Instant::now();
@@ -2615,7 +2655,9 @@ fn search_files(
             if cancelled.load(Ordering::Relaxed) {
                 anyhow::bail!("Codex turn was cancelled");
             }
-            let Some((content, bytes)) = read_workspace_file(root, &relative)? else {
+            let Some((content, bytes)) =
+                crate::agent_backend::workspace::read_workspace_file(root, &relative)?
+            else {
                 continue;
             };
             searched = searched.saturating_add(bytes);
@@ -2641,208 +2683,6 @@ fn search_files(
         }
         Ok(json!({"matches": matches, "truncated": truncated}))
     }
-}
-
-pub(crate) fn validate_workspace_root(root: &Path) -> Result<()> {
-    anyhow::ensure!(root.is_absolute(), "workspace root must be absolute");
-    let inspected = physical_workspace_root(root);
-    for ancestor in inspected.ancestors() {
-        let metadata =
-            std::fs::symlink_metadata(ancestor).context("failed to inspect workspace root")?;
-        anyhow::ensure!(
-            !metadata.file_type().is_symlink(),
-            "workspace root cannot contain a symlink"
-        );
-    }
-    anyhow::ensure!(
-        std::fs::symlink_metadata(inspected)?.is_dir(),
-        "workspace root must be a directory"
-    );
-    Ok(())
-}
-
-pub(crate) fn physical_workspace_root(root: &Path) -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        for (alias, target) in [
-            (Path::new("/var"), Path::new("/private/var")),
-            (Path::new("/tmp"), Path::new("/private/tmp")),
-            (Path::new("/etc"), Path::new("/private/etc")),
-        ] {
-            if let Ok(suffix) = root.strip_prefix(alias) {
-                return target.join(suffix);
-            }
-        }
-    }
-    root.to_path_buf()
-}
-
-#[cfg(unix)]
-fn open_workspace_directory(root: &Path) -> Result<File> {
-    use std::os::fd::{AsRawFd, FromRawFd};
-
-    use nix::{
-        fcntl::{openat, OFlag},
-        sys::stat::Mode,
-    };
-
-    let inspected = physical_workspace_root(root);
-    let descriptor = openat(
-        None,
-        Path::new("/"),
-        OFlag::O_RDONLY
-            | OFlag::O_CLOEXEC
-            | OFlag::O_DIRECTORY
-            | OFlag::O_NOFOLLOW
-            | OFlag::O_NONBLOCK,
-        Mode::empty(),
-    )
-    .context("failed to safely open filesystem root")?;
-    // SAFETY: `openat` returned a new descriptor and `File` becomes its sole owner.
-    let mut directory = unsafe { File::from_raw_fd(descriptor) };
-    for component in inspected.components() {
-        let name = match component {
-            Component::RootDir | Component::CurDir => continue,
-            Component::Normal(name) => name,
-            Component::ParentDir | Component::Prefix(_) => {
-                anyhow::bail!("workspace root contains a non-normal path component");
-            }
-        };
-        let descriptor = openat(
-            Some(directory.as_raw_fd()),
-            name,
-            OFlag::O_RDONLY
-                | OFlag::O_CLOEXEC
-                | OFlag::O_DIRECTORY
-                | OFlag::O_NOFOLLOW
-                | OFlag::O_NONBLOCK,
-            Mode::empty(),
-        )
-        .context("failed to safely open workspace root component")?;
-        // SAFETY: `openat` returned a new descriptor and `File` becomes its sole owner.
-        directory = unsafe { File::from_raw_fd(descriptor) };
-    }
-    Ok(directory)
-}
-
-#[cfg(unix)]
-fn open_workspace_file_at(directory: &File, relative: &Path) -> Result<Option<File>> {
-    use std::os::fd::{AsRawFd, FromRawFd};
-
-    use nix::{
-        fcntl::{openat, OFlag},
-        sys::stat::Mode,
-    };
-
-    let mut components = relative.components().peekable();
-    let mut opened_directory: Option<File> = None;
-    while let Some(component) = components.next() {
-        let Component::Normal(name) = component else {
-            anyhow::bail!("workspace walker returned a non-normal path");
-        };
-        let final_component = components.peek().is_none();
-        let mut flags = OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK;
-        if !final_component {
-            flags |= OFlag::O_DIRECTORY;
-        }
-        let parent = opened_directory.as_ref().unwrap_or(directory);
-        let descriptor = match openat(Some(parent.as_raw_fd()), name, flags, Mode::empty()) {
-            Ok(descriptor) => descriptor,
-            Err(_) => return Ok(None),
-        };
-        // SAFETY: `openat` returned a new descriptor and `File` becomes its sole owner.
-        let file = unsafe { File::from_raw_fd(descriptor) };
-        if final_component {
-            return Ok(Some(file));
-        }
-        opened_directory = Some(file);
-    }
-    Ok(None)
-}
-
-#[cfg(unix)]
-fn open_workspace_file(root: &Path, relative: &Path) -> Result<Option<File>> {
-    open_workspace_file_at(&open_workspace_directory(root)?, relative)
-}
-
-#[cfg(unix)]
-fn read_workspace_file(root: &Path, relative: &str) -> Result<Option<(String, u64)>> {
-    let Some(file) = open_workspace_file(root, Path::new(relative))? else {
-        return Ok(None);
-    };
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() > TOOL_CONTENT_BYTES as u64 {
-        return Ok(None);
-    }
-    let mut bytes = Vec::new();
-    file.take(TOOL_CONTENT_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > TOOL_CONTENT_BYTES {
-        return Ok(None);
-    }
-    let byte_count = bytes.len() as u64;
-    let Ok(content) = String::from_utf8(bytes) else {
-        return Ok(None);
-    };
-    Ok(Some((content, byte_count)))
-}
-
-/// Read through the same no-symlink descriptor walk used by workspace search.
-pub(crate) fn read_inline_workspace_file(
-    root: &Path,
-    relative: &str,
-    limit: usize,
-) -> Result<Option<String>> {
-    #[cfg(unix)]
-    {
-        validate_workspace_root(root)?;
-        let Some(file) = open_workspace_file(root, Path::new(relative))? else {
-            return Ok(None);
-        };
-        read_inline_workspace_handle(file, limit)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (root, relative, limit);
-        anyhow::bail!("safe on-disk inline context reads are unavailable on this platform")
-    }
-}
-
-/// A validated directory handle that confines every search read with `openat`.
-#[cfg(unix)]
-pub(crate) struct InlineWorkspaceReader {
-    directory: File,
-}
-
-#[cfg(unix)]
-impl InlineWorkspaceReader {
-    pub(crate) fn new(root: &Path) -> Result<Self> {
-        validate_workspace_root(root)?;
-        Ok(Self {
-            directory: open_workspace_directory(root)?,
-        })
-    }
-
-    pub(crate) fn read(&self, relative: &str, limit: usize) -> Result<Option<String>> {
-        let Some(file) = open_workspace_file_at(&self.directory, Path::new(relative))? else {
-            return Ok(None);
-        };
-        read_inline_workspace_handle(file, limit)
-    }
-}
-
-#[cfg(unix)]
-fn read_inline_workspace_handle(file: File, limit: usize) -> Result<Option<String>> {
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() > limit as u64 {
-        return Ok(None);
-    }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
-    if bytes.len() > limit || bytes.contains(&0) {
-        return Ok(None);
-    }
-    Ok(String::from_utf8(bytes).ok())
 }
 
 fn restricted_config(response: &Value, policy: &AgentRuntimePolicy) -> Option<Value> {
@@ -3158,64 +2998,13 @@ fn required_string<'a>(arguments: &'a Value, name: &str) -> Result<&'a str> {
         .with_context(|| format!("missing string argument {name}"))
 }
 
-#[must_use]
-pub fn find_executable(command: &str) -> Option<PathBuf> {
-    let command = Path::new(command);
-    if command.components().count() > 1 {
-        return is_executable(command).then(|| command.to_path_buf());
-    }
-    std::env::var_os("PATH").and_then(|path| {
-        std::env::split_paths(&path).find_map(|directory| find_in_directory(&directory, command))
-    })
-}
-
-#[cfg(not(windows))]
-fn find_in_directory(directory: &Path, command: &Path) -> Option<PathBuf> {
-    let candidate = directory.join(command);
-    is_executable(&candidate).then_some(candidate)
-}
-
-#[cfg(windows)]
-fn find_in_directory(directory: &Path, command: &Path) -> Option<PathBuf> {
-    let candidate = directory.join(command);
-    if is_executable(&candidate) {
-        return Some(candidate);
-    }
-    if candidate.extension().is_some() {
-        return None;
-    }
-    std::env::var("PATHEXT")
-        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
-        .split(';')
-        .filter(|extension| !extension.is_empty())
-        .map(|extension| directory.join(format!("{}{}", command.to_string_lossy(), extension)))
-        .find(|path| is_executable(path))
-}
-
-fn is_executable(path: &Path) -> bool {
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
-
 #[cfg(all(test, unix))]
 mod tests {
-    use std::os::unix::fs::{symlink, PermissionsExt as _};
+    use std::os::unix::fs::symlink;
 
     use super::*;
+    use crate::agent_backend::ids::SessionId;
+    use crate::agent_tools::EditorToolRequest;
 
     struct InlineReadHost(Arc<StdMutex<Vec<EditorToolRequest>>>);
 
@@ -3245,14 +3034,34 @@ mod tests {
 
     #[async_trait]
     impl CodexToolHost for InlineReadHost {
-        async fn read_file(&mut self, _: &str, _: &str, _: usize, _: usize) -> Result<Value> {
+        async fn read_file(
+            &mut self,
+            _: &CodexToolCtx<'_>,
+            _: &str,
+            _: usize,
+            _: usize,
+        ) -> Result<Value> {
             anyhow::bail!("regular read must not run")
         }
-        async fn write_file(&mut self, _: &str, _: &str, _: u64, _: String) -> Result<Value> {
+        async fn write_file(
+            &mut self,
+            _: &CodexToolCtx<'_>,
+            _: &str,
+            _: u64,
+            _: String,
+        ) -> Result<Value> {
             anyhow::bail!("write must not run")
         }
-        async fn editor_tool(&mut self, request: EditorToolRequest) -> Result<Value> {
-            self.0.lock().unwrap().push(request);
+        async fn editor_tool(
+            &mut self,
+            ctx: &CodexToolCtx<'_>,
+            call: EditorToolCall,
+        ) -> Result<Value> {
+            self.0.lock().unwrap().push(EditorToolRequest {
+                session_id: SessionId::from_raw(ctx.session_id.to_string()),
+                turn: ctx.turn,
+                call,
+            });
             Ok(json!({"path":"main.c","source":"editor","revision":9,"content":"unsaved"}))
         }
     }
@@ -3263,7 +3072,7 @@ mod tests {
     impl CodexToolHost for RevisionReadHost {
         async fn read_file(
             &mut self,
-            _: &str,
+            _: &CodexToolCtx<'_>,
             _: &str,
             start_line: usize,
             _: usize,
@@ -3276,11 +3085,17 @@ mod tests {
             }))
         }
 
-        async fn write_file(&mut self, _: &str, _: &str, _: u64, _: String) -> Result<Value> {
+        async fn write_file(
+            &mut self,
+            _: &CodexToolCtx<'_>,
+            _: &str,
+            _: u64,
+            _: String,
+        ) -> Result<Value> {
             anyhow::bail!("write must not run")
         }
 
-        async fn editor_tool(&mut self, _: EditorToolRequest) -> Result<Value> {
+        async fn editor_tool(&mut self, _: &CodexToolCtx<'_>, _: EditorToolCall) -> Result<Value> {
             anyhow::bail!("editor tool must not run")
         }
     }
@@ -3296,6 +3111,7 @@ mod tests {
                 model_info: None,
                 cwd: PathBuf::from("/workspace"),
                 active_turn: Some("turn".into()),
+                red_turn: None,
                 pending_interrupt_turn_id: None,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 allow_sensitive_paths: false,
@@ -3333,7 +3149,7 @@ mod tests {
                 panic!("expected activity")
             };
             assert_eq!(session_id, "agent");
-            assert_eq!(update["status"], expected);
+            assert_eq!(serde_json::to_value(update).unwrap()["status"], expected);
         }
         assert!(received.try_recv().is_err());
     }
@@ -3346,6 +3162,7 @@ mod tests {
                 model_info: None,
                 cwd: PathBuf::from("/workspace"),
                 active_turn: Some("turn".into()),
+                red_turn: None,
                 pending_interrupt_turn_id: None,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 allow_sensitive_paths: false,
@@ -3359,6 +3176,7 @@ mod tests {
 
         start_turn(
             "agent".into(),
+            None,
             json!([{"type": "text", "text": "follow-up"}]),
             &mut output,
             &events,
@@ -3443,6 +3261,7 @@ mod tests {
                 model_info: None,
                 cwd: PathBuf::from("/workspace"),
                 active_turn: Some("first".into()),
+                red_turn: None,
                 pending_interrupt_turn_id: None,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 allow_sensitive_paths: false,
@@ -3494,6 +3313,7 @@ mod tests {
         ));
         start_turn(
             "agent".into(),
+            None,
             json!([{"type": "text", "text": "second"}]),
             &mut output,
             &events,
@@ -3529,6 +3349,7 @@ mod tests {
                 model_info: None,
                 cwd: PathBuf::from("/workspace"),
                 active_turn: None,
+                red_turn: None,
                 pending_interrupt_turn_id: None,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 allow_sensitive_paths: false,
@@ -3566,6 +3387,7 @@ mod tests {
                 model_info: None,
                 cwd: PathBuf::from("/workspace"),
                 active_turn: None,
+                red_turn: None,
                 pending_interrupt_turn_id: None,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 allow_sensitive_paths: false,
@@ -3579,6 +3401,7 @@ mod tests {
 
         start_turn(
             "agent".into(),
+            None,
             json!([{"type": "text", "text": "edit main.rs"}]),
             &mut output,
             &events,
@@ -3687,6 +3510,7 @@ mod tests {
                 model_info: None,
                 cwd: PathBuf::from("/workspace"),
                 active_turn: Some("turn".into()),
+                red_turn: None,
                 pending_interrupt_turn_id: None,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 allow_sensitive_paths: false,
@@ -3785,6 +3609,7 @@ mod tests {
                 model_info: None,
                 cwd: PathBuf::from("/workspace"),
                 active_turn: None,
+                red_turn: None,
                 pending_interrupt_turn_id: None,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 allow_sensitive_paths: false,
@@ -3844,6 +3669,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn turn_start_response_reports_acceptance_only_for_turns_red_started() {
+        let session = |red_turn| Session {
+            model_info: None,
+            cwd: PathBuf::from("/workspace"),
+            active_turn: None,
+            red_turn,
+            pending_interrupt_turn_id: None,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            allow_sensitive_paths: false,
+            kind: SessionKind::Agent,
+        };
+        let mut sessions = HashMap::from([
+            ("red".to_string(), session(Some(TurnId::mint()))),
+            ("other".to_string(), session(None)),
+        ]);
+        let (events, mut received) = mpsc::channel(4);
+        let turn_start = |session_id: &str| Pending::Turn {
+            session_id: session_id.to_string(),
+        };
+        let mut pending = HashMap::from([
+            ("other-start".to_string(), turn_start("other")),
+            ("empty-start".to_string(), turn_start("red")),
+            ("red-start".to_string(), turn_start("red")),
+        ]);
+        let mut output = Vec::new();
+        let mut next_id = 0;
+
+        // A turn Red did not start, and a response that names no turn, are
+        // not acceptances.
+        for (request, turn) in [
+            ("other-start", "t0"),
+            ("empty-start", ""),
+            ("red-start", "t1"),
+        ] {
+            handle_response(
+                json!({"id": request, "result": {"turn": {"id": turn}}}),
+                &mut output,
+                &events,
+                &mut pending,
+                &mut sessions,
+                &mut next_id,
+                &AgentRuntimePolicy::default(),
+            )
+            .await
+            .unwrap();
+        }
+
+        assert!(matches!(
+            received.try_recv(),
+            Ok(CodexEvent::TurnAccepted { session_id }) if session_id == "red"
+        ));
+        assert!(received.try_recv().is_err());
+        assert_eq!(sessions["red"].active_turn.as_deref(), Some("t1"));
+    }
+
+    #[tokio::test]
     async fn inline_context_worker_allows_reads_but_never_editor_writes_or_extra_results() {
         let calls = Arc::new(StdMutex::new(Vec::new()));
         let host = Arc::new(Mutex::new(InlineReadHost(Arc::clone(&calls))));
@@ -3853,6 +3734,7 @@ mod tests {
                 model_info: None,
                 cwd: PathBuf::from("/workspace"),
                 active_turn: Some("turn".into()),
+                red_turn: None,
                 pending_interrupt_turn_id: None,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 allow_sensitive_paths: false,
@@ -4034,6 +3916,7 @@ mod tests {
 
     #[tokio::test]
     async fn directory_tool_routes_through_the_editor_owner() {
+        let turn = TurnId::mint();
         let calls = Arc::new(StdMutex::new(Vec::new()));
         let host = Arc::new(Mutex::new(InlineReadHost(Arc::clone(&calls))));
         let mut sessions = HashMap::from([(
@@ -4042,6 +3925,7 @@ mod tests {
                 model_info: None,
                 cwd: PathBuf::from("/workspace"),
                 active_turn: Some("turn".into()),
+                red_turn: Some(turn),
                 pending_interrupt_turn_id: None,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 allow_sensitive_paths: false,
@@ -4065,7 +3949,8 @@ mod tests {
         assert_eq!(
             calls.lock().unwrap()[0],
             EditorToolRequest {
-                session_id: "agent".to_string(),
+                session_id: SessionId::from_raw("agent".to_string()),
+                turn: Some(turn),
                 call: EditorToolCall::CreateDirectory {
                     path: "go/examples".to_string()
                 },
@@ -4083,6 +3968,7 @@ mod tests {
                 model_info: None,
                 cwd: PathBuf::from("/workspace"),
                 active_turn: Some("turn".into()),
+                red_turn: None,
                 pending_interrupt_turn_id: None,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 allow_sensitive_paths: false,
@@ -4179,6 +4065,7 @@ mod tests {
                 model_info: None,
                 cwd: PathBuf::from("/workspace"),
                 active_turn: Some("turn".into()),
+                red_turn: None,
                 pending_interrupt_turn_id: None,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 allow_sensitive_paths: false,
@@ -4308,16 +4195,6 @@ mod tests {
         let error = search_files(&root, "needle", &AtomicBool::new(false), false).unwrap_err();
 
         assert!(error.to_string().contains("symlink"));
-    }
-
-    #[test]
-    fn executable_discovery_rejects_non_executable_files() {
-        let directory = tempfile::tempdir().unwrap();
-        let command = directory.path().join("codex");
-        std::fs::write(&command, "not executable").unwrap();
-        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o644)).unwrap();
-
-        assert!(find_executable(command.to_str().unwrap()).is_none());
     }
 
     #[test]
@@ -4460,6 +4337,7 @@ mod tests {
                 model_info: None,
                 cwd: PathBuf::from("/workspace"),
                 active_turn: None,
+                red_turn: None,
                 pending_interrupt_turn_id: None,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 allow_sensitive_paths: false,
