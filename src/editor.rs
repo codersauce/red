@@ -52,10 +52,13 @@ mod inline_notifications;
 mod keyboard_shortcuts;
 mod learning;
 mod lsp_coordinator;
+mod markdown_blocks;
 mod markdown_conceal;
+mod markdown_fence;
 mod markdown_images;
 mod markdown_links;
 mod markdown_lists;
+mod markdown_outline;
 mod markdown_tables;
 mod mouse;
 mod multi_cursor;
@@ -65,6 +68,7 @@ mod notifications;
 mod package_actions;
 pub(crate) mod perf;
 mod plugin_status;
+mod readonly_preview;
 pub mod render_buffer;
 pub mod rendering;
 #[cfg(test)]
@@ -176,7 +180,7 @@ use crate::{
         SessionVisualSelection, SessionWindowJumps, SESSION_SCHEMA_VERSION,
     },
     textobjects::{ResolvedTextObject, SyntaxObjectKind, SyntaxTextObjectService},
-    theme::{parse_vscode_theme, parse_vscode_theme_contents, Style, Theme},
+    theme::{Style, Theme},
     tutorial::{
         TutorialController, TutorialLesson, TutorialObservation, TutorialProgress, TutorialTrack,
         PRACTICE_CONTENTS,
@@ -995,10 +999,14 @@ struct RenderedViewport {
     markdown_tables: bool,
     markdown_reveal: Option<(usize, usize)>,
     markdown_conceal: bool,
+    markdown_extended_marks: bool,
     markdown_conceal_reveal: Option<(usize, usize)>,
     markdown_images: MarkdownImagesMode,
     markdown_image_reveal: Option<(usize, usize)>,
     markdown_image_epoch: u64,
+    markdown_block_reveal: Option<(usize, usize)>,
+    markdown_block_generation: u64,
+    markdown_block_features: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2093,6 +2101,15 @@ pub enum PluginRequest {
         submit_command: Option<String>,
         cancel_command: Option<String>,
     },
+    OpenReadonlySplit {
+        request_id: RequestId,
+        key: String,
+        name: String,
+        text: String,
+        line: usize,
+        syntax: Option<String>,
+        side: Option<String>,
+    },
     CloseScratchBuffer {
         buffer_index: usize,
     },
@@ -2463,6 +2480,7 @@ impl PluginRequest {
             Self::GetSelection { .. } => "GetSelection",
             Self::GetAgentContext { .. } => "GetAgentContext",
             Self::OpenScratchBuffer { .. } => "OpenScratchBuffer",
+            Self::OpenReadonlySplit { .. } => "OpenReadonlySplit",
             Self::CloseScratchBuffer { .. } => "CloseScratchBuffer",
             Self::GetViewportLayout { .. } => "GetViewportLayout",
             Self::GetWindows { .. } => "GetWindows",
@@ -2969,6 +2987,16 @@ pub enum Action {
     ToggleMarkdownTables,
     /// Shows or hides inline Markdown syntax when measuring wrapped lines.
     ToggleMarkdownConceal,
+    /// Shows or hides `==highlight==` markers in Markdown.
+    ToggleMarkdownExtendedMarks,
+    /// Opens the heading outline for the current Markdown buffer.
+    MarkdownOutline,
+    /// Shows or hides rendered Mermaid diagrams in the current window.
+    ToggleMarkdownMermaid,
+    /// Shows or hides the rendered YAML frontmatter table in the current window.
+    ToggleMarkdownFrontmatter,
+    /// Shows or hides rendered LaTeX math in the current window.
+    ToggleMarkdownMath,
     SetRelativeLineNumbers(bool),
 
     DeletePreviousChar,
@@ -3232,6 +3260,9 @@ pub enum Action {
     Yank,
     YankCurrentLine,
     YankCurrentLines(u16),
+    /// Copies the fenced block around the cursor, without the fences.
+    #[serde(rename = "yank-code-block")]
+    YankCodeBlock,
     Delete,
     ChangeSelection,
     Paste,
@@ -3482,12 +3513,16 @@ struct LayoutCacheKey {
     markdown_tables: bool,
     markdown_reveal: Option<std::ops::Range<usize>>,
     markdown_conceal: bool,
+    markdown_extended_marks: bool,
     markdown_conceal_reveal: Option<std::ops::Range<usize>>,
     markdown_images: MarkdownImagesMode,
     markdown_image_reveal: Option<std::ops::Range<usize>>,
     markdown_image_epoch: u64,
     markdown_image_max_rows: usize,
     markdown_ascii: bool,
+    markdown_block_reveal: Option<std::ops::Range<usize>>,
+    markdown_block_generation: u64,
+    markdown_block_features: u8,
 }
 
 #[derive(Debug)]
@@ -3800,8 +3835,16 @@ pub struct Editor {
     markdown_table_cache: RefCell<HashMap<BufferId, markdown_tables::CachedTables>>,
     markdown_conceal_cache: RefCell<HashMap<BufferId, markdown_conceal::CachedConcealment>>,
     markdown_images: RefCell<markdown_images::ImageRuntime>,
+    markdown_block_cache: RefCell<HashMap<BufferId, markdown_blocks::CachedBlocks>>,
+    /// Bumps when the theme changes so rendered blocks can be cached against it.
+    theme_generation: u64,
+    /// Bumps when a test installs blocks, so the layout cache cannot reuse rows.
+    markdown_block_generation: u64,
+    #[cfg(test)]
+    markdown_block_override: Option<Vec<markdown_blocks::BlockSpec>>,
     markdown_link_cache: RefCell<HashMap<BufferId, markdown_links::CachedLinks>>,
     markdown_link_destinations: HashMap<WindowId, markdown_links::LinkDestination>,
+    readonly_previews: Vec<readonly_preview::PreviewPane>,
 
     /// Window manager handling splits and layout
     window_manager: WindowManager,
@@ -5988,8 +6031,14 @@ impl Editor {
             markdown_table_cache: RefCell::new(HashMap::new()),
             markdown_conceal_cache: RefCell::new(HashMap::new()),
             markdown_images: RefCell::new(markdown_images::ImageRuntime::new()),
+            markdown_block_cache: RefCell::new(HashMap::new()),
+            theme_generation: 0,
+            markdown_block_generation: 0,
+            #[cfg(test)]
+            markdown_block_override: None,
             markdown_link_cache: RefCell::new(HashMap::new()),
             markdown_link_destinations: HashMap::new(),
+            readonly_previews: Vec::new(),
             window_manager,
             stdout,
             keyboard_protocol: crate::keyboard::KeyboardProtocol::default(),
@@ -6538,6 +6587,8 @@ impl Editor {
                 .markdown_reveal_range(window)
                 .map(|range| (range.start, range.end)),
             markdown_conceal: self.markdown_conceal_enabled(window),
+            markdown_extended_marks: self.markdown_conceal_enabled(window)
+                && self.markdown_extended_marks_enabled(window),
             markdown_conceal_reveal: self
                 .markdown_conceal_reveal(window)
                 .map(|range| (range.start, range.end)),
@@ -6546,6 +6597,11 @@ impl Editor {
                 .markdown_image_source_reveal(window)
                 .map(|range| (range.start, range.end)),
             markdown_image_epoch: self.markdown_image_epoch(),
+            markdown_block_reveal: self
+                .markdown_block_reveal_range(window)
+                .map(|range| (range.start, range.end)),
+            markdown_block_generation: self.markdown_block_generation,
+            markdown_block_features: self.block_feature_bits(window),
         })
     }
 
@@ -7699,6 +7755,7 @@ impl Editor {
             .visible_inline_suggestion()
             .filter(|suggestion| window.active && suggestion.snapshot.buffer_id == buffer.id());
         let images = self.prepare_markdown_images(window);
+        let blocks = self.markdown_block_layout(window);
         let key = LayoutCacheKey {
             inline_selection: self.inline_comment_selection(window.id, buffer.id()),
             buffer_index: window.buffer_index,
@@ -7717,22 +7774,31 @@ impl Editor {
             markdown_tables: self.markdown_tables_enabled(window),
             markdown_reveal: self.markdown_reveal_range(window),
             markdown_conceal: self.markdown_conceal_enabled(window),
+            markdown_extended_marks: self.markdown_conceal_enabled(window)
+                && self.markdown_extended_marks_enabled(window),
             markdown_conceal_reveal: self.markdown_conceal_reveal(window),
             markdown_images: self.config.markdown_images,
             markdown_image_reveal: self.markdown_image_source_reveal(window),
             markdown_image_epoch: self.markdown_image_epoch(),
             markdown_image_max_rows: self.markdown_image_max_rows(),
             markdown_ascii: self.config.window_borders_ascii,
+            markdown_block_reveal: self.markdown_block_reveal_range(window),
+            markdown_block_generation: self.markdown_block_generation,
+            markdown_block_features: self.block_feature_bits(window),
         };
         if let Some(layout) = self.layout_cache.borrow().get(&key) {
             return layout.clone();
         }
 
         let _span = perf::PerfSpan::start("layout_for_window:miss");
-        let end = window
-            .vtop
-            .saturating_add(self.window_content_height(window))
-            .min(line_count);
+        let height = self.window_content_height(window);
+        let mut end = window.vtop.saturating_add(height).min(line_count);
+        if let Some(blocks) = blocks.as_ref().filter(|blocks| !blocks.is_empty()) {
+            end = blocks
+                .source_end_for_viewport(window.vtop, height, window.skipcol, line_count)
+                .max(end)
+                .min(line_count);
+        }
         let lines = (window.vtop..end)
             .filter_map(|line| buffer.get(line))
             .collect::<Vec<_>>();
@@ -7762,6 +7828,7 @@ impl Editor {
             concealments.as_deref(),
             key.markdown_conceal_reveal.as_ref(),
             images.as_ref(),
+            blocks.as_deref(),
         )
         .with_inline_comments(
             &comments,
@@ -7813,7 +7880,10 @@ impl Editor {
             .rows
             .iter()
             .map(|segment| {
-                let text = if !segment.first_segment {
+                let block_text = segment.block.as_ref().map(|block| block.text());
+                let text = if let Some(text) = block_text {
+                    text
+                } else if !segment.first_segment {
                     String::new()
                 } else if buffer.line_range_byte_len(segment.line, segment.line + 1)
                     > MAX_HIGHLIGHT_SLICE_BYTES
@@ -7823,9 +7893,12 @@ impl Editor {
                     buffer.get(segment.line).unwrap_or_default()
                 };
                 let text = text.trim_end_matches(['\r', '\n']);
-                let indent_width =
-                    leading_whitespace_display_width(text, indentation.tab_width.max(1));
-                if segment.first_segment {
+                let indent_width = if segment.block.is_some() {
+                    0
+                } else {
+                    leading_whitespace_display_width(text, indentation.tab_width.max(1))
+                };
+                if segment.first_segment && segment.block.is_none() {
                     append_viewport_indentation_key(
                         &mut indentation_key,
                         segment.line,
@@ -8648,6 +8721,12 @@ impl Editor {
         if let Some(segments) = self.markdown_image_line_segments(line_index, width) {
             return segments;
         }
+        if let Some(segments) = self.markdown_block_display_rows(line_index) {
+            return segments;
+        }
+        if self.markdown_block_hides_line(line_index) {
+            return Vec::new();
+        }
         if let Some(segments) = self.markdown_line_segments(line_index, width) {
             return segments;
         }
@@ -8692,6 +8771,9 @@ impl Editor {
             .is_some()
         {
             return self.source_text_segments(line_index, width);
+        }
+        if self.markdown_block_hides_line(line_index) {
+            return Vec::new();
         }
         self.wrapped_line_segments_for_width(line_index, width)
     }
@@ -8775,7 +8857,7 @@ impl Editor {
     fn clamp_cursor_to_scrolled_viewport(&mut self) {
         if !self.wrap
             && !self.has_inline_comments(self.current_buffer().id())
-            && !(self.active_has_markdown_tables() || self.active_has_markdown_images())
+            && !self.active_has_expanded_markdown()
         {
             return;
         }
@@ -8826,6 +8908,13 @@ impl Editor {
         self.wrap
             || self.has_inline_comments(self.current_buffer().id())
             || self.active_has_markdown_tables()
+            || self.active_has_markdown_blocks()
+    }
+
+    fn active_has_expanded_markdown(&self) -> bool {
+        self.active_has_markdown_tables()
+            || self.active_has_markdown_images()
+            || self.active_has_markdown_blocks()
     }
 
     /// Distance for `Ctrl-D` and `Ctrl-U`. A positive count becomes the
@@ -9012,7 +9101,7 @@ impl Editor {
     fn scroll_wrapped_viewport_down_one_screen_line(&mut self) -> bool {
         if !self.wrap
             && !self.has_inline_comments(self.current_buffer().id())
-            && !(self.active_has_markdown_tables() || self.active_has_markdown_images())
+            && !self.active_has_expanded_markdown()
         {
             return false;
         }
@@ -9032,12 +9121,12 @@ impl Editor {
     fn scroll_wrapped_viewport_up_one_screen_line(&mut self) -> bool {
         if !self.wrap
             && !self.has_inline_comments(self.current_buffer().id())
-            && !(self.active_has_markdown_tables() || self.active_has_markdown_images())
+            && !self.active_has_expanded_markdown()
         {
             return false;
         }
 
-        if !self.wrap && !(self.active_has_markdown_tables() || self.active_has_markdown_images()) {
+        if !self.wrap && !self.active_has_expanded_markdown() {
             let Some(previous_line) = self.vtop.checked_sub(1) else {
                 return false;
             };
@@ -9071,6 +9160,18 @@ impl Editor {
         let Some(previous_line) = self.vtop.checked_sub(1) else {
             return false;
         };
+        if self.markdown_block_hides_line(previous_line) {
+            let Some(anchor) = self.markdown_block_anchor(previous_line) else {
+                return false;
+            };
+            let segments = self.wrapped_line_segments_for_width(anchor, width);
+            let Some(last) = segments.last() else {
+                return false;
+            };
+            self.vtop = anchor;
+            self.skipcol = last.start_col;
+            return true;
+        }
         let segments = self.wrapped_line_segments_for_width(previous_line, width);
         let Some(previous_top) = segments.last().cloned() else {
             return false;
@@ -9096,7 +9197,7 @@ impl Editor {
 
         if !self.wrap
             && !self.has_inline_comments(self.current_buffer().id())
-            && !(self.active_has_markdown_tables() || self.active_has_markdown_images())
+            && !self.active_has_expanded_markdown()
         {
             let scrolloff = self
                 .config
@@ -9237,6 +9338,34 @@ impl Editor {
         }
     }
 
+    /// Next or previous source line that still has a cursor stop.
+    ///
+    /// Rendered block lines have none, so one screen step crosses the block.
+    fn adjacent_navigable_line(&self, line: usize, forward: bool, width: usize) -> Option<usize> {
+        let last = self.last_navigable_line();
+        if forward {
+            let mut next = line.saturating_add(1);
+            while next <= last {
+                if !self.navigable_line_segments(next, width).is_empty() {
+                    return Some(next);
+                }
+                if next == last {
+                    break;
+                }
+                next += 1;
+            }
+            None
+        } else {
+            let mut next = line.checked_sub(1)?;
+            loop {
+                if !self.navigable_line_segments(next, width).is_empty() {
+                    return Some(next);
+                }
+                next = next.checked_sub(1)?;
+            }
+        }
+    }
+
     fn wrapped_screen_line_target(
         &self,
         line_index: usize,
@@ -9298,14 +9427,14 @@ impl Editor {
                 }
 
                 remaining = remaining.saturating_sub(available_after + 1);
-                if line >= self.last_navigable_line() {
+                let Some(next) = self.adjacent_navigable_line(line, true, width) else {
                     if clamp_at_boundary {
                         let target = segments.last()?;
                         return Some(target_position(target));
                     }
                     return Some(unchanged);
-                }
-                line += 1;
+                };
+                line = next;
                 index = 0;
                 if remaining == 0 {
                     let target = self
@@ -9328,7 +9457,7 @@ impl Editor {
             }
 
             remaining = remaining.saturating_sub(index + 1);
-            let Some(previous_line) = line.checked_sub(1) else {
+            let Some(previous_line) = self.adjacent_navigable_line(line, false, width) else {
                 if clamp_at_boundary {
                     let segments = self.wrapped_line_segments_for_width(line, width);
                     let target = segments.first()?;
@@ -9757,7 +9886,7 @@ impl Editor {
     fn check_bounds(&mut self) -> bool {
         let old_position = (self.cx, self.cy, self.vtop);
         let has_comments = self.has_inline_comments(self.current_buffer().id())
-            || (self.active_has_markdown_tables() || self.active_has_markdown_images());
+            || self.active_has_expanded_markdown();
         let last_line = if self.is_insert() {
             self.current_buffer().len()
         } else {
@@ -13523,6 +13652,31 @@ impl Editor {
                             json!({ "buffer_index": buffer_index }),
                         )
                         .await?;
+                    needs_render = true;
+                }
+                PluginRequest::OpenReadonlySplit {
+                    request_id,
+                    key,
+                    name,
+                    text,
+                    line,
+                    syntax,
+                    side,
+                } => {
+                    self.open_readonly_split(
+                        buffer,
+                        runtime,
+                        request_id,
+                        readonly_preview::SplitPreview {
+                            key,
+                            name,
+                            text,
+                            line,
+                            syntax,
+                            side,
+                        },
+                    )
+                    .await?;
                     needs_render = true;
                 }
                 PluginRequest::CloseScratchBuffer { buffer_index } => {
@@ -19199,6 +19353,24 @@ impl Editor {
             if cmd == "markdown-conceal" {
                 actions.push(Action::ToggleMarkdownConceal);
             }
+            if cmd == "markdown-extended-marks" {
+                actions.push(Action::ToggleMarkdownExtendedMarks);
+            }
+            if cmd == "MarkdownOutline" {
+                actions.push(Action::MarkdownOutline);
+            }
+            if cmd == "yank-code-block" {
+                actions.push(Action::YankCodeBlock);
+            }
+            if cmd == "markdown-mermaid" {
+                actions.push(Action::ToggleMarkdownMermaid);
+            }
+            if cmd == "markdown-frontmatter" {
+                actions.push(Action::ToggleMarkdownFrontmatter);
+            }
+            if cmd == "markdown-math" {
+                actions.push(Action::ToggleMarkdownMath);
+            }
 
             if cmd == "statusline" {
                 actions.push(Action::OpenStatuslineManager);
@@ -20088,7 +20260,53 @@ impl Editor {
             panic!("expected nested mappings");
         };
 
-        self.event_to_key_action(&nested_mappings, ev)
+        if let Some(action) = self.event_to_key_action(&nested_mappings, ev) {
+            return Some(action);
+        }
+        self.markdown_outline_binding(&nested_mappings, ev)
+    }
+
+    /// `Space o` lists headings in a Markdown buffer and stays unbound elsewhere,
+    /// so the leader key is left free in other languages.
+    fn markdown_outline_binding(
+        &self,
+        mappings: &HashMap<String, KeyAction>,
+        ev: &event::Event,
+    ) -> Option<KeyAction> {
+        if self.keymap_hint_prefix != ["Space"] || mappings.contains_key("o") {
+            return None;
+        }
+        if Self::key_string_for_event(ev).as_deref() != Some("o") {
+            return None;
+        }
+        if self.current_language_id().as_deref() != Some("markdown") {
+            return None;
+        }
+        Some(KeyAction::Single(Action::MarkdownOutline))
+    }
+
+    fn keymap_hints_for_waiting(
+        &self,
+        mappings: &HashMap<String, KeyAction>,
+    ) -> Vec<crate::command_palette::KeymapHint> {
+        let mut hints = crate::command_palette::keymap_hints(&self.keymap_hint_prefix, mappings);
+        if self.keymap_hint_prefix == ["Space"]
+            && !mappings.contains_key("o")
+            && self.current_language_id().as_deref() == Some("markdown")
+        {
+            hints.push(crate::command_palette::KeymapHint {
+                key: "o".to_string(),
+                label: "Markdown outline".to_string(),
+                is_group: false,
+            });
+            hints.sort_unstable_by(|left, right| {
+                left.is_group
+                    .cmp(&right.is_group)
+                    .then_with(|| left.key.to_lowercase().cmp(&right.key.to_lowercase()))
+                    .then_with(|| left.key.cmp(&right.key))
+            });
+        }
+        hints
     }
 
     fn clear_keymap_hints(&mut self) {
@@ -22288,6 +22506,15 @@ impl Editor {
                     .await?;
             }
             Action::Quit(force) => {
+                if self.window_manager.window_count() > 1
+                    && self.active_window_is_readonly_preview()
+                {
+                    *add_to_history = false;
+                    if self.close_active_window() {
+                        self.render(buffer)?;
+                    }
+                    return Ok(Some((true, false)));
+                }
                 let scratch_command = self
                     .scratch_buffers
                     .get(&self.current_buffer().id())
@@ -22320,6 +22547,14 @@ impl Editor {
                     // are not stops on the way.
                     self.move_screen_line(-1);
                     self.finish_cursor_motion(buffer, true)?;
+                } else if let Some(target) = self.markdown_line_before_block(self.buffer_line()) {
+                    // A rendered block is one stop. Land on the source line above it.
+                    if target < self.vtop {
+                        self.vtop = target;
+                    }
+                    self.cy = target.saturating_sub(self.vtop);
+                    self.apply_cursor_goal_to_current_line();
+                    self.finish_cursor_motion(buffer, true)?;
                 } else if self.cy == 0 {
                     // scroll up
                     if self.vtop > 0 {
@@ -22336,6 +22571,14 @@ impl Editor {
             Action::MoveDown => {
                 if self.buffer_line_has_markdown_image(self.buffer_line()) {
                     self.move_screen_line(1);
+                    self.finish_cursor_motion(buffer, true)?;
+                } else if let Some(target) = self.markdown_line_after_block(self.buffer_line()) {
+                    self.cy = target.saturating_sub(self.vtop);
+                    if self.cy >= self.vheight() {
+                        self.vtop = target.saturating_sub(self.vheight().saturating_sub(1));
+                        self.cy = target.saturating_sub(self.vtop);
+                    }
+                    self.apply_cursor_goal_to_current_line();
                     self.finish_cursor_motion(buffer, true)?;
                 } else if self.vtop + self.cy < self.last_navigable_line() {
                     self.cy += 1;
@@ -23792,19 +24035,7 @@ impl Editor {
         if self.intercept_learn_action(action, buffer, runtime)? {
             return Ok(false);
         }
-        if self.current_buffer().directory.is_some()
-            && matches!(
-                action,
-                Action::Save
-                    | Action::ForceSave
-                    | Action::SaveAs(_)
-                    | Action::ForceSaveAs(_)
-                    | Action::SetBufferName(_)
-                    | Action::EnterMode(Mode::Insert)
-                    | Action::SetSyntax(_)
-            )
-        {
-            self.set_legacy_message(Some("Directory buffers are read-only".to_string()));
+        if self.block_readonly_mutation(action) {
             self.render(buffer)?;
             return Ok(false);
         }
@@ -24411,7 +24642,7 @@ impl Editor {
                 }
                 Action::ScrollUp => {
                     let scroll_lines = self.config.mouse_scroll_lines.unwrap_or(3);
-                    if self.active_has_markdown_tables() || self.active_has_markdown_images() {
+                    if self.active_has_expanded_markdown() {
                         self.scroll_markdown_viewport(false, scroll_lines);
                         self.sync_to_window();
                         self.render_motion_frame(buffer)?;
@@ -24438,7 +24669,7 @@ impl Editor {
                 }
                 Action::ScrollDown => {
                     let scroll_lines = self.config.mouse_scroll_lines.unwrap_or(3);
-                    if self.active_has_markdown_tables() || self.active_has_markdown_images() {
+                    if self.active_has_expanded_markdown() {
                         self.scroll_markdown_viewport(true, scroll_lines);
                         self.sync_to_window();
                         self.render_motion_frame(buffer)?;
@@ -24530,6 +24761,22 @@ impl Editor {
                     // Keep this arm tiny. `execute_action_inner` is already near the
                     // 2MB test-thread stack limit when a command re-enters it.
                     self.toggle_markdown_conceal();
+                    self.render(buffer)?;
+                }
+                Action::ToggleMarkdownExtendedMarks => {
+                    self.toggle_markdown_extended_marks();
+                    self.render(buffer)?;
+                }
+                Action::ToggleMarkdownMermaid => {
+                    self.toggle_markdown_mermaid();
+                    self.render(buffer)?;
+                }
+                Action::ToggleMarkdownFrontmatter => {
+                    self.toggle_markdown_frontmatter();
+                    self.render(buffer)?;
+                }
+                Action::ToggleMarkdownMath => {
+                    self.toggle_markdown_math();
                     self.render(buffer)?;
                 }
                 Action::SetWrap(wrap) => {
@@ -25230,6 +25477,12 @@ impl Editor {
                     self.open_diagnostics_picker(diagnostics_picker::DiagnosticFilter::All);
                     self.render(buffer)?;
                 }
+                Action::MarkdownOutline => {
+                    add_to_history = false;
+                    self.release_current_dialog_callbacks(runtime);
+                    self.open_markdown_outline();
+                    self.render(buffer)?;
+                }
                 Action::OpenErrorDiagnosticsPicker => {
                     self.release_current_dialog_callbacks(runtime);
                     self.open_diagnostics_picker(diagnostics_picker::DiagnosticFilter::Errors);
@@ -25707,6 +25960,10 @@ impl Editor {
                         self.draw_commandline(buffer);
                     }
                 }
+                Action::YankCodeBlock => {
+                    self.yank_code_block();
+                    self.draw_commandline(buffer);
+                }
                 Action::Delete => {
                     if self.selection.is_some() {
                         self.begin_transaction("delete selection");
@@ -26120,7 +26377,7 @@ impl Editor {
                     }
                 }
                 Action::CloseWindow => {
-                    if self.update_window_layout(WindowManager::close_window) {
+                    if self.close_active_window() {
                         self.render(buffer)?;
                     }
                 }
@@ -29198,17 +29455,10 @@ impl Editor {
     }
 
     fn apply_theme(&mut self, theme_name: &str, update_config: bool) -> anyhow::Result<()> {
-        let Some(theme_asset) = crate::assets::resolve_theme(theme_name, &Config::config_dir())
-        else {
-            anyhow::bail!("Theme file {} not found", theme_name);
-        };
-        let theme = if let Some(path) = theme_asset.path() {
-            parse_vscode_theme(&path.to_string_lossy())?
-        } else {
-            parse_vscode_theme_contents(&theme_asset.read_to_string()?)?
-        };
+        let theme = crate::theme::load_resolved_theme(theme_name, &Config::config_dir())?;
         let highlighter = Highlighter::with_registry(&theme, self.highlighter.registry())?;
         self.theme = theme;
+        self.theme_generation = self.theme_generation.wrapping_add(1);
         self.highlighter = highlighter;
         self.panel_manager
             .rehighlight_text_panels(&mut self.highlighter);
@@ -30069,8 +30319,7 @@ impl Editor {
     }
 
     fn replace_range(&mut self, range: TextRange, new_text: &str) {
-        if self.current_buffer().directory.is_some() {
-            self.set_legacy_message(Some("Directory buffers are read-only".to_string()));
+        if self.note_readonly_text_edit() {
             return;
         }
         let diagnostic_edit = (!self.diagnostics.is_empty())
@@ -32130,11 +32379,12 @@ impl Editor {
 
         // Image scrolling stores the visible image row in skipcol. Showing the
         // source again must not treat that row index as a horizontal offset.
-        if self.image_line_is_raw(buffer_line) {
+        if self.image_line_is_raw(buffer_line) || self.markdown_block_line_is_revealed(buffer_line)
+        {
             self.skipcol = 0;
         }
 
-        if self.active_has_markdown_tables() || self.active_has_markdown_images() {
+        if self.active_has_expanded_markdown() {
             self.ensure_markdown_cursor_visible(buffer_line, display_col, width);
             return;
         }
@@ -35939,6 +36189,7 @@ impl Editor {
 mod test {
     use super::*;
     use crate::lsp::DiagnosticSeverity;
+    use crate::theme::parse_vscode_theme;
     use std::path::{Path, PathBuf};
     use std::process::Command;
 

@@ -4225,6 +4225,7 @@ pub struct PickerBuilder {
     content_sizing: Option<PickerContentSizing>,
     status_on_query_line: bool,
     item_layout: PickerItemLayout,
+    initial_selection: Option<String>,
 }
 
 impl Default for PickerBuilder {
@@ -4253,6 +4254,7 @@ impl PickerBuilder {
             content_sizing: None,
             status_on_query_line: false,
             item_layout: PickerItemLayout::Default,
+            initial_selection: None,
         }
     }
 
@@ -4269,6 +4271,12 @@ impl PickerBuilder {
     /// Supplies precomputed picker rows with stable IDs and structured display fields.
     pub fn structured_items(mut self, items: Vec<PickerItem>) -> Self {
         self.structured_items = Some(items);
+        self
+    }
+
+    /// Selects a structured row by id after the picker is built.
+    pub fn initial_selection(mut self, id: impl Into<String>) -> Self {
+        self.initial_selection = Some(id.into());
         self
     }
 
@@ -4399,6 +4407,7 @@ impl PickerBuilder {
         let content_sizing = self.content_sizing;
         let status_on_query_line = self.status_on_query_line;
         let item_layout = self.item_layout;
+        let initial_selection = self.initial_selection;
 
         let mut picker = Picker::new(title, editor, &items, id);
         if let Some(structured_items) = structured_items {
@@ -4426,6 +4435,9 @@ impl PickerBuilder {
         picker.status_on_query_line = status_on_query_line;
         picker.item_layout = item_layout;
         picker.resize_to_viewport(editor.vwidth(), editor.vheight());
+        if let Some(selection) = initial_selection {
+            picker.select_dynamic_id(&selection);
+        }
 
         picker
     }

@@ -169,7 +169,7 @@ startup.
 ## Navigate syntax-aware text objects
 
 Red bundles structural Tree-sitter queries for Rust, Markdown, JavaScript, JSX,
-TypeScript, TSX, JSON, TOML, YAML, Bash, Fish, PowerShell, and Lua. Available
+TypeScript, TSX, JSON, TOML, YAML, Bash, Fish, PowerShell, Lua, and HTML. Available
 objects depend on the language's query: not every language defines calls,
 functions, classes, comments, and parameters.
 

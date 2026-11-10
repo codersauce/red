@@ -1,12 +1,14 @@
 //! Translation from VS Code color-theme JSON into Red's concrete [`Theme`].
 //!
-//! Import resolves workbench colors, token scopes, font styles, and fallback relationships
-//! without retaining the source JSON. Unknown source fields are ignored for compatibility;
-//! invalid colors or required structural values remain parse errors.
+//! Import resolves `extends` through the runtime asset system, then workbench colors,
+//! token scopes, font styles, and fallback relationships. The resolved document keeps
+//! inherited `type` and merged colors. Other unknown source fields are ignored for
+//! compatibility; invalid colors or required structural values remain parse errors.
 
 use std::{
     collections::{BTreeMap, HashMap},
     fs,
+    path::Path,
 };
 
 use json_comments::StripComments;
@@ -15,6 +17,10 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::color::{blend_color, ensure_minimum_contrast, parse_rgb, Color};
+use crate::config::Config;
+
+/// A theme may follow this many `extends` links, so the root plus four parents load.
+const MAX_THEME_EXTENDS_DEPTH: usize = 4;
 
 use super::{
     compose_selection_style, SelectionForegroundPriority, StatuslineStyle, Style, Theme,
@@ -67,13 +73,38 @@ static SYNTAX_HIGHLIGHTING_MAP: Lazy<HashMap<&'static str, &'static str>> = Lazy
 });
 
 pub fn parse_vscode_theme(file: &str) -> anyhow::Result<Theme> {
-    let contents = &fs::read_to_string(file)?;
-    parse_vscode_theme_contents(contents)
+    let contents = fs::read_to_string(file)?;
+    let value = parse_theme_json(&contents)?;
+    if value.get("extends").is_none() {
+        return theme_from_value(value);
+    }
+    let name = Path::new(file).file_name().and_then(|name| name.to_str());
+    let config_dir = Config::config_dir();
+    let layers = collect_layers(name, value, &config_dir, &mut Vec::new(), 0)?;
+    theme_from_layers(&layers)
 }
 
 pub fn parse_vscode_theme_contents(contents: &str) -> anyhow::Result<Theme> {
-    let vscode_theme: VsCodeTheme = serde_json::from_str(contents)
-        .or_else(|_| serde_json::from_reader(StripComments::new(contents.as_bytes())))?;
+    let value = parse_theme_json(contents)?;
+    if value.get("extends").is_none() {
+        return theme_from_value(value);
+    }
+    let config_dir = Config::config_dir();
+    let layers = collect_layers(None, value, &config_dir, &mut Vec::new(), 0)?;
+    theme_from_layers(&layers)
+}
+
+/// Loads a theme by file name, following `extends` from `config_dir`.
+pub fn load_resolved_theme(name: &str, config_dir: &Path) -> anyhow::Result<Theme> {
+    theme_from_layers(&layers_for_named_theme(name, config_dir)?)
+}
+
+/// Returns the theme document after `extends` has been merged away.
+pub fn resolved_vscode_theme_json(name: &str, config_dir: &Path) -> anyhow::Result<Value> {
+    Ok(merge_layers(&layers_for_named_theme(name, config_dir)?))
+}
+
+fn theme_from_vscode(vscode_theme: VsCodeTheme) -> anyhow::Result<Theme> {
     let default_theme = Theme::default();
 
     let error_style = vscode_theme.style_from("editorError.foreground", "editorError.background");
@@ -195,6 +226,180 @@ pub fn parse_vscode_theme_contents(contents: &str) -> anyhow::Result<Theme> {
         cursor_style,
         error_style,
     })
+}
+
+struct ThemeLayer {
+    fields: Map<String, Value>,
+    token_colors_present: bool,
+    token_colors: Vec<Value>,
+}
+
+fn theme_from_value(value: Value) -> anyhow::Result<Theme> {
+    let vscode_theme: VsCodeTheme = serde_json::from_value(value)?;
+    theme_from_vscode(vscode_theme)
+}
+
+fn theme_from_layers(layers: &[ThemeLayer]) -> anyhow::Result<Theme> {
+    let mut document = merge_layers(layers);
+    if layers.len() > 1 {
+        // Scope lookup keeps the first matching rule. Child layers go first so
+        // they win, while each file keeps its own rule order.
+        if let Some(Value::Array(tokens)) = document.get_mut("tokenColors") {
+            let mut child_first = Vec::with_capacity(tokens.len());
+            for layer in layers.iter().rev() {
+                if layer.token_colors_present {
+                    child_first.extend(layer.token_colors.iter().cloned());
+                }
+            }
+            *tokens = child_first;
+        }
+    }
+    theme_from_value(document)
+}
+
+fn layers_for_named_theme(name: &str, config_dir: &Path) -> anyhow::Result<Vec<ThemeLayer>> {
+    let Some(asset) = crate::assets::resolve_theme(name, config_dir) else {
+        anyhow::bail!("Theme file {name} not found");
+    };
+    let value = parse_theme_json(&asset.read_to_string()?)?;
+    collect_layers(Some(name), value, config_dir, &mut Vec::new(), 0)
+}
+
+fn collect_layers(
+    name: Option<&str>,
+    value: Value,
+    config_dir: &Path,
+    chain: &mut Vec<String>,
+    depth: usize,
+) -> anyhow::Result<Vec<ThemeLayer>> {
+    if let Some(name) = name {
+        if chain.iter().any(|existing| existing == name) {
+            chain.push(name.to_string());
+            let message = format!("theme inheritance cycle: {}", chain.join(" → "));
+            chain.pop();
+            anyhow::bail!(message);
+        }
+        chain.push(name.to_string());
+    }
+    if depth > MAX_THEME_EXTENDS_DEPTH {
+        let message = format!(
+            "theme inheritance is deeper than {MAX_THEME_EXTENDS_DEPTH}: {}",
+            chain.join(" → ")
+        );
+        if name.is_some() {
+            chain.pop();
+        }
+        anyhow::bail!(message);
+    }
+
+    let result = assemble_layers(value, config_dir, chain, depth);
+    if name.is_some() {
+        chain.pop();
+    }
+    result
+}
+
+fn assemble_layers(
+    value: Value,
+    config_dir: &Path,
+    chain: &mut Vec<String>,
+    depth: usize,
+) -> anyhow::Result<Vec<ThemeLayer>> {
+    let ThemeParts { extends, layer } = split_theme_document(value)?;
+    let mut layers = Vec::new();
+    if let Some(parent_name) = extends {
+        let parent_name = parent_name.trim();
+        if parent_name.is_empty() {
+            anyhow::bail!("theme extends must name a theme file");
+        }
+        let parent_value = read_parent_theme(parent_name, config_dir, chain)?;
+        layers = collect_layers(
+            Some(parent_name),
+            parent_value,
+            config_dir,
+            chain,
+            depth + 1,
+        )?;
+    }
+    layers.push(layer);
+    Ok(layers)
+}
+
+fn read_parent_theme(name: &str, config_dir: &Path, chain: &[String]) -> anyhow::Result<Value> {
+    let Some(asset) = crate::assets::resolve_theme(name, config_dir) else {
+        let mut missing = chain.to_vec();
+        missing.push(name.to_string());
+        anyhow::bail!("theme {name} not found: {}", missing.join(" → "));
+    };
+    parse_theme_json(&asset.read_to_string()?)
+}
+
+struct ThemeParts {
+    extends: Option<String>,
+    layer: ThemeLayer,
+}
+
+fn split_theme_document(value: Value) -> anyhow::Result<ThemeParts> {
+    let Value::Object(mut object) = value else {
+        anyhow::bail!("theme JSON must be an object");
+    };
+    let extends = match object.remove("extends") {
+        None => None,
+        Some(Value::String(name)) => Some(name),
+        Some(other) => anyhow::bail!("theme extends must be a string, got {other}"),
+    };
+    let (token_colors_present, token_colors) = match object.remove("tokenColors") {
+        None => (false, Vec::new()),
+        Some(Value::Array(tokens)) => (true, tokens),
+        Some(other) => anyhow::bail!("theme tokenColors must be an array, got {other}"),
+    };
+    Ok(ThemeParts {
+        extends,
+        layer: ThemeLayer {
+            fields: object,
+            token_colors_present,
+            token_colors,
+        },
+    })
+}
+
+fn merge_layers(layers: &[ThemeLayer]) -> Value {
+    let mut merged = Map::new();
+    let mut tokens = Vec::new();
+    let mut saw_tokens = false;
+    for layer in layers {
+        overlay_theme_fields(&mut merged, &layer.fields);
+        if layer.token_colors_present {
+            saw_tokens = true;
+            tokens.extend(layer.token_colors.iter().cloned());
+        }
+    }
+    if saw_tokens {
+        merged.insert("tokenColors".to_string(), Value::Array(tokens));
+    }
+    Value::Object(merged)
+}
+
+fn overlay_theme_fields(base: &mut Map<String, Value>, child: &Map<String, Value>) {
+    for (key, value) in child {
+        if key == "colors" {
+            if let Some(child_colors) = value.as_object() {
+                if let Some(Value::Object(parent_colors)) = base.get_mut(key) {
+                    for (color_key, color_value) in child_colors {
+                        parent_colors.insert(color_key.clone(), color_value.clone());
+                    }
+                    continue;
+                }
+            }
+        }
+        base.insert(key.clone(), value.clone());
+    }
+}
+
+fn parse_theme_json(contents: &str) -> anyhow::Result<Value> {
+    serde_json::from_str(contents)
+        .or_else(|_| serde_json::from_reader(StripComments::new(contents.as_bytes())))
+        .map_err(|error| anyhow::anyhow!("invalid theme JSON: {error}"))
 }
 
 #[derive(Deserialize, Debug)]
@@ -1163,5 +1368,291 @@ mod test {
                 }
             }
         }
+    }
+
+    fn write_theme(dir: &std::path::Path, name: &str, contents: &str) {
+        let themes = dir.join("themes");
+        std::fs::create_dir_all(&themes).unwrap();
+        std::fs::write(themes.join(name), contents).unwrap();
+    }
+
+    fn rgb(hex: &str) -> Color {
+        crate::color::parse_rgb(hex).unwrap()
+    }
+
+    #[test]
+    fn extends_bundled_parent_merges_colors_tokens_and_type() {
+        let dir = tempfile::tempdir().unwrap();
+        write_theme(
+            dir.path(),
+            "child.json",
+            r##"{
+                "name": "child",
+                "extends": "red.json",
+                "colors": { "editor.background": "#FFFFFF" },
+                "tokenColors": [{
+                    "scope": "comment",
+                    "settings": { "foreground": "#ABCDEF" }
+                }]
+            }"##,
+        );
+        write_theme(
+            dir.path(),
+            "typed.json",
+            r##"{
+                "name": "typed",
+                "extends": "red.json",
+                "type": "light",
+                "colors": { "editor.background": "#FFFFFF" },
+                "tokenColors": []
+            }"##,
+        );
+
+        let parent = load_resolved_theme("red.json", dir.path()).unwrap();
+        let child = load_resolved_theme("child.json", dir.path()).unwrap();
+        let resolved = resolved_vscode_theme_json("child.json", dir.path()).unwrap();
+        let parent_json = resolved_vscode_theme_json("red.json", dir.path()).unwrap();
+
+        assert_eq!(child.style.fg, parent.style.fg);
+        assert_eq!(child.style.bg, Some(rgb("#FFFFFF")));
+        assert_ne!(child.style.bg, parent.style.bg);
+        assert_eq!(
+            child.get_style("comment").and_then(|style| style.fg),
+            Some(rgb("#ABCDEF"))
+        );
+        assert_eq!(
+            child.get_style("string").and_then(|style| style.fg),
+            parent.get_style("string").and_then(|style| style.fg)
+        );
+        assert!(resolved.get("extends").is_none());
+        assert_eq!(resolved["type"], parent_json["type"]);
+        assert_eq!(resolved["colors"]["editor.background"], "#FFFFFF");
+        assert_eq!(
+            resolved["colors"]["editor.foreground"],
+            parent_json["colors"]["editor.foreground"]
+        );
+        let tokens = resolved["tokenColors"].as_array().unwrap();
+        assert_eq!(tokens.last().unwrap()["settings"]["foreground"], "#ABCDEF");
+        assert_ne!(tokens.first().unwrap()["settings"]["foreground"], "#ABCDEF");
+
+        let typed = resolved_vscode_theme_json("typed.json", dir.path()).unwrap();
+        assert_eq!(typed["type"], "light");
+    }
+
+    #[test]
+    fn extends_user_parent_overrides_a_bundled_name_and_keeps_rule_order() {
+        let dir = tempfile::tempdir().unwrap();
+        write_theme(
+            dir.path(),
+            "red.json",
+            r##"{
+                "name": "user-red",
+                "type": "light",
+                "colors": {
+                    "editor.background": "#EEEEEE",
+                    "editor.foreground": "#ABCABC",
+                    "editor.lineHighlightBackground": "#DDDDDD"
+                },
+                "tokenColors": [
+                    {
+                        "scope": "comment",
+                        "settings": { "foreground": "#111111", "fontStyle": "italic" }
+                    },
+                    {
+                        "scope": "comment",
+                        "settings": { "foreground": "#999999" }
+                    },
+                    {
+                        "scope": "string",
+                        "settings": { "foreground": "#222222" }
+                    }
+                ]
+            }"##,
+        );
+        write_theme(
+            dir.path(),
+            "child.json",
+            r##"{
+                // A short override of the user copy, not the bundled theme.
+                "name": "user-child",
+                "extends": "red.json",
+                "colors": { "editor.background": "#FFFFFF" },
+                "tokenColors": [{
+                    "scope": "comment",
+                    "settings": { "foreground": "#333333" }
+                }]
+            }"##,
+        );
+        write_theme(
+            dir.path(),
+            "grand.json",
+            r##"{
+                "name": "grand",
+                "type": "dark",
+                "colors": {
+                    "editor.background": "#101010",
+                    "editor.foreground": "#EFEFEF"
+                },
+                "tokenColors": [
+                    { "scope": "comment", "settings": { "foreground": "#AAAAAA" } },
+                    { "scope": "keyword", "settings": { "foreground": "#BBBBBB" } }
+                ]
+            }"##,
+        );
+        write_theme(
+            dir.path(),
+            "mid.json",
+            r##"{
+                "name": "mid",
+                "extends": "grand.json",
+                "tokenColors": [
+                    { "scope": "comment", "settings": { "foreground": "#CCCCCC" } }
+                ]
+            }"##,
+        );
+        write_theme(
+            dir.path(),
+            "nested.json",
+            r##"{ "name": "nested-child", "extends": "mid.json" }"##,
+        );
+        write_theme(
+            dir.path(),
+            "order.json",
+            r##"{
+                "name": "order",
+                "extends": "red.json",
+                "colors": { "editor.background": "#FFFFFF" },
+                "tokenColors": []
+            }"##,
+        );
+
+        let child = load_resolved_theme("child.json", dir.path()).unwrap();
+        assert_eq!(child.name, "user-child");
+        assert_eq!(child.style.bg, Some(rgb("#FFFFFF")));
+        assert_eq!(child.style.fg, Some(rgb("#ABCABC")));
+        assert_eq!(
+            child.colors.get("editor.lineHighlightBackground").copied(),
+            Some(rgb("#DDDDDD"))
+        );
+        assert_eq!(
+            child.get_style("comment").and_then(|style| style.fg),
+            Some(rgb("#333333"))
+        );
+        assert_eq!(
+            child.get_style("string").and_then(|style| style.fg),
+            Some(rgb("#222222"))
+        );
+
+        let resolved = resolved_vscode_theme_json("child.json", dir.path()).unwrap();
+        assert_eq!(resolved["type"], "light");
+        assert!(resolved.get("extends").is_none());
+        let tokens = resolved["tokenColors"].as_array().unwrap();
+        assert_eq!(tokens[0]["settings"]["foreground"], "#111111");
+        assert_eq!(tokens[1]["settings"]["foreground"], "#999999");
+        assert_eq!(tokens[2]["settings"]["foreground"], "#222222");
+        assert_eq!(tokens[3]["settings"]["foreground"], "#333333");
+
+        let inherited = load_resolved_theme("order.json", dir.path()).unwrap();
+        assert_eq!(
+            inherited.get_style("comment").and_then(|style| style.fg),
+            Some(rgb("#111111"))
+        );
+
+        let nested = load_resolved_theme("nested.json", dir.path()).unwrap();
+        let nested_json = resolved_vscode_theme_json("nested.json", dir.path()).unwrap();
+        assert_eq!(nested_json["type"], "dark");
+        assert_eq!(nested.style.bg, Some(rgb("#101010")));
+        assert_eq!(
+            nested.get_style("comment").and_then(|style| style.fg),
+            Some(rgb("#CCCCCC"))
+        );
+        assert_eq!(
+            nested.get_style("keyword").and_then(|style| style.fg),
+            Some(rgb("#BBBBBB"))
+        );
+    }
+
+    #[test]
+    fn extends_reports_cycles_missing_parents_and_depth() {
+        let dir = tempfile::tempdir().unwrap();
+        write_theme(
+            dir.path(),
+            "a.json",
+            r##"{
+                "name": "a",
+                "extends": "b.json",
+                "colors": { "editor.background": "#000000" },
+                "tokenColors": []
+            }"##,
+        );
+        write_theme(
+            dir.path(),
+            "b.json",
+            r##"{
+                "name": "b",
+                "extends": "a.json",
+                "colors": { "editor.background": "#000000" },
+                "tokenColors": []
+            }"##,
+        );
+        let cycle = load_resolved_theme("a.json", dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(cycle.contains("a.json → b.json → a.json"), "{cycle}");
+
+        write_theme(
+            dir.path(),
+            "missing-child.json",
+            r##"{
+                "name": "missing",
+                "extends": "nope.json",
+                "colors": { "editor.background": "#000000" },
+                "tokenColors": []
+            }"##,
+        );
+        let missing = load_resolved_theme("missing-child.json", dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing.contains("theme nope.json not found: missing-child.json → nope.json"),
+            "{missing}"
+        );
+
+        for index in 0..=4 {
+            let parent = (index < 4).then(|| format!("d{}.json", index + 1));
+            write_theme(
+                dir.path(),
+                &format!("d{index}.json"),
+                &chain_theme(&format!("d{index}"), parent.as_deref()),
+            );
+        }
+        assert!(load_resolved_theme("d0.json", dir.path()).is_ok());
+
+        for index in 0..=5 {
+            let parent = (index < 5).then(|| format!("e{}.json", index + 1));
+            write_theme(
+                dir.path(),
+                &format!("e{index}.json"),
+                &chain_theme(&format!("e{index}"), parent.as_deref()),
+            );
+        }
+        let deep = load_resolved_theme("e0.json", dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            deep.contains(
+                "theme inheritance is deeper than 4: e0.json → e1.json → e2.json → e3.json → e4.json → e5.json"
+            ),
+            "{deep}"
+        );
+    }
+
+    fn chain_theme(name: &str, parent: Option<&str>) -> String {
+        let extends = parent
+            .map(|parent| format!("\"extends\": \"{parent}\",\n  "))
+            .unwrap_or_default();
+        format!(
+            "{{\n  \"name\": \"{name}\",\n  {extends}\"type\": \"dark\",\n  \"colors\": {{ \"editor.background\": \"#010101\", \"editor.foreground\": \"#EEEEEE\" }},\n  \"tokenColors\": []\n}}\n"
+        )
     }
 }

@@ -164,6 +164,14 @@ pub struct Window {
     pub(crate) markdown_tables: Option<bool>,
     /// Window-local override for inline Markdown concealment.
     pub(crate) markdown_conceal: Option<bool>,
+    /// Window-local override for `==highlight==` marks.
+    pub(crate) markdown_extended_marks: Option<bool>,
+    /// Window-local override for rendered Mermaid diagrams.
+    pub(crate) markdown_mermaid: Option<bool>,
+    /// Window-local override for rendered YAML frontmatter.
+    pub(crate) markdown_frontmatter: Option<bool>,
+    /// Window-local override for rendered math.
+    pub(crate) markdown_math: Option<bool>,
 
     /// Cursor x position (column) within the buffer
     pub cx: usize,
@@ -233,6 +241,10 @@ impl Window {
             wrap: true,
             markdown_tables: None,
             markdown_conceal: None,
+            markdown_extended_marks: None,
+            markdown_mermaid: None,
+            markdown_frontmatter: None,
+            markdown_math: None,
             cx: 0,
             cy: 0,
             scroll_lines: None,
@@ -2693,6 +2705,10 @@ impl WindowManager {
                     new_window.wrap = window.wrap;
                     new_window.markdown_tables = window.markdown_tables;
                     new_window.markdown_conceal = window.markdown_conceal;
+                    new_window.markdown_extended_marks = window.markdown_extended_marks;
+                    new_window.markdown_mermaid = window.markdown_mermaid;
+                    new_window.markdown_frontmatter = window.markdown_frontmatter;
+                    new_window.markdown_math = window.markdown_math;
                     new_window.jump_list = window.jump_list.clone();
 
                     let mut old_window = window.clone();

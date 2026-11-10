@@ -1345,6 +1345,7 @@ fn render_source_segment(
     clear(geometry.x, geometry.width, buffer);
     let mut grapheme_col = segment.start_grapheme_col;
     let mut byte_offset = 0;
+    let mut skip_until_col = None;
     while byte_offset < text.len() {
         let remaining = &text[byte_offset..];
         let Some(grapheme) = remaining.graphemes(true).next() else {
@@ -1355,6 +1356,31 @@ fn render_source_segment(
         } else {
             display_width(grapheme)
         };
+        if let Some(end_col) = skip_until_col {
+            grapheme_col += width;
+            byte_offset += grapheme.len();
+            if grapheme_col >= end_col {
+                skip_until_col = None;
+            }
+            continue;
+        }
+        if let Some((replacement, end_col)) = segment.replacement_at(grapheme_col) {
+            let local_x = segment.visual_offset + segment.visible_columns_before(grapheme_col);
+            if local_x < geometry.width {
+                let source = segment.source_offset + segment.start_byte + byte_offset;
+                let style = styles.style_at(source).unwrap_or(theme_style);
+                let drawn = truncate_display_width(&replacement, geometry.width - local_x);
+                if !drawn.is_empty() {
+                    buffer.set_text(geometry.x + local_x, geometry.y, &drawn, style);
+                }
+            }
+            grapheme_col += width;
+            byte_offset += grapheme.len();
+            if grapheme_col < end_col {
+                skip_until_col = Some(end_col);
+            }
+            continue;
+        }
         if grapheme_col < segment.start_col || segment.hides_source_column(grapheme_col) {
             grapheme_col += width;
             byte_offset += grapheme.len();
@@ -2167,6 +2193,16 @@ impl Editor {
                 self.fill_line_in_window(buffer, term_x, term_y, content_width, &theme_style);
                 continue;
             };
+            if self.paint_markdown_block_segment(
+                buffer,
+                window,
+                segment,
+                term_x,
+                term_y,
+                content_width,
+            ) {
+                continue;
+            }
             if segment.image.is_some() {
                 self.paint_markdown_image_segment(
                     buffer,
@@ -2205,6 +2241,8 @@ impl Editor {
                 &theme_style,
                 &self.theme,
             );
+            self.paint_markdown_html_segment(buffer, window, segment, line);
+            self.paint_markdown_alert_segment(buffer, window, segment, line);
             self.render_decorations_for_segment(
                 buffer,
                 window,
@@ -2884,6 +2922,16 @@ impl Editor {
         for segment in &layout.rows {
             let term_y = self.window_to_terminal_y(window, segment.row);
             let term_x = self.window_to_terminal_x(window, gutter_width + 1);
+            if self.paint_markdown_block_segment(
+                buffer,
+                window,
+                segment,
+                term_x,
+                term_y,
+                content_width,
+            ) {
+                continue;
+            }
             if segment.image.is_some() {
                 self.paint_markdown_image_segment(
                     buffer,
@@ -2922,6 +2970,8 @@ impl Editor {
                 &theme_style,
                 &self.theme,
             );
+            self.paint_markdown_html_segment(buffer, window, segment, line);
+            self.paint_markdown_alert_segment(buffer, window, segment, line);
             self.render_decorations_for_segment(
                 buffer,
                 window,
@@ -3795,8 +3845,7 @@ impl Editor {
 
         if self.keymap_hints_visible {
             if let Some(KeyAction::Nested(mappings)) = &self.waiting_key_action {
-                let hints =
-                    crate::command_palette::keymap_hints(&self.keymap_hint_prefix, mappings);
+                let hints = self.keymap_hints_for_waiting(mappings);
                 crate::ui::draw_keymap_hints(
                     buffer,
                     &self.theme,
@@ -5076,7 +5125,9 @@ mod tests {
             last_segment: true,
             visual_offset: 0,
             concealed: Vec::new(),
+            replacements: Vec::new(),
             image: None,
+            block: None,
         }
     }
 

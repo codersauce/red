@@ -31,16 +31,44 @@ wrap = true
 markdown_tables = true
 
 # Hide inline Markdown markers while wrapping: link URLs and brackets, emphasis
-# markers, image markup, and code-span backticks take no cells. `:markdown-conceal`
+# markers, image markup, code-span backticks, GitHub alert markers
+# (`> [!NOTE]` and the other four kinds), and balanced inline HTML tags
+# (`<b>`, `<code>`, `<br>`, and the other kinds listed in docs/MARKDOWN.md)
+# take no cells. `:markdown-conceal`
 # toggles this in the current split. Insert, visual, search, and a cursor inside
 # concealed syntax show that line's raw text. Tables keep their own grid.
 markdown_conceal = true
 
-# Draw standalone Markdown images inline in Normal mode. "auto" queries the
+# Conceal ==highlight== markers and paint the text like <mark>. This is not
+# CommonMark. The text must not be empty or start or end with a space, and
+# marks inside code spans or fences stay as written. `:markdown-extended-marks`
+# toggles this in the current split. It follows markdown_conceal.
+markdown_extended_marks = true
+
+# Render ```mermaid fences as text diagrams in Normal mode. The cursor inside
+# a diagram shows the fence again. :markdown-mermaid toggles this in the
+# current split. A fence that cannot be parsed stays on screen with one
+# muted error line.
+markdown_mermaid = true
+
+# Render a leading `---` YAML block as a key/value table. The cursor inside
+# the block shows the source. :markdown-frontmatter toggles this in the
+# current split. A block that is not flat pairs stays as source.
+markdown_frontmatter = true
+
+# Render $...$ and $$...$$ math as Unicode in Normal mode. Off by default,
+# because dollar signs are common in prose and shell snippets.
+# :markdown-math toggles this in the current split. A price or an unknown
+# command stays as source.
+markdown_math = false
+
+# Draw standalone Markdown images inline in Normal mode, including a line whose
+# only content is an `<img>` tag (optionally wrapped in `<p>`). "auto" queries the
 # terminal (Kitty graphics, then Sixel) and falls back through Unicode
 # half-blocks to a text placeholder. Force "kitty", "iterm2", "sixel", or
 # "halfblocks", or set "off" to keep the placeholder only. The cursor line,
-# and Insert mode on that line, show the raw Markdown again.
+# and Insert mode on that line, show the raw Markdown again. `width` and
+# `height` on `<img>` are CSS pixels or a percent of the window.
 markdown_images = "auto"
 
 # Most screen rows reserved for one inline image.
@@ -515,6 +543,8 @@ Esc = { EnterMode = "Normal" }
 "o" = "OnlyWindow"
 
 [keys.normal." "]
+# Space o opens the Markdown outline, and only while the buffer is Markdown.
+# It is not listed here, so other languages keep the key unbound.
 "m" = "OpenMessages"
 "H" = "OpenInlineHistory"
 "N" = "OpenLatestInlineCompletion"

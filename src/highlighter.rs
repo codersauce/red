@@ -293,11 +293,18 @@ impl LanguageRegistry {
                 let query = Query::new(&language, &definition.textobject_queries.join("\n"))
                     .with_context(|| format!("language `{id}` has an invalid text-object query"))?;
                 for pattern in 0..query.pattern_count() {
-                    if let Some(predicate) = query.general_predicates(pattern).first() {
-                        anyhow::bail!(
-                            "language `{id}` uses unsupported text-object predicate `#{}`",
-                            predicate.operator
-                        );
+                    for predicate in query.general_predicates(pattern) {
+                        // Query cursors apply these. `#offset!` and other custom
+                        // predicates are not interpreted, so they stay rejected.
+                        if !matches!(
+                            predicate.operator.as_ref(),
+                            "eq?" | "not-eq?" | "match?" | "not-match?" | "any-of?" | "not-any-of?"
+                        ) {
+                            anyhow::bail!(
+                                "language `{id}` uses unsupported text-object predicate `#{}`",
+                                predicate.operator
+                            );
+                        }
                     }
                 }
             }
@@ -610,6 +617,8 @@ const LANGUAGE_NAMES: &[(&str, &str)] = &[
     ("shell", "bash"),
     ("zsh", "bash"),
     ("fish", "fish"),
+    ("html", "html"),
+    ("htm", "html"),
     ("powershell", "powershell"),
     ("pwsh", "powershell"),
     ("ps1", "powershell"),
@@ -1295,7 +1304,7 @@ impl Highlighter {
             let inline = self.registry.languages.get("markdown_inline")?;
             if definition.injection_query.as_deref() != Some(MARKDOWN_INJECTION_QUERY)
                 || !bundled_highlight_definition(inline, "markdown_inline")
-                || inline.injection_query.is_some()
+                || inline.injection_query.as_deref() != Some(MARKDOWN_INLINE_INJECTION_QUERY)
             {
                 return None;
             }
@@ -1618,6 +1627,7 @@ fn bundled_highlight_definition(definition: &RuntimeLanguageDefinition, language
         "fish" => &[tree_sitter_fish::HIGHLIGHTS_QUERY][..],
         "powershell" => &[tree_sitter_powershell::HIGHLIGHTS_QUERY][..],
         "lua" => &[tree_sitter_lua::HIGHLIGHTS_QUERY][..],
+        "html" => &[tree_sitter_html::HIGHLIGHTS_QUERY][..],
         _ => return false,
     };
     matches!(definition.grammar.as_ref(), Some(GrammarSource::Bundled(_)))
@@ -2334,7 +2344,7 @@ fn language_definitions() -> Vec<BundledLanguageDefinition> {
             language: Some(|| tree_sitter_md::INLINE_LANGUAGE.into()),
             highlight_queries: &[markdown_inline::HIGHLIGHT_QUERY],
             textobject_queries: &[],
-            injection_query: None,
+            injection_query: Some(MARKDOWN_INLINE_INJECTION_QUERY),
             specialized: None,
         },
         BundledLanguageDefinition {
@@ -2447,6 +2457,16 @@ fn language_definitions() -> Vec<BundledLanguageDefinition> {
             language: Some(|| tree_sitter_lua::LANGUAGE.into()),
             highlight_queries: &[tree_sitter_lua::HIGHLIGHTS_QUERY],
             textobject_queries: &[include_str!("queries/textobjects/lua.scm")],
+            injection_query: None,
+            specialized: None,
+        },
+        BundledLanguageDefinition {
+            id: "html",
+            extensions: &["html", "htm"],
+            filenames: &[],
+            language: Some(|| tree_sitter_html::LANGUAGE.into()),
+            highlight_queries: &[tree_sitter_html::HIGHLIGHTS_QUERY],
+            textobject_queries: &[include_str!("queries/textobjects/html.scm")],
             injection_query: None,
             specialized: None,
         },
@@ -2858,6 +2878,14 @@ const MARKDOWN_INJECTION_QUERY: &str = r#"
   (info_string
     (language) @injection.language)
   (code_fence_content) @injection.content)
+
+((html_block) @injection.content
+  (#set! injection.language "html"))
+"#;
+
+const MARKDOWN_INLINE_INJECTION_QUERY: &str = r#"
+((html_tag) @injection.content
+  (#set! injection.language "html"))
 "#;
 
 pub fn normalized_extension(file: &str) -> Option<String> {
@@ -3064,6 +3092,21 @@ mod tests {
         assert!(highlighter
             .startup_injected_language_ids("rust", source)
             .is_empty());
+
+        // HTML blocks and inline tags are not startup fences. A fenced html
+        // block still counts toward the same cap of three languages.
+        let with_html = concat!(
+            "<div>block</div>\n\n",
+            "Press <kbd>Enter</kbd>.\n\n",
+            "```html\n<span></span>\n```\n",
+            "```rust\nfn main() {}\n```\n",
+            "```yaml\nignored: true\n```\n",
+            "```lua\nprint(1)\n```\n",
+        );
+        assert_eq!(
+            highlighter.startup_injected_language_ids("markdown", with_html),
+            vec!["html", "rust", "yaml"]
+        );
     }
 
     #[test]
@@ -4210,6 +4253,149 @@ mod tests {
             .has_changes());
     }
 
+    fn scope_color(channel: u8) -> Style {
+        Style {
+            fg: Some(Color::Rgb {
+                r: channel,
+                g: 0,
+                b: 0,
+            }),
+            ..Style::default()
+        }
+    }
+
+    fn theme_with_distinct_scopes(scopes: &[(&str, u8)]) -> Theme {
+        Theme {
+            token_styles: scopes
+                .iter()
+                .map(|(scope, channel)| TokenStyle {
+                    name: None,
+                    scope: vec![(*scope).to_string()],
+                    style: scope_color(*channel),
+                })
+                .collect(),
+            ..Theme::default()
+        }
+    }
+
+    #[test]
+    fn markdown_html_blocks_and_inline_tags_use_html_scopes() {
+        let theme = theme_with_distinct_scopes(&[("tag", 1), ("attribute", 2), ("string", 3)]);
+        let mut highlighter = Highlighter::new(&theme).unwrap();
+        let code = concat!(
+            "<div align=\"center\">\n",
+            "  <span>inner</span>\n",
+            "</div>\n",
+            "\n",
+            "Press <kbd>Enter</kbd> now.\n",
+            "\n",
+            "```html\n",
+            "<em>fenced</em>\n",
+            "```\n",
+            "\n",
+            "```rust\n",
+            "let html = \"<div>\";\n",
+            "```\n",
+        );
+        let styles = highlighter.highlight("markdown", code).unwrap();
+
+        let div = code.find("<div").unwrap() + 1;
+        assert_eq!(
+            effective_style_at(&styles, div).map(|style| &style.fg),
+            Some(&scope_color(1).fg)
+        );
+        let align = code.find("align").unwrap();
+        assert_eq!(
+            effective_style_at(&styles, align).map(|style| &style.fg),
+            Some(&scope_color(2).fg)
+        );
+        let center = code.find("center").unwrap();
+        assert_eq!(
+            effective_style_at(&styles, center).map(|style| &style.fg),
+            Some(&scope_color(3).fg)
+        );
+        let kbd = code.find("<kbd>").unwrap() + 1;
+        assert_eq!(
+            effective_style_at(&styles, kbd).map(|style| &style.fg),
+            Some(&scope_color(1).fg),
+            "inline html tags are injected through markdown_inline"
+        );
+        let fenced = code.find("<em>").unwrap() + 1;
+        assert_eq!(
+            effective_style_at(&styles, fenced).map(|style| &style.fg),
+            Some(&scope_color(1).fg)
+        );
+        let rust_div = code.find("let html").unwrap();
+        let quoted = code[rust_div..].find("<div>").unwrap() + rust_div + 1;
+        assert_ne!(
+            effective_style_at(&styles, quoted).map(|style| &style.fg),
+            Some(&scope_color(1).fg),
+            "html inside another fence stays that language"
+        );
+    }
+
+    #[test]
+    fn markdown_html_block_edits_keep_the_injection_fresh() {
+        let theme = theme_with_distinct_scopes(&[("tag", 1), ("string", 3)]);
+        let before = "<div class=\"kept\">\n  <kbd>Enter</kbd>\n</div>\n";
+        let after = "<div class=\"kept\">\n  <kbd>Return</kbd>\n</div>\n";
+        let mut incremental = Highlighter::new(&theme).unwrap();
+        incremental.highlight("markdown", before).unwrap();
+        let actual = incremental.highlight("markdown", after).unwrap();
+        let expected = Highlighter::new(&theme)
+            .unwrap()
+            .highlight("markdown", after)
+            .unwrap();
+        let shape = |styles: &[StyleInfo]| {
+            styles
+                .iter()
+                .map(|style| (style.start, style.end, style.style.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(&actual), shape(&expected));
+        assert!(
+            !incremental.highlighters["markdown"]
+                .cached_tree
+                .as_ref()
+                .unwrap()
+                .tree
+                .root_node()
+                .has_changes(),
+            "editing inside an html block must reparse before reuse"
+        );
+        let inline_before = "Press <kbd>Enter</kbd> now.\n";
+        let inline_after = "Press <kbd>Return</kbd> now.\n";
+        let mut inline = Highlighter::new(&theme).unwrap();
+        inline.highlight("markdown", inline_before).unwrap();
+        let actual = inline.highlight("markdown", inline_after).unwrap();
+        let expected = Highlighter::new(&theme)
+            .unwrap()
+            .highlight("markdown", inline_after)
+            .unwrap();
+        assert_eq!(shape(&actual), shape(&expected));
+    }
+
+    #[test]
+    fn bundled_html_keeps_structural_queries_when_configuration_extends_it() {
+        let dark = parse_vscode_theme("themes/red.json").unwrap();
+        let light = parse_vscode_theme("themes/atom-one-light.json").unwrap();
+        for theme in [&dark, &light] {
+            assert!(theme.get_style("tag").is_some());
+            assert!(theme.get_style("attribute").is_some());
+            assert!(theme.get_style("string").is_some());
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut registry = LanguageRegistry::bundled();
+        registry
+            .insert_configured("html", &LanguageConfig::default(), directory.path())
+            .unwrap();
+        assert!(registry.grammar("html").is_some());
+        let (_, query) = registry.textobject_language("html").unwrap();
+        assert!(query.contains("@function.outer"));
+        assert!(query.contains("#match?"));
+    }
+
     #[test]
     fn markdown_heading_edits_preserve_fresh_captures_and_fenced_injections() {
         for sources in [
@@ -5064,6 +5250,7 @@ mod tests {
             ("jsx", "export const View = () => <div />;\n"),
             ("typescript", "const value: boolean = true;\n"),
             ("tsx", "export const View = () => <div />;\n"),
+            ("html", "<div class=\"value\">true</div>\n"),
             ("json", r#"{"value": true}"#),
             ("toml", "value = true\n"),
             ("yaml", "value: true\n"),
@@ -5110,6 +5297,8 @@ mod tests {
         assert_eq!(highlighter.language_id_for_name("fish"), Some("fish"));
         assert_eq!(highlighter.language_id_for_name("pwsh"), Some("powershell"));
         assert_eq!(highlighter.language_id_for_name("lua"), Some("lua"));
+        assert_eq!(highlighter.language_id_for_name("html"), Some("html"));
+        assert_eq!(highlighter.language_id_for_name("htm"), Some("html"));
         assert_eq!(highlighter.language_id_for_name("hk"), Some("husk"));
         assert_eq!(highlighter.language_id_for_name("husk"), Some("husk"));
         assert_eq!(highlighter.language_id_for_name("unknown"), None);
@@ -5227,6 +5416,7 @@ mod tests {
                 "bash",
                 "fish",
                 "gitcommit",
+                "html",
                 "husk",
                 "javascript",
                 "json",

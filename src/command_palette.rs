@@ -62,6 +62,12 @@ pub(crate) const BUILTIN_COLON_COMMANDS: &[CommandSpec] = &[
     CommandSpec::exact("nowrap"),
     CommandSpec::exact("markdown-tables"),
     CommandSpec::exact("markdown-conceal"),
+    CommandSpec::exact("markdown-extended-marks"),
+    CommandSpec::exact("MarkdownOutline"),
+    CommandSpec::exact("yank-code-block"),
+    CommandSpec::exact("markdown-mermaid"),
+    CommandSpec::exact("markdown-frontmatter"),
+    CommandSpec::exact("markdown-math"),
     CommandSpec::new("syntax", 2),
     CommandSpec::exact("syn"),
     CommandSpec::exact("ft"),
@@ -908,6 +914,60 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             Action::ToggleMarkdownConceal,
         ),
         builtin(
+            "view.toggle_markdown_extended_marks",
+            "Toggle Markdown highlight marks",
+            "View",
+            "Hide ==highlight== markers and paint the text like a mark",
+            Some(":markdown-extended-marks"),
+            &["highlight", "mark"],
+            Action::ToggleMarkdownExtendedMarks,
+        ),
+        builtin(
+            "view.markdown_outline",
+            "Markdown outline",
+            "Navigation",
+            "List headings in this Markdown buffer and jump to one. Space o opens it",
+            Some(":MarkdownOutline"),
+            &["headings", "table of contents", "toc"],
+            Action::MarkdownOutline,
+        ),
+        builtin(
+            "edit.yank_code_block",
+            "Copy code block",
+            "Edit",
+            "Copy the fenced code block around the cursor, without its fences",
+            Some(":yank-code-block"),
+            &["fence", "code block"],
+            Action::YankCodeBlock,
+        ),
+        builtin(
+            "view.toggle_markdown_mermaid",
+            "Toggle Mermaid diagrams",
+            "View",
+            "Draw Mermaid fences as text diagrams in this window",
+            Some(":markdown-mermaid"),
+            &["diagram", "flowchart"],
+            Action::ToggleMarkdownMermaid,
+        ),
+        builtin(
+            "view.toggle_markdown_frontmatter",
+            "Toggle Markdown frontmatter",
+            "View",
+            "Draw leading YAML frontmatter as a table in this window",
+            Some(":markdown-frontmatter"),
+            &["yaml", "front matter"],
+            Action::ToggleMarkdownFrontmatter,
+        ),
+        builtin(
+            "view.toggle_markdown_math",
+            "Toggle Markdown math",
+            "View",
+            "Draw $...$ and $$...$$ math as Unicode in this window",
+            Some(":markdown-math"),
+            &["latex", "unicode"],
+            Action::ToggleMarkdownMath,
+        ),
+        builtin(
             "view.enable_wrap",
             "Enable line wrapping",
             "View",
@@ -1628,6 +1688,12 @@ fn action_label(action: &Action) -> String {
         Action::ToggleWrap => "Toggle line wrapping".to_string(),
         Action::ToggleMarkdownTables => "Toggle Markdown tables".to_string(),
         Action::ToggleMarkdownConceal => "Toggle Markdown conceal".to_string(),
+        Action::ToggleMarkdownExtendedMarks => "Toggle Markdown highlight marks".to_string(),
+        Action::MarkdownOutline => "Markdown outline".to_string(),
+        Action::YankCodeBlock => "Copy code block".to_string(),
+        Action::ToggleMarkdownMermaid => "Toggle Mermaid diagrams".to_string(),
+        Action::ToggleMarkdownFrontmatter => "Toggle Markdown frontmatter".to_string(),
+        Action::ToggleMarkdownMath => "Toggle Markdown math".to_string(),
         Action::SplitHorizontal => "Split horizontally".to_string(),
         Action::SplitVertical => "Split vertically".to_string(),
         Action::SplitHorizontalNewBuffer => "New buffer in horizontal split".to_string(),
@@ -1781,6 +1847,23 @@ mod tests {
             ["enew"]
         );
         assert_eq!(command::parse(BUILTIN_COLON_COMMANDS, "en"), None);
+    }
+
+    #[test]
+    fn yank_code_block_accepts_its_initials_and_rejects_a_single_y() {
+        assert_eq!(
+            command::parse(BUILTIN_COLON_COMMANDS, "yank-code-block")
+                .unwrap()
+                .commands,
+            ["yank-code-block"]
+        );
+        assert_eq!(
+            command::parse(BUILTIN_COLON_COMMANDS, "ycb")
+                .unwrap()
+                .commands,
+            ["yank-code-block"]
+        );
+        assert_eq!(command::parse(BUILTIN_COLON_COMMANDS, "y"), None);
     }
 
     #[test]

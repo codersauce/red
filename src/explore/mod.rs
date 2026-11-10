@@ -86,6 +86,10 @@ pub struct View {
     pub dim: Option<DimZone>,
     pub file_key: String,
     pub line_starts: Vec<usize>,
+    /// `Some` for a Markdown buffer, including when the outline is empty.
+    pub outline: Option<Vec<crate::markdown_outline::MarkdownHeading>>,
+    /// Index into `outline` of the section at or before the cursor.
+    pub outline_active: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +105,7 @@ struct OpenFile {
     key: String,
     revision: u64,
     analysis: Analysis,
+    outline: Option<Vec<crate::markdown_outline::MarkdownHeading>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -142,6 +147,7 @@ impl Session {
             Some(language) => analyze_source(input.registry, language, input.source),
             None => Analysis::empty("no language detected for this buffer"),
         };
+        let outline = markdown_outline_for(input.language, input.source);
         if analysis.language.is_some() {
             self.index
                 .upsert(input.key, hash_text(input.source), &analysis);
@@ -150,6 +156,7 @@ impl Session {
             key: input.key.to_string(),
             revision: input.revision,
             analysis,
+            outline,
         });
     }
 
@@ -244,10 +251,19 @@ impl Session {
         let (following, follow_spans) = follow_spans(self.follow.as_ref(), analysis, &file_key);
         let dim = skeleton_zone(self.skeleton, analysis, function, &self.index, &file_key);
         let badges = badges(analysis, &self.index, &file_key);
-        View {
-            language: analysis
+        let outline = open.and_then(|open| open.outline.clone());
+        let outline_active = outline
+            .as_deref()
+            .and_then(|headings| crate::markdown_outline::active_heading(headings, line));
+        let language = if outline.is_some() {
+            "markdown".to_string()
+        } else {
+            analysis
                 .and_then(|analysis| analysis.language.clone())
-                .unwrap_or_else(|| "text".to_string()),
+                .unwrap_or_else(|| "text".to_string())
+        };
+        View {
+            language,
             note: analysis
                 .map(|analysis| analysis.note.clone())
                 .filter(|note| !note.is_empty())
@@ -275,6 +291,8 @@ impl Session {
             line_starts: analysis
                 .map(|analysis| analysis.line_starts.clone())
                 .unwrap_or_else(|| vec![0]),
+            outline,
+            outline_active,
         }
     }
 
@@ -453,6 +471,29 @@ impl Session {
     }
 
     pub fn install_analysis(&mut self, key: String, revision: u64, hash: u64, analysis: Analysis) {
+        let outline = markdown_outline_for(analysis.language.as_deref(), &analysis.source);
+        self.install_open(key, revision, hash, analysis, outline);
+    }
+
+    /// Records an outline when the buffer is too large for the tree-sitter parse.
+    pub fn install_outline(
+        &mut self,
+        key: String,
+        revision: u64,
+        note: impl Into<String>,
+        outline: Option<Vec<crate::markdown_outline::MarkdownHeading>>,
+    ) {
+        self.install_open(key, revision, 0, Analysis::empty(note), outline);
+    }
+
+    fn install_open(
+        &mut self,
+        key: String,
+        revision: u64,
+        hash: u64,
+        analysis: Analysis,
+        outline: Option<Vec<crate::markdown_outline::MarkdownHeading>>,
+    ) {
         if analysis.language.is_some() {
             self.index.upsert(&key, hash, &analysis);
         }
@@ -460,6 +501,7 @@ impl Session {
             key,
             revision,
             analysis,
+            outline,
         });
     }
 
@@ -580,6 +622,13 @@ pub(crate) fn spawn_buffer_parse(
 
 fn analyze_source(registry: &LanguageRegistry, language: &str, source: &str) -> Analysis {
     analyze::analyze(registry, language, source)
+}
+
+fn markdown_outline_for(
+    language: Option<&str>,
+    source: &str,
+) -> Option<Vec<crate::markdown_outline::MarkdownHeading>> {
+    (language == Some("markdown")).then(|| crate::markdown_outline::headings(source))
 }
 
 fn file_label(path: &str) -> String {
