@@ -31,6 +31,12 @@ pub struct Missing {
     pub active: &'static str,
 }
 
+impl From<Missing> for AgentError {
+    fn from(missing: Missing) -> Self {
+        Self::Unavailable(missing.to_string())
+    }
+}
+
 /// What an agent implements. Object safe, synchronous and non-blocking: every
 /// command either enqueues work for the backend's worker and returns, or fails
 /// without side effects. Results come back through [`AgentBackend::poll`].
