@@ -127,7 +127,7 @@ pub enum SessionScope {
 }
 
 /// A request for the saved-session picker.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionQuery {
     pub cwd: PathBuf,
     pub scope: SessionScope,
@@ -279,4 +279,25 @@ pub enum ToolStatus {
     Completed,
     Failed,
     Cancelled,
+}
+
+/// A user prompt as the editor hands it to a backend. The backend turns it
+/// into its own wire format; the editor never builds or parses marker text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Prompt {
+    /// What the person typed.
+    pub text: String,
+    /// The document the person was looking at, when the prompt should see it.
+    pub context: Option<EditorContext>,
+    /// Transcript recap for a conversation that was interrupted or forked.
+    pub recap: Option<String>,
+}
+
+/// Bounded editor context sent along with a prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditorContext {
+    /// URI of the active document.
+    pub uri: String,
+    /// Bounded excerpt of its contents.
+    pub text: String,
 }
