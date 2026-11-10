@@ -2692,6 +2692,9 @@ pub enum Action {
     FelixSplitAtFile(bool),
     #[cfg(feature = "helix")]
     FelixCopyBetweenRegisters,
+    /// A Helix typed command and its raw arguments, such as `sort -r`.
+    #[cfg(feature = "helix")]
+    FelixTypedCommand(String, String),
     #[cfg(feature = "helix")]
     FelixClipboardYank,
     #[cfg(feature = "helix")]
@@ -18879,6 +18882,18 @@ impl Editor {
             };
             if let Some(command) = routed {
                 return vec![Action::PluginCommand(command.clone())];
+            }
+        }
+
+        #[cfg(feature = "helix")]
+        if self.config.editing_model == crate::config::EditingModel::Helix {
+            let (name, args) = cmd.split_once(' ').unwrap_or((cmd, ""));
+            if felix::is_typed_command(name) {
+                return vec![Action::FelixTypedCommand(name.into(), args.trim().into())];
+            }
+            // `:N` is Helix's `:goto N`.
+            if cmd.parse::<usize>().is_ok() {
+                return vec![Action::FelixTypedCommand("goto".into(), cmd.into())];
             }
         }
 

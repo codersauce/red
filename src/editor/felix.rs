@@ -47,6 +47,26 @@ static NATIVE_KEYS: std::sync::LazyLock<crate::config::Keys> = std::sync::LazyLo
     keys
 });
 
+/// Helix typed commands that Felix runs instead of Red's command line.
+pub(super) fn is_typed_command(name: &str) -> bool {
+    matches!(
+        name,
+        "sort"
+            | "goto"
+            | "g"
+            | "reflow"
+            | "pipe"
+            | "|"
+            | "pipe-to"
+            | "insert-output"
+            | "append-output"
+            | "earlier"
+            | "ear"
+            | "later"
+            | "lat"
+    )
+}
+
 pub(super) fn native_keys() -> &'static crate::config::Keys {
     &NATIVE_KEYS
 }
@@ -59,6 +79,8 @@ pub(super) enum Input<'a> {
     ClipboardPaste(felix_core::Paste),
     ShellResult(felix_core::Shell, &'a [Option<String>]),
     Comment(felix_core::CommentMode),
+    Sort { reverse: bool, insensitive: bool },
+    ReplaceEach(&'a [String]),
     ClipboardReplace,
     ClipboardYank { primary: bool },
 }
@@ -345,6 +367,16 @@ impl Editor {
                     .await?;
                 Ok(false)
             })),
+            Action::FelixTypedCommand(name, args) => Some(Box::pin(async move {
+                if let Err(error) = self
+                    .execute_felix_typed_command(name, args, buffer, runtime)
+                    .await
+                {
+                    self.set_legacy_message(Some(error));
+                }
+                self.render(buffer)?;
+                Ok(false)
+            })),
             Action::FelixCopyBetweenRegisters => Some(Box::pin(async move {
                 if let Some(owner) = self.felix_owner() {
                     self.execute_felix(
@@ -380,6 +412,138 @@ impl Editor {
             self.place_felix_cursor(&state);
             self.felix.selections.insert((doc, view), state);
         }
+    }
+
+    /// Run a Helix typed command from the command line.
+    async fn execute_felix_typed_command(
+        &mut self,
+        name: &str,
+        args: &str,
+        frame: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> Result<(), String> {
+        let owner = self
+            .felix_owner()
+            .ok_or("Typed command requires a document window")?;
+        let run = |result: anyhow::Result<()>| result.map_err(|error| error.to_string());
+        match name {
+            "sort" => {
+                let (mut reverse, mut insensitive) = (false, false);
+                for flag in args.split_whitespace() {
+                    let seen = match flag {
+                        "-r" | "--reverse" => &mut reverse,
+                        "-i" | "--insensitive" => &mut insensitive,
+                        _ => return Err(format!("unrecognized flag '{flag}'")),
+                    };
+                    if *seen {
+                        return Err(format!("flag '{flag}' specified more than once"));
+                    }
+                    *seen = true;
+                }
+                let input = Input::Sort {
+                    reverse,
+                    insensitive,
+                };
+                run(self.execute_felix(input, owner, frame, runtime).await)
+            }
+            "reflow" => {
+                let width = match args.split_whitespace().collect::<Vec<_>>()[..] {
+                    [] => self.comment_text_width(),
+                    [width] => width.parse::<usize>().map_err(|error| error.to_string())?,
+                    _ => return Err("reflow takes at most one argument".into()),
+                };
+                let rope = self.current_buffer().contents_snapshot();
+                let selections = self
+                    .felix_active_selection()
+                    .cloned()
+                    .ok_or("Typed command requires a document window")?;
+                let options = textwrap::Options::new(width)
+                    .word_splitter(textwrap::WordSplitter::NoHyphenation)
+                    .word_separator(textwrap::WordSeparator::AsciiSpace);
+                let fragments: Vec<String> = selections
+                    .ranges()
+                    .iter()
+                    .map(|r| {
+                        let fragment = rope.slice(r.start()..r.end()).to_string();
+                        textwrap::refill(&fragment, options.clone())
+                    })
+                    .collect();
+                run(self
+                    .execute_felix(Input::ReplaceEach(&fragments), owner, frame, runtime)
+                    .await)
+            }
+            "pipe" | "|" | "pipe-to" | "insert-output" | "append-output" => {
+                if args.is_empty() {
+                    return Err(format!("{name} requires a shell command"));
+                }
+                let kind = match name {
+                    "pipe-to" => felix_core::Shell::PipeTo,
+                    "insert-output" => felix_core::Shell::Insert,
+                    "append-output" => felix_core::Shell::Append,
+                    _ => felix_core::Shell::Pipe,
+                };
+                let selections = self
+                    .felix_active_selection()
+                    .cloned()
+                    .ok_or("Typed command requires a document window")?;
+                self.start_felix_shell(kind, args.into(), &selections)
+            }
+            "goto" | "g" => {
+                let line = args
+                    .parse::<usize>()
+                    .map_err(|_| format!("{name} requires a line number"))?;
+                if line > 0 {
+                    // Center the destination as Red's own line jumps do.
+                    self.position_at_line(line, GoToLinePosition::Center);
+                    self.felix_goto_line(line);
+                }
+                Ok(())
+            }
+            "earlier" | "ear" | "later" | "lat" => {
+                let steps = match args {
+                    "" => 1,
+                    steps => steps
+                        .parse::<usize>()
+                        .map_err(|_| format!("{name} only accepts a number of steps"))?,
+                };
+                let key = if name.starts_with('e') {
+                    "<a-u>"
+                } else {
+                    "<a-U>"
+                };
+                for _ in 0..steps {
+                    run(self
+                        .execute_felix(Input::Key(key), owner, frame, runtime)
+                        .await)?;
+                }
+                Ok(())
+            }
+            _ => Err(format!("Unknown typed command '{name}'")),
+        }
+    }
+
+    /// Helix's `:goto` and `:N`: save a jump, then move every selection to the
+    /// start of `line` (1-based), never past the last line with content.
+    pub(super) fn felix_goto_line(&mut self, line: usize) {
+        let Some((doc, view, _, _)) = self.felix_owner() else {
+            return;
+        };
+        if let Some(saved) = self.felix.selections.get(&(doc, view)).cloned() {
+            self.felix.jumps.entry(view).or_default().save(doc, &saved);
+        }
+        let rope = self.current_buffer().contents_snapshot();
+        let text = rope.slice(..);
+        let last = text.len_lines() - 1;
+        let max_line = if text.line(last).len_chars() == 0 {
+            last.saturating_sub(1)
+        } else {
+            last
+        };
+        let pos = text.line_to_char(line.saturating_sub(1).min(max_line));
+        self.set_felix_active_selection(Selections::single(text, FelixRange::at(text, pos)));
+        self.snippet_session = None;
+        self.felix.session.cancel_pending();
+        self.felix.generation = self.felix.generation.wrapping_add(1);
     }
 
     /// A host jump already positioned the viewport. Start the next Felix edit
@@ -1309,6 +1473,17 @@ impl Editor {
                 self.felix.session.shell_result(&initial, kind, outputs)
             }
             Input::Bracketed(value) => self.felix.session.bracketed_paste(text, &initial, value),
+            Input::Sort {
+                reverse,
+                insensitive,
+            } => self
+                .felix
+                .session
+                .sort_selections(text, &initial, reverse, insensitive),
+            Input::ReplaceEach(fragments) => self
+                .felix
+                .session
+                .replace_each_selection(&initial, fragments.to_vec()),
             Input::Comment(mode) => {
                 let (line, blocks) = native::comment_tokens(self.current_language_id().as_deref());
                 self.felix
@@ -3443,6 +3618,44 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(editor.current_buffer().contents(), "x-Ci()\n");
+    }
+
+    async fn helix_keys(editor: &mut Editor, keys: &str) {
+        for key in felix_core::parse_keys(keys).unwrap() {
+            let mut event = super::macros::terminal_key(key);
+            if matches!(event.code, KeyCode::Char(c) if c.is_uppercase()) {
+                event.modifiers |= KeyModifiers::SHIFT;
+            }
+            editor.test_execute_event(Event::Key(event)).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn helix_typed_commands_edit_the_selections() {
+        let cases = [
+            ("b\nc\na\n", "%<A-s>:sort<ret>", "a\nb\nc\n"),
+            ("b\nc\na\n", "%<A-s>:sort -r<ret>", "c\nb\na\n"),
+            ("B\na\nC\n", "%<A-s>:sort -i<ret>", "a\nB\nC\n"),
+            ("b a\n", "x:sort<ret>", "b a\n"),
+            (
+                "one two three four\n",
+                "x:reflow 9<ret>",
+                "one two\nthree\nfour\n",
+            ),
+            ("one\nthree\n", "x:goto 2<ret>d", "one\nhree\n"),
+            ("one\ntwo\n", ":9<ret>d", "one\nwo\n"),
+            ("abc\n", "ifoo<esc>:earlier<ret>", "abc\n"),
+            ("abc\n", "ifoo<esc>u:later<ret>", "fooabc\n"),
+        ];
+        for (text, keys, expected) in cases {
+            let (mut editor, _, _) = fixture_editor(text);
+            helix_keys(&mut editor, keys).await;
+            assert_eq!(
+                editor.current_buffer().contents(),
+                expected,
+                "{keys:?} in {text:?}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -9,6 +9,7 @@ mod navigation;
 pub use navigation::Navigation;
 mod shell;
 mod surround;
+mod typed;
 use crate::search::{Prompt, Query};
 use crate::{Range, Selections, boundary};
 pub use lines::open_line_site;
