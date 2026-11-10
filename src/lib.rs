@@ -22,6 +22,7 @@ pub mod buffer;
 pub mod cli;
 pub mod cli_style;
 pub mod clipboard;
+#[doc(hidden)]
 pub mod codex;
 pub mod color;
 pub mod command;
