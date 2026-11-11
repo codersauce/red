@@ -15,6 +15,9 @@ use std::path::Component;
 
 use serde::{Deserialize, Serialize};
 
+mod workspace;
+pub use workspace::WorkspaceSession;
+
 use crate::{
     agent_conversation::AgentConversationSnapshot,
     editor::Content,
@@ -138,6 +141,46 @@ pub struct SessionSnapshot {
     /// Unknown top-level fields retained for manifest-declared plugin migrations.
     #[serde(default, flatten)]
     pub legacy_extensions: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+impl SessionSnapshot {
+    pub(crate) fn editor_view(
+        cwd: String,
+        buffers: Vec<SessionBufferSnapshot>,
+        current_buffer_index: usize,
+        window_layout: WindowManagerSnapshot,
+        panels: PanelManagerSnapshot,
+    ) -> Self {
+        Self {
+            version: SESSION_SCHEMA_VERSION,
+            generation: 0,
+            cwd,
+            saved_at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| {
+                    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+                }),
+            buffers,
+            current_buffer_index,
+            window_layout,
+            panels,
+            registers: HashMap::new(),
+            jumps: Vec::new(),
+            jump_index: 0,
+            window_jumps: Vec::new(),
+            local_marks: Vec::new(),
+            global_marks: Vec::new(),
+            special_marks: Vec::new(),
+            last_visual_selections: Vec::new(),
+            agent_transcript: None,
+            agent_conversation: None,
+            inline_history: Default::default(),
+            legacy_agent_workspace: None,
+            agent_session_resumable: false,
+            plugin_extensions: HashMap::new(),
+            legacy_extensions: Default::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -417,6 +460,11 @@ impl SessionStore {
     /// A missing or invalid `latest.json` falls back to `previous.json`.
     /// Other I/O errors are surfaced rather than silently bypassed.
     pub fn load(&self) -> anyhow::Result<SessionSnapshot> {
+        self.load_optional()?
+            .ok_or_else(|| anyhow::anyhow!("no session snapshots found"))
+    }
+
+    fn load_optional(&self) -> anyhow::Result<Option<SessionSnapshot>> {
         let validated = |path: &Path| {
             read_snapshot(path).and_then(|snapshot| {
                 validate_snapshot(snapshot)
@@ -424,16 +472,23 @@ impl SessionStore {
             })
         };
         match validated(&self.latest_path()) {
-            Ok(snapshot) => Ok(snapshot),
+            Ok(snapshot) => Ok(Some(snapshot)),
             Err(latest_error)
                 if latest_error.kind() == io::ErrorKind::InvalidData
                     || latest_error.kind() == io::ErrorKind::NotFound =>
             {
-                validated(&self.previous_path()).map_err(|previous_error| {
-                        anyhow::anyhow!(
+                match validated(&self.previous_path()) {
+                    Ok(snapshot) => Ok(Some(snapshot)),
+                    Err(error)
+                        if error.kind() == io::ErrorKind::NotFound
+                            && latest_error.kind() == io::ErrorKind::NotFound =>
+                    {
+                        Ok(None)
+                    }
+                    Err(previous_error) => Err(anyhow::anyhow!(
                             "latest session snapshot is invalid ({latest_error}); last known-good snapshot is unavailable ({previous_error})"
-                        )
-                    })
+                    )),
+                }
             }
             Err(error) => Err(error.into()),
         }

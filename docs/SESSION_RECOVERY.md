@@ -1,14 +1,21 @@
 # Session recovery
 
-On a normal clean exit, Red's bundled `session_restore` plugin remembers clean,
-file-backed buffers, cursor positions, viewports, and split layout. Starting
-`red` again without file arguments in the same working directory restores that
-lightweight workspace automatically. Supplying files starts the requested
-workspace instead, and dirty buffers remain the responsibility of core crash
-recovery. Each canonical working directory has an independent lightweight
-snapshot, so exiting Red in another workspace does not replace its saved state.
-The former global `latest` value remains readable by its matching workspace and
-is replaced by a workspace-scoped value on the next clean exit.
+Starting `red` without file arguments reopens the last completed session for
+the same working directory. This includes ordinary `[No Name]` buffers with
+their text and undo history, open files, the active buffer, cursor positions,
+viewports, and splits. Each working directory has its own session.
+
+`:q` keeps scratchpads and still checks for unsaved changes to files. `:q!`
+keeps scratchpads and discards file edits from the next automatic restore.
+Red reopens named files from disk and drops their saved undo history when the
+text has changed. If the session can't be saved, Red keeps the editor open and
+shows the error.
+
+Supplying files opens just those files. Quitting from that launch can add new
+scratchpads to the saved session while preserving its existing buffers and
+layout. If another editor owns the session, close it before retrying the quit,
+or save your scratchpads as files. Older workspace layouts from the bundled
+`session_restore` plugin are still recognized.
 
 Red's core writes versioned recovery snapshots under `sessions/<owner>/latest.json` in the configuration directory. Each editor and named detached owner has an independent namespace, so concurrent sessions cannot replace one another's recovery point. Run `red --resume` after a crash to restore the newest valid snapshot containing dirty buffers, falling back to the newest clean snapshot when no work is pending; legacy `sessions/latest.json` snapshots remain supported. An interactive resume continues the selected owner namespace so a subsequent clean save replaces the stale dirty recovery point. Recovery is deliberately separate from opening files: restored dirty contents remain in memory and Red never writes them to disk until an explicit save. Do not resume an editor that is still running, since interactive owners do not currently hold an exclusive recovery lock.
 

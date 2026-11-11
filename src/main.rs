@@ -43,7 +43,7 @@ use red::language::GrammarTrustStore;
 use red::logger::Logger;
 use red::lsp::{LspClient, LspManager};
 use red::preferences::PreferencesStore;
-use red::session::SessionStore;
+use red::session::{SessionStore, WorkspaceSession};
 use red::theme::{parse_vscode_theme, parse_vscode_theme_contents, Theme};
 use red::utils::expand_user_path;
 use red::{log, run_self_check, LOGGER};
@@ -322,6 +322,25 @@ async fn run_editor_inner(args: Args) -> anyhow::Result<()> {
     } else {
         (None, None)
     };
+    let workspace = std::env::current_dir()?.canonicalize()?;
+    let mut workspace_session = WorkspaceSession::new(&Config::config_dir(), workspace);
+    let workspace_snapshot = if !args.resume && args.files.is_empty() {
+        match workspace_session.claim_and_load() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                eprintln!("Could not restore the workspace session: {error}");
+                None
+            }
+        }
+    } else {
+        if args.resume {
+            if let Err(error) = workspace_session.claim() {
+                eprintln!("Could not claim the workspace session: {error}");
+            }
+        }
+        None
+    };
+    loaded.config.startup_session_resumed |= workspace_snapshot.is_some();
     let session_store = match (&args.core_session, resumed_store) {
         (Some(session), _) => {
             SessionStore::for_owner(&session_root, &format!("detached-{session}"))?
@@ -339,16 +358,21 @@ async fn run_editor_inner(args: Args) -> anyhow::Result<()> {
         buffers = Editor::buffers_from_session_snapshot(snapshot);
         anyhow::ensure!(!buffers.is_empty(), "session snapshot contains no buffers");
     } else if args.files.is_empty() {
-        let buffer = Buffer::new(None, String::new());
-        buffers.push(buffer);
+        if let Some(snapshot) = &workspace_snapshot {
+            buffers = Editor::buffers_from_session_snapshot(snapshot);
+        }
+        if buffers.is_empty() {
+            buffers.push(Buffer::new(None, String::new()));
+        }
     } else {
         buffers = load_startup_buffers(&args.files).await?;
     }
 
     let diagnostics = std::mem::take(&mut loaded.diagnostics);
     let recovery = loaded.recovery;
+    let restored_session = loaded.config.startup_session_resumed;
     let mut editor = Editor::new_with_preferences(lsp, loaded.config, theme, buffers, preferences)?;
-    editor.enable_first_launch_welcome(first_launch && resumed_session.is_none());
+    editor.enable_first_launch_welcome(first_launch && !restored_session);
     editor.set_language_reload_source(config_file, args.config_overrides.clone());
     editor.set_config_diagnostics(diagnostics, recovery);
     if let Some(snapshot) = &resumed_session {
@@ -360,6 +384,7 @@ async fn run_editor_inner(args: Args) -> anyhow::Result<()> {
             );
         }
     }
+    editor.set_workspace_session(workspace_session, workspace_snapshot.as_ref());
     editor.enable_diagnostic_cache(Config::path("cache/lsp-diagnostics"));
     editor.enable_agent_continuity(Config::path("agent/conversations"));
     editor.enable_update_checks(Config::path("cache/updates"));
