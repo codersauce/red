@@ -1,6 +1,12 @@
 {
-  "api_version": "0.22.0",
+  "api_version": "0.23.0",
   "changes": [
+    {
+      "version": "0.23.0",
+      "kind": "introduced",
+      "symbols": ["OpenThemeBrowser"],
+      "migration_note": "docs/PLUGIN_API.md#theme-browser"
+    },
     {
       "version": "0.22.0",
       "kind": "introduced",

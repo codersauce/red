@@ -59,7 +59,7 @@ is retained, and disconnect discards it so reconnect cannot replay old copies.
 Native clipboard reads are requested only during paste actions, never on input
 polling or reconnect. Detach IPC bounds clipboard text to 1 MiB and chunks writes
 to fit frame limits, preserving the existing plugin write limit. OSC 52 retains
-its smaller terminal-specific limit. IPC protocol version 4 requires restarting
+its smaller terminal-specific limit. IPC protocol version 5 requires restarting
 older detached owners before attaching the updated frontend.
 
 ## Diagnose and verify

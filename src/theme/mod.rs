@@ -30,10 +30,35 @@ pub(crate) enum SelectionForegroundPriority {
 }
 
 /// Overall appearance of the active editor theme, independent of the terminal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ThemeMode {
     Dark,
     Light,
+}
+
+impl ThemeMode {
+    pub(crate) fn opposite(self) -> Self {
+        match self {
+            Self::Dark => Self::Light,
+            Self::Light => Self::Dark,
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Dark => "Dark",
+            Self::Light => "Light",
+        }
+    }
+}
+
+impl From<crossterm::event::TerminalAppearance> for ThemeMode {
+    fn from(appearance: crossterm::event::TerminalAppearance) -> Self {
+        match appearance {
+            crossterm::event::TerminalAppearance::Dark => Self::Dark,
+            crossterm::event::TerminalAppearance::Light => Self::Light,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,7 +102,9 @@ pub struct ThemeStyleSpec {
 impl Theme {
     /// Classifies the editor's resolved background by perceived luminance.
     pub fn mode(&self) -> ThemeMode {
-        if self.style.bg.is_some_and(Color::is_light) {
+        let background = self.style.bg.unwrap_or(Color::Rgb { r: 0, g: 0, b: 0 });
+        // The editor draws its canvas style over the composited theme background.
+        if blend_color(background, background).is_light() {
             ThemeMode::Light
         } else {
             ThemeMode::Dark

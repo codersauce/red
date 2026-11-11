@@ -591,6 +591,36 @@ delay_ms = 250
 
 See [`default_config.toml`](../default_config.toml) for every supported setting.
 
+### Light and dark themes
+
+Open the theme picker with `Space t` to preview and select a single theme.
+For separate Light and Dark themes, press `Ctrl+t` in the picker and check
+**Enable automatic switching**. Red keeps your current theme in the slot
+that matches its editor background. It suggests `red-light` for a missing Light
+choice and `red` for a missing Dark choice.
+
+Choose either slot to edit it. `Tab` switches between slots, `Ctrl+r` switches
+between matching and all themes, and `Enter` saves the selected theme for
+that slot. `Alt+/` opens contextual shortcuts. Unchecking automatic
+switching keeps the theme currently in use and remembers both preferences.
+
+The picker saves these preferences in `config.toml`.
+
+```toml
+theme = "red.json"
+
+[appearance]
+mode = "terminal"
+light_theme = "red-light.json"
+dark_theme = "red.json"
+```
+
+Red uses `theme` at startup and switches only after the attached terminal
+reports its appearance. It keeps the last working theme if the terminal is
+silent or the chosen theme cannot be loaded. The appearance report protocol
+is available through Red's Unix terminal input path. Delivery through a
+multiplexer or remote connection depends on the terminal and that connection.
+
 ## Plugins and themes
 
 Bundled plugins are enabled by default. Disable or configure them by ID:

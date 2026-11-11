@@ -501,6 +501,16 @@ impl Command for PopKeyboardEnhancementFlags {
     }
 }
 
+/// An explicit light or dark appearance report from the terminal.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, PartialOrd, PartialEq, Eq, Clone, Copy, Hash)]
+pub enum TerminalAppearance {
+    /// The terminal reports dark appearance.
+    Dark,
+    /// The terminal reports light appearance.
+    Light,
+}
+
 /// Represents an event.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(not(feature = "bracketed-paste"), derive(Copy))]
@@ -510,6 +520,8 @@ pub enum Event {
     FocusGained,
     /// The terminal lost focus
     FocusLost,
+    /// The terminal reported its appearance.
+    TerminalAppearance(TerminalAppearance),
     /// A single key event with additional pressed modifiers.
     Key(KeyEvent),
     /// A single mouse event with additional pressed modifiers.

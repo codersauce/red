@@ -86,3 +86,29 @@ pub(crate) fn coalesce_resize_run(first: Event, pending_events: &mut VecDeque<Ev
 
     Event::Resize(width, height)
 }
+
+/// Subscribe to terminal appearance notifications and request the current value.
+pub fn start_appearance_reports(output: &mut impl std::io::Write) -> std::io::Result<()> {
+    if cfg!(unix) {
+        output.write_all(b"\x1b[?2031h")?;
+    }
+    query_appearance(output)
+}
+
+/// Request a terminal appearance report without blocking on a reply.
+pub fn query_appearance(output: &mut impl std::io::Write) -> std::io::Result<()> {
+    if cfg!(unix) {
+        output.write_all(b"\x1b[?996n")?;
+        output.flush()?;
+    }
+    Ok(())
+}
+
+/// Stop appearance notifications before restoring the terminal.
+pub fn stop_appearance_reports(output: &mut impl std::io::Write) -> std::io::Result<()> {
+    if cfg!(unix) {
+        output.write_all(b"\x1b[?2031l")?;
+        output.flush()?;
+    }
+    Ok(())
+}

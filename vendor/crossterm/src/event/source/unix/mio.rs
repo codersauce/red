@@ -206,6 +206,12 @@ impl Parser {
 
             self.buffer.push(*byte);
 
+            // Preserve Alt+] unless the bytes introduce an OSC 11 background reply.
+            let more = if self.buffer == b"\x1b]" {
+                buffer[idx + 1..].starts_with(b"11;")
+            } else {
+                more
+            };
             match parse_event(&self.buffer, more) {
                 Ok(Some(ie)) => {
                     self.internal_events.push_back(ie);

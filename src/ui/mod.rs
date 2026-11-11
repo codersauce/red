@@ -27,6 +27,7 @@ mod learn;
 mod list;
 mod messages;
 mod picker;
+pub(crate) use picker::{ThemeBrowser, ThemeCatalogEntry, ThemeSettings};
 mod picker_items;
 mod picker_matching;
 mod prompt_buffer;
@@ -210,6 +211,8 @@ pub trait Component: Send {
     }
 
     fn set_theme(&mut self, _theme: &Theme) {}
+
+    fn set_terminal_appearance(&mut self, _appearance: Option<crate::theme::ThemeMode>) {}
 
     fn handle_event(&mut self, ev: &Event) -> Option<crate::config::KeyAction> {
         match ev {

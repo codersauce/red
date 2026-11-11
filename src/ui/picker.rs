@@ -400,6 +400,9 @@ struct CachedLocationPreview {
     complete: bool,
 }
 
+mod themes;
+pub(crate) use themes::{ThemeBrowser, ThemeCatalogEntry, ThemeSettings};
+
 pub struct Picker {
     id: Option<i32>,
     callback_handle: Option<PickerHandle>,
@@ -436,6 +439,8 @@ pub struct Picker {
     busy_since: Option<Instant>,
     busy_frame: u64,
     key_actions: Vec<PickerKeyAction>,
+    native_actions: Vec<UiAction>,
+    reserved_annotation_width: usize,
     show_preview: bool,
     preview: Option<PickerPreview>,
     item_preview_root: Option<PathBuf>,
@@ -641,6 +646,8 @@ impl Picker {
             busy_since: None,
             busy_frame: 0,
             key_actions: Vec::new(),
+            native_actions: Vec::new(),
+            reserved_annotation_width: 0,
             show_preview: true,
             preview: None,
             item_preview_root: None,
@@ -1827,7 +1834,9 @@ impl Picker {
     }
 
     fn layout(&self) -> PickerLayout {
-        let action_rows = usize::from(!self.key_actions.is_empty() && self.height >= 6);
+        let action_rows = usize::from(
+            (!self.key_actions.is_empty() || !self.native_actions.is_empty()) && self.height >= 6,
+        );
         let action_y = (action_rows > 0).then_some(self.y + self.height.saturating_sub(1));
         let content_y = match self.input_position {
             PickerInputPosition::Top => self.y + 3,
@@ -2481,6 +2490,14 @@ impl Picker {
     /// move the columns. Labels take priority over annotations and descriptions;
     /// document-symbol positions occupy a stable right-aligned numeric gutter.
     fn label_first_columns(&self, items: &PickerItems, content_width: usize) -> LabelFirstColumns {
+        let reserved = self.reserved_annotation_width;
+        if reserved > 0 && content_width > reserved + INTRINSIC_COLUMN_GAP {
+            return LabelFirstColumns {
+                label: content_width - reserved - INTRINSIC_COLUMN_GAP,
+                annotation: reserved,
+                ..Default::default()
+            };
+        }
         let mut columns = self.label_first_column_widths.get().unwrap_or_else(|| {
             let mut columns = LabelFirstColumns::default();
             let tree_prefixes = self.tree_prefixes(items);
@@ -3851,6 +3868,9 @@ impl Component for Picker {
         self.dialog.title().unwrap_or("Picker")
     }
     fn surface_actions(&self) -> Vec<UiAction> {
+        if !self.native_actions.is_empty() {
+            return self.native_actions.clone();
+        }
         let mut actions = vec![
             UiAction::new("select", "Enter", "select").with_priority(ActionPriority::Essential)
         ];

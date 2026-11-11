@@ -74,6 +74,7 @@ mod session_manager;
 mod shell_command;
 mod signature_help;
 mod snippet;
+mod theme_browser;
 mod update;
 mod workspace_search;
 
@@ -2663,6 +2664,25 @@ impl PickerCallback {
     }
 }
 
+/// Actions from the built-in theme browser and its appearance settings.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub enum ThemeBrowserAction {
+    Open(Option<PickerHandle>),
+    BackToList,
+    Settings,
+    Choose(crate::theme::ThemeMode),
+    ToggleAutomatic,
+    Preview(Option<String>),
+    Save {
+        name: String,
+        slot: Option<crate::theme::ThemeMode>,
+        return_to_settings: bool,
+    },
+    Cancel {
+        return_to_settings: bool,
+    },
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 /// Semantic editor operation produced by keymaps, commands, UI, or plugins.
 ///
@@ -3086,6 +3106,7 @@ pub enum Action {
     /// Opens contextual, searchable keyboard help without replacing the active surface.
     KeyboardShortcuts,
     OpenSyntaxPicker,
+    ThemeBrowser(ThemeBrowserAction),
     SetSyntax(String),
     OpenWhatsNew,
     UpdateRed,
@@ -3753,8 +3774,8 @@ pub struct Editor {
     /// Recoverable configuration problems retained until explicitly acknowledged.
     config_diagnostics: Vec<ConfigDiagnostic>,
     config_diagnostics_acknowledged: bool,
-    /// Original configuration source and strict overrides reused by explicit language reloads.
-    language_config_path: PathBuf,
+    /// Original user configuration file, used by reloads and picker settings.
+    config_path: PathBuf,
     language_config_overrides: Vec<String>,
 
     /// Visual theme settings
@@ -3774,6 +3795,11 @@ pub struct Editor {
 
     /// Lazily spawned native companions owned by installed plugins.
     companion_manager: Arc<tokio::sync::Mutex<plugin::companion::CompanionManager>>,
+
+    terminal_appearance: Option<crate::theme::ThemeMode>,
+    committed_theme: String,
+    theme_preview_base: Option<Theme>,
+    terminal_theme_errors: [Option<String>; 2],
 
     /// Syntax highlighting engine
     highlighter: Highlighter,
@@ -4373,7 +4399,12 @@ impl DetachedEditorCore {
                     Event::Paste(std::mem::take(&mut self.pending_paste))
                 }
                 event => {
-                    self.pending_paste.clear();
+                    if !matches!(
+                        event,
+                        crate::headless::InputEvent::TerminalAppearance { .. }
+                    ) {
+                        self.pending_paste.clear();
+                    }
                     detached_input_to_crossterm(event)
                 }
             };
@@ -4544,6 +4575,7 @@ impl DetachedEditorCore {
     }
 
     pub fn client_disconnected(&mut self) {
+        self.editor.set_terminal_appearance(None);
         self.client_clipboard.set_attached(false);
         self.editor.mouse_selection.gesture = None;
         self.editor.mouse_selection.last_click = None;
@@ -4699,6 +4731,9 @@ fn detached_input_to_crossterm(event: crate::headless::InputEvent) -> Event {
         crate::headless::InputEvent::Paste { text }
         | crate::headless::InputEvent::PasteChunk { text, .. } => Event::Paste(text),
         crate::headless::InputEvent::Mouse { event } => Event::Mouse(event),
+        crate::headless::InputEvent::TerminalAppearance { appearance } => {
+            Event::TerminalAppearance(appearance)
+        }
         crate::headless::InputEvent::Key {
             code,
             modifiers,
@@ -5481,20 +5516,20 @@ impl Editor {
 
     /// Records the exact configuration inputs that explicit language reloads must reuse.
     pub fn set_language_reload_source(&mut self, path: PathBuf, overrides: Vec<String>) {
-        self.language_config_path = path;
+        self.config_path = path;
         self.language_config_overrides = overrides;
     }
 
     /// Atomically replaces language definitions while retaining unrelated live LSP clients.
     pub async fn reload_languages(&mut self) -> anyhow::Result<usize> {
         let mut loaded =
-            Config::load_user_file(&self.language_config_path, &self.language_config_overrides)?;
+            Config::load_user_file(&self.config_path, &self.language_config_overrides)?;
         anyhow::ensure!(
             loaded.recovery != ConfigRecovery::WholeFileFallback,
             "configuration is invalid; the previous languages remain active"
         );
         let config_dir = self
-            .language_config_path
+            .config_path
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(Config::config_dir);
@@ -5957,10 +5992,14 @@ impl Editor {
             inline_history: InlineHistory::default(),
             inline_history_browser: None,
             lsp,
+            committed_theme: config.theme.clone(),
+            terminal_appearance: None,
+            theme_preview_base: None,
+            terminal_theme_errors: [None, None],
             config,
             config_diagnostics: Vec::new(),
             config_diagnostics_acknowledged: true,
-            language_config_path: Config::path("config.toml"),
+            config_path: Config::path("config.toml"),
             language_config_overrides: Vec::new(),
             theme,
             statusline_git_cache: StatuslineGitCache {
@@ -11503,6 +11542,8 @@ impl Editor {
         self.stdout
             .execute(terminal::Clear(terminal::ClearType::All))?;
 
+        crate::terminal_input::start_appearance_reports(&mut self.stdout)?;
+
         // Crossterm installs its SIGWINCH listener lazily on the first poll.
         // Register it before plugin startup so pane resizes during awaited
         // initialization are not lost.
@@ -13326,9 +13367,20 @@ impl Editor {
                         .as_ref()
                         .is_some_and(|dialog| dialog.picker_id() == Some(id))
                     {
-                        self.release_current_dialog_callbacks(runtime);
-                        self.current_dialog = None;
-                        needs_render = true;
+                        if self.theme_preview_base.is_some() {
+                            self.handle_theme_browser_action(
+                                &ThemeBrowserAction::Cancel {
+                                    return_to_settings: false,
+                                },
+                                buffer,
+                                runtime,
+                            )
+                            .await?;
+                        } else {
+                            self.release_current_dialog_callbacks(runtime);
+                            self.current_dialog = None;
+                            needs_render = true;
+                        }
                     }
                 }
                 PluginRequest::PluginQuarantined {
@@ -14609,6 +14661,14 @@ impl Editor {
     ) -> anyhow::Result<ProcessedEvent> {
         let _span =
             perf::enabled().then(|| perf::PerfSpan::with_detail("editor:input", format!("{ev:?}")));
+        if let Event::TerminalAppearance(appearance) = ev {
+            self.set_terminal_appearance(Some(appearance.into()));
+            self.resolve_terminal_theme(buffer, runtime).await?;
+            return Ok(ProcessedEvent::default());
+        }
+        if matches!(ev, Event::FocusGained) && self.terminal_active {
+            crate::terminal_input::query_appearance(&mut self.stdout)?;
+        }
         self.rpc_commands.interrupt(&ev);
         if matches!(
             ev,
@@ -19805,6 +19865,13 @@ impl Editor {
     }
 
     fn release_current_dialog_callbacks(&mut self, runtime: &mut Runtime) {
+        if self.theme_preview_base.is_some() {
+            let restored = self.restore_theme_preview();
+            let changed = self.apply_terminal_preference();
+            if restored || changed {
+                _ = self.refresh_plugin_snapshots(runtime, false, false, true);
+            }
+        }
         if let Some(handle) = self
             .current_dialog
             .as_ref()
@@ -21715,9 +21782,11 @@ impl Editor {
             let _ = self.stdout.flush();
         }
         let keyboard_result = std::mem::take(&mut self.keyboard_protocol).stop(&mut self.stdout);
+        let appearance_result = crate::terminal_input::stop_appearance_reports(&mut self.stdout);
         let output_result = Self::restore_terminal_output(&mut self.stdout);
         let raw_mode_result = terminal::disable_raw_mode();
         keyboard_result?;
+        appearance_result?;
         output_result?;
         raw_mode_result?;
         self.terminal_active = false;
@@ -25628,6 +25697,11 @@ impl Editor {
                     add_to_history = false;
                     self.record_picker_history(key, query);
                 }
+                Action::ThemeBrowser(action) => {
+                    add_to_history = false;
+                    self.handle_theme_browser_action(action, buffer, runtime)
+                        .await?;
+                }
                 Action::PreviewTheme(theme_name) => {
                     match self.apply_theme(theme_name, false) {
                         Ok(()) => {
@@ -25679,6 +25753,8 @@ impl Editor {
                         )?;
                         self.stdout
                             .execute(terminal::Clear(terminal::ClearType::All))?;
+                        self.set_terminal_appearance(None);
+                        crate::terminal_input::start_appearance_reports(&mut self.stdout)?;
                         self.invalidate_terminal_render_state(buffer);
                         self.render(buffer)?;
                     }
@@ -29198,7 +29274,19 @@ impl Editor {
     }
 
     fn apply_theme(&mut self, theme_name: &str, update_config: bool) -> anyhow::Result<()> {
-        let Some(theme_asset) = crate::assets::resolve_theme(theme_name, &Config::config_dir())
+        let (theme, highlighter) = self.prepare_theme(theme_name)?;
+        if update_config {
+            Config::persist_theme(theme_name)?;
+            self.config.theme = theme_name.to_string();
+            self.committed_theme = theme_name.to_string();
+            self.theme_preview_base = None;
+        }
+        self.install_theme(theme, highlighter);
+        Ok(())
+    }
+
+    fn load_theme(&self, theme_name: &str) -> anyhow::Result<Theme> {
+        let Some(theme_asset) = crate::assets::resolve_theme(theme_name, self.theme_config_dir())
         else {
             anyhow::bail!("Theme file {} not found", theme_name);
         };
@@ -29207,7 +29295,16 @@ impl Editor {
         } else {
             parse_vscode_theme_contents(&theme_asset.read_to_string()?)?
         };
+        Ok(theme)
+    }
+
+    fn prepare_theme(&self, theme_name: &str) -> anyhow::Result<(Theme, Highlighter)> {
+        let theme = self.load_theme(theme_name)?;
         let highlighter = Highlighter::with_registry(&theme, self.highlighter.registry())?;
+        Ok((theme, highlighter))
+    }
+
+    fn install_theme(&mut self, theme: Theme, highlighter: Highlighter) {
         self.theme = theme;
         self.highlighter = highlighter;
         self.panel_manager
@@ -29220,11 +29317,6 @@ impl Editor {
         if let Some(dialog) = &mut self.current_dialog {
             dialog.set_theme(&self.theme);
         }
-        if update_config {
-            self.config.theme = theme_name.to_string();
-            Config::persist_theme(theme_name)?;
-        }
-        Ok(())
     }
 
     async fn go_to_line(

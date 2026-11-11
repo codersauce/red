@@ -24,14 +24,18 @@ impl Editor {
                     .map(|entry| entry.in_context(&region.context)),
             );
         }
+        let dialog = self
+            .current_dialog
+            .as_ref()
+            .filter(|dialog| dialog.has_shortcut_context());
+        // The footer and keyboard alias open the same actionable dialog help.
+        let clicked = clicked.filter(|region| {
+            dialog.is_none_or(|dialog| region.actions != dialog.surface_actions())
+        });
         let (context, current) = if let Some(region) = clicked {
             let entries = ShortcutEntry::from_actions(&region.context, &region.actions);
             (region.context, entries)
-        } else if let Some(dialog) = self
-            .current_dialog
-            .as_ref()
-            .filter(|dialog| dialog.has_shortcut_context())
-        {
+        } else if let Some(dialog) = dialog {
             let context = dialog.shortcut_context().to_owned();
             let actions = dialog.surface_actions();
             let mut entries = ShortcutEntry::from_actions(&context, &actions);
