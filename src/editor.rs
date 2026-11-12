@@ -76,6 +76,7 @@ mod signature_help;
 mod snippet;
 mod update;
 mod workspace_search;
+mod workspace_session;
 
 use std::{
     borrow::Cow,
@@ -3720,6 +3721,7 @@ pub struct Editor {
 
     /// Domain sub-controller managing session recovery and snapshots
     session_manager: session_manager::SessionManager,
+    workspace_session: Option<crate::session::WorkspaceSession>,
 
     /// Domain sub-controller coordinating LSP document state and notifications
     lsp_coordinator: lsp_coordinator::LspCoordinator,
@@ -5945,6 +5947,7 @@ impl Editor {
             open_file_watcher: Box::default(),
             file_picker_cache: Arc::default(),
             session_manager,
+            workspace_session: None,
             lsp_coordinator,
             agent_manager,
             agent_edit_decisions: Default::default(),
@@ -11700,6 +11703,15 @@ impl Editor {
         while let Some(request) = runtime.try_recv_request() {
             match request {
                 PluginRequest::SetPluginStorage { plugin, key, value } => {
+                    if plugin == "session_restore"
+                        && key == "latest"
+                        && self
+                            .workspace_session
+                            .as_ref()
+                            .is_some_and(|session| !session.owns_workspace())
+                    {
+                        continue;
+                    }
                     let key = scoped_plugin_storage_key(&plugin, &key);
                     storage_updates.push((plugin, key, value));
                 }
@@ -22328,21 +22340,20 @@ impl Editor {
                     self.execute_plugin_command(buffer, runtime, &command)
                         .await?;
                 } else {
-                    if *force {
-                        return Ok(Some((true, true)));
+                    if !*force {
+                        if self.defer_quit_for_pending_save() {
+                            return Ok(Some((true, false)));
+                        }
+                        let modified_buffers = self.modified_buffers();
+                        if !modified_buffers.is_empty() {
+                            self.set_legacy_message(Some(format!(
+                                "The following buffers have unwritten changes: {}",
+                                modified_buffers.join(", ")
+                            )));
+                            return Ok(Some((true, false)));
+                        }
                     }
-                    if self.defer_quit_for_pending_save() {
-                        return Ok(Some((true, false)));
-                    }
-                    let modified_buffers = self.modified_buffers();
-                    if modified_buffers.is_empty() {
-                        return Ok(Some((true, true)));
-                    }
-                    self.set_legacy_message(Some(format!(
-                        "The following buffers have unwritten changes: {}",
-                        modified_buffers.join(", ")
-                    )));
-                    return Ok(Some((true, false)));
+                    return Ok(Some((true, self.persist_workspace_on_quit())));
                 }
             }
             Action::MoveUp => {
@@ -30905,9 +30916,14 @@ impl Editor {
     fn modified_buffers(&self) -> Vec<&str> {
         self.buffer_manager
             .iter()
-            .filter(|b| b.is_dirty())
+            .filter(|b| self.buffer_blocks_quit(b))
             .map(|b| b.name())
             .collect()
+    }
+
+    fn buffer_blocks_quit(&self, buffer: &Buffer) -> bool {
+        buffer.is_dirty()
+            && !(self.workspace_session.is_some() && self.is_workspace_scratchpad(buffer))
     }
 
     fn has_pending_format_save(&self, buffer_id: BufferId) -> bool {
@@ -30925,7 +30941,7 @@ impl Editor {
         let dirty = self
             .buffer_manager
             .iter()
-            .filter(|buffer| buffer.is_dirty())
+            .filter(|buffer| self.buffer_blocks_quit(buffer))
             .map(Buffer::id)
             .collect::<Vec<_>>();
         let should_defer =
@@ -30966,7 +30982,7 @@ impl Editor {
             DeferredQuit::Ready => {
                 self.deferred_quit = DeferredQuit::None;
                 // A buffer may have changed while the asynchronous save was pending.
-                self.modified_buffers().is_empty()
+                self.modified_buffers().is_empty() && self.persist_workspace_on_quit()
             }
             // A save that vanished without reporting back cancels the quit.
             DeferredQuit::AfterSaves(ref waiting)
@@ -31119,33 +31135,9 @@ impl Editor {
             self.buffer_manager.len() == snapshot.buffers.len(),
             "session buffer count does not match the reconstructed editor"
         );
-        self.clear_pane_zoom();
         let duplicate_file_count = snapshot_duplicate_file_count(snapshot);
         let divergences = detect_disk_divergence(snapshot);
-        let buffer_map = snapshot
-            .buffers
-            .iter()
-            .enumerate()
-            .map(|(position, buffer)| (buffer.index, position))
-            .collect::<HashMap<_, _>>();
-        self.buffer_manager.set_active_index(
-            buffer_map
-                .get(&snapshot.current_buffer_index)
-                .copied()
-                .unwrap_or_default(),
-        );
-        self.window_manager = WindowManager::from_snapshot(
-            &snapshot.window_layout,
-            (self.size.0 as usize, self.size.1 as usize),
-            &buffer_map,
-        )
-        .unwrap_or_else(|| {
-            WindowManager::new(
-                self.buffer_manager.active_index(),
-                (self.size.0 as usize, self.size.1 as usize),
-            )
-        });
-        self.panel_manager.stage_restore(snapshot.panels.clone());
+        let buffer_map = self.restore_session_layout(snapshot);
         self.registers = snapshot.registers.clone();
         let saved_window_jumps = if snapshot.window_jumps.is_empty() {
             vec![SessionWindowJumps {
@@ -31375,6 +31367,35 @@ impl Editor {
         Ok(divergences)
     }
 
+    fn restore_session_layout(&mut self, snapshot: &SessionSnapshot) -> HashMap<usize, usize> {
+        self.clear_pane_zoom();
+        let buffer_map = snapshot
+            .buffers
+            .iter()
+            .enumerate()
+            .map(|(position, buffer)| (buffer.index, position))
+            .collect::<HashMap<_, _>>();
+        self.buffer_manager.set_active_index(
+            buffer_map
+                .get(&snapshot.current_buffer_index)
+                .copied()
+                .unwrap_or_default(),
+        );
+        self.window_manager = WindowManager::from_snapshot(
+            &snapshot.window_layout,
+            (self.size.0 as usize, self.size.1 as usize),
+            &buffer_map,
+        )
+        .unwrap_or_else(|| {
+            WindowManager::new(
+                self.buffer_manager.active_index(),
+                (self.size.0 as usize, self.size.1 as usize),
+            )
+        });
+        self.panel_manager.stage_restore(snapshot.panels.clone());
+        buffer_map
+    }
+
     fn restore_session_mark(
         &self,
         mark: &SessionMark,
@@ -31435,26 +31456,14 @@ impl Editor {
             .ok()
             .map(|path| path.to_string_lossy().to_string())
             .unwrap_or_default();
-        let saved_at_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
-            .unwrap_or_default();
-        let mut visible_buffer_positions = HashMap::new();
-        for window in self.window_manager.windows() {
-            visible_buffer_positions.insert(
-                window.buffer_index,
-                (window.cx, window.vtop + window.cy, window.vtop),
-            );
-        }
+        let visible_buffer_positions = self.session_buffer_positions();
         let (buffers, disk_fingerprints) = self
             .buffer_manager
             .iter()
             .enumerate()
             .map(|(index, buffer)| {
-                let (cursor_x, cursor_y, viewport_top) = visible_buffer_positions
-                    .get(&index)
-                    .copied()
-                    .unwrap_or((buffer.pos.0, buffer.vtop + buffer.pos.1, buffer.vtop));
+                let (cursor_x, cursor_y, viewport_top) =
+                    session_buffer_position(buffer, index, &visible_buffer_positions);
                 let mut undo_history = buffer.undo_history.clone();
                 undo_history.commit_transaction(CursorSnapshot::new(
                     cursor_x,
@@ -31591,14 +31600,6 @@ impl Editor {
 
         (
             SessionSnapshot {
-                version: SESSION_SCHEMA_VERSION,
-                generation: 0,
-                cwd,
-                saved_at_ms,
-                buffers,
-                current_buffer_index: self.buffer_manager.active_index(),
-                window_layout: self.window_manager.snapshot(),
-                panels: self.panel_manager.snapshot(usize::from(self.size.0)),
                 registers: self.registers.clone(),
                 jumps,
                 jump_index,
@@ -31614,13 +31615,29 @@ impl Editor {
                 } else {
                     InlineHistory::default()
                 },
-                legacy_agent_workspace: None,
                 agent_session_resumable,
                 plugin_extensions: self.preferences.plugin_storage_snapshot(),
-                legacy_extensions: std::collections::BTreeMap::new(),
+                ..SessionSnapshot::editor_view(
+                    cwd,
+                    buffers,
+                    self.buffer_manager.active_index(),
+                    self.window_manager.snapshot(),
+                    self.panel_manager.snapshot(usize::from(self.size.0)),
+                )
             },
             disk_fingerprints,
         )
+    }
+
+    fn session_buffer_positions(&self) -> HashMap<usize, (usize, usize, usize)> {
+        let mut positions = HashMap::new();
+        for window in self.window_manager.windows() {
+            positions.insert(
+                window.buffer_index,
+                (window.cx, window.vtop + window.cy, window.vtop),
+            );
+        }
+        positions
     }
 
     fn snapshot_mark(
@@ -34577,6 +34594,18 @@ fn transform_text_position_after_edit(
 
 fn compare_text_positions(a: TextPosition, b: TextPosition) -> Ordering {
     a.line.cmp(&b.line).then(a.character.cmp(&b.character))
+}
+
+fn session_buffer_position(
+    buffer: &Buffer,
+    index: usize,
+    positions: &HashMap<usize, (usize, usize, usize)>,
+) -> (usize, usize, usize) {
+    positions.get(&index).copied().unwrap_or((
+        buffer.pos.0,
+        buffer.vtop + buffer.pos.1,
+        buffer.vtop,
+    ))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
