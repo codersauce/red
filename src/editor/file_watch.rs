@@ -355,7 +355,7 @@ impl Editor {
 
     /// Keeps diff construction and confirmation state out of the recursive action future.
     #[inline(never)]
-    pub(super) fn open_disk_conflict_dialog(&mut self, runtime: &mut Runtime) -> bool {
+    pub(super) async fn open_disk_conflict_dialog(&mut self, runtime: &mut Runtime) -> bool {
         let Some(file) = self.current_buffer().file.clone() else {
             self.set_legacy_message(Some("No file name".to_string()));
             return false;
@@ -397,7 +397,7 @@ impl Editor {
         let message = format!(
             "{file}\n\n{visible_diff}{truncation}\n\nOverwrite replaces the disk version. Keep edits preserves both versions; use :e! to discard your edits or :w <file> to save elsewhere."
         );
-        self.release_current_dialog_callbacks(runtime);
+        self.release_current_dialog_callbacks(runtime).await;
         self.current_dialog = Some(Box::new(super::Confirmation::new_actions(
             self,
             "File changed on disk",

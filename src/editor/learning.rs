@@ -47,7 +47,7 @@ impl Editor {
         }
     }
 
-    pub(super) fn open_learn_hub(&mut self, runtime: &mut Runtime) {
+    pub(super) async fn open_learn_hub(&mut self, runtime: &mut Runtime) {
         if self.inline_assist.is_some()
             || self.workspace_manager.is_active()
             || self
@@ -61,7 +61,7 @@ impl Editor {
             ));
             return;
         }
-        self.release_current_dialog_callbacks(runtime);
+        self.release_current_dialog_callbacks(runtime).await;
         self.current_dialog = Some(Box::new(LearnHub::new(
             self,
             Lesson::AVAILABLE.map(|lesson| self.preferences.learn_lesson_completed(lesson.id())),
@@ -95,8 +95,8 @@ impl Editor {
             self.finish_tutorial(/*completed*/ false, buffer, runtime)
                 .await?;
         }
-        self.finish_learn_lesson(buffer, runtime)?;
-        self.open_learn_hub(runtime);
+        self.finish_learn_lesson(buffer, runtime).await?;
+        self.open_learn_hub(runtime).await;
         self.render(buffer)
     }
 
@@ -135,7 +135,7 @@ impl Editor {
                 .await?;
         }
         if self.learn_session.is_some() {
-            self.finish_learn_lesson(buffer, runtime)?;
+            self.finish_learn_lesson(buffer, runtime).await?;
         }
         if self.size.0 < 32 || self.size.1 < 12 {
             self.set_legacy_message(Some(
@@ -159,7 +159,7 @@ impl Editor {
             ));
             return self.render(buffer);
         }
-        self.release_current_dialog_callbacks(runtime);
+        self.release_current_dialog_callbacks(runtime).await;
         self.current_dialog = None;
         self.sync_to_window();
         // The temporary lesson must never replace the user's recovery layout.
@@ -209,13 +209,13 @@ impl Editor {
         self.splash_dismissed = true;
         self.force_full_redraw = true;
         if let Err(error) = self.set_current_buffer(buffer, practice_index).await {
-            self.finish_learn_lesson(buffer, runtime)?;
+            self.finish_learn_lesson(buffer, runtime).await?;
             return Err(error);
         }
         Ok(())
     }
 
-    pub(super) fn finish_learn_lesson(
+    pub(super) async fn finish_learn_lesson(
         &mut self,
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
@@ -223,7 +223,7 @@ impl Editor {
         let Some(session) = self.learn_session.take() else {
             return Ok(());
         };
-        self.release_current_dialog_callbacks(runtime);
+        self.release_current_dialog_callbacks(runtime).await;
         self.current_dialog = None;
         self.completion_snapshot = None;
         if let Some(index) = self
@@ -270,7 +270,7 @@ impl Editor {
     }
 
     /// Returns true when a practice action was handled or safely refused.
-    pub(super) fn intercept_learn_action(
+    pub(super) async fn intercept_learn_action(
         &mut self,
         action: &Action,
         buffer: &mut RenderBuffer,
@@ -280,11 +280,11 @@ impl Editor {
             return Ok(false);
         };
         if matches!(action, Action::Quit(_)) {
-            self.finish_learn_lesson(buffer, runtime)?;
+            self.finish_learn_lesson(buffer, runtime).await?;
             return Ok(true);
         }
         if self.current_buffer().id() != session.practice_buffer_id {
-            self.finish_learn_lesson(buffer, runtime)?;
+            self.finish_learn_lesson(buffer, runtime).await?;
             self.set_legacy_message(Some(
                 "lesson paused because the active buffer changed".into(),
             ));

@@ -6334,7 +6334,7 @@ impl Editor {
         }
 
         self.finish_welcome();
-        self.release_current_dialog_callbacks(runtime);
+        self.release_current_dialog_callbacks(runtime).await;
         self.current_dialog = None;
         self.sync_to_window();
         let original_window_layout = self.window_manager.snapshot();
@@ -6380,7 +6380,7 @@ impl Editor {
             log!("could not persist guided-tour progress: {error}");
         }
 
-        self.release_current_dialog_callbacks(runtime);
+        self.release_current_dialog_callbacks(runtime).await;
         self.current_dialog = None;
         if let Some(index) = self
             .buffer_manager
@@ -13191,7 +13191,7 @@ impl Editor {
                     if id == 802 {
                         self.remove_legacy_agent_picker_history();
                     }
-                    self.release_current_dialog_callbacks(runtime);
+                    self.release_current_dialog_callbacks(runtime).await;
                     self.current_dialog = Some(Box::new(AgentComposer::new(
                         self, title, id, query, history, owner,
                     )));
@@ -13215,7 +13215,7 @@ impl Editor {
                     if owner == "agent" {
                         self.remove_legacy_agent_picker_history();
                     }
-                    self.release_current_dialog_callbacks(runtime);
+                    self.release_current_dialog_callbacks(runtime).await;
                     self.current_dialog = Some(Box::new(AgentComposer::new_callback(
                         self, title, query, history, handle,
                     )));
@@ -13235,7 +13235,7 @@ impl Editor {
                         needs_render = true;
                         continue;
                     }
-                    self.release_current_dialog_callbacks(runtime);
+                    self.release_current_dialog_callbacks(runtime).await;
                     self.current_dialog = Some(Box::new(InputPrompt::new_callback(
                         self, title, initial, handle,
                     )));
@@ -13248,12 +13248,12 @@ impl Editor {
                     options,
                 } => {
                     let history_key = Self::picker_history_key(&title, Some(id));
+                    self.release_current_dialog_callbacks(runtime).await;
                     let mut picker = Picker::new_dynamic(title, self, items, id, options);
                     if let Some(history_key) = history_key {
                         let history = self.picker_history(&history_key).to_vec();
                         picker.set_history(history_key, history);
                     }
-                    self.release_current_dialog_callbacks(runtime);
                     self.current_dialog = Some(Box::new(picker));
                     needs_render = true;
                 }
@@ -13295,6 +13295,7 @@ impl Editor {
                             action.action == Picker::RESET_FILTERS_ACTION
                                 && action.key == Picker::RESET_FILTERS_KEY
                         });
+                    self.release_current_dialog_callbacks(runtime).await;
                     let mut picker = Picker::new_callback(title, self, items, handle, options);
                     if reset_filters {
                         picker.enable_filter_reset();
@@ -13304,7 +13305,6 @@ impl Editor {
                         let history = self.picker_history(&history_key).to_vec();
                         picker.set_history(history_key, history);
                     }
-                    self.release_current_dialog_callbacks(runtime);
                     self.current_dialog = Some(Box::new(picker));
                     needs_render = true;
                 }
@@ -13324,7 +13324,7 @@ impl Editor {
                         needs_render = true;
                         continue;
                     }
-                    self.release_current_dialog_callbacks(runtime);
+                    self.release_current_dialog_callbacks(runtime).await;
                     self.current_dialog = Some(Box::new(Confirmation::new_callback_with_options(
                         self, title, message, handle, options,
                     )));
@@ -13388,7 +13388,7 @@ impl Editor {
                             )
                             .await?;
                         } else {
-                            self.release_current_dialog_callbacks(runtime);
+                            self.release_current_dialog_callbacks(runtime).await;
                             self.current_dialog = None;
                             needs_render = true;
                         }
@@ -13410,7 +13410,7 @@ impl Editor {
                                 .composer_handle()
                                 .is_some_and(|handle| composers.contains(&handle))
                     }) {
-                        self.release_current_dialog_callbacks(runtime);
+                        self.release_current_dialog_callbacks(runtime).await;
                         self.current_dialog = None;
                     }
                     self.publish_plugin_quarantine(&plugin, &stage, &path, &diagnostic);
@@ -19895,12 +19895,18 @@ impl Editor {
         })
     }
 
-    fn release_current_dialog_callbacks(&mut self, runtime: &mut Runtime) {
+    async fn release_current_dialog_callbacks(&mut self, runtime: &mut Runtime) {
         if self.theme_preview_base.is_some() {
             let restored = self.restore_theme_preview();
             let changed = self.apply_terminal_preference();
             if restored || changed {
-                _ = self.refresh_plugin_snapshots(runtime, false, false, true);
+                let name = self.committed_theme.clone();
+                if let Err(error) = self
+                    .notify_theme_browser_change(runtime, &name, false)
+                    .await
+                {
+                    log!("failed to notify plugins of restored theme: {error:#}");
+                }
             }
         }
         if let Some(handle) = self
@@ -23889,7 +23895,7 @@ impl Editor {
         // log!("Action: {action:?}");
         self.half_page_keeps_screen_row = false;
         self.set_legacy_message(None);
-        if self.intercept_learn_action(action, buffer, runtime)? {
+        if self.intercept_learn_action(action, buffer, runtime).await? {
             return Ok(false);
         }
         if self.current_buffer().directory.is_some()
@@ -24061,7 +24067,7 @@ impl Editor {
                         _ => None,
                     };
                     if let Some(kind) = demo {
-                        self.release_current_dialog_callbacks(runtime);
+                        self.release_current_dialog_callbacks(runtime).await;
                         self.current_dialog = Some(Box::new(TutorialDemoPanel::new(self, kind)));
                         self.render(buffer)?;
                     } else {
@@ -24102,8 +24108,8 @@ impl Editor {
                 }
                 Action::ShowLineDiagnostics => {
                     if let Some(diagnostics) = self.diagnostics_for_current_line() {
+                        self.release_current_dialog_callbacks(runtime).await;
                         let popup = DiagnosticInfo::new(self, diagnostics);
-                        self.release_current_dialog_callbacks(runtime);
                         self.current_dialog = Some(Box::new(popup));
                         self.render(buffer)?;
                     } else {
@@ -24149,7 +24155,7 @@ impl Editor {
                             uri: uri.clone(),
                         };
                         let revisions = self.open_buffer_revision_snapshot();
-                        self.release_current_dialog_callbacks(runtime);
+                        self.release_current_dialog_callbacks(runtime).await;
                         self.clear_pending_code_action_requests();
                         self.current_dialog = Some(Box::new(self.code_action_loading_picker()));
                         self.render(buffer)?;
@@ -24853,7 +24859,7 @@ impl Editor {
                     self.render(buffer)?;
                 }
                 Action::CompareFileOnDisk => {
-                    let opened = self.open_disk_conflict_dialog(runtime);
+                    let opened = self.open_disk_conflict_dialog(runtime).await;
                     self.render(buffer)?;
                     if !opened {
                         return Ok(false);
@@ -25121,7 +25127,7 @@ impl Editor {
                     self.notify_change(runtime).await?;
                 }
                 Action::FilePicker => {
-                    self.release_current_dialog_callbacks(runtime);
+                    self.release_current_dialog_callbacks(runtime).await;
                     self.current_dialog =
                         Some(Box::new(FilePicker::new(self, std::env::current_dir()?)?));
                 }
@@ -25150,8 +25156,8 @@ impl Editor {
                     if self.learn_session.is_none() {
                         picker = picker.history_key("command-palette");
                     }
+                    self.release_current_dialog_callbacks(runtime).await;
                     let picker = picker.build(self);
-                    self.release_current_dialog_callbacks(runtime);
                     self.current_dialog = Some(Box::new(picker));
                     self.render(buffer)?;
                 }
@@ -25161,13 +25167,13 @@ impl Editor {
                         .chain(self.highlighter.language_ids())
                         .map(str::to_string)
                         .collect();
+                    self.release_current_dialog_callbacks(runtime).await;
                     let picker = Picker::builder()
                         .title("Syntax")
                         .items(items)
                         .placeholder("Select a syntax or choose auto/off")
                         .select_action(Action::SetSyntax)
                         .build(self);
-                    self.release_current_dialog_callbacks(runtime);
                     self.current_dialog = Some(Box::new(picker));
                     self.render(buffer)?;
                 }
@@ -25209,7 +25215,7 @@ impl Editor {
                     {
                         self.finish_welcome();
                     }
-                    self.release_current_dialog_callbacks(runtime);
+                    self.release_current_dialog_callbacks(runtime).await;
                     if self.open_whats_new_panel() {
                         self.render(buffer)?;
                         self.mark_whats_new_presented();
@@ -25228,8 +25234,8 @@ impl Editor {
                         self.finish_tutorial(/*completed*/ false, buffer, runtime)
                             .await?;
                     }
-                    self.finish_learn_lesson(buffer, runtime)?;
-                    self.open_learn_hub(runtime);
+                    self.finish_learn_lesson(buffer, runtime).await?;
+                    self.open_learn_hub(runtime).await;
                     self.render(buffer)?;
                 }
                 Action::StartLearnLesson => {
@@ -25251,15 +25257,15 @@ impl Editor {
                     self.continue_learn_lesson(buffer, runtime).await?;
                 }
                 Action::ExitLearnLesson => {
-                    self.finish_learn_lesson(buffer, runtime)?;
+                    self.finish_learn_lesson(buffer, runtime).await?;
                 }
                 Action::OpenStatuslineManager => {
-                    self.release_current_dialog_callbacks(runtime);
+                    self.release_current_dialog_callbacks(runtime).await;
                     self.current_dialog = Some(Box::new(StatuslineLayoutPanel::new(self)));
                     self.render(buffer)?;
                 }
                 Action::OpenWelcome => {
-                    self.release_current_dialog_callbacks(runtime);
+                    self.release_current_dialog_callbacks(runtime).await;
                     if !self.open_welcome_panel() {
                         self.last_error =
                             Some("terminal is too small for the welcome screen".into());
@@ -25268,7 +25274,7 @@ impl Editor {
                 }
                 Action::DismissWelcome => {
                     self.finish_welcome();
-                    self.release_current_dialog_callbacks(runtime);
+                    self.release_current_dialog_callbacks(runtime).await;
                     self.current_dialog = None;
                     self.render(buffer)?;
                 }
@@ -25304,12 +25310,12 @@ impl Editor {
                         .await?;
                 }
                 Action::DismissTutorialDemo | Action::RejectTutorialProposal => {
-                    self.release_current_dialog_callbacks(runtime);
+                    self.release_current_dialog_callbacks(runtime).await;
                     self.current_dialog = None;
                     self.render(buffer)?;
                 }
                 Action::AcceptTutorialProposal => {
-                    self.release_current_dialog_callbacks(runtime);
+                    self.release_current_dialog_callbacks(runtime).await;
                     self.current_dialog = None;
                     self.accept_tutorial_proposal(buffer, runtime).await?;
                     self.render(buffer)?;
@@ -25326,12 +25332,12 @@ impl Editor {
                     self.render(buffer)?;
                 }
                 Action::OpenDiagnosticsPicker => {
-                    self.release_current_dialog_callbacks(runtime);
+                    self.release_current_dialog_callbacks(runtime).await;
                     self.open_diagnostics_picker(diagnostics_picker::DiagnosticFilter::All);
                     self.render(buffer)?;
                 }
                 Action::OpenErrorDiagnosticsPicker => {
-                    self.release_current_dialog_callbacks(runtime);
+                    self.release_current_dialog_callbacks(runtime).await;
                     self.open_diagnostics_picker(diagnostics_picker::DiagnosticFilter::Errors);
                     self.render(buffer)?;
                 }
@@ -25371,12 +25377,12 @@ impl Editor {
                     self.render(buffer)?;
                 }
                 Action::ConfigDiagnostics => {
-                    self.release_current_dialog_callbacks(runtime);
+                    self.release_current_dialog_callbacks(runtime).await;
                     self.open_config_diagnostics();
                     self.render(buffer)?;
                 }
                 Action::PluginStatus => {
-                    self.release_current_dialog_callbacks(runtime);
+                    self.release_current_dialog_callbacks(runtime).await;
                     self.open_plugin_status();
                     self.render(buffer)?;
                 }
@@ -25406,7 +25412,7 @@ impl Editor {
                         {
                             self.close_messages();
                         } else {
-                            self.release_current_dialog_callbacks(runtime);
+                            self.release_current_dialog_callbacks(runtime).await;
                             self.refresh_message_browser();
                         }
                         self.render(buffer)?;
@@ -25428,7 +25434,7 @@ impl Editor {
                     {
                         self.clear_pending_code_action_requests();
                     }
-                    self.release_current_dialog_callbacks(runtime);
+                    self.release_current_dialog_callbacks(runtime).await;
                     self.current_dialog = None;
                     self.completion_snapshot = None;
                     self.render(buffer)?;
@@ -25600,6 +25606,7 @@ impl Editor {
                                 preview: None,
                             })
                             .collect();
+                        self.release_current_dialog_callbacks(runtime).await;
                         let picker = Picker::builder()
                             .title("Turn actions")
                             .structured_items(items)
@@ -25612,7 +25619,6 @@ impl Editor {
                                 })
                             })
                             .build(self);
-                        self.release_current_dialog_callbacks(runtime);
                         self.current_dialog = Some(Box::new(picker));
                     } else {
                         self.set_legacy_message(Some("no user prompt selected".to_string()));
@@ -25661,7 +25667,7 @@ impl Editor {
                             ));
                         }
                         Ok(plugin::panel::TextPanelReuseOutcome::Confirm(revision)) => {
-                            self.release_current_dialog_callbacks(runtime);
+                            self.release_current_dialog_callbacks(runtime).await;
                             self.current_dialog = Some(Box::new(Confirmation::new_actions(
                             self,
                             "Replace unsent draft?",
@@ -25682,17 +25688,18 @@ impl Editor {
                 }
                 Action::OpenPicker(title, items, id) => {
                     let history_key = Self::picker_history_key(title, *id);
+                    self.release_current_dialog_callbacks(runtime).await;
                     let mut picker = Picker::new(title.clone(), self, items, *id);
                     if let Some(history_key) = history_key {
                         let history = self.picker_history(&history_key).to_vec();
                         picker.set_history(history_key, history);
                     }
-                    self.release_current_dialog_callbacks(runtime);
                     self.current_dialog = Some(Box::new(picker));
                     self.render(buffer)?;
                 }
                 Action::OpenLivePicker(title, items, id, options) => {
                     let history_key = Self::picker_history_key(title, *id);
+                    self.release_current_dialog_callbacks(runtime).await;
                     let mut picker = Picker::new_live_with_options(
                         title.clone(),
                         self,
@@ -25704,7 +25711,6 @@ impl Editor {
                         let history = self.picker_history(&history_key).to_vec();
                         picker.set_history(history_key, history);
                     }
-                    self.release_current_dialog_callbacks(runtime);
                     self.current_dialog = Some(Box::new(picker));
                     self.render(buffer)?;
                 }
@@ -28366,7 +28372,7 @@ impl Editor {
         self.finish_rpc_text_panel_change(render_buffer)
     }
 
-    fn rpc_presentation_request(
+    async fn rpc_presentation_request(
         &mut self,
         render_buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
@@ -28377,6 +28383,7 @@ impl Editor {
         match method {
             plugin::rpc::PICKER_OPEN_METHOD => {
                 self.rpc_picker_open_request(render_buffer, runtime, owner, params)
+                    .await
             }
             plugin::rpc::TEXT_PANEL_CREATE_METHOD => self.rpc_text_panel_create_request(
                 render_buffer,
@@ -28502,7 +28509,7 @@ impl Editor {
         Ok(Value::Null)
     }
 
-    fn rpc_picker_open_request(
+    async fn rpc_picker_open_request(
         &mut self,
         render_buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
@@ -28519,7 +28526,7 @@ impl Editor {
             ));
         }
 
-        self.release_current_dialog_callbacks(runtime);
+        self.release_current_dialog_callbacks(runtime).await;
         let handle = self.plugin_registry.register_rpc_picker(owner, params.id);
         self.current_dialog = Some(Box::new(Picker::new_callback(
             params.title,
@@ -29077,7 +29084,10 @@ impl Editor {
                 self.rpc_message_show_request(render_buffer, params)
             }
             plugin::rpc::CLIPBOARD_WRITE_METHOD => self.rpc_clipboard_write_request(params),
-            _ => self.rpc_presentation_request(render_buffer, runtime, owner, method, params),
+            _ => {
+                self.rpc_presentation_request(render_buffer, runtime, owner, method, params)
+                    .await
+            }
         }
     }
 
@@ -53629,6 +53639,42 @@ while True:
             }
             _ => panic!("unexpected plugin request"),
         }
+    }
+
+    #[tokio::test]
+    async fn replacing_theme_browser_notifies_plugins_of_restored_theme() {
+        let mut editor = test_editor(80, 24);
+        let original_theme = editor.theme.name.clone();
+        let mut runtime = Runtime::new();
+        install_theme_probe(&mut editor, &mut runtime).await;
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+
+        for action in [
+            ThemeBrowserAction::Open(None),
+            ThemeBrowserAction::Preview(Some("lackluster.json".into())),
+        ] {
+            editor
+                .execute(
+                    &Action::ThemeBrowser(action),
+                    &mut render_buffer,
+                    &mut runtime,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(collect_print_requests(), ["lackluster"]);
+
+        editor
+            .execute(
+                &Action::OpenPicker(Some("Replacement".into()), vec!["Item".into()], None),
+                &mut render_buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(editor.theme.name, original_theme);
+        assert_eq!(collect_print_requests(), [original_theme]);
     }
 
     #[test]

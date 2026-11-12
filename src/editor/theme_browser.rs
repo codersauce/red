@@ -125,7 +125,7 @@ impl Editor {
         self.render(buffer)
     }
 
-    async fn notify_theme_browser_change(
+    pub(super) async fn notify_theme_browser_change(
         &mut self,
         runtime: &mut Runtime,
         name: &str,
@@ -341,7 +341,7 @@ impl Editor {
                 }
                 restored = self.restore_theme_preview();
                 self.apply_terminal_preference();
-                self.release_current_dialog_callbacks(runtime);
+                self.release_current_dialog_callbacks(runtime).await;
                 self.current_dialog = None;
                 let opened = self.open_theme_list(self.current_theme_slot(), false, *new_handle);
                 if let (Err(_), Some(handle)) = (&opened, new_handle) {
@@ -392,7 +392,7 @@ impl Editor {
                     if *return_to_settings {
                         self.open_theme_settings(handle);
                     } else {
-                        self.release_current_dialog_callbacks(runtime);
+                        self.release_current_dialog_callbacks(runtime).await;
                         self.current_dialog = None;
                     }
                     Ok(())
@@ -408,7 +408,7 @@ impl Editor {
                 if *return_to_settings {
                     self.open_theme_settings(handle);
                 } else {
-                    self.release_current_dialog_callbacks(runtime);
+                    self.release_current_dialog_callbacks(runtime).await;
                     self.current_dialog = None;
                 }
                 Ok(())
