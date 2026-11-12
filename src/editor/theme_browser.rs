@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use anyhow::Context;
+use futures::future::BoxFuture;
 use serde_json::json;
 
 use super::{Editor, RenderBuffer, Runtime, ThemeBrowserAction};
@@ -125,24 +126,27 @@ impl Editor {
         self.render(buffer)
     }
 
-    pub(super) async fn notify_theme_browser_change(
-        &mut self,
-        runtime: &mut Runtime,
-        name: &str,
+    // Keep plugin activation and notification state out of nested editor futures.
+    #[inline(never)]
+    pub(super) fn notify_theme_browser_change<'a>(
+        &'a mut self,
+        runtime: &'a mut Runtime,
+        name: &'a str,
         persisted: bool,
-    ) -> anyhow::Result<()> {
-        self.refresh_plugin_snapshots(runtime, false, false, true)?;
-        self.plugin_registry
-            .notify(
-                runtime,
-                "theme:changed",
-                json!({
-                    "name": name,
-                    "persisted": persisted,
-                }),
-            )
-            .await?;
-        Ok(())
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            self.refresh_plugin_snapshots(runtime, false, false, true)?;
+            self.plugin_registry
+                .notify(
+                    runtime,
+                    "theme:changed",
+                    json!({
+                        "name": name,
+                        "persisted": persisted,
+                    }),
+                )
+                .await
+        })
     }
 
     fn proposed_theme_pair(&self) -> AppearanceConfig {
