@@ -153,6 +153,23 @@ fn mebibytes(bytes: usize) -> String {
 }
 
 impl Editor {
+    /// Explain the starter config at startup and immediately after its creation.
+    pub fn show_generated_config_notice(&mut self, path: &std::path::Path) {
+        if !self.config.auto_generated_config {
+            return;
+        }
+        let message = format!(
+            "Auto-generated config file. Remove auto_generated_config in {} and restart Red to hide this message.",
+            path.display()
+        );
+        let notice = Notice::new(NotificationSource::Editor, Severity::Info, message)
+            .with_key("auto-generated-config")
+            .with_attention(crate::notification::AttentionPolicy::RequiresAcknowledgment);
+        if let Err(error) = self.publish_notification(notice) {
+            log!("could not publish generated-config notice: {error}");
+        }
+    }
+
     /// Operation-local feedback never enters the actionable inbox.
     pub(super) fn set_legacy_message(&mut self, message: Option<String>) {
         self.set_notification_message(Severity::Info, message);
@@ -893,6 +910,23 @@ mod tests {
         .unwrap();
         editor.test_disable_terminal_output();
         editor
+    }
+
+    #[test]
+    fn generated_config_notice_requires_flag_and_names_the_actual_path() {
+        let mut editor = editor(100, 24);
+        let path = std::path::Path::new("/custom config/red/config.toml");
+        editor.show_generated_config_notice(path);
+        assert_eq!(editor.notifications.records().count(), 0);
+
+        editor.config.auto_generated_config = true;
+        editor.show_generated_config_notice(path);
+        let notice = editor.notifications.records().next().unwrap();
+        assert_eq!(notice.severity, Severity::Info);
+        assert!(notice.content.summary.contains("auto_generated_config"));
+        assert!(notice.content.summary.contains(&path.display().to_string()));
+        // Startup overlays must not cause this notice to expire before it is seen.
+        assert!(notice.is_active(Instant::now() + Duration::from_secs(60)));
     }
 
     #[tokio::test]

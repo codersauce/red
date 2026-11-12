@@ -74,6 +74,10 @@ sidescrolloff = 0
 # disappears on the first edit, file open, or window split.
 splash = true
 
+# Generated starter configs enable this notice. Remove the setting or set it
+# to false in your config, then restart Red to hide the notice.
+auto_generated_config = false
+
 # Present a themed release announcement once after installing a new version.
 show_whats_new = true
 

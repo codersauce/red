@@ -25,7 +25,7 @@ static THEMES: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/themes");
 static PLUGINS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/plugins");
 
 const BUNDLED_PLUGIN_SCHEME: &str = "red-bundled";
-const STARTER_CONFIG_HEADER: &str = "# Red user config.\n# Defaults are built into this version of red.\n# Uncomment settings below to override them.\n# Uncomment the matching table header, such as [keys.normal], with any setting inside it.\n\n";
+const STARTER_CONFIG_HEADER: &str = "# Red user config.\n# Defaults are built into this version of red.\n# Uncomment settings below to override them.\n# Uncomment the matching table header, such as [keys.normal], with any setting inside it.\n# Remove auto_generated_config below to hide the notice on subsequent launches.\nauto_generated_config = true\n\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 /// Category of runtime file resolved by the asset system.
@@ -186,7 +186,7 @@ pub struct RuntimeAssetListEntry {
     pub shadows: Vec<RuntimeAssetSource>,
 }
 
-/// Produces a commented copy of embedded defaults for a new user config.
+/// Produces commented defaults with an enabled generated-config notice.
 pub fn starter_config() -> String {
     let mut out = String::from(STARTER_CONFIG_HEADER);
 
@@ -689,6 +689,19 @@ mod tests {
         assert_eq!(config.theme, "red.json");
         assert!(config.plugins.contains_key("theme_browser"));
         assert!(config.keys.normal.contains_key("Ctrl-t"));
+        assert!(config.auto_generated_config);
+    }
+
+    #[test]
+    fn removing_or_disabling_generated_config_flag_hides_notice() {
+        let starter = starter_config();
+        for replacement in ["", "auto_generated_config = false\n"] {
+            let contents = starter.replace("auto_generated_config = true\n", replacement);
+            let config = Config::from_user_toml_with_overrides(&contents, &[]).unwrap();
+            assert!(!config.auto_generated_config);
+        }
+        let config = Config::from_user_toml_with_overrides("", &[]).unwrap();
+        assert!(!config.auto_generated_config);
     }
 
     #[test]

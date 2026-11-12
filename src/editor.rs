@@ -18786,7 +18786,7 @@ impl Editor {
             return Vec::new();
         }
 
-        if matches!(cmd, "keys" | "keyboard-shortcuts") {
+        if matches!(cmd, "keys" | "keyboard-shortcuts" | "help" | "h") {
             return vec![Action::KeyboardShortcuts];
         }
         if matches!(cmd, "commands" | "command-palette") {
@@ -25246,9 +25246,14 @@ impl Editor {
                     self.render(buffer)?;
                 }
                 Action::CreateStarterConfig => {
+                    let config_exists = Config::path("config.toml").exists();
                     match crate::onboarding::create_starter_config(&Config::config_dir()) {
                         Ok(path) => {
-                            self.last_error = Some(format!("starter config: {}", path.display()))
+                            if !config_exists {
+                                self.config.auto_generated_config = true;
+                                self.show_generated_config_notice(&path);
+                            }
+                            self.last_error = Some(format!("starter config: {}", path.display()));
                         }
                         Err(error) => {
                             self.last_error = Some(format!("could not create config: {error}"))
@@ -39779,6 +39784,34 @@ builtin = "rust"
 
         assert!(editor.current_dialog.is_some());
         assert!(render_text_rows(&buffer).join("\n").contains("Commands"));
+    }
+
+    #[tokio::test]
+    async fn help_colon_aliases_open_and_close_the_shortcut_explorer() {
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 24);
+        let mut buffer = RenderBuffer::new(100, 24, &Style::default());
+        let mut runtime = Runtime::new();
+        let original = editor.current_buffer().contents();
+
+        for command in ["help", "h", "keys", "keyboard-shortcuts"] {
+            enter_colon_command(&mut editor, &mut buffer, &mut runtime, command).await;
+            assert!(editor.keyboard_shortcuts.is_some(), ":{command}");
+            assert!(render_text_rows(&buffer)
+                .join("\n")
+                .contains("Keyboard shortcuts"));
+            editor
+                .process_editor_event(
+                    Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                    &mut buffer,
+                    &mut runtime,
+                    EventRenderMode::Immediate,
+                )
+                .await
+                .unwrap();
+            assert!(editor.keyboard_shortcuts.is_none());
+            assert_eq!(editor.current_buffer().contents(), original);
+        }
     }
 
     #[tokio::test]

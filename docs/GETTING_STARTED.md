@@ -40,6 +40,10 @@ Start or control it at any time:
 A starter configuration at `~/.config/red/config.toml` remains optional. Press
 `c` on the welcome screen to create one without overwriting existing settings.
 Embedded configuration, themes, and plugins work when the file is absent.
+Generated configs contain `auto_generated_config = true`, which shows an
+informational notice with the config path. Remove that setting or set it to
+`false`, then restart Red to hide the notice. You can also acknowledge the
+notice for the current session in Messages (`Space m`).
 
 For one launch, repeat `-c` or `--config` to override a dotted key. The value
 is TOML, or a plain string when it is not valid TOML. These flags win over
@@ -295,7 +299,7 @@ Use Neo-tree for file operations.
 
 | Key | Action |
 | --- | --- |
-| `F1`, `:keys` | Contextual keyboard-shortcut explorer |
+| `F1`, `:keys`, `:help`, `:h` | Contextual keyboard-shortcut explorer |
 | `Space ?`, `Alt-x`, `Ctrl-Shift-p` | Command palette |
 | `Ctrl-p` | File picker |
 | `Ctrl-p`, then `>` | Switch from files to commands |
@@ -322,7 +326,11 @@ defaults and refresh the current query.
 In the file picker, append `:<line>` to a fuzzy filename query to open the
 selected file at that line. For example, `sona:123` opens `source_name.rs` at line 123.
 
-Press `F1` or click **F1 shortcuts** in an action strip to open keyboard help without closing the current pane or dialog. `Tab` switches between the current context and all Red keys; `/` searches by action or binding. `Esc` returns to exactly where you were. The **Keyboard shortcuts** command and `:keys` open the same explorer. User keymap overrides are reflected in the list.
+Press `F1` or click **F1 shortcuts** in an action strip to open keyboard help
+without closing the current pane or dialog. `Tab` switches between the current
+context and all Red keys; `/` searches by action or binding. `Esc` returns to
+exactly where you were. The **Keyboard shortcuts** command, `:keys`, `:help`, and
+`:h` open the same explorer. User keymap overrides are reflected in the list.
 
 The command palette includes descriptions, effective keymaps, and accepted
 `:Command` invocations. Pause after a configured prefix such as `Space`,
