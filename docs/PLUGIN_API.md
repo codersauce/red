@@ -1,6 +1,6 @@
 # Plugin compatibility
 
-Red host API version `0.22.0` is defined by
+Red host API version `0.23.0` is defined by
 [`src/plugin/host_api.json`](../src/plugin/host_api.json). That file is the canonical,
 machine-readable list of execute actions, request actions, signatures, and introduction
 versions. Runtime dispatch and the bundled-plugin corpus are checked against it in tests.
@@ -24,11 +24,11 @@ required/optional arity (`HUSK-A0002`) and obvious literal argument types
 annotations use `HUSK-A0004`. `--no-typecheck` is an unsupported development
 escape hatch; compatibility guarantees do not apply while it is enabled.
 
-Host API `0.22.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`,
+Host API `0.23.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`,
 `0.8.0`, `0.9.0`,
 `0.10.0`, `0.11.0`, `0.12.0`, `0.14.0`, `0.16.0`, `0.17.0`, `0.18.0`, `0.19.0`,
-`0.20.0`, and `0.21.0` contracts, so existing packages that declare those minors continue
-to load. New packages should target `"red_api_version": "^0.21.0"`.
+`0.20.0`, `0.21.0`, and `0.22.0` contracts, so existing packages that declare those minors continue
+to load. New packages should target `"red_api_version": "^0.23.0"`.
 
 ## Standalone JSON-RPC packages
 
@@ -656,7 +656,30 @@ A focused footer is a host-owned modal text area, not an editor file buffer. It 
 
 The footer uses the same Enter policy as `OpenComposer`: Enter or `Ctrl-Enter` submits; `Alt-Enter`, `Shift-Enter`, or `Ctrl-j` inserts a newline. While the footer is focused, `Ctrl-j` edits the prompt rather than scrolling the conversation. Escape enters Normal mode. In idle Normal mode, Enter submits and Escape emits `composer_blur`; Escape from Visual or Search mode first returns to Normal. `Ctrl-p`/`Ctrl-n` navigate local prompt history. In Insert mode, Up moves within a multiline draft until the first visual row, then recalls older prompts; once history navigation starts, Up/Down browse entries and Down past the newest entry restores the exact draft and cursor. `Ctrl-r` opens an empty, editable `Search prompts:` field with matching history entries previewed separately; repeated `Ctrl-r` selects older matches, Enter loads the selected match without submitting it, and Escape or `Ctrl-g` cancels. Normal-mode `Ctrl-r` remains redo, and `/` or `?` remains prompt-local text search. `Ctrl-c` remains a pane-level shortcut that emits `interrupt` without changing the composer draft or focus. Successful submission emits `panel:event:<id>` with `action: "submit"` and the complete `text`; other footer actions include `composer_focus`, `composer_blur`, `interrupt`, `clear`, `new`, `history`, and `close`. `SetPanelVisible(id, visible)` hides or restores a panel without discarding its blocks, scroll position, or draft. Replacing text-panel blocks with an empty list resets scrolling and restores tail-following. Side panels with a footer composer are responsive: at their declared width they take at most 45% of the terminal, a width the user chose by resizing still leaves the editor 40 columns, and no conversation pane docks narrower than 32 columns. Several conversation panes dock in order while each still gets 32 columns and the editor keeps 40. A pane that does not fit stops docking: it covers the editor while it has focus and steps aside when the editor does, emitting `panel:event:<id>` with `action: "view"` and `text` `"hidden"` or `"visible"` so the plugin can announce output the user cannot see.
 
-Codex app-server updates other than assistant text chunks are forwarded to plugins as `agent:activity` with the normalized `update` payload. Core editor-tool calls also emit this event with `session_update: "editor_tool"`, `status: "in_progress"`, and a concise `title` such as `Opening src/main.rs` or `Editing src/main.rs (2 changes)`. This allows status/tool/plan progress to be displayed without treating it as transcript text. Agent recovery uses `agent:conversation_restore_pending`, `AgentResumeSession`, `agent:session_restored`, and `agent:session_restore_failed`; plugins must not enable follow-up input while restoration is pending.
+Codex app-server updates other than assistant text chunks are forwarded to plugins as `agent:activity` with the normalized `update` payload (see [Agent event fields](#agent-event-fields)). Core editor-tool calls also emit this event with `session_update: "editor_tool"`, `status: "in_progress"`, and a concise `title` such as `Opening src/main.rs` or `Editing src/main.rs (2 changes)`. This allows status/tool/plan progress to be displayed without treating it as transcript text. Agent recovery uses `agent:conversation_restore_pending`, `AgentResumeSession`, `agent:session_restored`, and `agent:session_restore_failed`; plugins must not enable follow-up input while restoration is pending.
+
+### Agent event fields
+
+Host API `0.23.0` adds backend-neutral fields beside the Codex and ACP vocabulary
+that three agent events have always carried. The change is additive: every key
+and value a `0.22.0` plugin reads is still sent unchanged.
+
+| Event | New field | Value | Deprecated field it replaces |
+| --- | --- | --- | --- |
+| `agent:conversation_restore_pending`, `agent:session_restored`, `agent:conversation_resumable` | `session_id` | The conversation's session ID, identical to `thread_id`. | `thread_id` |
+| `agent:activity` (inside `update`) | `activity` | `"thought"` or `"tool"`. | `update.session_update` |
+| `agent:activity` (inside `update`) | `phase` | `"updated"` for `thought`; `"started"` or `"finished"` for `tool`. | `update.session_update` |
+
+`thread_id` and `update.session_update` (`agent_thought_chunk`, `tool_call`,
+`tool_call_update`) are deprecated but still sent; new plugins should read
+`session_id`, `update.activity`, and `update.phase`, and fall back to the old
+fields when talking to an older host. `update.kind` still names the tool kind
+(`read`, `edit`, `search`, and so on) and is not part of this change.
+
+`agent:completed.stop_reason` is `"completed"` when a turn ends normally,
+`"interrupted"` when it was stopped, and otherwise the backend's own status
+string (for example `"failed"`). `"completed"` is canonical; `"end_turn"` is a
+legacy spelling that plugins and the pane still accept but Red does not emit.
 
 ## Quarantine and self-check
 

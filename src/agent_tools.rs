@@ -10,7 +10,10 @@ use tokio::{
     time::timeout,
 };
 
-use crate::codex::CodexToolHost;
+use crate::agent_backend::{
+    ids::{SessionId, TurnId},
+    tool_host::{ToolCtx, ToolHost},
+};
 
 /// Maximum number of edits accepted in one atomic editor operation.
 pub const MAX_EDITOR_EDITS: usize = 128;
@@ -349,12 +352,16 @@ pub enum EditorOpenTarget {
     Vertical,
 }
 
-/// One Codex editor-tool request tied to an active session.
+/// One editor-tool request tied to an active session.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct EditorToolRequest {
-    /// Active Codex session that owns the call.
-    pub session_id: String,
+    /// Active agent session that owns the call.
+    pub session_id: SessionId,
+    /// The turn that issued the call; `None` for inline and commit-message
+    /// conversations. Never on the wire.
+    #[serde(skip)]
+    pub turn: Option<TurnId>,
     /// Strictly parsed semantic operation.
     #[serde(flatten)]
     pub call: EditorToolCall,
@@ -364,7 +371,7 @@ pub struct EditorToolRequest {
 /// changes in its buffer.
 pub const USER_DECISION_TOOL_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// Codex tool host that forwards all editor-aware reads and writes to Red's owner task.
+/// Tool host that forwards all editor-aware reads and writes to Red's owner task.
 #[derive(Debug, Clone)]
 pub struct EditorToolHost {
     sender: mpsc::Sender<PendingEditorTool>,
@@ -402,16 +409,17 @@ impl EditorToolHost {
 }
 
 #[async_trait]
-impl CodexToolHost for EditorToolHost {
+impl ToolHost for EditorToolHost {
     async fn read_file(
         &mut self,
-        session_id: &str,
+        ctx: &ToolCtx,
         path: &str,
         start_line: usize,
         line_count: usize,
     ) -> anyhow::Result<Value> {
         self.request(EditorToolRequest {
-            session_id: session_id.to_string(),
+            session_id: ctx.session.clone(),
+            turn: ctx.turn,
             call: EditorToolCall::ReadFile {
                 path: path.to_string(),
                 start_line,
@@ -423,13 +431,14 @@ impl CodexToolHost for EditorToolHost {
 
     async fn write_file(
         &mut self,
-        session_id: &str,
+        ctx: &ToolCtx,
         path: &str,
         expected_revision: u64,
         content: String,
     ) -> anyhow::Result<Value> {
         self.request(EditorToolRequest {
-            session_id: session_id.to_string(),
+            session_id: ctx.session.clone(),
+            turn: ctx.turn,
             call: EditorToolCall::WriteFile {
                 path: path.to_string(),
                 expected_revision,
@@ -439,8 +448,13 @@ impl CodexToolHost for EditorToolHost {
         .await
     }
 
-    async fn editor_tool(&mut self, request: EditorToolRequest) -> anyhow::Result<Value> {
-        self.request(request).await
+    async fn editor_tool(&mut self, ctx: &ToolCtx, call: EditorToolCall) -> anyhow::Result<Value> {
+        self.request(EditorToolRequest {
+            session_id: ctx.session.clone(),
+            turn: ctx.turn,
+            call,
+        })
+        .await
     }
 }
 
@@ -449,7 +463,7 @@ impl CodexToolHost for EditorToolHost {
 pub struct PendingEditorTool {
     /// Request to execute on the editor owner task.
     pub request: EditorToolRequest,
-    /// One-shot result channel back to the Codex worker.
+    /// One-shot result channel back to the agent backend's worker.
     pub response: oneshot::Sender<Result<Value, String>>,
 }
 
@@ -869,7 +883,8 @@ mod tests {
     #[test]
     fn editor_tool_request_round_trips_the_flat_dynamic_tool_shape() {
         let request = EditorToolRequest {
-            session_id: "session-1".to_string(),
+            session_id: SessionId::from_raw("session-1".to_string()),
+            turn: None,
             call: EditorToolCall::GetEditorState {},
         };
         let encoded = serde_json::to_value(&request).unwrap();

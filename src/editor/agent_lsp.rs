@@ -141,7 +141,7 @@ impl Editor {
         request: EditorToolRequest,
     ) -> tokio::sync::oneshot::Receiver<Result<Value, String>> {
         self.agent_manager
-            .mark_session_active(request.session_id.clone());
+            .mark_session_active(request.session_id.as_str().to_string());
         let (response, receiver) = tokio::sync::oneshot::channel();
         let mut render = RenderBuffer::new(
             self.size.0 as usize,
@@ -223,7 +223,8 @@ impl Editor {
 
     async fn start_agent_lsp(&mut self, request: &EditorToolRequest) -> anyhow::Result<StartQuery> {
         anyhow::ensure!(
-            self.agent_manager.is_session_active(&request.session_id),
+            self.agent_manager
+                .is_session_active(request.session_id.as_str()),
             "inactive agent session"
         );
         let root = self
@@ -240,7 +241,7 @@ impl Editor {
                 anyhow::anyhow!("unknown or expired LSP plan; request a new preview")
             })?;
             anyhow::ensure!(
-                plan.context.session == request.session_id,
+                plan.context.session == request.session_id.as_str(),
                 "LSP plan belongs to another session"
             );
             anyhow::ensure!(
@@ -487,10 +488,10 @@ impl Editor {
             });
         }
         let context = QueryContext {
-            session: request.session_id.clone(),
+            session: request.session_id.as_str().to_string(),
             turn_id: self
                 .agent_manager
-                .turn_id(&request.session_id)
+                .turn_id(request.session_id.as_str())
                 .map(str::to_string),
             root,
             server_root,

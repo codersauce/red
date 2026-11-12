@@ -13,6 +13,7 @@
 
 #![recursion_limit = "256"]
 
+pub mod agent_backend;
 pub mod agent_check;
 pub mod agent_conversation;
 pub mod agent_tools;
@@ -21,6 +22,7 @@ pub mod buffer;
 pub mod cli;
 pub mod cli_style;
 pub mod clipboard;
+#[doc(hidden)]
 pub mod codex;
 pub mod color;
 pub mod command;

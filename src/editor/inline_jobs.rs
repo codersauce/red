@@ -217,10 +217,8 @@ impl Editor {
         {
             state = self.inline_session_state(&session);
             if matches!(state, InlineAssistPopupState::Prompt { .. }) {
-                if let (Some(session_id), Some(bridge)) =
-                    (session.session_id, self.agent_manager.bridge())
-                {
-                    let _ = bridge.try_send(CodexCommand::CloseSession { session_id });
+                if let Some(session_id) = session.session_id {
+                    self.agent_manager.close_session(session_id);
                 }
                 if self
                     .current_dialog
@@ -739,10 +737,8 @@ impl Editor {
 
     pub(super) fn release_parked_inline_job(&mut self, group: &str) {
         if let Some(job) = self.inline_jobs.remove(group) {
-            if let (Some(session_id), Some(bridge)) =
-                (job.session.session_id, self.agent_manager.bridge())
-            {
-                let _ = bridge.try_send(CodexCommand::CloseSession { session_id });
+            if let Some(session_id) = job.session.session_id {
+                self.agent_manager.close_session(session_id);
             }
         }
         self.sync_inline_activity();

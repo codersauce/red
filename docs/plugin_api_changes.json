@@ -1,6 +1,12 @@
 {
-  "api_version": "0.22.0",
+  "api_version": "0.23.0",
   "changes": [
+    {
+      "version": "0.23.0",
+      "kind": "introduced",
+      "symbols": ["agent:conversation_restore_pending.session_id", "agent:session_restored.session_id", "agent:conversation_resumable.session_id", "agent:activity.activity", "agent:activity.phase"],
+      "migration_note": "docs/PLUGIN_API.md#agent-event-fields"
+    },
     {
       "version": "0.22.0",
       "kind": "introduced",

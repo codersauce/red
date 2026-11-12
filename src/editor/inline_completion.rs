@@ -412,7 +412,7 @@ impl Editor {
     }
 
     fn copilot_executable_available(&self) -> bool {
-        crate::codex::find_executable(&self.config.copilot.command).is_some()
+        crate::utils::find_executable(&self.config.copilot.command).is_some()
     }
 
     fn mark_copilot_setup_hint_seen(&mut self) {

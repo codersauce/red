@@ -169,7 +169,7 @@ fn inline_workspace_reader_remains_anchored_and_rejects_replaced_symlinks() {
     let root = directory.path().join("workspace");
     std::fs::create_dir(&root).unwrap();
     std::fs::write(root.join("source.rs"), "original\n").unwrap();
-    let reader = crate::codex::InlineWorkspaceReader::new(&root).unwrap();
+    let reader = crate::agent_backend::workspace::InlineWorkspaceReader::new(&root).unwrap();
 
     let original = directory.path().join("original");
     std::fs::rename(&root, &original).unwrap();

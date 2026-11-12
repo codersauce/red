@@ -1,4 +1,5 @@
 use super::*;
+use crate::editor::test_agent::AgentTestHandle;
 use crate::{inline_assist::InlineCommentInput, lsp::LspManager};
 
 const SOURCE: &str = "preamble\nbody\nhelper\ntail\n";
@@ -94,16 +95,8 @@ async fn inline_expansion_requires_review_and_applies_as_one_unsaved_undo() {
         )
         .await
         .is_err());
-    let (bridge, worker) = CodexBridge::channel(std::num::NonZeroUsize::new(2).unwrap());
-    editor.agent_manager.set_bridge(bridge);
-    worker
-        .send(CodexEvent::InlineResult {
-            request_id: "request".into(),
-            session_id: "provider".into(),
-            result,
-        })
-        .await
-        .unwrap();
+    let agent = AgentTestHandle::install(&mut editor);
+    agent.emit_inline_result("request", "provider", result);
     editor
         .service_background(
             &mut RenderBuffer::new(100, 30, &Style::default()),

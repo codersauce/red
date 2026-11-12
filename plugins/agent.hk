@@ -84,6 +84,9 @@ struct AgentConversationItem {
 }
 
 struct AgentConversationEvent {
+    // `session_id` is the backend-neutral name; `thread_id` is the deprecated
+    // Codex spelling of the same value, still sent for older plugins.
+    session_id: Option<String>,
     thread_id: String,
     cwd: String,
     model_info: Json,
@@ -92,6 +95,7 @@ struct AgentConversationEvent {
 
 /// A conversation saved by an earlier Red launch in this workspace.
 struct AgentResumableEvent {
+    session_id: Option<String>,
     thread_id: String,
     cwd: String,
     model_info: Json,
@@ -153,18 +157,24 @@ struct AgentToolCallUpdate {
     detail: Option<String>,
 }
 
-enum AgentActivityUpdate {
-    AgentThoughtChunk(AgentThoughtChunk),
-    ToolCall(AgentToolCall),
-    ToolCallUpdate(AgentToolCallUpdate),
-    Plan,
-    // Forward-compatible agent updates remain intentionally opaque.
-    Unknown(Json),
+// Every field is optional so the same shape reads current payloads
+// (`activity`, `phase`) and older ones that only carry `session_update`.
+struct AgentActivityFields {
+    activity: Option<String>,
+    phase: Option<String>,
+    session_update: Option<String>,
+    content: Option<AgentThoughtContent>,
+    title: Option<String>,
+    full_title: Option<String>,
+    kind: Option<String>,
+    tool_call_id: Option<String>,
+    status: Option<String>,
+    detail: Option<String>,
 }
 
 struct AgentActivityEvent {
     session_id: String,
-    update: AgentActivityUpdate,
+    update: AgentActivityFields,
 }
 
 struct AgentTextBlock {
@@ -1618,12 +1628,47 @@ fn activity(event: AgentActivityEvent) {
     if !is_current_session(event.session_id) {
         return;
     }
-    match event.update {
-        AgentActivityUpdate::AgentThoughtChunk(update) => thought_activity(update),
-        AgentActivityUpdate::ToolCall(update) => tool_activity(update),
-        AgentActivityUpdate::ToolCallUpdate(update) => update_tool_activity(update),
-        AgentActivityUpdate::Plan => set_phase("working", "Planning…"),
-        AgentActivityUpdate::Unknown(update) => {},
+    let update = event.update;
+    let activity = optional_text(update.activity, "");
+    let phase = optional_text(update.phase, "");
+    if activity == "" {
+        // Payloads from before `activity` and `phase` only carry `session_update`.
+        let legacy = optional_text(update.session_update, "");
+        if legacy == "agent_thought_chunk" {
+            activity = "thought";
+        } else if legacy == "tool_call" {
+            activity = "tool";
+            phase = "started";
+        } else if legacy == "tool_call_update" {
+            activity = "tool";
+            phase = "finished";
+        } else if legacy == "plan" {
+            activity = "plan";
+        }
+    }
+    // Other activities are forward-compatible and intentionally ignored.
+    if activity == "thought" {
+        thought_activity(AgentThoughtChunk { content: update.content });
+    } else if activity == "tool" && phase == "started" {
+        tool_activity(AgentToolCall {
+            title: update.title,
+            full_title: update.full_title,
+            kind: update.kind,
+            tool_call_id: update.tool_call_id,
+            status: update.status,
+            detail: update.detail,
+        });
+    } else if activity == "tool" {
+        update_tool_activity(AgentToolCallUpdate {
+            tool_call_id: update.tool_call_id,
+            status: update.status,
+            title: update.title,
+            full_title: update.full_title,
+            kind: update.kind,
+            detail: update.detail,
+        });
+    } else if activity == "plan" {
+        set_phase("working", "Planning…");
     }
 }
 
@@ -2663,6 +2708,14 @@ fn transcript_restored(event: AgentTranscriptEvent) {
 /// Whether the pane already shows this thread, as after Codex restarts under a
 /// running editor. Its transcript then stays: it holds partial replies and
 /// activity that Codex's saved history does not.
+fn conversation_session_id(session_id: Option<String>, thread_id: String) -> String {
+    let id = optional_text(session_id, "");
+    if id != "" {
+        return id;
+    }
+    return thread_id;
+}
+
 fn shows_thread(thread_id: String) -> bool {
     // A transcript saved by an earlier launch may be stale; Codex's copy wins.
     return thread_id != "" && red::string(state().session_id, "") == thread_id
@@ -2686,7 +2739,7 @@ fn conversation_restore_pending(event: AgentConversationEvent) {
     // A bridge restart abandons any session switch that had not completed.
     red::state_patch(AgentState { session_switch_target: "" });
     red::state_patch(AgentState { model_info: event.model_info, accepted_model: Json {}, turn_model_info: Json {} });
-    if shows_thread(event.thread_id) {
+    if shows_thread(conversation_session_id(event.session_id, event.thread_id)) {
         // Codex stopped under us. Keep what streamed so far; the core marks a
         // running turn as interrupted and the notice follows with the snapshot.
         red::state_patch(AgentState { codex_lost: true });
@@ -2709,7 +2762,7 @@ fn conversation_resumable(event: AgentResumableEvent) {
     // opens or the next message is sent.
     red::state_patch(AgentState { model_info: event.model_info, accepted_model: Json {}, turn_model_info: Json {} });
     load_conversation(AgentConversationEvent {
-        thread_id: event.thread_id, cwd: event.cwd, model_info: event.model_info, items: event.items,
+        session_id: event.session_id, thread_id: event.thread_id, cwd: event.cwd, model_info: event.model_info, items: event.items,
     });
     let age = red::string(event.age, "earlier");
     red::state_patch(AgentState { resume_hint: "Continuing · :AgentNew starts fresh", resume_age: age });
@@ -2730,10 +2783,11 @@ fn session_restored(event: AgentConversationEvent) {
         red::state_patch(AgentState { resume_hint: "", resume_age: "" });
     }
     // Decided before naming the thread below, which would make it look shown.
-    let shown = shows_thread(event.thread_id);
+    let restored_id = conversation_session_id(event.session_id, event.thread_id);
+    let shown = shows_thread(restored_id);
     // The thread's model follows in its own event, which can arrive before the
     // pane state names the restored thread.
-    red::state_patch(AgentState { session_id: event.thread_id });
+    red::state_patch(AgentState { session_id: restored_id });
     if !shown {
         let age = state().resume_age;
         load_conversation(event);
