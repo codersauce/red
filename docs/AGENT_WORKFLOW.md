@@ -287,7 +287,10 @@ messages come back to the pane as paused follow-ups. Queued follow-ups pause aft
 failed turn; the pane status shows how many are held, `:AgentSendQueued`
 resumes them, and `:AgentDiscardQueued` drops them. A message sent while Codex
 cannot start is held the same way: it stays visible in the pane, and the Retry
-action or `:AgentSendQueued` sends it once Codex is available. While a turn is in flight,
+action or `:AgentSendQueued` sends it once Codex is available. A message typed
+while a selected session is reconnecting goes to that session once it opens; if
+it fails to open, the message is held for the current conversation instead of
+being sent there. While a turn is in flight,
 the `agent_activity` statusline field (on the right by default) shows
 `agent working`, `agent following`, or `agent stopping`, plus any queued count,
 and it disappears when the agent is idle. A turn that finishes while the pane is
