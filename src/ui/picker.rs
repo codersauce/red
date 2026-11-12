@@ -10,7 +10,9 @@
 
 use super::picker_items::PickerItems;
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use rayon::prelude::*;
 use ropey::{Rope, RopeSlice};
@@ -136,6 +138,7 @@ const INTRINSIC_COLUMN_GAP: usize = 2;
 const INTRINSIC_FOOTER_GAP: usize = 4;
 /// Divider cells kept between the left corner and the first filter badge.
 const BADGE_DIVIDER_LEAD: usize = 1;
+const RESET_FILTERS_BUTTON: &str = " F6 Reset filters ";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -433,6 +436,7 @@ pub struct Picker {
     external_filter: bool,
     status: Option<String>,
     badges: Vec<String>,
+    filter_reset_enabled: bool,
     busy_since: Option<Instant>,
     busy_frame: u64,
     key_actions: Vec<PickerKeyAction>,
@@ -535,6 +539,9 @@ pub(crate) struct PickerFilterHighlights {
 }
 
 impl Picker {
+    pub(crate) const RESET_FILTERS_ACTION: &str = "reset_filters";
+    pub(crate) const RESET_FILTERS_KEY: &str = "F6";
+
     fn geometry_for_viewport(
         total_width: usize,
         total_height: usize,
@@ -638,6 +645,7 @@ impl Picker {
             external_filter: false,
             status: None,
             badges: Vec::new(),
+            filter_reset_enabled: false,
             busy_since: None,
             busy_frame: 0,
             key_actions: Vec::new(),
@@ -1156,7 +1164,7 @@ impl Picker {
             }
             PickerUpdate::Selection(id) => self.select_dynamic_id(&id),
             PickerUpdate::Status(status) => self.status = status,
-            PickerUpdate::Badges(badges) => self.badges = badges,
+            PickerUpdate::Badges(badges) => self.set_badges(badges),
             PickerUpdate::Busy(busy) => self.set_busy(busy),
             PickerUpdate::Preview(preview) => self.preview = preview,
         }
@@ -1193,7 +1201,36 @@ impl Picker {
 
     /// Replaces the active-filter labels shown on the footer divider.
     pub fn set_badges(&mut self, badges: Vec<String>) {
+        let reset_changed =
+            self.filter_reset_enabled && self.badges.is_empty() != badges.is_empty();
         self.badges = badges;
+        if reset_changed {
+            self.sync_list_bounds();
+        }
+    }
+
+    pub(crate) fn enable_filter_reset(&mut self) {
+        self.filter_reset_enabled = true;
+        self.key_actions
+            .retain(|action| action.action != Self::RESET_FILTERS_ACTION);
+        self.sync_list_bounds();
+    }
+
+    pub(super) fn is_filter_reset_event(&self, event: &Event) -> bool {
+        if !self.filter_reset_enabled {
+            return false;
+        }
+        match event {
+            Event::Key(key) => {
+                key.code == KeyCode::F(6)
+                    && key.kind == KeyEventKind::Press
+                    && key.modifiers.is_empty()
+            }
+            Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => self
+                .filter_reset_rect(self.layout())
+                .is_some_and(|rect| rect.contains(mouse.column.into(), mouse.row.into())),
+            _ => false,
+        }
     }
 
     /// Keeps file previews aligned with structurally shared open-buffer contents.
@@ -1367,11 +1404,15 @@ impl Picker {
                 .split(" / ")
                 .any(|binding| binding.trim().to_ascii_lowercase().replace("ctrl-", "c-") == key)
         })?;
+        self.notify_action(&action.action)
+    }
+
+    fn notify_action(&self, action: &str) -> Option<KeyAction> {
         if let Some(handle) = self.callback_handle {
             return Some(KeyAction::Single(Action::NotifyPicker(
                 handle,
                 Box::new(PickerCallback::Action {
-                    action: action.action.clone(),
+                    action: action.to_owned(),
                     item: self.selected_dynamic_item().cloned(),
                     query: self.search.clone(),
                 }),
@@ -1381,7 +1422,7 @@ impl Picker {
         Some(KeyAction::Single(Action::NotifyPlugins(
             format!("picker:action:{id}"),
             json!({
-                "action": action.action,
+                "action": action,
                 "item": self.selected_value(),
                 "query": self.search,
             }),
@@ -1826,8 +1867,29 @@ impl Picker {
         visible_width
     }
 
+    fn show_filter_reset(&self) -> bool {
+        self.filter_reset_enabled
+            && !self.badges.is_empty()
+            && self.width >= RESET_FILTERS_BUTTON.len()
+    }
+
+    fn filter_reset_rect(&self, layout: PickerLayout) -> Option<ScreenRect> {
+        if !self.show_filter_reset() {
+            return None;
+        }
+        let width = RESET_FILTERS_BUTTON.len();
+        Some(ScreenRect {
+            x: self.x + 1 + self.width - width,
+            y: layout.action_y?,
+            width,
+            height: 1,
+        })
+    }
+
     fn layout(&self) -> PickerLayout {
-        let action_rows = usize::from(!self.key_actions.is_empty() && self.height >= 6);
+        let action_rows = usize::from(
+            (!self.key_actions.is_empty() || self.show_filter_reset()) && self.height >= 6,
+        );
         let action_y = (action_rows > 0).then_some(self.y + self.height.saturating_sub(1));
         let content_y = match self.input_position {
             PickerInputPosition::Top => self.y + 3,
@@ -3862,6 +3924,13 @@ impl Component for Picker {
             )
             .with_priority(ActionPriority::Secondary)
         }));
+        if self.filter_reset_enabled {
+            actions.push(UiAction::new(
+                Self::RESET_FILTERS_ACTION,
+                Self::RESET_FILTERS_KEY,
+                "Reset filters",
+            ));
+        }
         actions.push(
             UiAction::new("cancel", "Esc", "cancel").with_priority(ActionPriority::Essential),
         );
@@ -3902,6 +3971,9 @@ impl Component for Picker {
     }
 
     fn handle_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
+        if self.is_filter_reset_event(ev) {
+            return self.notify_action(Self::RESET_FILTERS_ACTION);
+        }
         if matches!(ev, Event::Key(key) if key.kind == KeyEventKind::Release) {
             return None;
         }
@@ -4099,14 +4171,27 @@ impl Component for Picker {
             self.draw_preview(buffer, preview.as_ref(), preview_layout)?;
         }
         if let Some(y) = layout.action_y {
-            ActionBar::new(&self.surface_actions()).render(
+            let mut actions = self.surface_actions();
+            if self.filter_reset_enabled {
+                actions.retain(|action| action.id != Self::RESET_FILTERS_ACTION);
+            }
+            let reset = self.filter_reset_rect(layout);
+            ActionBar::new(&actions).render(
                 buffer,
                 self.x + 1,
                 y,
-                self.width,
+                self.width - reset.map_or(0, |rect| rect.width),
                 &self.theme,
                 &self.theme.ui_style.popup,
             );
+            if let Some(rect) = reset {
+                let style = Style {
+                    bold: true,
+                    bg: self.theme.ui_style.popup.bg,
+                    ..self.theme.ui_style.picker_prompt.clone()
+                };
+                buffer.set_text(rect.x, rect.y, RESET_FILTERS_BUTTON, &style);
+            }
         }
 
         Ok(())

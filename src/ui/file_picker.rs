@@ -21,11 +21,13 @@ use std::{
 
 use crossterm::event::{self};
 use fuzzy_matcher::skim::SkimMatcherV2;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     config::KeyAction,
     editor::{Action, Editor, RenderBuffer},
     plugin::{LocationColumnEncoding, OpenLocationTarget, PluginLocation},
+    preferences::PickerFilterSlot,
     theme::Theme,
 };
 
@@ -58,6 +60,7 @@ pub struct FilePicker {
     sender: mpsc::Sender<FilePickerLoad>,
     root_path: PathBuf,
     visibility: FilePickerVisibility,
+    filter_slot: PickerFilterSlot,
     load_generation: u64,
 }
 
@@ -95,7 +98,8 @@ impl<'a> FilePickerQuery<'a> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(default)]
 struct FilePickerVisibility {
     hidden: bool,
     ignored: bool,
@@ -147,6 +151,12 @@ impl FilePicker {
             .select_action(Action::OpenFile)
             .build(editor);
         picker.set_empty_message(Some("Loading files...".to_string()));
+        picker.enable_filter_reset();
+        let filter_slot = editor.file_picker_filter_slot(&root_path);
+        let visibility = filter_slot
+            .load()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default();
 
         FilePicker {
             picker,
@@ -164,7 +174,8 @@ impl FilePicker {
             #[cfg(test)]
             sender,
             root_path,
-            visibility: FilePickerVisibility::default(),
+            visibility,
+            filter_slot,
             load_generation: 0,
         }
     }
@@ -192,6 +203,13 @@ impl FilePicker {
         self.picker.set_status(Some("Scanning...".to_string()));
         self.picker.set_badges(self.visibility.badges());
         self.picker.set_busy(true);
+    }
+
+    fn set_visibility(&mut self, visibility: FilePickerVisibility) -> KeyAction {
+        self.visibility = visibility;
+        self.filter_slot.save(serde_json::json!(visibility));
+        self.start_load(false);
+        KeyAction::Single(Action::Refresh)
     }
 
     #[cfg(test)]
@@ -226,7 +244,7 @@ impl Component for FilePicker {
     fn surface_actions(&self) -> Vec<super::UiAction> {
         let mut actions = self.picker.surface_actions();
         actions.extend(super::reference_actions(&[
-            ("Files", "Ctrl+e", "Toggle hidden files"),
+            ("Files", "Ctrl+e", "Toggle hidden and ignored files"),
             ("Files", "Ctrl+r", "Refresh file index"),
             ("Files", ">", "Open commands when the query is empty"),
         ]));
@@ -302,6 +320,9 @@ impl Component for FilePicker {
     }
 
     fn handle_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
+        if self.picker.is_filter_reset_event(ev) {
+            return Some(self.set_visibility(FilePickerVisibility::default()));
+        }
         if self.picker.query().is_empty()
             && matches!(
                 ev,
@@ -323,9 +344,9 @@ impl Component for FilePicker {
                 if key.code == event::KeyCode::Char('e')
                     && key.modifiers.contains(event::KeyModifiers::CONTROL)
         ) {
-            self.visibility.toggle_all();
-            self.start_load(false);
-            return Some(KeyAction::Single(Action::Refresh));
+            let mut visibility = self.visibility;
+            visibility.toggle_all();
+            return Some(self.set_visibility(visibility));
         }
         if matches!(ev, event::Event::Key(key) if key.code == event::KeyCode::Char('r') && key.modifiers.contains(event::KeyModifiers::CONTROL))
         {
@@ -1521,6 +1542,8 @@ mod tests {
             text.contains("+hidden  +ignored") && text.contains("2/3"),
             "badges must stay visible next to the result count:\n{text}"
         );
+        let reopened = FilePicker::new(&editor, root.path().to_path_buf()).unwrap();
+        assert_eq!(reopened.visibility, picker.visibility);
 
         let expanded_selection = picker.handle_event(&key(KeyCode::Enter));
         assert_eq!(
@@ -1535,8 +1558,26 @@ mod tests {
             ]))
         );
 
-        picker.handle_event(&ctrl_key('e'));
+        let (column, row) = text
+            .lines()
+            .enumerate()
+            .find_map(|(row, line)| {
+                let start = line.find("F6 Reset filters")?;
+                Some((crate::unicode_utils::display_width(&line[..start]), row))
+            })
+            .expect("nondefault filters should show a Reset button");
+        assert_eq!(
+            picker.handle_event(&Event::Mouse(event::MouseEvent {
+                kind: event::MouseEventKind::Down(event::MouseButton::Left),
+                column: column.try_into().unwrap(),
+                row: row.try_into().unwrap(),
+                modifiers: event::KeyModifiers::NONE,
+            })),
+            Some(KeyAction::Single(Action::Refresh))
+        );
         assert_eq!(picker.visibility, FilePickerVisibility::default());
+        let reopened = FilePicker::new(&editor, root.path().to_path_buf()).unwrap();
+        assert_eq!(reopened.visibility, FilePickerVisibility::default());
         wait_for_load(&mut picker);
         let mut buffer = RenderBuffer::new(80, 24, &Style::default());
         picker.draw(&mut buffer).unwrap();

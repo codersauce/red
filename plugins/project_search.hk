@@ -1,4 +1,4 @@
-// Find in Files presents bundled workspace search results and stores query history per cwd.
+// Find in Files remembers filters per checkout and query history per search directory.
 
 struct StringValueEvent {
     value: String,
@@ -144,6 +144,19 @@ fn history_loaded(event: StoredValueEvent) {
     let history = history_by_cwd[red::string(state().cwd, ".")];
     if history == red::null() { history = []; }
     red::state_patch(ProjectSearchState { history: history });
+    red::request("GetStorage", filters_loaded, "filters");
+}
+
+fn filters_loaded(event: StoredValueEvent) {
+    let filters = event.value;
+    if filters != red::null() {
+        red::state_patch(ProjectSearchState {
+            hidden: red::bool(filters["hidden"], false),
+            ignored: red::bool(filters["ignored"], false),
+            follow: red::bool(filters["follow"], false),
+            regex: red::bool(filters["regex"], true),
+        });
+    }
     let handle = red::execute("OpenPicker", "Find in Files", [], PickerOptions {
         external_filter: true,
         placeholder: "Search workspace files",
@@ -158,6 +171,7 @@ fn history_loaded(event: StoredValueEvent) {
             PickerAction { action: "toggle_ignored", key: "Alt-i", label: "Toggle ignored" },
             PickerAction { action: "toggle_follow", key: "Alt-f", label: "Toggle symlink following" },
             PickerAction { action: "toggle_all", key: "Ctrl-e", label: "Toggle hidden and ignored" },
+            PickerAction { action: "reset_filters", key: "F6", label: "Reset filters" },
             PickerAction { action: "toggle_preview", key: "Alt-p / F4", label: "Toggle preview" },
             PickerAction { action: "history_back", key: "Ctrl-h", label: "Previous search" },
             PickerAction { action: "history_forward", key: "Ctrl-l", label: "Next search" },
@@ -303,21 +317,26 @@ fn picker_action(event: PickerActionEvent) {
         export_results();
     } else if event.action == "toggle_regex" {
         red::state_patch(ProjectSearchState { regex: !state().regex });
-        run_search(red::string(state().query, ""));
+        filters_changed();
     } else if event.action == "toggle_hidden" {
         red::state_patch(ProjectSearchState { hidden: !state().hidden });
-        run_search(red::string(state().query, ""));
+        filters_changed();
     } else if event.action == "toggle_ignored" {
         red::state_patch(ProjectSearchState { ignored: !state().ignored });
-        run_search(red::string(state().query, ""));
+        filters_changed();
     } else if event.action == "toggle_follow" {
         red::state_patch(ProjectSearchState { follow: !state().follow });
-        run_search(red::string(state().query, ""));
+        filters_changed();
     } else if event.action == "toggle_all" {
         let enabled = !state().hidden;
-        red::state_patch(ProjectSearchState { hidden: enabled });
-        red::state_patch(ProjectSearchState { ignored: enabled });
-        run_search(red::string(state().query, ""));
+        red::state_patch(ProjectSearchState { hidden: enabled, ignored: enabled });
+        filters_changed();
+    } else if event.action == "reset_filters" {
+        let defaults = initial_state();
+        red::state_patch(ProjectSearchState {
+            hidden: defaults.hidden, ignored: defaults.ignored, follow: defaults.follow, regex: defaults.regex,
+        });
+        filters_changed();
     } else if event.action == "toggle_preview" {
         red::state_patch(ProjectSearchState { preview: !state().preview });
         rebuild_items();
@@ -326,6 +345,14 @@ fn picker_action(event: PickerActionEvent) {
     } else if event.action == "history_forward" {
         move_history(-1);
     }
+}
+
+fn filters_changed() {
+    let current = state();
+    red::execute("SetStorage", "filters", Json {
+        hidden: current.hidden, ignored: current.ignored, follow: current.follow, regex: current.regex,
+    });
+    run_search(red::string(current.query, ""));
 }
 
 fn open_current(item: PickerItem) {
