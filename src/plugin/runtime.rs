@@ -5751,6 +5751,14 @@ mod tests {
     }
 
     async fn open_project_search_picker(runtime: &mut Runtime) -> PickerHandle {
+        open_project_search_picker_with_filters(runtime, serde_json::Value::Null, &[]).await
+    }
+
+    async fn open_project_search_picker_with_filters(
+        runtime: &mut Runtime,
+        saved_filters: serde_json::Value,
+        expected_badges: &[&str],
+    ) -> PickerHandle {
         runtime.execute_command("ProjectSearch").await.unwrap();
 
         let cwd_request_id = match ACTION_DISPATCHER.recv_request() {
@@ -5780,6 +5788,25 @@ mod tests {
             .resolve_request(storage_request_id, serde_json::json!({ "value": {} }))
             .await
             .unwrap();
+        let filter_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetPluginStorage {
+                plugin,
+                key,
+                request_id,
+            } => {
+                assert_eq!(plugin, "project_search");
+                assert_eq!(key, "filters");
+                request_id
+            }
+            _ => panic!("expected a filter storage request"),
+        };
+        runtime
+            .resolve_request(
+                filter_request_id,
+                serde_json::json!({ "value": saved_filters }),
+            )
+            .await
+            .unwrap();
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::OpenCallbackPicker {
                 owner,
@@ -5792,7 +5819,7 @@ mod tests {
                 assert_eq!(title.as_deref(), Some("Find in Files"));
                 assert!(items.is_empty());
                 assert!(options.external_filter);
-                assert!(options.badges.is_empty(), "default scope has no badges");
+                assert_eq!(options.badges, expected_badges);
                 assert!(options
                     .actions
                     .iter()
@@ -18375,11 +18402,56 @@ mod tests {
             toggle("toggle_follow"),
             ["literal", "+hidden", "+ignored", "+symlinks"]
         );
+        assert!(toggle("reset_filters").is_empty());
 
         runtime
             .notify_picker(handle, PickerCallback::Cancelled)
             .unwrap();
         drain_requests();
+    }
+
+    #[tokio::test]
+    async fn project_search_restores_filters_and_resets_the_current_query() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        load_project_search(&mut runtime).await;
+        let handle = open_project_search_picker_with_filters(
+            &mut runtime,
+            serde_json::json!({ "hidden": true, "ignored": true, "follow": true, "regex": false }),
+            &["literal", "+hidden", "+ignored", "+symlinks"],
+        )
+        .await;
+        runtime
+            .notify_picker(handle, PickerCallback::Query("needle".to_string()))
+            .unwrap();
+        drain_requests();
+        runtime
+            .notify_picker(
+                handle,
+                PickerCallback::Action {
+                    action: "reset_filters".to_string(),
+                    item: None,
+                    query: "needle".to_string(),
+                },
+            )
+            .unwrap();
+        let requests = drain_collect();
+        assert!(requests.iter().any(|request| matches!(
+            request,
+            PluginRequest::SetPluginStorage { plugin, key, value }
+                if plugin == "project_search"
+                    && key == "filters"
+                    && value == &serde_json::json!({
+                        "hidden": false, "ignored": false, "follow": false, "regex": true
+                    })
+        )));
+        assert!(requests.iter().any(|request| matches!(
+            request,
+            PluginRequest::SearchWorkspaceContent { options, .. }
+                if options.query.pattern == "needle"
+                    && options.query.regex
+                    && options.query.visibility == red_workspace_search::Visibility::default()
+        )));
     }
 
     #[tokio::test]

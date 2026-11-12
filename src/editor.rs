@@ -169,7 +169,7 @@ use crate::{
         NotificationSource, NotificationTime, Severity,
     },
     plugin::{self, ComposerHandle, PickerHandle, PluginRegistry, RequestId, Runtime},
-    preferences::{PanelLayoutPreference, PreferencesStore},
+    preferences::{PanelLayoutPreference, PickerFilterKind, PickerFilterSlot, PreferencesStore},
     session::{
         capture_session_disk_fingerprint, detect_disk_divergence, read_session_disk_contents,
         RecoveryDivergence, SessionAnchorAffinity, SessionBufferSnapshot, SessionDiskFingerprint,
@@ -191,7 +191,10 @@ use crate::{
         TutorialDemoPanel, WelcomePanel, WhatsNewPanel,
     },
     undo::{AppliedTextEdit, CursorSnapshot, EditOrigin, RevertEdit, TextPosition, TextRange},
-    utils::{expand_user_path, get_workspace_path, normalized_file_path, same_file_path},
+    utils::{
+        expand_user_path, get_workspace_path, git_checkout_root, normalized_file_path,
+        same_file_path,
+    },
     whats_new::ReleaseNotes,
     window::{
         JumpEntry, JumpList, WindowDivider, WindowId, WindowManager, WindowManagerSnapshot,
@@ -13287,7 +13290,15 @@ impl Editor {
                                 .then(|| (path.clone(), buffer.contents_snapshot()))
                         })
                         .collect();
+                    let reset_filters = owner == "project_search"
+                        && options.actions.iter().any(|action| {
+                            action.action == Picker::RESET_FILTERS_ACTION
+                                && action.key == Picker::RESET_FILTERS_KEY
+                        });
                     let mut picker = Picker::new_callback(title, self, items, handle, options);
+                    if reset_filters {
+                        picker.enable_filter_reset();
+                    }
                     picker.set_location_preview_contents(preview_contents);
                     if let Some(history_key) = history_key {
                         let history = self.picker_history(&history_key).to_vec();
@@ -13709,16 +13720,24 @@ impl Editor {
                     key,
                     request_id,
                 } => {
-                    let value = plugin_storage_value(&self.preferences, &plugin, &key)
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null);
+                    let value =
+                        if let Some(slot) = self.project_search_filter_slot(&plugin, &key) {
+                            slot.load().filter(Value::is_object)
+                        } else {
+                            plugin_storage_value(&self.preferences, &plugin, &key).cloned()
+                        }
+                        .unwrap_or(Value::Null);
                     self.plugin_registry
                         .resolve_request(runtime, request_id, json!({ "value": value }))
                         .await?;
                 }
                 PluginRequest::SetPluginStorage { plugin, key, value } => {
-                    let key = scoped_plugin_storage_key(&plugin, &key);
-                    self.preferences.set_plugin_storage(&plugin, &key, value)?;
+                    if let Some(slot) = self.project_search_filter_slot(&plugin, &key) {
+                        slot.save(value);
+                    } else {
+                        let key = scoped_plugin_storage_key(&plugin, &key);
+                        self.preferences.set_plugin_storage(&plugin, &key, value)?;
+                    }
                 }
                 PluginRequest::GetEditorState { request_id } => {
                     let snapshot = self.editor_state_snapshot();
@@ -19853,6 +19872,18 @@ impl Editor {
 
     pub(crate) fn picker_history(&self, key: &str) -> &[String] {
         self.preferences.picker_history(key)
+    }
+
+    pub(crate) fn file_picker_filter_slot(&self, search_dir: &Path) -> PickerFilterSlot {
+        self.preferences
+            .picker_filter_slot(search_dir, PickerFilterKind::Files)
+    }
+
+    fn project_search_filter_slot(&self, plugin: &str, key: &str) -> Option<PickerFilterSlot> {
+        (plugin == "project_search" && key == "filters").then(|| {
+            self.preferences
+                .picker_filter_slot(&get_workspace_path(), PickerFilterKind::Content)
+        })
     }
 
     fn picker_history_key(title: &Option<String>, id: Option<i32>) -> Option<String> {
@@ -35051,15 +35082,8 @@ async fn git_status_output(
 
 fn git_status_root(path: &str) -> Option<String> {
     let search_dir = git_search_dir(path);
-    Path::new(&search_dir)
-        .canonicalize()
-        .ok()
-        .and_then(|directory| {
-            directory
-                .ancestors()
-                .find(|ancestor| ancestor.join(".git").exists())
-                .map(|ancestor| ancestor.to_string_lossy().into_owned())
-        })
+    let directory = Path::new(&search_dir).canonicalize().ok()?;
+    git_checkout_root(&directory).map(|root| root.to_string_lossy().into_owned())
 }
 
 fn git_status_payload(root: &str, output: std::process::Output) -> Value {

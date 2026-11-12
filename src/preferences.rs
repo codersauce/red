@@ -9,16 +9,100 @@
 use std::{
     collections::HashMap,
     fs,
+    io::{self, Write as _},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 
-use crate::{plugin::PanelSide, tutorial::TutorialProgress, LOGGER};
+use crate::{plugin::PanelSide, tutorial::TutorialProgress, utils::git_checkout_root, LOGGER};
 
 const COMMAND_HISTORY_LIMIT: usize = 100;
 const SEARCH_HISTORY_LIMIT: usize = 100;
 const PICKER_HISTORY_LIMIT: usize = 100;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PickerFilterKind {
+    Files,
+    Content,
+}
+
+type MemoryPickerFilters = Arc<Mutex<HashMap<String, Value>>>;
+
+/// A single project's filter values for one picker. Disk slots can be updated
+/// independently by different Red processes.
+#[derive(Debug)]
+pub(crate) enum PickerFilterSlot {
+    File(PathBuf),
+    Memory {
+        key: String,
+        entries: MemoryPickerFilters,
+    },
+}
+
+impl PickerFilterSlot {
+    pub(crate) fn load(&self) -> Option<Value> {
+        let result = match self {
+            Self::File(path) => read_preferences(path)
+                .and_then(|text| serde_json::from_str(&text).map(Some).map_err(Into::into)),
+            Self::Memory { key, entries } => entries
+                .lock()
+                .map(|entries| entries.get(key).cloned())
+                .map_err(|_| anyhow::anyhow!("picker filter state lock poisoned")),
+        };
+        match result {
+            Ok(value) => value,
+            Err(error) => {
+                if !error
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|error| error.kind() == io::ErrorKind::NotFound)
+                {
+                    log_if_configured(&format!("failed to load picker filters: {error:#}"));
+                }
+                None
+            }
+        }
+    }
+
+    pub(crate) fn save(&self, value: Value) {
+        let result = match self {
+            Self::File(path) => write_picker_filter_slot(path, &value),
+            Self::Memory { key, entries } => entries
+                .lock()
+                .map(|mut entries| {
+                    entries.insert(key.clone(), value);
+                })
+                .map_err(|_| anyhow::anyhow!("picker filter state lock poisoned")),
+        };
+        if let Err(error) = result {
+            log_if_configured(&format!("failed to save picker filters: {error:#}"));
+        }
+    }
+}
+
+fn write_picker_filter_slot(path: &Path, value: &Value) -> anyhow::Result<()> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("picker filter slot has no parent directory"))?;
+    fs::create_dir_all(directory)?;
+    anyhow::ensure!(
+        fs::symlink_metadata(directory)?.is_dir(),
+        "picker filter directory must be a directory"
+    );
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => anyhow::ensure!(metadata.is_file(), "picker filter slot must be a file"),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+    serde_json::to_writer(&mut temporary, value)?;
+    temporary.flush()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 /// Serialized convenience state owned by [`PreferencesStore`].
@@ -72,6 +156,7 @@ pub struct PreferencesStore {
     path: Option<PathBuf>,
     preferences: Preferences,
     plugin_storage_dirty: bool,
+    memory_picker_filters: MemoryPickerFilters,
 }
 
 impl PreferencesStore {
@@ -81,6 +166,7 @@ impl PreferencesStore {
             path: None,
             preferences: Preferences::default(),
             plugin_storage_dirty: false,
+            memory_picker_filters: MemoryPickerFilters::default(),
         }
     }
 
@@ -125,6 +211,7 @@ impl PreferencesStore {
             path: Some(path),
             preferences,
             plugin_storage_dirty: false,
+            memory_picker_filters: MemoryPickerFilters::default(),
         };
         if let Err(error) = store.import_legacy_plugin_storage() {
             log_if_configured(&format!("failed to import legacy plugin storage: {error}"));
@@ -149,6 +236,32 @@ impl PreferencesStore {
             .get(key)
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    /// Resolves a filter slot using the checkout for preferences and leaves the
+    /// supplied search directory available for the picker to scan as before.
+    pub(crate) fn picker_filter_slot(
+        &self,
+        search_dir: &Path,
+        kind: PickerFilterKind,
+    ) -> PickerFilterSlot {
+        let directory = search_dir
+            .canonicalize()
+            .unwrap_or_else(|_| search_dir.to_path_buf());
+        let project = git_checkout_root(&directory).unwrap_or(&directory);
+        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let kind = match kind {
+            PickerFilterKind::Files => "files",
+            PickerFilterKind::Content => "content",
+        };
+        let key = format!("{digest:x}-{kind}.json");
+        match &self.path {
+            Some(path) => PickerFilterSlot::File(path.with_file_name("picker-filters").join(key)),
+            None => PickerFilterSlot::Memory {
+                key,
+                entries: Arc::clone(&self.memory_picker_filters),
+            },
+        }
     }
 
     /// Returns the most recent Red release successfully presented to the user.
@@ -632,6 +745,71 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    #[test]
+    fn picker_filters_share_a_checkout_but_keep_other_records_independent() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let nested = project.join("src");
+        let linked = temp.path().join("linked");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(project.join(".git")).unwrap();
+        fs::create_dir(&nested).unwrap();
+        fs::create_dir(&linked).unwrap();
+        fs::write(
+            linked.join(".git"),
+            "gitdir: ../project/.git/worktrees/linked",
+        )
+        .unwrap();
+        fs::create_dir(&outside).unwrap();
+        let config = temp.path().join("config/preferences.json");
+        let first = PreferencesStore::load(&config);
+        let second = PreferencesStore::load(&config);
+
+        let content_filters = serde_json::json!({ "ignored": true, "regex": false });
+        let file_filters = serde_json::json!({ "hidden": true, "ignored": true });
+        first
+            .picker_filter_slot(&nested, PickerFilterKind::Content)
+            .save(content_filters.clone());
+        second
+            .picker_filter_slot(&project, PickerFilterKind::Files)
+            .save(file_filters.clone());
+        let reopened = PreferencesStore::load(&config);
+        let content_at_root = reopened.picker_filter_slot(&project, PickerFilterKind::Content);
+        assert_eq!(content_at_root.load(), Some(content_filters));
+        assert_eq!(
+            reopened
+                .picker_filter_slot(&nested, PickerFilterKind::Files)
+                .load(),
+            Some(file_filters.clone())
+        );
+
+        let linked_content = second.picker_filter_slot(&linked, PickerFilterKind::Content);
+        assert_eq!(linked_content.load(), None);
+        let linked_filters = serde_json::json!({ "follow": true });
+        linked_content.save(linked_filters.clone());
+        assert_eq!(
+            reopened
+                .picker_filter_slot(&outside, PickerFilterKind::Content)
+                .load(),
+            None
+        );
+
+        let defaults = serde_json::json!({
+            "hidden": false, "ignored": false, "follow": false, "regex": true
+        });
+        second
+            .picker_filter_slot(&nested, PickerFilterKind::Content)
+            .save(defaults.clone());
+        assert_eq!(content_at_root.load(), Some(defaults));
+        assert_eq!(linked_content.load(), Some(linked_filters));
+        assert_eq!(
+            reopened
+                .picker_filter_slot(&project, PickerFilterKind::Files)
+                .load(),
+            Some(file_filters)
+        );
+    }
 
     fn unique_temp_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("red-{name}-{}", uuid::Uuid::new_v4()))

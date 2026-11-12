@@ -299,7 +299,8 @@ Use Neo-tree for file operations.
 | `Space ?`, `Alt-x`, `Ctrl-Shift-p` | Command palette |
 | `Ctrl-p` | File picker |
 | `Ctrl-p`, then `>` | Switch from files to commands |
-| `Ctrl-e` | Toggle hidden files in the picker; open the tree otherwise |
+| `Ctrl-e` | Toggle hidden and ignored files in the file picker; open the tree otherwise |
+| `F6` | Reset filters in the file picker or Find in Files |
 | `Ctrl-j` or `Space b` | Buffer picker |
 | `Space g` | Find in Files |
 | `Space t` | Theme browser |
@@ -311,6 +312,12 @@ the preview gives long result paths more room.
 Press `Space g` to search file contents with Red’s bundled FFF index. Find in
 Files works out of the box. Existing `plugin_config.project_search.backend`
 settings can be removed.
+
+Find in Files and the file picker each remember their own filters across
+restarts. Settings are shared across folders in the same Git checkout, with
+separate settings for linked worktrees. Outside Git, settings follow the search
+folder. Click **Reset filters** or press `F6` to restore the current picker's
+defaults and refresh the current query.
 
 In the file picker, append `:<line>` to a fuzzy filename query to open the
 selected file at that line. For example, `sona:123` opens `source_name.rs` at line 123.

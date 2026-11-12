@@ -1,8 +1,7 @@
 //! Small path helpers shared by configuration, buffers, and workspace-aware features.
 //!
-//! User-home expansion is explicit and fallible. Workspace discovery prefers the Git
-//! root containing the current directory and falls back to the current directory, so it
-//! is a convenience boundary rather than a security boundary for untrusted paths.
+//! User-home expansion is explicit and fallible. Checkout discovery finds an ancestor
+//! of a supplied path, while the editor workspace follows the current directory.
 
 use std::{
     borrow::Cow,
@@ -142,6 +141,13 @@ fn display_components(path: &Path) -> Vec<String> {
         }
     }
     parts
+}
+
+/// Finds the closest enclosing checkout, including worktrees with a `.git` file.
+pub(crate) fn git_checkout_root(directory: &Path) -> Option<&Path> {
+    directory
+        .ancestors()
+        .find(|ancestor| ancestor.join(".git").exists())
 }
 
 /// Get the current working directory
