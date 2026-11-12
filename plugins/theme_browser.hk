@@ -1,56 +1,10 @@
-// Live theme picker with preview, cancellation rollback, and final persistence.
-//
-// The original theme is retained until selection. Query movement previews a candidate,
-// cancellation restores the original, and only explicit selection persists the chosen
-// theme through the core configuration boundary.
-
-struct ThemeConfigValue {
-    value: String,
-}
-
-struct RuntimeAssetListing {
-    entries: [RuntimeAssetEntry],
-    error: Option<String>,
-}
-
-struct ThemePickerData {
-    theme: String,
-}
-
-struct ThemePickerItem {
-    id: String,
-    label: String,
-    kind: String,
-    annotation: String,
-    detail: String,
-    data: ThemePickerData,
-}
-
-struct ThemePickerHandlers {
-    changed: fn(ThemePickerItem),
-    cancelled: fn(PickerCancelled),
-    selected: fn(ThemePickerItem),
-}
-
 struct ThemeBrowserState {
-    original: String,
-    config_loaded: bool,
-    assets_loaded: bool,
-    entries: [RuntimeAssetEntry],
+    picker: Option<i32>,
 }
 
 #[red::state]
 fn initial_state() -> ThemeBrowserState {
-    return ThemeBrowserState {
-        original: "",
-        config_loaded: false,
-        assets_loaded: false,
-        entries: [],
-    };
-}
-
-fn state() -> ThemeBrowserState {
-    return red::state();
+    return ThemeBrowserState { picker: None };
 }
 
 #[red::command(
@@ -62,97 +16,13 @@ fn state() -> ThemeBrowserState {
     scope = "global",
 )]
 fn theme_browser() {
-    red::state_patch(ThemeBrowserState { original: "" });
-    red::state_patch(ThemeBrowserState { config_loaded: false });
-    red::state_patch(ThemeBrowserState { assets_loaded: false });
-    red::state_patch(ThemeBrowserState { entries: [] });
-    red::request("GetConfig", config_loaded, "theme");
-    red::request("ListRuntimeAssets", themes_loaded, "themes");
+    let handle = red::execute("OpenThemeBrowser");
+    red::state_patch(ThemeBrowserState { picker: Some(handle) });
 }
 
-fn config_loaded(event: ThemeConfigValue) {
-    red::state_patch(ThemeBrowserState { original: red::string(event.value, "") });
-    red::state_patch(ThemeBrowserState { config_loaded: true });
-    open_picker_if_ready();
-}
-
-fn themes_loaded(listing: RuntimeAssetListing) {
-    if let Some(error) = listing.error {
-        red::execute("Print", error);
-        return;
+fn deactivate() {
+    let state: ThemeBrowserState = red::state();
+    if let Some(handle) = state.picker {
+        red::execute("ClosePicker", handle);
     }
-
-    red::state_patch(ThemeBrowserState { entries: listing.entries });
-    red::state_patch(ThemeBrowserState { assets_loaded: true });
-    open_picker_if_ready();
-}
-
-fn open_picker_if_ready() {
-    if !state().config_loaded || !state().assets_loaded {
-        return;
-    }
-
-    let entries = state().entries;
-    if red::len(entries) == 0 {
-        red::execute("Print", "No themes found");
-        return;
-    }
-
-    let items: [ThemePickerItem] = [];
-    let index = 0;
-    while index < red::len(entries) && index < 500 {
-        items = red::push(items, theme_item(entries[index]));
-        index = index + 1;
-    }
-
-    let status = red::len(items) + " themes";
-    if index < red::len(entries) {
-        status = status + " (results truncated)";
-    }
-    red::execute("OpenPicker", "Themes", items, PickerOptions {
-        placeholder: "Filter themes",
-        status: status,
-        initial_selection: red::string(state().original, ""),
-        presentation: "compact",
-        item_layout: "label_first",
-    }, ThemePickerHandlers {
-        changed: theme_changed,
-        cancelled: theme_cancelled,
-        selected: theme_selected,
-    });
-}
-
-fn theme_item(entry: RuntimeAssetEntry) -> ThemePickerItem {
-    let name = red::string(entry.name, entry.file);
-
-    let detail = entry.source;
-    if red::len(entry.shadows) > 0 {
-        detail = detail + " shadows " + red::len(entry.shadows) + " lower-priority source";
-    }
-
-    return ThemePickerItem {
-        id: entry.file,
-        label: name,
-        kind: "Theme",
-        annotation: entry.file,
-        detail: detail,
-        data: ThemePickerData {
-            theme: entry.file,
-        },
-    };
-}
-
-fn theme_changed(item: ThemePickerItem) {
-    red::execute("PreviewTheme", item.data.theme);
-}
-
-fn theme_cancelled(event: PickerCancelled) {
-    let original = red::string(state().original, "");
-    if original != "" {
-        red::execute("PreviewTheme", original);
-    }
-}
-
-fn theme_selected(item: ThemePickerItem) {
-    red::execute("SetTheme", item.data.theme);
 }

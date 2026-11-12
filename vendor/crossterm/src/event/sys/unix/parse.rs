@@ -74,6 +74,7 @@ pub(crate) fn parse_event(
                         }
                     }
                     b'[' => parse_csi(buffer),
+                    b']' if buffer.len() > 2 || input_available => discard_background_report(buffer),
                     b'\x1B' => Ok(Some(InternalEvent::Event(Event::Key(KeyCode::Esc.into())))),
                     _ => parse_event(&buffer[1..], input_available).map(|event_option| {
                         event_option.map(|event| {
@@ -134,6 +135,22 @@ fn char_code_to_event(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, modifiers)
 }
 
+// OSC 11 describes a color, not the terminal's light/dark appearance.
+fn discard_background_report(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
+    const PREFIX: &[u8] = b"\x1b]11;";
+    if PREFIX.starts_with(buffer) {
+        return Ok(None);
+    }
+    if buffer.starts_with(PREFIX)
+        && buffer.len() < 64
+        && !buffer.ends_with(b"\x07")
+        && !buffer.ends_with(b"\x1b\\")
+    {
+        return Ok(None);
+    }
+    Err(could_not_parse_event_error())
+}
+
 pub(crate) fn parse_csi(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
     assert!(buffer.starts_with(&[b'\x1B', b'['])); // ESC [
 
@@ -180,6 +197,17 @@ pub(crate) fn parse_csi(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
         b'?' => match buffer[buffer.len() - 1] {
             b'u' => return parse_csi_keyboard_enhancement_flags(buffer),
             b'c' => return parse_csi_primary_device_attributes(buffer),
+            b'n' => {
+                use crate::event::TerminalAppearance;
+                match buffer {
+                    b"\x1b[?997;1n" => Some(Event::TerminalAppearance(TerminalAppearance::Dark)),
+                    b"\x1b[?997;2n" => Some(Event::TerminalAppearance(TerminalAppearance::Light)),
+                    _ => return Err(could_not_parse_event_error()),
+                }
+            }
+            byte if (0x40..=0x7e).contains(&byte) => {
+                return Err(could_not_parse_event_error());
+            }
             _ => None,
         },
         b'0'..=b'9' => {
@@ -1159,6 +1187,26 @@ mod tests {
             parse_event(b"\x1B[200~o\x1B[2D\x1B[201~", false).unwrap(),
             Some(InternalEvent::Event(Event::Paste("o\x1B[2D".to_string())))
         );
+    }
+
+    #[test]
+    fn test_parse_terminal_appearance_report() {
+        use crate::event::TerminalAppearance;
+        for (report, appearance) in [
+            (b"\x1b[?997;1n", TerminalAppearance::Dark),
+            (b"\x1b[?997;2n", TerminalAppearance::Light),
+        ] {
+            for prefix in 2..report.len() {
+                assert!(parse_event(&report[..prefix], true).unwrap().is_none());
+            }
+            assert_eq!(
+                parse_event(report, false).unwrap(),
+                Some(InternalEvent::Event(Event::TerminalAppearance(appearance)))
+            );
+        }
+        assert!(parse_event(b"\x1b[?997;3n", false).is_err());
+        assert!(parse_event(b"\x1b]11;rgb:ffff/ffff/ffff\x07", false).is_err());
+        assert!(parse_event(b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\", false).is_err());
     }
 
     #[test]

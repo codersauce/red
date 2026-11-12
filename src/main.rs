@@ -870,6 +870,7 @@ async fn attach_session(session: &str) -> anyhow::Result<()> {
         output
             .execute(terminal::DisableLineWrap)?
             .execute(terminal::Clear(terminal::ClearType::All))?;
+        red::terminal_input::start_appearance_reports(&mut output)?;
         let result: anyhow::Result<()> = async {
             paint_detached_delta(&mut output, &mut rows, &client.initial_render)?;
             let mut last_revision = client.initial_render.revision;
@@ -890,7 +891,23 @@ async fn attach_session(session: &str) -> anyhow::Result<()> {
                             paint_detached_resize(&mut output, &mut rows, &delta, rows_count)?;
                             last_revision = delta.revision;
                         }
+                        event::Event::TerminalAppearance(appearance) => {
+                            let delta = send_detached_input(
+                                &mut client,
+                                &mut clipboard,
+                                &mut output,
+                                DetachedInput::TerminalAppearance { appearance },
+                            )
+                            .await?;
+                            paint_detached_if_changed(
+                                &mut output,
+                                &mut rows,
+                                &delta,
+                                &mut last_revision,
+                            )?;
+                        }
                         event::Event::FocusGained => {
+                            red::terminal_input::query_appearance(&mut output)?;
                             let delta = client.focus(/*focused*/ true).await?;
                             paint_detached_if_changed(
                                 &mut output,
@@ -1045,6 +1062,7 @@ impl Drop for DetachedTerminalGuard {
         _ = output.execute(event::DisableFocusChange);
         _ = output.execute(event::DisableMouseCapture);
         _ = output.execute(terminal::EnableLineWrap);
+        _ = red::terminal_input::stop_appearance_reports(&mut output);
         _ = self.keyboard_protocol.stop(&mut output);
         _ = output.execute(terminal::LeaveAlternateScreen);
         _ = output.execute(cursor::Show);

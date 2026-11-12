@@ -22,7 +22,7 @@ use tokio::{
 use tokio::net::{UnixListener, UnixStream};
 
 /// First stable version of Red's detachable-core IPC protocol.
-pub const IPC_PROTOCOL_VERSION: u32 = 4;
+pub const IPC_PROTOCOL_VERSION: u32 = 5;
 
 const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 /// Maximum aggregate size accepted for a chunked paste operation.
@@ -42,6 +42,10 @@ const MAX_TERMINAL_CELLS: usize = 12 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InputEvent {
+    /// Appearance reported by the terminal attached to this connection.
+    TerminalAppearance {
+        appearance: crossterm::event::TerminalAppearance,
+    },
     /// A normalized keyboard event.
     Key {
         /// Key identity independent of the terminal backend.
@@ -345,6 +349,7 @@ impl HeadlessOwner {
             }
         );
         let changed_row = match event {
+            InputEvent::TerminalAppearance { .. } => Vec::new(),
             InputEvent::Key {
                 code, modifiers, ..
             } => {

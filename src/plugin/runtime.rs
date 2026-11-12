@@ -1224,6 +1224,21 @@ impl RedHost {
             "ListPlugins" => {
                 self.send_request(PluginRequest::Action(Action::ListPlugins));
             }
+            "OpenThemeBrowser" => {
+                let policy = self.policy_mut();
+                let handle = policy.allocate_picker_handle();
+                policy.picker_handlers.insert(
+                    handle,
+                    PickerRegistration {
+                        plugin: plugin.to_string(),
+                        handlers: PickerHandlers::default(),
+                    },
+                );
+                self.send_request(PluginRequest::Action(Action::ThemeBrowser(
+                    crate::editor::ThemeBrowserAction::Open(Some(handle)),
+                )));
+                return Ok(Value::Int(i64::from(handle.get())));
+            }
             "PreviewTheme" => {
                 let theme_name = args.first().map(value_to_string).unwrap_or_default();
                 self.send_request(PluginRequest::Action(Action::PreviewTheme(theme_name)));
@@ -4884,7 +4899,7 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use crate::{color::Color, editor::PluginRequest, ui::PickerPresentation};
+    use crate::{color::Color, editor::PluginRequest};
 
     pub(super) fn drain_requests() {
         while ACTION_DISPATCHER.try_recv_request().is_some() {}
@@ -20107,9 +20122,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn theme_browser_previews_restores_and_sets_selected_theme() {
+    async fn theme_browser_command_and_aliases_open_the_editor_picker() {
         drain_requests();
-
         let mut runtime = Runtime::new();
         runtime
             .load_plugin(
@@ -20120,143 +20134,26 @@ mod tests {
             .unwrap();
 
         runtime.execute_command("ThemeBrowser").await.unwrap();
-
-        let config_request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetConfig { request_id, key } => {
-                assert_eq!(key.as_deref(), Some("theme"));
-                request_id
-            }
-            _ => panic!("unexpected plugin request"),
+        let PluginRequest::Action(Action::ThemeBrowser(crate::editor::ThemeBrowserAction::Open(
+            Some(handle),
+        ))) = ACTION_DISPATCHER.recv_request()
+        else {
+            panic!("expected the editor-owned theme picker");
         };
-        let assets_request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::ListRuntimeAssets { kind, request_id } => {
-                assert_eq!(kind, RuntimeAssetKind::Theme);
-                request_id
-            }
-            _ => panic!("unexpected plugin request"),
-        };
-
-        runtime
-            .resolve_request(
-                config_request_id,
-                serde_json::json!({ "value": "custom.json" }),
-            )
-            .await
+        assert_eq!(
+            runtime.picker_plugin(handle).as_deref(),
+            Some("theme_browser")
+        );
+        let command = runtime
+            .registered_commands()
+            .into_iter()
+            .find(|command| command.name == "ThemeBrowser")
             .unwrap();
-        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
-
-        let listing = serde_json::json!({
-            "kind": "themes",
-            "entries": [
-                {
-                    "file": "mocha.json",
-                    "name": "Mocha",
-                    "source": "embedded",
-                    "shadows": [],
-                },
-                {
-                    "file": "custom.json",
-                    "name": "Custom",
-                    "source": "user",
-                    "shadows": ["embedded"],
-                },
-                {
-                    "file": "custom-dark.json",
-                    "name": "Custom",
-                    "source": "embedded",
-                    "shadows": [],
-                }
-            ],
-            "error": null,
-        });
-        runtime
-            .resolve_request(assets_request_id, listing.clone())
-            .await
-            .unwrap();
-
-        let (handle, items) = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenCallbackPicker {
-                owner,
-                handle,
-                title,
-                items,
-                options,
-            } => {
-                assert_eq!(owner, "theme_browser");
-                assert_eq!(title.as_deref(), Some("Themes"));
-                assert_eq!(options.initial_selection.as_deref(), Some("custom.json"));
-                assert_eq!(options.presentation, PickerPresentation::Compact);
-                assert_eq!(options.item_layout, crate::ui::PickerItemLayout::LabelFirst);
-                assert_eq!(items[0].label, "Mocha");
-                assert_eq!(items[0].kind.as_deref(), Some("Theme"));
-                assert_eq!(items[1].label, "Custom");
-                assert_eq!(items[2].label, "Custom");
-                assert_eq!(items[1].annotation.as_deref(), Some("custom.json"));
-                (handle, items)
-            }
-            _ => panic!("unexpected plugin request"),
-        };
-
-        runtime
-            .notify_picker(handle, PickerCallback::Changed(items[0].clone()))
-            .unwrap();
-        match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::Action(Action::PreviewTheme(theme)) => {
-                assert_eq!(theme, "mocha.json");
-            }
-            _ => panic!("unexpected plugin request"),
-        }
-
-        runtime
-            .notify_picker(handle, PickerCallback::Cancelled)
-            .unwrap();
-        match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::Action(Action::PreviewTheme(theme)) => {
-                assert_eq!(theme, "custom.json");
-            }
-            _ => panic!("unexpected plugin request"),
-        }
-
-        assert!(!runtime
-            .notify_picker(handle, PickerCallback::Selected(items[1].clone()))
-            .unwrap());
-        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
-
-        runtime.execute_command("ThemeBrowser").await.unwrap();
-        let config_request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetConfig { request_id, .. } => request_id,
-            _ => panic!("unexpected plugin request"),
-        };
-        let assets_request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::ListRuntimeAssets { request_id, .. } => request_id,
-            _ => panic!("unexpected plugin request"),
-        };
-        runtime
-            .resolve_request(
-                config_request_id,
-                serde_json::json!({ "value": "custom.json" }),
-            )
-            .await
-            .unwrap();
-        runtime
-            .resolve_request(assets_request_id, listing)
-            .await
-            .unwrap();
-        let (handle, item) = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenCallbackPicker {
-                handle, mut items, ..
-            } => (handle, items.remove(1)),
-            _ => panic!("unexpected plugin request"),
-        };
-        runtime
-            .notify_picker(handle, PickerCallback::Selected(item))
-            .unwrap();
-        match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::Action(Action::SetTheme(theme)) => {
-                assert_eq!(theme, "custom.json");
-            }
-            _ => panic!("unexpected plugin request"),
-        }
+        assert_eq!(command.metadata.aliases, ["colorscheme", "theme"]);
+        runtime.unload_plugin("theme_browser").unwrap();
+        assert!(
+            matches!(ACTION_DISPATCHER.recv_request(), PluginRequest::ClosePicker { id } if id == handle.get())
+        );
     }
 
     #[tokio::test]

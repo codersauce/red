@@ -247,6 +247,23 @@ pub struct UpdateConfig {
     pub mode: UpdateMode,
 }
 
+/// Optional automatic theme switching preferences.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AppearanceConfig {
+    pub mode: AppearanceMode,
+    pub light_theme: Option<String>,
+    pub dark_theme: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppearanceMode {
+    #[default]
+    Fixed,
+    Terminal,
+}
+
 #[derive(Debug, Serialize, Deserialize, Default)]
 /// Complete effective editor configuration.
 ///
@@ -258,6 +275,8 @@ pub struct Config {
     pub keys: Keys,
     /// Runtime theme name.
     pub theme: String,
+    #[serde(default)]
+    pub appearance: AppearanceConfig,
     /// Cursor shape by editor mode.
     #[serde(default)]
     pub cursor: CursorConfig,
@@ -1993,36 +2012,21 @@ impl Config {
 
     /// Saves Copilot consent without replacing unrelated settings or a config symlink.
     pub(crate) fn persist_copilot_enabled(path: &Path, enabled: bool) -> anyhow::Result<()> {
-        use std::io::Write;
+        write_config_atomically(path, |contents| {
+            update_copilot_config_contents(contents, enabled)
+        })
+    }
 
-        let target = match fs::symlink_metadata(path) {
-            Ok(_) => fs::canonicalize(path)?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => path.to_path_buf(),
-            Err(error) => return Err(error.into()),
-        };
-        let contents = match fs::read_to_string(&target) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
-            Err(error) => return Err(error.into()),
-        };
-        let updated = update_copilot_config_contents(&contents, enabled)?;
-        if updated == contents {
-            return Ok(());
-        }
-        let parent = target
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent)?;
-        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-        if let Ok(metadata) = fs::metadata(&target) {
-            temporary
-                .as_file()
-                .set_permissions(metadata.permissions())?;
-        }
-        temporary.write_all(updated.as_bytes())?;
-        temporary.persist(&target)?;
-        Ok(())
+    pub(crate) fn persist_appearance(
+        path: &Path,
+        fixed_theme: Option<&str>,
+        mode: Option<AppearanceMode>,
+        light_theme: Option<&str>,
+        dark_theme: Option<&str>,
+    ) -> anyhow::Result<()> {
+        write_config_atomically(path, |contents| {
+            update_appearance_config(contents, fixed_theme, mode, light_theme, dark_theme)
+        })
     }
 
     /// Resolves a plugin path or bundled-plugin specifier for runtime loading.
@@ -2169,6 +2173,7 @@ fn known_top_level_field(field: &str) -> bool {
         field,
         "keys"
             | "theme"
+            | "appearance"
             | "cursor"
             | "plugins"
             | "disabled_plugins"
@@ -2346,6 +2351,7 @@ fn known_schema_path(path: &[String]) -> bool {
         ["agent", "env", _] => true,
         ["diagnostics", field] => matches!(*field, "gutter_signs" | "icon_style"),
         ["updates", field] => *field == "mode",
+        ["appearance", field] => matches!(*field, "mode" | "light_theme" | "dark_theme"),
         ["cursor", field] => matches!(
             *field,
             "normal"
@@ -3049,6 +3055,99 @@ fn update_statusline_config_contents(
     table["icons"] = Item::Table(icons);
     document["statusline"] = Item::Table(table);
 
+    Ok(document.to_string())
+}
+
+fn write_config_atomically(
+    path: &Path,
+    update: impl FnOnce(&str) -> anyhow::Result<String>,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    let target = match fs::symlink_metadata(path) {
+        Ok(_) => fs::canonicalize(path)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => path.to_path_buf(),
+        Err(error) => return Err(error.into()),
+    };
+    let contents = match fs::read_to_string(&target) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let updated = update(&contents)?;
+    if updated == contents {
+        return Ok(());
+    }
+    let parent = target
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    if let Ok(metadata) = fs::metadata(&target) {
+        temporary
+            .as_file()
+            .set_permissions(metadata.permissions())?;
+    }
+    temporary.write_all(updated.as_bytes())?;
+    temporary.persist(&target)?;
+    Ok(())
+}
+
+fn update_appearance_config(
+    contents: &str,
+    fixed_theme: Option<&str>,
+    mode: Option<AppearanceMode>,
+    light_theme: Option<&str>,
+    dark_theme: Option<&str>,
+) -> anyhow::Result<String> {
+    use anyhow::Context;
+    use toml_edit::{DocumentMut, Item, Table, Value};
+
+    fn set(table: &mut dyn toml_edit::TableLike, key: &str, text: &str) -> anyhow::Result<()> {
+        let mut replacement = Value::from(text);
+        if let Some(item) = table.get_mut(key) {
+            let value = item
+                .as_value_mut()
+                .with_context(|| format!("{key} is not a value"))?;
+            *replacement.decor_mut() = value.decor().clone();
+            *value = replacement;
+        } else {
+            table.insert(key, Item::Value(replacement));
+        }
+        Ok(())
+    }
+
+    let mut document = contents
+        .parse::<DocumentMut>()
+        .context("could not update config.toml")?;
+    if let Some(theme) = fixed_theme {
+        set(document.as_table_mut(), "theme", theme)?;
+    }
+    if mode.is_some() || light_theme.is_some() || dark_theme.is_some() {
+        if !document.contains_key("appearance") {
+            document["appearance"] = Item::Table(Table::new());
+        }
+        let appearance = document["appearance"]
+            .as_table_like_mut()
+            .context("appearance is not a table")?;
+        if let Some(mode) = mode {
+            set(
+                appearance,
+                "mode",
+                match mode {
+                    AppearanceMode::Fixed => "fixed",
+                    AppearanceMode::Terminal => "terminal",
+                },
+            )?;
+        }
+        if let Some(theme) = light_theme {
+            set(appearance, "light_theme", theme)?;
+        }
+        if let Some(theme) = dark_theme {
+            set(appearance, "dark_theme", theme)?;
+        }
+    }
     Ok(document.to_string())
 }
 

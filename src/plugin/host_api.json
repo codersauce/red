@@ -1,5 +1,5 @@
 {
-  "version": "0.22.0",
+  "version": "0.23.0",
   "calls": [
     { "name": "PublishIssue", "kind": "execute", "signature": "(key: String, message: String, remedy: String)", "introduced": "0.21.0" },
     { "name": "ResolveIssue", "kind": "execute", "signature": "(key: String)", "introduced": "0.21.0" },
@@ -16,6 +16,7 @@
     { "name": "ShowLineDiagnostics", "kind": "execute", "signature": "()", "introduced": "0.8.0" },
     { "name": "ViewLogs", "kind": "execute", "signature": "()", "introduced": "0.1.0" },
     { "name": "ListPlugins", "kind": "execute", "signature": "()", "introduced": "0.1.0" },
+    { "name": "OpenThemeBrowser", "kind": "execute", "signature": "()", "introduced": "0.23.0" },
     { "name": "PreviewTheme", "kind": "execute", "signature": "(theme: String)", "introduced": "0.1.0" },
     { "name": "SetTheme", "kind": "execute", "signature": "(theme: String)", "introduced": "0.1.0" },
     { "name": "AgentReadDefaultModel", "kind": "request", "signature": "(callback: fn(Json))", "introduced": "0.14.0" },

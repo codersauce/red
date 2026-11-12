@@ -467,7 +467,7 @@ impl Editor {
             self.preferences.is_persistent(),
             "no persistent user configuration"
         );
-        Config::persist_copilot_enabled(&self.language_config_path, enabled)?;
+        Config::persist_copilot_enabled(&self.config_path, enabled)?;
         self.config.copilot.enabled = enabled;
         Ok(())
     }

@@ -14,6 +14,9 @@
 # Name of the VSCode theme to use. The theme file should be present in the
 # themes directory: $XDG_CONFIG_HOME/red/themes or $HOME/.config/red/themes
 theme = "red.json"
+# To use different themes for light and dark, press Ctrl+t in the Themes
+# picker and enable automatic switching. The picker saves an [appearance]
+# table. The theme above remains the startup fallback.
 
 # The number of lines to scroll when using the mouse wheel
 mouse_scroll_lines = 3
