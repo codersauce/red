@@ -287,7 +287,11 @@ mod tests {
         assert!(!quit(&mut secondary, false).await);
         assert!(quit(&mut primary, false).await);
         drop(primary);
-        assert!(quit(&mut secondary, false).await);
+        assert!(
+            quit(&mut secondary, false).await,
+            "secondary editor quit was blocked: {:?}",
+            secondary.last_error
+        );
         drop(secondary);
 
         let mut session = WorkspaceSession::new(temp.path(), workspace);

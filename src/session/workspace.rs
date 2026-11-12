@@ -16,7 +16,19 @@ pub struct WorkspaceSession {
     root: PathBuf,
     workspace: PathBuf,
     owner: String,
-    lock: Option<File>,
+    lock: Option<WorkspaceLock>,
+}
+
+struct WorkspaceLock(File);
+
+impl Drop for WorkspaceLock {
+    fn drop(&mut self) {
+        // A child process can still have the descriptor open between fork and exec.
+        // Release the lock without waiting for every copy of the descriptor to close.
+        if let Err(error) = self.0.unlock() {
+            crate::log!("Could not release workspace session lock: {error}");
+        }
+    }
 }
 
 impl WorkspaceSession {
@@ -90,7 +102,7 @@ impl WorkspaceSession {
         Ok(snapshot)
     }
 
-    fn try_lock(store: &SessionStore) -> anyhow::Result<Option<File>> {
+    fn try_lock(store: &SessionStore) -> anyhow::Result<Option<WorkspaceLock>> {
         let _directory = SnapshotWriteDirectory::open(store)?;
         let mut options = OpenOptions::new();
         options.write(true).create(true).truncate(false);
@@ -116,7 +128,7 @@ impl WorkspaceSession {
             "workspace lock must not be a reparse point"
         );
         match lock.try_lock() {
-            Ok(()) => Ok(Some(lock)),
+            Ok(()) => Ok(Some(WorkspaceLock(lock))),
             Err(TryLockError::WouldBlock) => Ok(None),
             Err(TryLockError::Error(error)) => Err(error.into()),
         }
@@ -204,4 +216,24 @@ fn read_workspace_file(path: &Path) -> anyhow::Result<String> {
         "file exceeds the session restore size limit"
     );
     Ok(contents)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn releasing_workspace_lock_does_not_wait_for_duplicate_descriptor() {
+        let config = tempfile::tempdir().unwrap();
+        let workspace = config.path().canonicalize().unwrap();
+        let mut primary = WorkspaceSession::new(config.path(), workspace.clone());
+        assert!(primary.claim().unwrap());
+        let duplicate = primary.lock.as_ref().unwrap().0.try_clone().unwrap();
+
+        let mut secondary = WorkspaceSession::new(config.path(), workspace);
+        assert!(!secondary.claim().unwrap());
+        drop(primary);
+        assert!(secondary.claim().unwrap());
+        drop(duplicate);
+    }
 }
