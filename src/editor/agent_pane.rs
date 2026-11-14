@@ -607,6 +607,9 @@ impl AgentPaneLifecycle {
             self.switch_target = None;
             self.session_id = self.switch_previous_session.take();
             self.phase = Some(AgentPanePhase::Idle);
+            // Messages typed during the switch were meant for the conversation
+            // that failed to open. Hold them rather than send them to this one.
+            self.paused = !self.queue.is_empty();
             return Vec::new();
         }
         if self.session_id.as_deref() != Some(session_id) {
@@ -1127,6 +1130,48 @@ mod tests {
         assert_eq!(snapshot.phase, AgentPanePhase::Idle);
         assert_eq!(snapshot.session_id.as_deref(), Some("old"));
         assert!(!snapshot.recap_pending);
+    }
+
+    #[test]
+    fn a_message_typed_during_a_failed_switch_is_held() {
+        let mut pane = live("old");
+        assert!(pane.switch_pending("selected"));
+        // The composer stays open while the selected conversation restores.
+        let (result, effects) = pane.submit("typed while reconnecting".into(), "");
+        assert_eq!(result, AgentSubmitResult::Accepted);
+        assert!(effects.is_empty());
+
+        assert!(pane.restore_failed("selected").is_empty());
+        let snapshot = pane.snapshot();
+        assert_eq!(snapshot.phase, AgentPanePhase::Idle);
+        assert_eq!(snapshot.session_id.as_deref(), Some("old"));
+        assert!(snapshot.paused, "a queued message must show why it waits");
+        assert_eq!(snapshot.queued.len(), 1);
+
+        // The next message does not carry the held one into the old conversation.
+        let (result, effects) = pane.submit("next".into(), "");
+        assert_eq!(result, AgentSubmitResult::Queued);
+        assert!(dispatched(&effects).is_empty());
+
+        // Sending the queue is the user's explicit choice.
+        assert_eq!(
+            dispatched(&pane.send_queued("")),
+            ["typed while reconnecting"]
+        );
+    }
+
+    #[test]
+    fn a_message_typed_during_a_successful_switch_goes_to_the_new_conversation() {
+        let mut pane = live("old");
+        assert!(pane.switch_pending("selected"));
+        pane.submit("typed while reconnecting".into(), "");
+
+        let effects = pane.restored("selected");
+        assert_eq!(dispatched(&effects), ["typed while reconnecting"]);
+        assert!(effects.contains(&AgentPaneEffect::CloseSession {
+            session_id: "old".into()
+        }));
+        assert!(!pane.snapshot().paused);
     }
 
     #[test]
