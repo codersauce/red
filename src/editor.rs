@@ -850,17 +850,14 @@ fn command_available(command: &str) -> bool {
     };
     std::env::split_paths(&path).any(|directory| {
         let candidate = directory.join(command);
-        if candidate.is_file() {
-            return true;
-        }
         #[cfg(windows)]
-        {
-            ["exe", "cmd", "bat"]
+        let executable = candidate.is_file()
+            || ["exe", "cmd", "bat"]
                 .iter()
-                .any(|extension| candidate.with_extension(extension).is_file())
-        }
+                .any(|extension| candidate.with_extension(extension).is_file());
         #[cfg(not(windows))]
-        false
+        let executable = candidate.is_file();
+        executable
     })
 }
 const MACRO_MAX_REPLAY_DEPTH: usize = 20;
