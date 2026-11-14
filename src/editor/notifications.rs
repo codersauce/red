@@ -1419,7 +1419,8 @@ mod tests {
         assert!(editor.last_error.is_none());
 
         editor.mode = Mode::Command;
-        editor.command = "write pending.txt".to_string();
+        editor.command =
+            vimlet::CommandLine::new(vimlet::PromptKind::Ex, "write pending.txt").unwrap();
         editor.draw_commandline(&mut buffer);
         let row = render_text_rows(&buffer).pop().unwrap();
         assert!(row.starts_with(":write pending.txt"));

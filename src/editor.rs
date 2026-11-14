@@ -873,16 +873,6 @@ fn normalize_terminal_paste(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
-/// Command lines, searches, and pickers are single-line inputs. Keep a pasted
-/// newline from accidentally accepting or executing their current contents.
-fn pasted_input_line(text: &str) -> String {
-    normalize_terminal_paste(text)
-        .split('\n')
-        .next()
-        .unwrap_or_default()
-        .to_string()
-}
-
 fn normalize_macro_register(register: char) -> Option<char> {
     (register.is_ascii_alphanumeric()).then(|| register.to_ascii_lowercase())
 }
@@ -4041,7 +4031,7 @@ pub struct Editor {
     substitute_confirmation: Option<SubstituteConfirmation>,
 
     /// Current command line content
-    command: String,
+    command: vimlet::CommandLine,
 
     /// Persistent preferences, including command-line history.
     preferences: PreferencesStore,
@@ -4768,16 +4758,11 @@ struct HistoryEntry {
     y: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PromptHistoryDirection {
-    Previous,
-    Next,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PromptHistoryNavigation {
     prefix: String,
     original: String,
+    original_caret: vimlet::ByteOffset,
     position: usize,
 }
 
@@ -4785,12 +4770,13 @@ impl PromptHistoryNavigation {
     fn navigate(
         history: &[String],
         navigation: &mut Option<Self>,
-        text: &mut String,
-        direction: PromptHistoryDirection,
+        line: &mut vimlet::CommandLine,
+        direction: vimlet::PromptDirection,
     ) -> bool {
         let mut state = navigation.take().unwrap_or_else(|| Self {
-            prefix: text.clone(),
-            original: text.clone(),
+            prefix: line.text()[..line.caret().0].into(),
+            original: line.text().into(),
+            original_caret: line.caret(),
             position: history.len(),
         });
         let matches: Vec<_> = history
@@ -4803,11 +4789,11 @@ impl PromptHistoryNavigation {
         state.position = state.position.min(matches.len());
 
         let recalled = match direction {
-            PromptHistoryDirection::Previous => {
+            vimlet::PromptDirection::Previous => {
                 state.position = state.position.saturating_sub(1);
                 matches[state.position]
             }
-            PromptHistoryDirection::Next => {
+            vimlet::PromptDirection::Next => {
                 state.position = (state.position + 1).min(matches.len());
                 matches
                     .get(state.position)
@@ -4815,8 +4801,13 @@ impl PromptHistoryNavigation {
                     .unwrap_or(&state.original)
             }
         };
-        let changed = text.as_str() != recalled.as_str();
-        text.clone_from(recalled);
+        let caret = if state.position == matches.len() {
+            state.original_caret
+        } else {
+            vimlet::ByteOffset(recalled.len())
+        };
+        let changed = line.text() != recalled;
+        let _ = line.replace(recalled.clone(), caret);
         *navigation = Some(state);
         changed
     }
@@ -4828,7 +4819,7 @@ struct SearchSession {
     jump_origin: JumpEntry,
     origin_vtop: usize,
     direction: SearchDirection,
-    draft: String,
+    draft: vimlet::CommandLine,
     history_navigation: Option<PromptHistoryNavigation>,
     preview: Option<SearchMatch>,
 }
@@ -6016,7 +6007,7 @@ impl Editor {
             special_marks: HashMap::new(),
             last_visual_selections: HashMap::new(),
             substitute_confirmation: None,
-            command: String::new(),
+            command: Default::default(),
             preferences,
             whats_new_startup_pending,
             learn_session: None,
@@ -8472,12 +8463,30 @@ impl Editor {
         self.is_command() || self.is_search()
     }
 
-    fn term(&self) -> &str {
-        if self.is_command() {
-            &self.command
+    fn prompt_view(&self) -> (&str, &str, usize) {
+        let (prefix, draft, caret) = if self.is_command() {
+            (":", self.command.text(), self.command.caret().0)
+        } else if let Some(search) = &self.active_search {
+            (
+                self.search_commandline_prefix(),
+                search.draft.text(),
+                search.draft.caret().0,
+            )
         } else {
-            self.active_search_text().unwrap_or(&self.search_term)
+            ("/", self.search_term.as_str(), self.search_term.len())
+        };
+        let width = usize::from(self.size.0).saturating_sub(2);
+        let mut visible = &draft[..caret];
+        let mut col = crate::unicode_utils::display_width(visible);
+        while col > width {
+            let first = visible
+                .graphemes(true)
+                .next()
+                .expect("positive display width");
+            col = col.saturating_sub(crate::unicode_utils::display_width(first));
+            visible = &visible[first.len()..];
         }
+        (prefix, &draft[caret - visible.len()..], col + 1)
     }
 
     fn current_cursor_display_col(&self) -> usize {
@@ -14590,8 +14599,6 @@ impl Editor {
         runtime: &mut Runtime,
         render_mode: EventRenderMode,
     ) -> anyhow::Result<ProcessedEvent> {
-        let _span =
-            perf::enabled().then(|| perf::PerfSpan::with_detail("editor:input", format!("{ev:?}")));
         if let Event::TerminalAppearance(appearance) = ev {
             self.set_terminal_appearance(Some(appearance.into()));
             self.resolve_terminal_theme(buffer, runtime).await?;
@@ -18625,7 +18632,7 @@ impl Editor {
         } else {
             log!("handle_command called with: {}", cmd);
         }
-        self.command = String::new();
+        self.command = Default::default();
         self.waiting_command = None;
         self.repeater = None;
         self.set_legacy_message(None);
@@ -19215,10 +19222,6 @@ impl Editor {
         actions
     }
 
-    fn delete_last_char(text: &mut String) {
-        text.pop();
-    }
-
     fn search_uses_case_insensitive(&self, pattern: &str) -> bool {
         self.config.search.ignorecase
             && !(self.config.search.smartcase && pattern.chars().any(char::is_uppercase))
@@ -19550,7 +19553,10 @@ impl Editor {
             jump_origin: self.current_jump_entry(),
             origin_vtop: self.vtop,
             direction,
-            draft: String::new(),
+            draft: vimlet::CommandLine::empty(match direction {
+                SearchDirection::Forward => vimlet::PromptKind::SearchForward,
+                SearchDirection::Backward => vimlet::PromptKind::SearchBackward,
+            }),
             history_navigation: None,
             preview: None,
         });
@@ -19565,7 +19571,7 @@ impl Editor {
             return;
         };
 
-        if session.draft.is_empty() || !self.config.search.incsearch {
+        if session.draft.text().is_empty() || !self.config.search.incsearch {
             self.restore_search_origin(&session.origin, session.origin_vtop);
             if let Some(active_search) = &mut self.active_search {
                 active_search.preview = None;
@@ -19574,7 +19580,7 @@ impl Editor {
         }
 
         let preview = match self.search_match_from_origin(
-            &session.draft,
+            session.draft.text(),
             &session.origin,
             session.direction,
             self.config.search.wrapscan,
@@ -19608,7 +19614,7 @@ impl Editor {
 
     fn finish_search_session(&mut self, session: SearchSession) {
         self.restore_search_origin(&session.origin, session.origin_vtop);
-        self.search_term = session.draft;
+        self.search_term = session.draft.text().to_owned();
         self.search_direction = session.direction;
         self.search_highlights_suppressed = false;
         self.active_search = None;
@@ -19632,7 +19638,7 @@ impl Editor {
     fn active_search_text(&self) -> Option<&str> {
         self.active_search
             .as_ref()
-            .map(|session| session.draft.as_str())
+            .map(|session| session.draft.text())
     }
 
     fn search_commandline_prefix(&self) -> &'static str {
@@ -19655,7 +19661,7 @@ impl Editor {
         let pattern = self
             .active_search
             .as_ref()
-            .map(|search| search.draft.as_str())
+            .map(|search| search.draft.text())
             .unwrap_or(&self.search_term)
             .to_string();
         if pattern.is_empty() {
@@ -19733,7 +19739,7 @@ impl Editor {
         self.command_completion = None;
     }
 
-    fn navigate_command_history(&mut self, direction: PromptHistoryDirection) {
+    fn navigate_command_history(&mut self, direction: vimlet::PromptDirection) {
         PromptHistoryNavigation::navigate(
             self.preferences.command_history(),
             &mut self.command_history_navigation,
@@ -19742,7 +19748,7 @@ impl Editor {
         );
     }
 
-    fn navigate_search_history(&mut self, direction: PromptHistoryDirection) {
+    fn navigate_search_history(&mut self, direction: vimlet::PromptDirection) {
         let Some(session) = &mut self.active_search else {
             return;
         };
@@ -19764,9 +19770,12 @@ impl Editor {
         direction: CompletionDirection,
         plugin_commands: &[plugin::RegisteredPluginCommand],
     ) {
+        let caret = self.command.caret().0;
+        let (prefix, suffix) = self.command.text().split_at(caret);
+        let mut prefix = prefix.to_owned();
         command_completion::complete(
             &mut self.command_completion,
-            &mut self.command,
+            &mut prefix,
             direction,
             plugin_commands,
             |fragment| {
@@ -19777,6 +19786,9 @@ impl Editor {
                     .collect()
             },
         );
+        let caret = vimlet::ByteOffset(prefix.len());
+        prefix.push_str(suffix);
+        let _ = self.command.replace(prefix, caret);
     }
 
     fn record_command_history(&mut self, command: &str) {
@@ -19871,131 +19883,79 @@ impl Editor {
         ev: &event::Event,
         runtime: Option<&Runtime>,
     ) -> Option<KeyAction> {
-        if let Event::Paste(text) = ev {
-            self.command.push_str(&pasted_input_line(text));
-            self.reset_command_history_navigation();
-            self.reset_command_completion();
-            return None;
-        }
-
-        if let Event::Key(ref event) = ev {
-            let code = event.code;
-            let _modifiers = event.modifiers;
-
-            match code {
-                KeyCode::Esc | KeyCode::Backspace
-                    if code == KeyCode::Esc || self.command.is_empty() =>
-                {
-                    self.command = String::new();
-                    self.reset_command_history_navigation();
-                    self.reset_command_completion();
-                    return Some(KeyAction::Single(Action::EnterMode(Mode::Normal)));
-                }
-                KeyCode::Backspace => {
-                    Self::delete_last_char(&mut self.command);
-                    self.reset_command_history_navigation();
-                    self.reset_command_completion();
-                }
-                KeyCode::Up => {
-                    self.reset_command_completion();
-                    self.navigate_command_history(PromptHistoryDirection::Previous);
-                }
-                KeyCode::Down => {
-                    self.reset_command_completion();
-                    self.navigate_command_history(PromptHistoryDirection::Next);
-                }
-                KeyCode::Tab => {
-                    self.reset_command_history_navigation();
-                    let commands = runtime
-                        .map(|runtime| self.plugin_registry.registered_commands(runtime))
-                        .unwrap_or_default();
-                    self.complete_command_line(CompletionDirection::Next, &commands);
-                }
-                KeyCode::BackTab => {
-                    self.reset_command_history_navigation();
-                    let commands = runtime
-                        .map(|runtime| self.plugin_registry.registered_commands(runtime))
-                        .unwrap_or_default();
-                    self.complete_command_line(CompletionDirection::Previous, &commands);
-                }
-                KeyCode::Enter => {
-                    self.reset_command_history_navigation();
-                    self.reset_command_completion();
-                    if self.command.trim().is_empty() {
-                        return Some(KeyAction::Single(Action::EnterMode(Mode::Normal)));
-                    }
-                    return Some(KeyAction::Multiple(vec![
-                        Action::EnterMode(Mode::Normal),
-                        Action::Command(self.command.clone()),
-                    ]));
-                }
-                KeyCode::Char(c) => {
-                    self.command.push(c);
-                    self.reset_command_history_navigation();
-                    self.reset_command_completion();
-                }
-                _ => {}
+        use vimlet::PromptOutcome::*;
+        let key = crate::keyboard::prompt_key(ev)?;
+        match self.command.handle(key) {
+            Cancelled => {
+                self.reset_command_history_navigation();
+                self.reset_command_completion();
+                return Some(KeyAction::Single(Action::EnterMode(Mode::Normal)));
             }
+            Accepted(command) => {
+                self.reset_command_history_navigation();
+                self.reset_command_completion();
+                let mut actions = vec![Action::EnterMode(Mode::Normal)];
+                if !command.trim().is_empty() {
+                    actions.push(Action::Command(command));
+                }
+                return if actions.len() == 1 {
+                    Some(KeyAction::Single(Action::EnterMode(Mode::Normal)))
+                } else {
+                    Some(KeyAction::Multiple(actions))
+                };
+            }
+            History(direction) => {
+                self.reset_command_completion();
+                self.navigate_command_history(direction);
+            }
+            Complete(direction) => {
+                self.reset_command_history_navigation();
+                let commands = runtime
+                    .map(|runtime| self.plugin_registry.registered_commands(runtime))
+                    .unwrap_or_default();
+                self.complete_command_line(
+                    match direction {
+                        vimlet::PromptDirection::Previous => CompletionDirection::Previous,
+                        vimlet::PromptDirection::Next => CompletionDirection::Next,
+                    },
+                    &commands,
+                );
+            }
+            Edited | Moved => {
+                self.reset_command_history_navigation();
+                self.reset_command_completion();
+            }
+            Consumed | Unhandled => {}
         }
-
         None
     }
 
-    #[allow(clippy::single_match)]
     fn handle_search_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
-        match ev {
-            Event::Paste(text) => {
-                if let Some(active_search) = &mut self.active_search {
-                    active_search.draft.push_str(&pasted_input_line(text));
-                    active_search.history_navigation = None;
-                    active_search.preview = None;
-                }
+        use vimlet::{Key, PromptOutcome};
+        let key = match crate::keyboard::prompt_key(ev)? {
+            Key::Ctrl('p') => Key::Up,
+            Key::Ctrl('n') => Key::Down,
+            key => key,
+        };
+        let session = self.active_search.as_mut()?;
+        match session.draft.handle(key.clone()) {
+            PromptOutcome::Accepted(_) => return Some(KeyAction::Single(Action::CommitSearch)),
+            PromptOutcome::Cancelled => return Some(KeyAction::Single(Action::CancelSearch)),
+            PromptOutcome::History(direction) => self.navigate_search_history(direction),
+            PromptOutcome::Edited => {
+                session.history_navigation = None;
+                session.preview = None;
                 self.update_search_preview();
             }
-            Event::Key(ref event) => {
-                let code = event.code;
-                let modifiers = event.modifiers;
-
-                match (code, modifiers) {
-                    (KeyCode::Esc, _) => {
-                        return Some(KeyAction::Single(Action::CancelSearch));
-                    }
-                    (KeyCode::Backspace, _) => {
-                        if let Some(active_search) = &mut self.active_search {
-                            Self::delete_last_char(&mut active_search.draft);
-                            active_search.history_navigation = None;
-                            active_search.preview = None;
-                        }
-                        self.update_search_preview();
-                    }
-                    (KeyCode::Enter, _) => {
-                        return Some(KeyAction::Single(Action::CommitSearch));
-                    }
-                    (KeyCode::Up, _) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
-                        self.navigate_search_history(PromptHistoryDirection::Previous);
-                    }
-                    (KeyCode::Down, _) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
-                        self.navigate_search_history(PromptHistoryDirection::Next);
-                    }
-                    (KeyCode::Char('g'), KeyModifiers::CONTROL) => {
-                        return Some(KeyAction::Single(Action::FindNext));
-                    }
-                    (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
-                        return Some(KeyAction::Single(Action::FindPrevious));
-                    }
-                    (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-                        if let Some(active_search) = &mut self.active_search {
-                            active_search.draft.push(c);
-                            active_search.history_navigation = None;
-                        }
-                        self.update_search_preview();
-                    }
-                    _ => {}
-                }
+            PromptOutcome::Moved => session.history_navigation = None,
+            PromptOutcome::Unhandled if key == Key::Ctrl('g') => {
+                return Some(KeyAction::Single(Action::FindNext))
+            }
+            PromptOutcome::Unhandled if key == Key::Ctrl('t') => {
+                return Some(KeyAction::Single(Action::FindPrevious))
             }
             _ => {}
         }
-
         None
     }
 
@@ -21319,7 +21279,8 @@ impl Editor {
                     old_mode,
                     Mode::Visual | Mode::VisualLine | Mode::VisualBlock
                 ) {
-                    self.command = "'<,'>".to_string();
+                    self.command = vimlet::CommandLine::new(vimlet::PromptKind::Ex, "'<,'>")
+                        .expect("single-line Visual range");
                 }
             }
 
@@ -23880,13 +23841,13 @@ impl Editor {
                     let Some(session) = self.active_search.clone() else {
                         return Ok(false);
                     };
-                    if session.draft.is_empty() {
+                    if session.draft.text().is_empty() {
                         self.active_search = None;
                         self.mode = Mode::Normal;
                         self.render(buffer)?;
                     } else {
-                        self.record_search_history(&session.draft);
-                        let matches = match self.search_matches(&session.draft) {
+                        self.record_search_history(session.draft.text());
+                        let matches = match self.search_matches(session.draft.text()) {
                             Ok(matches) => matches,
                             Err(err) => {
                                 self.finish_search_with_error(session, err.to_string());
@@ -23900,7 +23861,7 @@ impl Editor {
                             session.direction,
                             self.config.search.wrapscan,
                         ) else {
-                            let error = Self::pattern_not_found_message(&session.draft);
+                            let error = Self::pattern_not_found_message(session.draft.text());
                             self.finish_search_without_match(session, error);
                             self.render(buffer)?;
                             return Ok(false);
@@ -23912,7 +23873,7 @@ impl Editor {
                                 session.direction,
                             );
 
-                        self.search_term = session.draft;
+                        self.search_term = session.draft.text().to_owned();
                         self.search_direction = session.direction;
                         self.search_highlights_suppressed = false;
                         self.active_search = None;
@@ -34943,7 +34904,9 @@ impl Editor {
         self.mode = mode;
         self.reset_command_completion();
         match mode {
-            Mode::Command => self.command = text.to_string(),
+            Mode::Command => {
+                self.command = vimlet::CommandLine::new(vimlet::PromptKind::Ex, text).unwrap()
+            }
             Mode::Search => self.search_term = text.to_string(),
             _ => {}
         }
@@ -34962,7 +34925,7 @@ impl Editor {
     #[doc(hidden)]
     pub fn test_commandline_text(&self) -> &str {
         match self.mode {
-            Mode::Command => &self.command,
+            Mode::Command => self.command.text(),
             Mode::Search => self.active_search_text().unwrap_or(&self.search_term),
             _ => "",
         }
@@ -37886,7 +37849,7 @@ mod test {
         command: &str,
     ) {
         editor.mode = Mode::Command;
-        editor.command = command.to_string();
+        editor.command = vimlet::CommandLine::new(vimlet::PromptKind::Ex, command).unwrap();
         editor
             .process_editor_event(
                 Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
@@ -38056,7 +38019,7 @@ builtin = "rust"
                 .await
                 .unwrap();
         }
-        assert_eq!(editor.command, "Service enable local");
+        assert_eq!(editor.command.text(), "Service enable local");
         assert!(collect_print_requests().is_empty());
         assert_eq!(editor.last_error, None);
 
@@ -38103,7 +38066,7 @@ builtin = "rust"
             )
             .await
             .unwrap();
-        assert_eq!(editor.command, "Agent");
+        assert_eq!(editor.command.text(), "Agent");
 
         editor
             .process_editor_event(
@@ -38114,7 +38077,7 @@ builtin = "rust"
             )
             .await
             .unwrap();
-        assert_eq!(editor.command, "AgentInspect");
+        assert_eq!(editor.command.text(), "AgentInspect");
 
         editor.test_set_commandline(Mode::Command, "ag");
         editor
@@ -38126,7 +38089,7 @@ builtin = "rust"
             )
             .await
             .unwrap();
-        assert_eq!(editor.command, "ag");
+        assert_eq!(editor.command.text(), "ag");
     }
 
     #[tokio::test]
@@ -42905,7 +42868,13 @@ builtin = "rust"
             format!("{}\n", "x".repeat(MAX_HIGHLIGHT_SLICE_BYTES + 1)),
         );
         editor.begin_search(SearchDirection::Forward);
-        editor.active_search.as_mut().unwrap().draft = "x".to_string();
+        editor
+            .active_search
+            .as_mut()
+            .unwrap()
+            .draft
+            .replace("x".into(), vimlet::ByteOffset(1))
+            .unwrap();
 
         editor.update_search_preview();
 
@@ -52063,7 +52032,7 @@ while True:
             let mut editor = test_editor(100, 5);
             editor.current_buffer_mut().dirty = dirty;
             editor.mode = Mode::Command;
-            editor.command = command.to_string();
+            editor.command = vimlet::CommandLine::new(vimlet::PromptKind::Ex, command).unwrap();
             let mut render_buffer = RenderBuffer::new(100, 5, &Style::default());
             let mut runtime = Runtime::new();
 
@@ -53971,15 +53940,6 @@ while True:
         buffer._set_char(2, 0, 'x', &Style::default());
 
         assert_eq!(buffer.cells, unchanged);
-    }
-
-    #[test]
-    fn test_delete_last_char_handles_multibyte_text() {
-        let mut text = "ab👋".to_string();
-
-        Editor::delete_last_char(&mut text);
-
-        assert_eq!(text, "ab");
     }
 
     //     #[test]

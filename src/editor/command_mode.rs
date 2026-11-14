@@ -184,7 +184,7 @@ mod tests {
         assert_eq!(editor.cx, 3);
         editor.mode = Mode::Command;
         assert_eq!(dispatch(&mut editor, KeyCode::Char(';')), None);
-        assert_eq!(editor.command, ";");
+        assert_eq!(editor.command.text(), ";");
         editor.begin_search(SearchDirection::Forward);
         assert_eq!(dispatch(&mut editor, KeyCode::Char(';')), None);
         assert_eq!(editor.active_search_text(), Some(";"));
@@ -377,7 +377,7 @@ mod tests {
             .unwrap();
         assert!(editor.is_command());
         dispatch(&mut editor, KeyCode::Char('x'));
-        assert_eq!(editor.command, "x");
+        assert_eq!(editor.command.text(), "x");
         editor
             .process_editor_event(
                 key(KeyCode::Esc),
@@ -457,7 +457,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(editor.mode, Mode::Command);
-            assert_eq!(editor.command, "'<,'>");
+            assert_eq!(editor.command.text(), "'<,'>");
             editor
                 .process_editor_event(
                     key(KeyCode::Esc),

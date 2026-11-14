@@ -218,7 +218,7 @@ fn inline_completion_notice_preserves_errors_commands_and_narrow_layouts() {
     editor.notifications.acknowledge(error).unwrap();
     editor.notifications.clear_inactive(Instant::now());
     editor.mode = Mode::Command;
-    editor.command = "write".into();
+    editor.command = vimlet::CommandLine::new(vimlet::PromptKind::Ex, "write").unwrap();
     assert_eq!(row(&mut editor), ":write");
     assert!(editor.inline_completion_notice.hit.is_none());
     editor.mode = Mode::Normal;
