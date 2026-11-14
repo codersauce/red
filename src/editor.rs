@@ -29929,23 +29929,25 @@ impl Editor {
     }
 
     fn commit_transaction(&mut self, after_cursor: CursorSnapshot) -> bool {
-        let previous_edit = self
-            .macro_playback
-            .as_mut()
-            .and_then(|playback| playback.previous_edit.take());
+        let mut playback = self.macro_playback.take();
+        let previous_edit = playback
+            .as_ref()
+            .and_then(|macro_run| macro_run.previous_edit.as_deref());
         let buffer = self.current_buffer_mut();
         let committed = buffer
             .undo_history
-            .commit_with_previous_user_edit(after_cursor, previous_edit.as_deref());
-        let last_edit = committed
-            .then(|| buffer.undo_history.latest_transaction())
-            .flatten()
-            .filter(|edit| edit.origin == EditOrigin::User)
-            .map(|edit| edit.id.clone());
+            .commit_with_previous_user_edit(after_cursor, previous_edit);
         buffer.refresh_dirty();
-        if let Some(playback) = &mut self.macro_playback {
-            playback.previous_edit = if committed { last_edit } else { previous_edit };
+        if let Some(macro_run) = &mut playback {
+            if committed {
+                macro_run.previous_edit = buffer
+                    .undo_history
+                    .latest_transaction()
+                    .filter(|edit| edit.origin == EditOrigin::User)
+                    .map(|edit| edit.id.clone());
+            }
         }
+        self.macro_playback = playback;
         committed
     }
 
