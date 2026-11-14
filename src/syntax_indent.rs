@@ -3,6 +3,7 @@
 //! Queries describe structure, never edits. Display-column decisions are applied by
 //! the editor's existing transaction boundary. Unknown query features are rejected.
 
+use crate::tab_stops::TabStops;
 use std::{
     collections::{HashMap, HashSet},
     ops::Range,
@@ -38,8 +39,8 @@ pub(crate) struct IndentRequest<'a> {
     pub language: &'a str,
     pub source: &'a str,
     pub line: usize,
-    pub shift_width: usize,
-    pub tab_width: usize,
+    pub shift_width: &'a dyn Fn(usize) -> usize,
+    pub tab_width: &'a TabStops,
     pub reason: IndentReason,
 }
 
@@ -194,7 +195,6 @@ impl SyntaxIndentation {
             tab_width,
             reason,
         } = request;
-        let widths = (shift_width, tab_width);
         if source.len() > MAX_BYTES {
             return Ok(IndentDecision::Keep);
         }
@@ -236,7 +236,7 @@ impl SyntaxIndentation {
             if let Some(opener) = stack.iter().rev().find(|e| e.key == closer.key) {
                 return Ok(IndentDecision::Columns(columns(
                     lines[opener.line],
-                    widths.1,
+                    tab_width,
                 )));
             }
             return Ok(IndentDecision::Keep);
@@ -256,14 +256,13 @@ impl SyntaxIndentation {
             while anchor > 0 && continued(anchor - 1) {
                 anchor -= 1;
             }
+            let column = columns(lines[anchor], tab_width);
             let extra = if continued(previous) {
-                widths.0.max(1)
+                shift_width(column)
             } else {
                 0
             };
-            return Ok(IndentDecision::Columns(
-                columns(lines[anchor], widths.1) + extra,
-            ));
+            return Ok(IndentDecision::Columns(column.saturating_add(extra)));
         }
         let previous_start = lines[..previous].iter().map(|s| s.len() + 1).sum::<usize>();
         let previous_first =
@@ -286,8 +285,9 @@ impl SyntaxIndentation {
             }
         }
         let delta = target_depth as isize - depth(&stack) as isize;
-        let expected = columns(lines[previous], widths.1)
-            .saturating_add_signed(delta.saturating_mul(widths.0.max(1) as isize));
+        let column = columns(lines[previous], tab_width);
+        let expected =
+            column.saturating_add_signed(delta.saturating_mul(shift_width(column) as isize));
         Ok(IndentDecision::Columns(expected))
     }
 
@@ -549,9 +549,9 @@ fn depth(stack: &[&Event]) -> usize {
     stack.iter().map(|e| e.line).collect::<HashSet<_>>().len()
 }
 
-fn columns(line: &str, tab_width: usize) -> usize {
+fn columns(line: &str, tab_width: &TabStops) -> usize {
     let whitespace = &line[..line.len() - line.trim_start_matches([' ', '\t']).len()];
-    display_width_with_tabs(whitespace, tab_width.max(1))
+    display_width_with_tabs(whitespace, tab_width)
 }
 
 fn point(source: &str, byte: usize) -> Point {
@@ -630,8 +630,8 @@ pub fn check_fixtures(
             language: &fixture.language,
             source: &fixture.source,
             line: fixture.line,
-            shift_width: fixture.width,
-            tab_width: fixture.width,
+            shift_width: &|_| fixture.width,
+            tab_width: &fixture.width.into(),
             reason: IndentReason::NewLine,
         });
         if decision == IndentDecision::Keep {
@@ -639,8 +639,8 @@ pub fn check_fixtures(
                 Some(&fixture.language),
                 &fixture.source,
                 fixture.line,
-                fixture.width,
-                fixture.width,
+                |_| fixture.width,
+                &fixture.width.into(),
             );
         }
         if decision == IndentDecision::Keep {
@@ -649,7 +649,7 @@ pub fn check_fixtures(
                 .split('\n')
                 .nth(fixture.line)
                 .ok_or_else(|| anyhow!("{}: target line is out of range", fixture.name))?;
-            decision = IndentDecision::Columns(columns(line, fixture.width));
+            decision = IndentDecision::Columns(columns(line, &fixture.width.into()));
         }
         anyhow::ensure!(
             decision == IndentDecision::Columns(fixture.expected),
@@ -711,8 +711,8 @@ mod tests {
             language: "rust",
             source,
             line,
-            shift_width: 4,
-            tab_width: 4,
+            shift_width: &|_| 4,
+            tab_width: &4.into(),
             reason: IndentReason::NewLine,
         })
     }
@@ -812,8 +812,8 @@ mod tests {
                     language: "rust",
                     source,
                     line: 2,
-                    shift_width: 4,
-                    tab_width: 4,
+                    shift_width: &|_| 4,
+                    tab_width: &4.into(),
                     reason: IndentReason::NewLine
                 }),
                 IndentDecision::Columns(expected)

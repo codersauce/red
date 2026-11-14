@@ -271,6 +271,8 @@ pub enum AppearanceMode {
 /// access sites apply embedded defaults. Collections use Serde defaults so
 /// older user files remain compatible.
 pub struct Config {
+    #[serde(flatten)]
+    pub indentation: IndentationConfig,
     /// Per-mode key mappings.
     pub keys: Keys,
     /// Runtime theme name.
@@ -1204,10 +1206,134 @@ impl Default for FormattingConfig {
     }
 }
 
+/// Overrides for tab display, editing, and automatic indentation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IndentationConfig {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_tabstop"
+    )]
+    pub tabstop: Option<usize>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_shiftwidth"
+    )]
+    pub shiftwidth: Option<usize>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_softtabstop"
+    )]
+    pub softtabstop: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expandtab: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smarttab: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shiftround: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copyindent: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preserveindent: Option<bool>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_variable_stops"
+    )]
+    pub vartabstop: Option<Vec<usize>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_variable_stops"
+    )]
+    pub varsofttabstop: Option<Vec<usize>>,
+}
+
+impl IndentationConfig {
+    pub(crate) fn overlay(&self, overrides: &Self) -> Self {
+        Self {
+            tabstop: overrides.tabstop.or(self.tabstop),
+            shiftwidth: overrides.shiftwidth.or(self.shiftwidth),
+            softtabstop: overrides.softtabstop.or(self.softtabstop),
+            expandtab: overrides.expandtab.or(self.expandtab),
+            smarttab: overrides.smarttab.or(self.smarttab),
+            shiftround: overrides.shiftround.or(self.shiftround),
+            copyindent: overrides.copyindent.or(self.copyindent),
+            preserveindent: overrides.preserveindent.or(self.preserveindent),
+            vartabstop: overrides
+                .vartabstop
+                .as_ref()
+                .or(self.vartabstop.as_ref())
+                .cloned(),
+            varsofttabstop: overrides
+                .varsofttabstop
+                .as_ref()
+                .or(self.varsofttabstop.as_ref())
+                .cloned(),
+        }
+    }
+}
+
+// Bound the size of a single whitespace expansion and its display coordinates.
+const MAX_TAB_OPTION_WIDTH: usize = 9999;
+
+fn deserialize_tabstop<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<usize>, D::Error> {
+    let width = usize::deserialize(deserializer)?;
+    if !(1..=MAX_TAB_OPTION_WIDTH).contains(&width) {
+        return Err(serde::de::Error::custom(
+            "tabstop must be between 1 and 9999",
+        ));
+    }
+    Ok(Some(width))
+}
+
+fn deserialize_shiftwidth<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<usize>, D::Error> {
+    let width = usize::deserialize(deserializer)?;
+    if width > MAX_TAB_OPTION_WIDTH {
+        return Err(serde::de::Error::custom(
+            "shiftwidth must be between 0 and 9999",
+        ));
+    }
+    Ok(Some(width))
+}
+
+fn deserialize_softtabstop<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<i64>, D::Error> {
+    let width = i64::deserialize(deserializer)?;
+    if width > MAX_TAB_OPTION_WIDTH as i64 {
+        return Err(serde::de::Error::custom("softtabstop must be at most 9999"));
+    }
+    Ok(Some(width))
+}
+
+fn deserialize_variable_stops<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<usize>>, D::Error> {
+    let widths = Vec::<usize>::deserialize(deserializer)?;
+    if widths
+        .iter()
+        .any(|width| !(1..=MAX_TAB_OPTION_WIDTH).contains(width))
+    {
+        return Err(serde::de::Error::custom(
+            "tab stop widths must be between 1 and 9999",
+        ));
+    }
+    Ok(Some(widths))
+}
+
 /// One configurable language shared by highlighting, editing, and LSP routing.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LanguageConfig {
+    #[serde(flatten)]
+    pub indentation: IndentationConfig,
     /// Case-insensitive file extensions, with or without leading dots.
     #[serde(default)]
     pub extensions: Vec<String>,
@@ -2191,6 +2317,16 @@ fn known_top_level_field(field: &str) -> bool {
             | "wrap_window_navigation"
             | "relative_line_numbers"
             | "breakindent"
+            | "tabstop"
+            | "shiftwidth"
+            | "softtabstop"
+            | "expandtab"
+            | "smarttab"
+            | "shiftround"
+            | "copyindent"
+            | "preserveindent"
+            | "vartabstop"
+            | "varsofttabstop"
             | "sidescroll"
             | "sidescrolloff"
             | "splash"
@@ -2435,6 +2571,16 @@ fn known_schema_path(path: &[String]) -> bool {
                 | "comment"
                 | "text_width"
                 | "indent_width"
+                | "tabstop"
+                | "shiftwidth"
+                | "softtabstop"
+                | "expandtab"
+                | "smarttab"
+                | "shiftround"
+                | "copyindent"
+                | "preserveindent"
+                | "vartabstop"
+                | "varsofttabstop"
                 | "grammar"
                 | "lsp"
                 | "formatter"
@@ -5562,6 +5708,22 @@ file_extensions = ["js"]
                 },
             ]
         );
+    }
+
+    #[test]
+    fn invalid_tab_widths_report_config_errors_and_preserve_other_settings() {
+        let loaded = Config::load_user_toml(
+            "tabstop = 0\nvarsofttabstop = [4, 0]\nshiftwidth = 2",
+            Path::new("config.toml"),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(loaded.config.indentation.shiftwidth, Some(2));
+        assert_eq!(loaded.config.indentation.tabstop, None);
+        assert_eq!(loaded.config.indentation.varsofttabstop, None);
+        for option in ["tabstop", "varsofttabstop"] {
+            assert!(loaded.diagnostics.iter().any(|d| d.path == option));
+        }
     }
 
     #[test]

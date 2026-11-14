@@ -9,6 +9,7 @@
 //! Any feature that changes visible state without changing text must also advance the
 //! editor's render generation or request an explicit render.
 
+use crate::tab_stops::TabStops;
 use std::{
     collections::{HashMap, HashSet},
     ffi::OsStr,
@@ -1276,18 +1277,18 @@ pub(super) fn resolve_cell_colors(cell_style: &Style, theme_style: &Style) -> (C
 }
 
 #[derive(Clone, Copy)]
-struct SourceSegmentGeometry {
+struct SourceSegmentGeometry<'a> {
     x: usize,
     y: usize,
     width: usize,
-    tab_width: usize,
+    tab_width: &'a TabStops,
 }
 
 fn render_source_segment(
     buffer: &mut RenderBuffer,
     segment: &LineSegment,
     line: &str,
-    geometry: SourceSegmentGeometry,
+    geometry: SourceSegmentGeometry<'_>,
     styles: &mut StyleCursor<'_>,
     theme_style: &Style,
     theme: &Theme,
@@ -1351,7 +1352,7 @@ fn render_source_segment(
             break;
         };
         let width = if grapheme == "\t" {
-            geometry.tab_width - (grapheme_col % geometry.tab_width)
+            geometry.tab_width.advance(grapheme_col)
         } else {
             display_width(grapheme)
         };
@@ -2149,10 +2150,7 @@ impl Editor {
         let gutter_width = self.gutter_width_for_window(window);
         let content_start = gutter_width + 1;
         let content_width = self.window_content_width(window);
-        let tab_width = self
-            .indentation_for_buffer_index(window.buffer_index)
-            .shift_width
-            .max(1);
+        let tab_width = self.tab_stops_for_buffer_index(window.buffer_index).clone();
         let mut cached_line: Option<(usize, String)> = None;
 
         for &row in local_rows {
@@ -2199,7 +2197,7 @@ impl Editor {
                     x: self.window_to_terminal_x(window, content_start),
                     y: term_y,
                     width: content_width,
-                    tab_width,
+                    tab_width: &tab_width,
                 },
                 &mut style_cursor,
                 &theme_style,
@@ -2373,7 +2371,7 @@ impl Editor {
         };
         let width = self.window_content_width(window);
         let start_x = self.window_to_terminal_x(window, self.gutter_width_for_window(window) + 1);
-        let tab_width = self.tab_width_for_buffer_index(window.buffer_index).max(1);
+        let tab_width = self.tab_stops_for_buffer_index(window.buffer_index).clone();
         for row in &layout.inline_prediction {
             let y = self.window_to_terminal_y(window, row.row);
             self.fill_line_in_window(buffer, start_x, y, width, &normal);
@@ -2394,7 +2392,7 @@ impl Editor {
                         .unwrap_or(&normal)
                 };
                 let cells = if grapheme == "\t" {
-                    tab_width - col % tab_width
+                    tab_width.advance(col)
                 } else {
                     display_width(grapheme)
                 };
@@ -2875,10 +2873,7 @@ impl Editor {
         let gutter_width = self.gutter_width_for_window(window);
         let content_start = gutter_width + 1;
         let content_width = self.window_content_width(window);
-        let tab_width = self
-            .indentation_for_buffer_index(window.buffer_index)
-            .shift_width
-            .max(1);
+        let tab_width = self.tab_stops_for_buffer_index(window.buffer_index).clone();
         let mut cached_line: Option<(usize, String)> = None;
 
         for segment in &layout.rows {
@@ -2916,7 +2911,7 @@ impl Editor {
                     x: self.window_to_terminal_x(window, content_start),
                     y: term_y,
                     width: content_width,
-                    tab_width,
+                    tab_width: &tab_width,
                 },
                 &mut style_cursor,
                 &theme_style,
@@ -3013,7 +3008,7 @@ impl Editor {
             return;
         }
 
-        let tab_width = self.indentation().shift_width.max(1);
+        let tab_width = self.active_tab_stops();
         let leading_width = leading_whitespace_display_width(line, tab_width);
         let line_is_blank = line.trim().is_empty();
         let line_width = display_width_with_tabs(line, tab_width);
@@ -3123,7 +3118,7 @@ impl Editor {
                 continue;
             };
             let line = trim_line_ending(&line);
-            let tab_width = self.tab_width_for_buffer_index(window.buffer_index);
+            let tab_width = self.tab_stops_for_buffer_index(window.buffer_index);
             let start_col =
                 display_width_with_tabs(char_prefix(line, range.start.character), tab_width);
             let end_col = if collapsed {
@@ -3176,7 +3171,7 @@ impl Editor {
                 if end <= start {
                     continue;
                 }
-                let tab_width = self.tab_width_for_buffer_index(window.buffer_index);
+                let tab_width = self.tab_stops_for_buffer_index(window.buffer_index);
                 let start_col = display_width_with_tabs(char_prefix(line, start), tab_width);
                 let end_col = display_width_with_tabs(char_prefix(line, end), tab_width);
                 let points =
@@ -3263,7 +3258,7 @@ impl Editor {
                 continue;
             };
             let line = trim_line_ending(&line);
-            let tab_width = self.tab_width_for_buffer_index(window.buffer_index);
+            let tab_width = self.tab_stops_for_buffer_index(window.buffer_index);
             let start_col =
                 display_width_with_tabs(char_prefix(line, position.character), tab_width);
             let end_col = display_width_with_tabs(
@@ -3394,7 +3389,7 @@ impl Editor {
             .as_ref()
             .and_then(|style| style.bg)
             .or(match_bg);
-        let tab_width = self.tab_width_for_buffer_index(window.buffer_index);
+        let tab_width = self.tab_stops_for_buffer_index(window.buffer_index);
         let content_start = self.gutter_width_for_window(window) + 1;
         let content_width = self.window_content_width(window);
         let mut cached_line: Option<(usize, String, bool, std::ops::Range<usize>)> = None;
@@ -3656,7 +3651,7 @@ impl Editor {
             let gutter_width = self.gutter_width_for_window(window);
             let line_width = display_width_with_tabs(
                 trim_line_ending(&line),
-                self.tab_width_for_buffer_index(window.buffer_index),
+                self.tab_stops_for_buffer_index(window.buffer_index),
             );
             if segment.projection.is_none() && line_width > segment.end_col {
                 continue;
@@ -3736,7 +3731,7 @@ impl Editor {
                 continue;
             };
             let line = trim_line_ending(&line);
-            let tab_width = self.tab_width_for_buffer_index(window.buffer_index);
+            let tab_width = self.tab_stops_for_buffer_index(window.buffer_index);
             let start_col = grapheme_to_column_with_tabs(line, start_x, tab_width);
             let end_col = grapheme_to_column_with_tabs(line, end_x.saturating_add(1), tab_width);
             cells.extend(self.display_col_range_points_in_window(window, y, start_col, end_col));
@@ -4072,7 +4067,12 @@ impl Editor {
                 .map(|r| r.to_ascii_lowercase()),
             search_matches,
             indentation: if configured(StatuslineSection::Indentation) {
-                format!("spaces:{}", self.indentation().shift_width)
+                let indentation = self.indentation();
+                if indentation.expand_tab {
+                    format!("spaces:{}", indentation.shift_width)
+                } else {
+                    format!("tabs:{}", indentation.tab_width)
+                }
             } else {
                 String::new()
             },
@@ -5133,7 +5133,7 @@ mod tests {
                 x: 0,
                 y: 0,
                 width: 10,
-                tab_width: 4,
+                tab_width: &4.into(),
             },
             &mut cursor,
             &theme.style,
@@ -5171,7 +5171,7 @@ mod tests {
                 x: 1,
                 y: 0,
                 width: 10,
-                tab_width: 4,
+                tab_width: &4.into(),
             },
             &mut cursor,
             &theme.style,
@@ -5216,7 +5216,7 @@ mod tests {
                 x: 0,
                 y: 0,
                 width: 10,
-                tab_width: 4,
+                tab_width: &4.into(),
             },
             &mut cursor,
             &theme.style,
@@ -5256,7 +5256,7 @@ mod tests {
                 x: 0,
                 y: 0,
                 width,
-                tab_width: 4,
+                tab_width: &4.into(),
             },
             &mut cursor,
             &theme.style,
@@ -5314,7 +5314,7 @@ mod tests {
                 x: 0,
                 y: 0,
                 width: 40,
-                tab_width: 4,
+                tab_width: &4.into(),
             },
             &mut cursor,
             &theme.style,
@@ -6429,7 +6429,7 @@ mod tests {
         });
         editor.search_term = "alpha".to_string();
         let window = editor.window_manager.active_window().unwrap().clone();
-        let tab_width = editor.tab_width_for_buffer_index(window.buffer_index);
+        let tab_width = editor.tab_stops_for_buffer_index(window.buffer_index);
         let expected: HashSet<_> = (0..4)
             .flat_map(|line_index| {
                 let line = editor.current_buffer().get(line_index).unwrap();

@@ -6175,6 +6175,121 @@ async fn tab_advances_to_the_next_soft_tab_stop() {
 }
 
 #[tokio::test]
+async fn independent_tab_settings_edit_whitespace_at_the_target_column() {
+    for (initial, expandtab, first, second) in [
+        ("", false, "    \n", "\t\n"),
+        ("", true, "    \n", "        \n"),
+        ("界", false, "界  ", "界\t"),
+    ] {
+        let mut config = default_key_config();
+        config.indentation.tabstop = Some(8);
+        config.indentation.shiftwidth = Some(4);
+        config.indentation.softtabstop = Some(-1);
+        config.indentation.expandtab = Some(expandtab);
+        let mut harness = EditorHarness::with_config(Buffer::new(None, initial.into()), config);
+        type_normal_keys(&mut harness, "A").await;
+        harness.execute_action(Action::InsertTab).await.unwrap();
+        harness.assert_buffer_contents(first);
+        harness.execute_action(Action::InsertTab).await.unwrap();
+        harness.assert_buffer_contents(second);
+        harness
+            .execute_action(Action::DeletePreviousChar)
+            .await
+            .unwrap();
+        harness.assert_buffer_contents(first);
+        harness.assert_cursor_at(first.trim_end_matches('\n').chars().count(), 0);
+    }
+}
+
+#[tokio::test]
+async fn tab_settings_zero_soft_stop_uses_hard_stops_and_character_backspace() {
+    for (expandtab, after_tab, after_backspace) in
+        [(true, "        x", "       x"), (false, "   \tx", "   x")]
+    {
+        let mut config = default_key_config();
+        config.indentation.tabstop = Some(8);
+        config.indentation.shiftwidth = Some(0);
+        config.indentation.softtabstop = Some(0);
+        config.indentation.expandtab = Some(expandtab);
+        let mut harness = EditorHarness::with_config(Buffer::new(None, "   x".into()), config);
+        harness
+            .execute_action(Action::EnterMode(Mode::Insert))
+            .await
+            .unwrap();
+        harness
+            .execute_action(Action::SetCursor(3, 0))
+            .await
+            .unwrap();
+        harness.execute_action(Action::InsertTab).await.unwrap();
+        harness.assert_buffer_contents(after_tab);
+        harness
+            .execute_action(Action::DeletePreviousChar)
+            .await
+            .unwrap();
+        harness.assert_buffer_contents(after_backspace);
+    }
+}
+
+#[tokio::test]
+async fn tab_settings_round_shifts_and_preserve_existing_whitespace() {
+    let mut config = default_key_config();
+    config.indentation.tabstop = Some(8);
+    config.indentation.shiftwidth = Some(4);
+    config.indentation.shiftround = Some(true);
+    config.indentation.preserveindent = Some(true);
+    let mut harness =
+        EditorHarness::with_config(Buffer::new(None, "      one\n \t two".into()), config);
+    type_normal_keys(&mut harness, ">>").await;
+    harness.assert_buffer_contents("        one\n \t two");
+    type_normal_keys(&mut harness, "Vj>").await;
+    harness.assert_buffer_contents("            one\n \t    two");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("        one\n \t two");
+}
+
+#[tokio::test]
+async fn tab_settings_copy_indent_and_use_smart_tab_only_in_leading_whitespace() {
+    let mut config = default_key_config();
+    config.indentation.tabstop = Some(8);
+    config.indentation.shiftwidth = Some(2);
+    config.indentation.softtabstop = Some(4);
+    config.indentation.copyindent = Some(true);
+    config.indentation.smarttab = Some(true);
+    let mut harness = EditorHarness::with_config(Buffer::new(None, " \tx\n".into()), config);
+    type_normal_keys(&mut harness, "o").await;
+    harness.execute_action(Action::InsertTab).await.unwrap();
+    harness.type_text("y").await.unwrap();
+    harness.execute_action(Action::InsertTab).await.unwrap();
+    harness.assert_buffer_contents(" \tx\n \t  y \n");
+}
+
+#[tokio::test]
+async fn variable_tab_stops_control_soft_edits_and_mouse_positions() {
+    let mut config = mouse_selection_config();
+    config.indentation.vartabstop = Some(vec![4, 8]);
+    config.indentation.varsofttabstop = Some(vec![4, 8]);
+    config.indentation.shiftwidth = Some(0);
+    config.indentation.softtabstop = Some(0);
+    config.indentation.expandtab = Some(false);
+    let mut harness =
+        EditorHarness::with_config_and_size(Buffer::new(None, "界\t\tZ".into()), config, 16, 8);
+    // The second tab ends at logical column 12, putting Z on the wrapped row.
+    select_with_mouse(&mut harness, (6, 0), (4, 1)).await;
+    assert_eq!(harness.selection(), Some((1, 0, 3, 0)));
+    command_key(&mut harness, KeyCode::Esc).await;
+    type_normal_keys(&mut harness, "o").await;
+    for expected in ["界\t\tZ\n\t", "界\t\tZ\n\t\t", "界\t\tZ\n\t\t\t"] {
+        harness.execute_action(Action::InsertTab).await.unwrap();
+        harness.assert_buffer_contents(expected);
+    }
+    harness
+        .execute_action(Action::DeletePreviousChar)
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("界\t\tZ\n\t\t");
+}
+
+#[tokio::test]
 async fn untouched_generated_indent_is_removed_on_escape_and_carried_across_enter() {
     let mut escaped = python_harness("def something(x):");
     escaped

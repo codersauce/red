@@ -211,7 +211,7 @@ async fn daily_driver_lsp_actions_open_active_buffer_and_use_utf16_cursor() {
         recorded(&events),
         vec![
             LspEvent::DidOpen("src/main.rs".to_string()),
-            LspEvent::FormatDocument("src/main.rs".to_string()),
+            LspEvent::FormatDocument("src/main.rs".to_string(), 4, true),
             LspEvent::CodeAction {
                 file: "src/main.rs".to_string(),
                 range: red::lsp::Range {
@@ -395,7 +395,7 @@ async fn default_format_on_save_requests_once_before_writing_and_ignores_a_dupli
         vec![
             LspEvent::DidOpen(path.to_string_lossy().into_owned()),
             LspEvent::DidChange(path.to_string_lossy().into_owned()),
-            LspEvent::FormatDocument(path.to_string_lossy().into_owned()),
+            LspEvent::FormatDocument(path.to_string_lossy().into_owned(), 4, true),
         ]
     );
     assert!(editor
@@ -433,7 +433,7 @@ async fn disabled_format_on_save_skips_lsp_for_save_and_save_as_but_allows_manua
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "value   \n");
     assert!(!recorded(&events)
         .iter()
-        .any(|event| matches!(event, LspEvent::FormatDocument(_))));
+        .any(|event| matches!(event, LspEvent::FormatDocument(..))));
 
     editor
         .test_execute_action(Action::FormatDocument)
@@ -442,12 +442,35 @@ async fn disabled_format_on_save_skips_lsp_for_save_and_save_as_but_allows_manua
     assert_eq!(
         recorded(&events)
             .into_iter()
-            .filter(|event| matches!(event, LspEvent::FormatDocument(_)))
+            .filter(|event| matches!(event, LspEvent::FormatDocument(..)))
             .collect::<Vec<_>>(),
         vec![LspEvent::FormatDocument(
-            target.to_string_lossy().into_owned()
+            target.to_string_lossy().into_owned(),
+            4,
+            true
         )],
     );
+}
+
+#[tokio::test]
+async fn formatter_receives_shift_width_instead_of_display_tab_width() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("source.rs").to_string_lossy().into_owned();
+    let mut config = Config::default();
+    config.indentation.tabstop = Some(8);
+    config.indentation.shiftwidth = Some(2);
+    config.indentation.expandtab = Some(false);
+    let (mut editor, events) = recording_workspace_editor_with_config(
+        root.path(),
+        vec![Buffer::new(Some(file.clone()), "\tvalue".into())],
+        config,
+    );
+
+    editor
+        .test_execute_action(Action::FormatDocument)
+        .await
+        .unwrap();
+    assert!(recorded(&events).contains(&LspEvent::FormatDocument(file, 2, false)));
 }
 
 #[tokio::test]

@@ -4,6 +4,7 @@
 //! display-column target. The editor remains responsible for applying whitespace
 //! through its undoable text-mutation boundary.
 
+use crate::tab_stops::TabStops;
 use crate::unicode_utils::display_width_with_tabs;
 
 const PYTHON_BRACKET_LOOKBACK_LINES: usize = 50;
@@ -44,8 +45,8 @@ pub(crate) fn indent_for_line(
     language_id: Option<&str>,
     document: &str,
     target_line: usize,
-    shift_width: usize,
-    tab_width: usize,
+    shift_width: impl Fn(usize) -> usize,
+    tab_width: &TabStops,
 ) -> IndentDecision {
     match language_id {
         Some("python") => python_indent_for_line(document, target_line, shift_width, tab_width),
@@ -74,11 +75,9 @@ pub(crate) fn should_reindent_after(
 fn python_indent_for_line(
     document: &str,
     target_line: usize,
-    shift_width: usize,
-    tab_width: usize,
+    shift_width: impl Fn(usize) -> usize,
+    tab_width: &TabStops,
 ) -> IndentDecision {
-    let shift_width = shift_width.max(1);
-    let tab_width = tab_width.max(1);
     // `split` preserves the implicit final empty line after a trailing newline,
     // which is exactly the line `o` or Enter asks us to indent at EOF.
     let lines = document
@@ -103,6 +102,7 @@ fn python_indent_for_line(
         return IndentDecision::Columns(0);
     };
     let previous_indent = indentation_columns(lines[previous_line], tab_width);
+    let shift_width = shift_width(previous_indent);
     let previous_code = analysis[previous_line].code.trim_end();
 
     // Explicit backslash continuations use two shift widths for their first line,
@@ -226,7 +226,7 @@ fn preserve_manual_dedent(current: usize, expected: usize, shift_width: usize) -
     }
 }
 
-fn indentation_columns(line: &str, tab_width: usize) -> usize {
+fn indentation_columns(line: &str, tab_width: &TabStops) -> usize {
     let whitespace = line
         .char_indices()
         .find(|(_, character)| !character.is_whitespace())
@@ -253,7 +253,7 @@ fn matching_brackets(open: char, close: char) -> bool {
     matches!((open, close), ('(', ')') | ('[', ']') | ('{', '}'))
 }
 
-fn analyze_python(lines: &[&str], tab_width: usize) -> Vec<PythonLineAnalysis> {
+fn analyze_python(lines: &[&str], tab_width: &TabStops) -> Vec<PythonLineAnalysis> {
     let mut analyses = Vec::with_capacity(lines.len());
     let mut stack = Vec::<OpenBracket>::new();
     let mut quote = None::<QuoteState>;
@@ -365,7 +365,7 @@ mod tests {
     use super::{indent_for_line, should_reindent_after, IndentDecision};
 
     fn python(document: &str, line: usize) -> IndentDecision {
-        indent_for_line(Some("python"), document, line, 4, 4)
+        indent_for_line(Some("python"), document, line, |_| 4, &4.into())
     }
 
     #[test]

@@ -2946,8 +2946,16 @@ mod tests {
             skipcol: 0,
             break_indent: BreakIndentOptions::disabled(),
         };
-        let layout =
-            layout_lines_with_tables(&lines, 2, config, None, None, None, None, Some(&plan));
+        let layout = layout_lines_with_tables(
+            &lines,
+            2,
+            config.clone(),
+            None,
+            None,
+            None,
+            None,
+            Some(&plan),
+        );
         assert_eq!(layout.rows.len(), 5);
         assert!(layout.rows[..4]
             .iter()
@@ -3880,14 +3888,22 @@ mod tests {
             skipcol: 0,
             break_indent: BreakIndentOptions::disabled(),
         };
-        let hidden =
-            layout_lines_with_tables(&lines, 2, config, None, None, None, None, Some(&plan));
+        let hidden = layout_lines_with_tables(
+            &lines,
+            2,
+            config.clone(),
+            None,
+            None,
+            None,
+            None,
+            Some(&plan),
+        );
         let mut revealed_plan = plan;
         revealed_plan.raw_lines.insert(0);
         let revealed = layout_lines_with_tables(
             &lines,
             2,
-            config,
+            config.clone(),
             None,
             None,
             None,
@@ -3923,8 +3939,16 @@ mod tests {
             raw_lines: long_plan.raw_lines.clone(),
         };
         revealed_long_plan.raw_lines.insert(0);
-        let hidden_long =
-            layout_lines_with_tables(&long, 2, narrow, None, None, None, None, Some(&long_plan));
+        let hidden_long = layout_lines_with_tables(
+            &long,
+            2,
+            narrow.clone(),
+            None,
+            None,
+            None,
+            None,
+            Some(&long_plan),
+        );
         let revealed_long = layout_lines_with_tables(
             &long,
             2,

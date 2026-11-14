@@ -689,7 +689,7 @@ impl Editor {
         let gutter = self.gutter_width_for_window(window);
         let origin_x = self.window_to_terminal_x(window, gutter + 1);
         let content_width = self.window_content_width(window);
-        let tab_width = self.tab_width_for_buffer_index(window.buffer_index).max(1);
+        let tab_width = self.tab_stops_for_buffer_index(window.buffer_index);
         let background = self
             .theme
             .style
@@ -713,7 +713,7 @@ impl Editor {
             let mut display = 0usize;
             for grapheme in line.graphemes(true) {
                 let width = if grapheme == "\t" {
-                    tab_width - (display % tab_width)
+                    tab_width.advance(display)
                 } else {
                     display_width(grapheme).max(1)
                 };

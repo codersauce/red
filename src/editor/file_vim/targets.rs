@@ -1,5 +1,6 @@
 //! Resolve file searches, syntax queries and rectangular selections against the active buffer.
 
+use super::FileGeometry;
 use crate::editor::{Editor, Mode, RenderBuffer, Runtime};
 use vimlet::{ByteOffset, EditTarget, HostOutcome, HostResult, OperationKind, Shape};
 
@@ -13,9 +14,7 @@ pub(in crate::editor) fn syntax_target(prefix: u8, key: char) -> EditTarget {
 impl Editor {
     pub(super) fn file_block_target(&self, selection: vimlet::Selection) -> HostOutcome {
         let rope = self.current_buffer().contents_snapshot();
-        let geometry = vimlet::TerminalGeometry {
-            tabstop: self.active_tab_width(),
-        };
+        let geometry = FileGeometry(self.active_tab_stops().clone());
         let resolver = vimlet::MotionResolver::from_view(self.file_view(&rope, &geometry));
         HostOutcome::Target(resolver.block_range(selection))
     }
@@ -64,9 +63,7 @@ impl Editor {
                 HostOutcome::Rejected
             };
             let rope = self.current_buffer().contents_snapshot();
-            let geometry = vimlet::TerminalGeometry {
-                tabstop: self.active_tab_width(),
-            };
+            let geometry = FileGeometry(self.active_tab_stops().clone());
             let view = self.file_view(&rope, &geometry);
             let result = HostResult {
                 operation: op.id,

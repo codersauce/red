@@ -1,5 +1,6 @@
 //! Source text reflow shared by file-backed and embedded editors.
 
+use crate::tab_stops::TabStops;
 use textwrap::{Options, WordSplitter, WrapAlgorithm};
 
 use crate::unicode_utils::{display_width, display_width_with_tabs};
@@ -46,7 +47,7 @@ pub(crate) fn plain_line(line: &str) -> ReflowLine {
 pub(crate) fn reflow_text(
     text: &str,
     width: usize,
-    tab_width: usize,
+    tab_width: impl Into<TabStops>,
     mut classify: impl FnMut(&str) -> ReflowLine,
 ) -> String {
     let trailing_newline = text.ends_with('\n');
@@ -55,14 +56,14 @@ pub(crate) fn reflow_text(
         .split_terminator('\n')
         .map(|line| classify(line.strip_suffix('\r').unwrap_or(line)))
         .collect::<Vec<_>>();
-    let mut formatted = reflow_lines(&lines, width, tab_width).join(line_ending);
+    let mut formatted = reflow_lines(&lines, width, &tab_width.into()).join(line_ending);
     if trailing_newline {
         formatted.push_str(line_ending);
     }
     formatted
 }
 
-fn reflow_lines(lines: &[ReflowLine], width: usize, tab_width: usize) -> Vec<String> {
+fn reflow_lines(lines: &[ReflowLine], width: usize, tab_width: &TabStops) -> Vec<String> {
     let mut formatted = Vec::new();
     let mut index = 0;
     while index < lines.len() {
