@@ -272,7 +272,7 @@ fn keyboard_repeat_drain_excludes_counts_operators_and_macro_state() {
     editor.start_macro_recording('q');
     assert!(!editor.should_drain_repeated_motion(&key('j'), &motion));
     editor.finish_macro_recording();
-    editor.macro_playback = Some(vimlet::MacroPlayback::default());
+    editor.macro_playback = Some(super::FileMacroPlayback::default());
     assert!(!editor.should_drain_repeated_motion(&key('j'), &motion));
     editor.macro_playback = None;
     editor.replaying_semantic_change = true;

@@ -757,6 +757,9 @@ async fn nested_macro_events_survive_a_second_wait() -> Result<()> {
     h.until(|h| h.marker("done", 4).exists() && !h.core.test_rpc_command_pending("slow"))
         .await?;
     assert!(h.screen().contains("ABABhello"), "{}", h.screen());
+    h.text("u").await?;
+    assert!(h.document_screen().contains("hello"), "{}", h.screen());
+    assert!(!h.document_screen().contains("Ahello") && !h.document_screen().contains("Bhello"));
     Ok(())
 }
 

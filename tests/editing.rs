@@ -2549,6 +2549,16 @@ async fn counted_macro_playback_runs_the_register_repeatedly() {
     type_normal_keys(&mut harness, "qaxjq2@a").await;
 
     harness.assert_buffer_contents("bc\nef\nhi");
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents("bc\ndef\nghi");
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('r'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("bc\nef\nhi");
 }
 
 #[tokio::test]

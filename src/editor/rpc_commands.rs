@@ -16,7 +16,7 @@ struct RpcSequence {
 }
 
 struct RpcReplayContext {
-    playback: Option<(vimlet::DocumentVersion, vimlet::MacroPlayback<Event>)>,
+    playback: Option<(vimlet::DocumentVersion, FileMacroPlayback)>,
     semantic: bool,
 }
 

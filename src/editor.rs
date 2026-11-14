@@ -1007,6 +1007,12 @@ struct RenderedViewport {
     markdown_image_epoch: u64,
 }
 
+#[derive(Default)]
+struct FileMacroPlayback {
+    keys: vimlet::MacroPlayback<Event>,
+    previous_edit: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct KeySignature {
     code: KeyCode,
@@ -4026,7 +4032,7 @@ pub struct Editor {
 
     /// Vim-style macro state. Register contents are stored as editable key notation;
     /// `events` is only the in-progress recording.
-    macro_playback: Option<vimlet::MacroPlayback<Event>>,
+    macro_playback: Option<FileMacroPlayback>,
 
     /// Buffer-local, file-global, and special Vim marks. Anchors use flat Unicode
     /// character coordinates and are transformed at the canonical edit boundary.
@@ -15687,7 +15693,7 @@ impl Editor {
     ) -> anyhow::Result<()> {
         let Some(keys) = self.file_vim.session.macro_keys(register) else {
             if let Some(playback) = &mut self.macro_playback {
-                playback.cancel();
+                playback.keys.cancel();
             }
             let message = if register == '@' {
                 "no previously played macro".into()
@@ -15709,14 +15715,17 @@ impl Editor {
         }
 
         let nested = self.macro_playback.is_some();
-        let playback = self.macro_playback.get_or_insert_with(|| {
-            vimlet::MacroPlayback::with_limits(vimlet::Limits {
-                macro_depth: MACRO_MAX_REPLAY_DEPTH,
-                macro_steps: MACRO_MAX_REPLAY_EVENTS,
-                ..vimlet::Limits::default()
-            })
-        });
-        if playback.push(events, usize::from(count)).is_err() {
+        let playback = self
+            .macro_playback
+            .get_or_insert_with(|| FileMacroPlayback {
+                keys: vimlet::MacroPlayback::with_limits(vimlet::Limits {
+                    macro_depth: MACRO_MAX_REPLAY_DEPTH,
+                    macro_steps: MACRO_MAX_REPLAY_EVENTS,
+                    ..vimlet::Limits::default()
+                }),
+                previous_edit: None,
+            });
+        if playback.keys.push(events, usize::from(count)).is_err() {
             self.set_legacy_message(Some(format!(
                 "macro recursion limit ({MACRO_MAX_REPLAY_DEPTH}) reached"
             )));
@@ -15735,7 +15744,7 @@ impl Editor {
     ) -> anyhow::Result<()> {
         let result = async {
             while let Some(playback) = &mut self.macro_playback {
-                let event = match playback.next_key() {
+                let event = match playback.keys.next_key() {
                     Ok(Some(event)) => event,
                     Ok(None) => break,
                     Err(_) => {
@@ -29920,11 +29929,23 @@ impl Editor {
     }
 
     fn commit_transaction(&mut self, after_cursor: CursorSnapshot) -> bool {
-        let committed = self
-            .current_buffer_mut()
+        let previous_edit = self
+            .macro_playback
+            .as_mut()
+            .and_then(|playback| playback.previous_edit.take());
+        let buffer = self.current_buffer_mut();
+        let committed = buffer
             .undo_history
-            .commit_transaction(after_cursor);
-        self.current_buffer_mut().refresh_dirty();
+            .commit_with_previous_user_edit(after_cursor, previous_edit.as_deref());
+        let last_edit = committed
+            .then(|| buffer.undo_history.latest_transaction())
+            .flatten()
+            .filter(|edit| edit.origin == EditOrigin::User)
+            .map(|edit| edit.id.clone());
+        buffer.refresh_dirty();
+        if let Some(playback) = &mut self.macro_playback {
+            playback.previous_edit = if committed { last_edit } else { previous_edit };
+        }
         committed
     }
 
