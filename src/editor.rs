@@ -37,6 +37,7 @@ mod display_layout;
 mod edit_batch;
 mod edit_history;
 mod explore_ui;
+mod file_vim;
 mod file_watch;
 mod inline_actions;
 mod inline_agent_outcomes;
@@ -144,8 +145,8 @@ use crate::{
     },
     dispatcher::Dispatcher,
     editing::{
-        apply_transactional_replacement, plain_line, reflow_text, text_object_kind_for_key,
-        CharacterMotion as ForwardCharacterMotion, MotionResolver, TextObjectKind, TextObjectScope,
+        apply_transactional_replacement, plain_line, reflow_text,
+        CharacterMotion as ForwardCharacterMotion, MotionResolver, TextObjectScope,
     },
     highlighter::{Highlighter, LanguageRegistry},
     indent::{self, IndentDecision},
@@ -849,17 +850,14 @@ fn command_available(command: &str) -> bool {
     };
     std::env::split_paths(&path).any(|directory| {
         let candidate = directory.join(command);
-        if candidate.is_file() {
-            return true;
-        }
         #[cfg(windows)]
-        {
-            ["exe", "cmd", "bat"]
+        let executable = candidate.is_file()
+            || ["exe", "cmd", "bat"]
                 .iter()
-                .any(|extension| candidate.with_extension(extension).is_file())
-        }
+                .any(|extension| candidate.with_extension(extension).is_file());
         #[cfg(not(windows))]
-        false
+        let executable = candidate.is_file();
+        executable
     })
 }
 const MACRO_MAX_REPLAY_DEPTH: usize = 20;
@@ -1006,6 +1004,12 @@ struct RenderedViewport {
     markdown_image_epoch: u64,
 }
 
+#[derive(Default)]
+struct FileMacroPlayback {
+    keys: vimlet::MacroPlayback<Event>,
+    previous_edit: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct KeySignature {
     code: KeyCode,
@@ -1037,6 +1041,7 @@ enum VisualLineShiftDirection {
 
 #[derive(Debug)]
 struct PendingSemanticChange {
+    vimlet: bool,
     buffer_id: BufferId,
     base_revision: u64,
     events: Vec<Event>,
@@ -1055,12 +1060,6 @@ struct PendingSemanticRecipe {
 struct PendingSemanticRecipeToken {
     consumed_events: usize,
     step_count: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PendingMacroAction {
-    Record,
-    Play,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1083,18 +1082,6 @@ struct EditAnchor {
     char_index: usize,
     fallback: TextPosition,
     affinity: AnchorAffinity,
-}
-
-#[derive(Debug)]
-struct MacroRecording {
-    register: char,
-    events: Vec<Event>,
-}
-
-#[derive(Debug, Clone)]
-struct MacroReplayEvent {
-    event: Event,
-    depth: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2694,6 +2681,9 @@ pub enum ThemeBrowserAction {
 /// serializes their execution through its event loop and canonical edit
 /// transaction boundary.
 pub enum Action {
+    /// A resolved modal command from file input. The host executes it against the active revision.
+    #[serde(skip)]
+    VimletInput(vimlet::Input),
     /// Starts an editor-owned pointer gesture in terminal-cell coordinates.
     MousePress {
         column: u16,
@@ -3262,6 +3252,7 @@ pub enum Action {
     Paste,
     PasteBefore,
     InsertBlock,
+    AppendBlock,
 
     InsertText {
         x: usize,
@@ -4015,19 +4006,14 @@ pub struct Editor {
     pending_select_action: Option<ActionOnSelection>,
 
     /// Partially entered visual-mode text object, such as `i` in `viw`.
-    pending_visual_text_object_scope: Option<TextObjectScope>,
 
     /// Partially entered normal-mode Vim operator, such as `d` in `diw`.
-    pending_operator: Option<PendingOperator>,
 
     /// Partially entered character motion, such as f or F followed by a target.
-    pending_character_motion: Option<PendingCharacterMotion>,
 
     /// Last completed character search, used by the reverse-repeat binding.
-    last_character_motion: Option<(ForwardCharacterMotion, char)>,
 
     /// Whether Normal-mode `r` is waiting for its replacement character.
-    pending_replace: bool,
 
     /// Executed actions
     actions: Vec<Action>,
@@ -4038,16 +4024,12 @@ pub struct Editor {
     /// the edit transaction returns to a stable Normal-mode boundary.
     last_semantic_change: Option<SemanticChange>,
     pending_semantic_change: Option<PendingSemanticChange>,
+    file_vim: Box<file_vim::FileVim>,
     replaying_semantic_change: bool,
 
     /// Vim-style macro state. Register contents are stored as editable key notation;
     /// `events` is only the in-progress recording.
-    pending_macro_action: Option<PendingMacroAction>,
-    macro_recording: Option<MacroRecording>,
-    last_played_macro: Option<char>,
-    macro_replay_depth: usize,
-    macro_instructions_remaining: usize,
-    macro_replay_queue: VecDeque<MacroReplayEvent>,
+    macro_playback: Option<FileMacroPlayback>,
 
     /// Buffer-local, file-global, and special Vim marks. Anchors use flat Unicode
     /// character coordinates and are transformed at the canonical edit boundary.
@@ -5354,60 +5336,6 @@ impl From<Mode> for ContentKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EditOperator {
-    Delete,
-    Change,
-    Yank,
-    Comment,
-    Format,
-    Lowercase,
-    Uppercase,
-    ToggleCase,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PendingOperatorStep {
-    Operator,
-    GPrefix,
-    FindForward,
-    TillForward,
-    FindBackward,
-    TillBackward,
-    StructuralMotion { backward: bool },
-    TextObjectScope(TextObjectScope),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PendingOperator {
-    operator: EditOperator,
-    step: PendingOperatorStep,
-    operator_count: u16,
-    motion_count: Option<u16>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PendingCharacterMotion {
-    kind: ForwardCharacterMotion,
-    count: u16,
-}
-
-impl PendingOperator {
-    fn new(operator: EditOperator, operator_count: u16) -> Self {
-        Self {
-            operator,
-            step: PendingOperatorStep::Operator,
-            operator_count,
-            motion_count: None,
-        }
-    }
-
-    fn count(self) -> u16 {
-        self.operator_count
-            .saturating_mul(self.motion_count.unwrap_or(1))
-    }
-}
-
 fn structural_motion_kind(key: char) -> Option<SyntaxObjectKind> {
     match key {
         'm' => Some(SyntaxObjectKind::Call),
@@ -5423,21 +5351,6 @@ fn structural_motion_label(key: char) -> &'static str {
         'f' => "functions",
         'c' => "classes",
         _ => unreachable!("validated structural motion key"),
-    }
-}
-
-impl EditOperator {
-    fn as_str(self) -> &'static str {
-        match self {
-            EditOperator::Delete => "d",
-            EditOperator::Change => "c",
-            EditOperator::Yank => "y",
-            EditOperator::Comment => "gc",
-            EditOperator::Format => "gq",
-            EditOperator::Lowercase => "gu",
-            EditOperator::Uppercase => "gU",
-            EditOperator::ToggleCase => "g~",
-        }
     }
 }
 
@@ -5833,11 +5746,7 @@ impl Editor {
 
     fn is_waiting_for_key_sequence(&self) -> bool {
         self.waiting_key_action.is_some()
-            || self.pending_operator.is_some()
-            || self.pending_character_motion.is_some()
-            || self.pending_replace
-            || self.pending_visual_text_object_scope.is_some()
-            || self.pending_macro_action.is_some()
+            || self.file_vim.pending()
             || self.pending_mark_action.is_some()
             || self.repeater.is_some()
     }
@@ -6095,21 +6004,12 @@ impl Editor {
             keymap_hint_deadline: None,
             keymap_hints_visible: false,
             pending_select_action: None,
-            pending_visual_text_object_scope: None,
-            pending_operator: None,
-            pending_character_motion: None,
-            last_character_motion: None,
-            pending_replace: false,
             actions: vec![],
             last_semantic_change: None,
             pending_semantic_change: None,
+            file_vim: Default::default(),
             replaying_semantic_change: false,
-            pending_macro_action: None,
-            macro_recording: None,
-            last_played_macro: None,
-            macro_replay_depth: 0,
-            macro_instructions_remaining: 0,
-            macro_replay_queue: VecDeque::new(),
+            macro_playback: None,
             pending_mark_action: None,
             local_marks: HashMap::new(),
             global_marks: HashMap::new(),
@@ -14795,7 +14695,7 @@ impl Editor {
         let started_with_panel_focus = self.panel_manager.focused_panel_id().is_some();
         let started_in_normal = self.is_normal();
         let semantic_can_start = started_in_normal || self.is_visual();
-        let was_recording_macro = self.macro_recording.is_some();
+        let was_recording_macro = self.file_vim.session.recording().is_some();
         let resolve_span = perf::PerfSpan::start("event:resolve_action");
         let mut action = self.handle_event_with_runtime(&ev, Some(runtime))?;
         if started_with_panel_focus {
@@ -14816,7 +14716,7 @@ impl Editor {
             }
         }
         if !sensitive_input {
-            if was_recording_macro && self.macro_recording.is_some() {
+            if was_recording_macro && self.file_vim.session.recording().is_some() {
                 self.record_macro_event(&ev);
             }
             self.record_semantic_change_event(
@@ -14935,7 +14835,7 @@ impl Editor {
         ) && self.is_normal()
             && self.current_dialog.is_none()
             && self.waiting_key_action.is_none()
-            && self.pending_operator.is_none()
+            && !self.file_vim.pending()
             && self.divider_drag.is_none()
             && self.pane_resize_mode.is_none()
             && !self.workspace_manager.is_active()
@@ -15197,6 +15097,7 @@ impl Editor {
                 return;
             }
             self.pending_semantic_change = Some(PendingSemanticChange {
+                vimlet: false,
                 buffer_id: self.current_buffer().id(),
                 base_revision: self.current_buffer().revision(),
                 events: Vec::new(),
@@ -15211,7 +15112,15 @@ impl Editor {
 
     fn key_action_repeats_last_change(action: &KeyAction) -> bool {
         match action {
-            KeyAction::Single(Action::RepeatLastChange) => true,
+            KeyAction::Single(Action::RepeatLastChange)
+            | KeyAction::Single(Action::VimletInput(vimlet::Input {
+                binding:
+                    vimlet::Binding::Command(vimlet::Command {
+                        action: vimlet::Action::History(_),
+                        ..
+                    }),
+                ..
+            })) => true,
             KeyAction::Multiple(actions) => actions
                 .iter()
                 .any(|action| matches!(action, Action::RepeatLastChange)),
@@ -15221,11 +15130,30 @@ impl Editor {
     }
 
     fn record_macro_event(&mut self, event: &Event) {
-        let Some(recording) = &mut self.macro_recording else {
-            return;
-        };
-        if Self::macro_event_notation(event).is_some() {
-            recording.events.push(event.clone());
+        if let Some(key) = Self::file_macro_key(event) {
+            if let Err(error) = self.file_vim.session.record_key(&key) {
+                self.set_legacy_message(Some(error.to_string()));
+            }
+        }
+    }
+
+    fn file_macro_key(event: &Event) -> Option<vimlet::Key> {
+        let notation = Self::macro_event_notation(event)?;
+        let Event::Key(key) = event else { return None };
+        Some(crate::keyboard::modal_key(*key).unwrap_or(vimlet::Key::Named(notation)))
+    }
+
+    fn file_macro_notation(key: &vimlet::Key) -> String {
+        use vimlet::Key;
+        match key {
+            Key::Char('<') => "<lt>".into(),
+            Key::Char(c) => c.to_string(),
+            Key::Ctrl(c) => format!("<C-{c}>"),
+            Key::Enter => "<CR>".into(),
+            Key::Escape => "<Esc>".into(),
+            Key::Backspace => "<BS>".into(),
+            Key::Text(text) | Key::Named(text) => text.clone(),
+            other => format!("<{other:?}>"),
         }
     }
 
@@ -15243,11 +15171,7 @@ impl Editor {
 
         let pending_input = !self.is_normal()
             || self.waiting_key_action.is_some()
-            || self.pending_operator.is_some()
-            || self.pending_character_motion.is_some()
-            || self.pending_replace
-            || self.pending_visual_text_object_scope.is_some()
-            || self.pending_macro_action.is_some()
+            || self.file_vim.pending()
             || self.pending_mark_action.is_some()
             || self.repeater.is_some()
             || self.transaction_active();
@@ -15260,6 +15184,12 @@ impl Editor {
             .take()
             .expect("completed semantic change must exist");
         if self.current_buffer().revision() != change.base_revision && !change.events.is_empty() {
+            if change.vimlet {
+                return;
+            }
+            self.file_vim
+                .session
+                .record_host_change(file_vim::REPEAT_HOST_CHANGE);
             self.last_semantic_change = Some(if let Some(mut recipe) = change.repeat_recipe {
                 recipe.steps.extend(
                     change
@@ -15367,10 +15297,10 @@ impl Editor {
         Self::key_signature(ev).is_some()
             && self.is_normal()
             && self.repeater.is_none()
-            && self.pending_operator.is_none()
+            && !self.file_vim.pending()
             && self.waiting_key_action.is_none()
-            && self.macro_recording.is_none()
-            && self.macro_replay_depth == 0
+            && self.file_vim.session.recording().is_none()
+            && self.macro_playback.is_none()
             && !self.replaying_semantic_change
             && !matches!(action, KeyAction::Repeating(_, _))
             && Self::key_action_is_pure_motion(action)
@@ -15646,22 +15576,6 @@ impl Editor {
         Ok(quit)
     }
 
-    #[inline(never)]
-    fn replay_last_semantic_change<'a>(
-        &'a mut self,
-        buffer: &'a mut RenderBuffer,
-        runtime: &'a mut Runtime,
-    ) -> BoxFuture<'a, anyhow::Result<()>> {
-        Box::pin(async move {
-            let Some(change) = self.last_semantic_change.clone() else {
-                self.set_legacy_message(Some("no change to repeat".to_string()));
-                return Ok(());
-            };
-
-            self.replay_semantic_change(change, buffer, runtime).await
-        })
-    }
-
     fn replay_semantic_change<'a>(
         &'a mut self,
         change: SemanticChange,
@@ -15770,47 +15684,53 @@ impl Editor {
     async fn play_macro(
         &mut self,
         register: char,
+        count: u16,
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
-        let Some(register) = normalize_macro_register(register) else {
-            self.set_legacy_message(Some("macro register must be a letter or digit".to_string()));
+        let Some(keys) = self.file_vim.session.macro_keys(register) else {
+            if let Some(playback) = &mut self.macro_playback {
+                playback.keys.cancel();
+            }
+            let message = if register == '@' {
+                "no previously played macro".into()
+            } else {
+                format!("macro register @{register} is empty")
+            };
+            self.set_legacy_message(Some(message));
             return Ok(());
         };
-        let depth = self.macro_replay_depth.saturating_add(1);
-        if depth > MACRO_MAX_REPLAY_DEPTH {
+        let mut events = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let vimlet::Key::Text(text) = key {
+                events.push(Event::Paste(text));
+            } else {
+                events.extend(Self::macro_events_from_notation(
+                    &Self::file_macro_notation(&key),
+                )?);
+            }
+        }
+
+        let nested = self.macro_playback.is_some();
+        let playback = self
+            .macro_playback
+            .get_or_insert_with(|| FileMacroPlayback {
+                keys: vimlet::MacroPlayback::with_limits(vimlet::Limits {
+                    macro_depth: MACRO_MAX_REPLAY_DEPTH,
+                    macro_steps: MACRO_MAX_REPLAY_EVENTS,
+                    ..vimlet::Limits::default()
+                }),
+                previous_edit: None,
+            });
+        if playback.keys.push(events, usize::from(count)).is_err() {
             self.set_legacy_message(Some(format!(
                 "macro recursion limit ({MACRO_MAX_REPLAY_DEPTH}) reached"
             )));
             return Ok(());
         }
-        let Some(content) = self.registers.get(&register) else {
-            self.set_legacy_message(Some(format!("macro register @{register} is empty")));
-            return Ok(());
-        };
-        let events = match Self::macro_events_from_notation(&content.text) {
-            Ok(events) => events,
-            Err(error) => {
-                self.set_legacy_message(Some(error.to_string()));
-                return Ok(());
-            }
-        };
-
-        self.last_played_macro = Some(register);
-
-        for event in events.into_iter().rev() {
-            self.macro_replay_queue
-                .push_front(MacroReplayEvent { event, depth });
-        }
-
-        // A nested @ invocation only expands the active replay queue. The outermost
-        // invocation owns the iterative driver, so self-recursive registers cannot
-        // consume the async call stack before the deterministic limits fire.
-        if self.macro_replay_depth > 0 {
+        if nested {
             return Ok(());
         }
-
-        self.macro_instructions_remaining = MACRO_MAX_REPLAY_EVENTS;
         self.drain_macro_replay(buffer, runtime).await
     }
 
@@ -15820,22 +15740,21 @@ impl Editor {
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
         let result = async {
-            while let Some(replay) = self.macro_replay_queue.pop_front() {
+            while let Some(playback) = &mut self.macro_playback {
+                let event = match playback.keys.next_key() {
+                    Ok(Some(event)) => event,
+                    Ok(None) => break,
+                    Err(_) => {
+                        self.set_legacy_message(Some(format!(
+                            "macro instruction limit ({MACRO_MAX_REPLAY_EVENTS}) reached"
+                        )));
+                        break;
+                    }
+                };
                 let checkpoint = self.rpc_command_checkpoint();
-                if self.macro_instructions_remaining == 0 {
-                    self.set_legacy_message(Some(format!(
-                        "macro instruction limit ({MACRO_MAX_REPLAY_EVENTS}) reached"
-                    )));
-                    self.macro_replay_queue.clear();
-                    break;
-                }
-                self.macro_instructions_remaining -= 1;
-                self.macro_replay_depth = replay.depth;
-                if let Some(action) =
-                    self.handle_event_with_runtime(&replay.event, Some(runtime))?
-                {
+                if let Some(action) = self.handle_event_with_runtime(&event, Some(runtime))? {
                     if self
-                        .handle_resolved_key_action(&replay.event, &action, buffer, runtime)
+                        .handle_resolved_key_action(&event, &action, buffer, runtime)
                         .await?
                     {
                         anyhow::bail!("macro attempted to quit the editor");
@@ -15852,8 +15771,7 @@ impl Editor {
             Ok(())
         }
         .await;
-        self.macro_replay_depth = 0;
-        self.macro_replay_queue.clear();
+        self.macro_playback = None;
         result
     }
 
@@ -15915,6 +15833,7 @@ impl Editor {
                     "Esc" => (KeyCode::Esc, KeyModifiers::NONE),
                     "CR" | "Enter" => (KeyCode::Enter, KeyModifiers::NONE),
                     "BS" => (KeyCode::Backspace, KeyModifiers::NONE),
+                    "Delete" => (KeyCode::Delete, KeyModifiers::NONE),
                     "Tab" => (KeyCode::Tab, KeyModifiers::NONE),
                     "S-Tab" => (KeyCode::BackTab, KeyModifiers::SHIFT),
                     "Up" => (KeyCode::Up, KeyModifiers::NONE),
@@ -17584,9 +17503,7 @@ impl Editor {
             self.waiting_command = None;
             self.clear_keymap_hints();
             self.repeater = None;
-            self.pending_operator = None;
-            self.pending_character_motion = None;
-            self.pending_visual_text_object_scope = None;
+            self.file_vim.cancel_pending();
         }
 
         if self.waiting_key_action.is_some() && matches!(ev, Event::Mouse(_)) {
@@ -20083,120 +20000,12 @@ impl Editor {
     }
 
     fn handle_visual_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
-        if self.pending_replace {
-            return self.handle_replace_event(ev);
+        if let Some(input) = self.file_prefix_input(ev) {
+            return Some(input);
         }
-
-        if self.pending_visual_text_object_scope.is_some() {
-            return self.handle_visual_text_object_event(ev);
-        }
-
-        if let Some(action) = self.handle_character_motion_event(ev) {
-            return Some(action);
-        }
-
-        if let Some(action) = self.handle_replace_event(ev) {
-            return Some(action);
-        }
-
-        if let Some(action) = self.handle_visual_text_object_event(ev) {
-            return Some(action);
-        }
-
         let visual = self.visual_key_mappings();
-        self.event_to_key_action(&visual, ev)
-    }
-
-    fn handle_visual_text_object_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
-        if !matches!(self.mode, Mode::Visual) {
-            return None;
-        }
-
-        let Event::Key(KeyEvent { code, .. }) = ev else {
-            return None;
-        };
-
-        if *code == KeyCode::Esc {
-            self.pending_visual_text_object_scope = None;
-            self.waiting_command = None;
-            return None;
-        }
-
-        if let Some(scope) = self.pending_visual_text_object_scope.take() {
-            let KeyCode::Char(c) = code else {
-                return self.pending_visual_text_object_invalid();
-            };
-
-            self.waiting_command = None;
-            if let Some(kind) = SyntaxObjectKind::for_text_object_key(*c) {
-                let Some(object) = self.syntax_text_object(scope, kind) else {
-                    if self.last_error.is_none() {
-                        self.set_legacy_message(Some("text object not found".to_string()));
-                    }
-                    return Some(KeyAction::None);
-                };
-                let selected = if object.linewise {
-                    self.select_linewise_text_range(self.linewise_text_object_range(object.range))
-                } else {
-                    self.select_text_range(object.range)
-                };
-                if selected {
-                    return Some(KeyAction::Single(Action::Refresh));
-                }
-                self.set_legacy_message(Some("text object not found".to_string()));
-                return Some(KeyAction::None);
-            }
-            let Some(kind) = text_object_kind_for_key(*c) else {
-                if *c == '%' {
-                    let Some(range) = self.matchit_select_around_range() else {
-                        self.set_legacy_message(Some("text object not found".to_string()));
-                        return Some(KeyAction::None);
-                    };
-                    if self.select_text_range(range) {
-                        return Some(KeyAction::Single(Action::Refresh));
-                    }
-                    self.set_legacy_message(Some("text object not found".to_string()));
-                    return Some(KeyAction::None);
-                }
-                return self.pending_visual_text_object_invalid();
-            };
-
-            let count = self.repeater.take().unwrap_or(1);
-            let Some(range) = self.text_object_range_with_count(scope, kind, count) else {
-                self.set_legacy_message(Some("text object not found".to_string()));
-                return Some(KeyAction::None);
-            };
-
-            if kind == TextObjectKind::Paragraph && self.select_linewise_text_range(range) {
-                return Some(KeyAction::Single(Action::Refresh));
-            }
-            if self.select_text_range(range) {
-                return Some(KeyAction::Single(Action::Refresh));
-            }
-            self.set_legacy_message(Some("text object not found".to_string()));
-            return Some(KeyAction::None);
-        }
-
-        let KeyCode::Char(c) = code else {
-            return None;
-        };
-
-        let scope = match c {
-            'i' => TextObjectScope::Inner,
-            'a' => TextObjectScope::Around,
-            _ => return None,
-        };
-
-        self.pending_visual_text_object_scope = Some(scope);
-        self.waiting_command = Some(c.to_string());
-        Some(KeyAction::None)
-    }
-
-    fn pending_visual_text_object_invalid(&mut self) -> Option<KeyAction> {
-        self.pending_visual_text_object_scope = None;
-        self.waiting_command = None;
-        self.set_legacy_message(Some("invalid text object".to_string()));
-        Some(KeyAction::None)
+        let mapping = self.event_to_key_action(&visual, ev)?;
+        Some(self.file_binding(ev, mapping))
     }
 
     fn handle_waiting_command(&mut self, ka: KeyAction, ev: &event::Event) -> Option<KeyAction> {
@@ -20243,6 +20052,20 @@ impl Editor {
                     }
                     // Otherwise insert normally
                     Ok(KeyAction::Single(Action::InsertCharAtCursorPos(c)).into())
+                }
+                KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::Delete
+                    if self.file_vim.inserting() && event.modifiers.is_empty() =>
+                {
+                    let key = crate::keyboard::modal_key(*event).expect("supported insert key");
+                    Ok(Some(KeyAction::Single(Action::VimletInput(
+                        vimlet::Input::key(key),
+                    ))))
                 }
                 _ => Ok(None),
             },
@@ -20397,20 +20220,11 @@ impl Editor {
             }
         }
 
-        if self.pending_replace {
-            return self.handle_replace_event(ev);
+        if self.file_vim.state.awaiting_macro_register() {
+            return self.handle_macro_event(ev);
         }
-
-        if let Some(action) = self.handle_operator_event(ev) {
-            return Some(action);
-        }
-
-        if let Some(action) = self.handle_character_motion_event(ev) {
-            return Some(action);
-        }
-
-        if let Some(action) = self.handle_replace_event(ev) {
-            return Some(action);
+        if let Some(input) = self.file_prefix_input(ev) {
+            return Some(input);
         }
 
         if let Some(action) = self.handle_mark_event(ev) {
@@ -20422,52 +20236,8 @@ impl Editor {
         }
 
         let normal = self.config.keys.normal.clone();
-        self.event_to_key_action(&normal, ev)
-    }
-
-    fn handle_replace_event(&mut self, event: &Event) -> Option<KeyAction> {
-        let Event::Key(KeyEvent {
-            code,
-            modifiers,
-            kind: KeyEventKind::Press | KeyEventKind::Repeat,
-            ..
-        }) = event
-        else {
-            return None;
-        };
-        if self.pending_replace {
-            self.pending_replace = false;
-            self.waiting_command = None;
-            if *code == KeyCode::Esc {
-                self.repeater = None;
-                return Some(KeyAction::None);
-            }
-            if !matches!(*modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) {
-                self.set_legacy_message(Some("replacement must be a character".to_string()));
-                self.repeater = None;
-                return Some(KeyAction::None);
-            }
-            let KeyCode::Char(character) = code else {
-                self.set_legacy_message(Some("replacement must be a character".to_string()));
-                self.repeater = None;
-                return Some(KeyAction::None);
-            };
-            return Some(KeyAction::Single(if self.is_visual() {
-                self.repeater = None;
-                Action::ReplaceSelection(*character)
-            } else {
-                Action::ReplaceCharsAtCursor {
-                    character: *character,
-                    count: self.repeater.take().unwrap_or(1),
-                }
-            }));
-        }
-        if *code == KeyCode::Char('r') && *modifiers == KeyModifiers::NONE {
-            self.pending_replace = true;
-            self.waiting_command = Some("r".to_string());
-            return Some(KeyAction::None);
-        }
-        None
+        let mapping = self.event_to_key_action(&normal, ev)?;
+        Some(self.file_binding(ev, mapping))
     }
 
     fn handle_mark_event(&mut self, event: &Event) -> Option<KeyAction> {
@@ -20552,7 +20322,9 @@ impl Editor {
             return None;
         };
 
-        if self.macro_recording.is_some()
+        if self.file_vim.session.recording().is_some()
+            && self.macro_playback.is_none()
+            && !self.file_vim.state.awaiting_macro_register()
             && *code == KeyCode::Char('q')
             && *modifiers == KeyModifiers::NONE
         {
@@ -20560,700 +20332,66 @@ impl Editor {
             return Some(KeyAction::None);
         }
 
-        if let Some(pending) = self.pending_macro_action.take() {
-            self.waiting_command = None;
-            if *code == KeyCode::Esc {
-                self.repeater = None;
-                return Some(KeyAction::None);
-            }
-            let KeyCode::Char(register) = code else {
-                return self.invalid_macro_register();
-            };
-            return match pending {
-                PendingMacroAction::Record => {
-                    self.start_macro_recording(*register);
-                    Some(KeyAction::None)
-                }
-                PendingMacroAction::Play => {
-                    let register = if *register == '@' {
-                        let Some(register) = self.last_played_macro else {
-                            self.set_legacy_message(Some("no previously played macro".to_string()));
-                            self.repeater = None;
-                            return Some(KeyAction::None);
-                        };
-                        register
-                    } else {
-                        let Some(register) = normalize_macro_register(*register) else {
-                            return self.invalid_macro_register();
-                        };
-                        register
-                    };
-                    let action = KeyAction::Single(Action::PlayMacro(register));
-                    Some(if let Some(count) = self.repeater.take() {
-                        KeyAction::Repeating(count, Box::new(action))
-                    } else {
-                        action
-                    })
-                }
-            };
-        }
-
-        if *modifiers != KeyModifiers::NONE {
+        if !self.file_vim.state.awaiting_macro_register() && *modifiers != KeyModifiers::NONE {
             return None;
         }
-        match code {
-            KeyCode::Char('q') => {
-                self.pending_macro_action = Some(PendingMacroAction::Record);
-                self.waiting_command = Some("q".to_string());
-                Some(KeyAction::None)
+        let Event::Key(event) = event else {
+            return None;
+        };
+        let key = crate::keyboard::modal_key(*event).unwrap_or(vimlet::Key::Escape);
+        let binding = self
+            .file_vim
+            .state
+            .macro_binding(&key, usize::from(self.repeater.unwrap_or(0)))?;
+        self.repeater = None;
+        self.waiting_command = None;
+        match binding {
+            vimlet::MacroBinding::AwaitingRegister => {
+                self.waiting_command = Self::macro_event_notation(&Event::Key(*event));
             }
-            KeyCode::Char('@') => {
-                self.pending_macro_action = Some(PendingMacroAction::Play);
-                self.waiting_command = Some("@".to_string());
-                Some(KeyAction::None)
+            vimlet::MacroBinding::Record(register) => self.start_macro_recording(register),
+            vimlet::MacroBinding::Play { register, count } => {
+                if register != '@' && normalize_macro_register(register).is_none() {
+                    return self.invalid_macro_register();
+                }
+                let action = KeyAction::Single(Action::PlayMacro(register));
+                return Some(if count > 1 {
+                    KeyAction::Repeating(count as u16, Box::new(action))
+                } else {
+                    action
+                });
             }
-            _ => None,
+            vimlet::MacroBinding::Cancelled if *code != KeyCode::Esc => {
+                return self.invalid_macro_register()
+            }
+            vimlet::MacroBinding::Cancelled => {}
         }
+        Some(KeyAction::None)
     }
 
     fn start_macro_recording(&mut self, register: char) {
-        let append = register.is_ascii_uppercase();
-        let Some(register) = normalize_macro_register(register) else {
+        if self.file_vim.session.start_recording(register).is_err() {
             self.invalid_macro_register();
-            return;
-        };
-        let events = if append {
-            self.registers
-                .get(&register)
-                .and_then(|content| Self::macro_events_from_notation(&content.text).ok())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        self.macro_recording = Some(MacroRecording { register, events });
+        }
     }
 
     fn finish_macro_recording(&mut self) {
-        let Some(recording) = self.macro_recording.take() else {
-            return;
-        };
-        let notation = recording
-            .events
-            .iter()
-            .filter_map(Self::macro_event_notation)
-            .collect::<String>();
-        self.set_register(recording.register, Content::charwise(notation));
+        if let Some(name) = self.file_vim.session.finish_recording() {
+            let register = self.file_vim.session.registers().get(name).unwrap();
+            let notation = register
+                .playback()
+                .iter()
+                .map(Self::file_macro_notation)
+                .collect();
+            self.registers.insert(name, Content::charwise(notation));
+        }
     }
 
     fn invalid_macro_register(&mut self) -> Option<KeyAction> {
-        self.pending_macro_action = None;
         self.waiting_command = None;
         self.repeater = None;
         self.set_legacy_message(Some("macro register must be a letter or digit".to_string()));
         Some(KeyAction::None)
-    }
-
-    fn handle_character_motion_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
-        let Event::Key(KeyEvent {
-            code, modifiers, ..
-        }) = ev
-        else {
-            return None;
-        };
-
-        if *code == KeyCode::Esc {
-            if self.pending_character_motion.take().is_some() {
-                self.waiting_command = None;
-                self.repeater = None;
-                return Some(KeyAction::None);
-            }
-            return None;
-        }
-
-        if let Some(pending) = self.pending_character_motion.take() {
-            self.waiting_command = None;
-            let KeyCode::Char(target) = code else {
-                return self.pending_character_motion_invalid();
-            };
-            if !matches!(*modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) {
-                return self.pending_character_motion_invalid();
-            }
-            self.last_character_motion = Some((pending.kind, *target));
-            let action = match pending.kind {
-                ForwardCharacterMotion::Find => Action::FindCharForward {
-                    target: *target,
-                    count: pending.count,
-                },
-                ForwardCharacterMotion::Till => Action::TillCharForward {
-                    target: *target,
-                    count: pending.count,
-                },
-                ForwardCharacterMotion::FindBackward => Action::FindCharBackward {
-                    target: *target,
-                    count: pending.count,
-                },
-                ForwardCharacterMotion::TillBackward => Action::TillCharBackward {
-                    target: *target,
-                    count: pending.count,
-                },
-            };
-            return Some(KeyAction::Single(action));
-        }
-
-        if !matches!(*modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) {
-            return None;
-        }
-        let KeyCode::Char(c @ ('f' | 't' | 'F' | 'T')) = code else {
-            return None;
-        };
-        let kind = match *c {
-            'f' => ForwardCharacterMotion::Find,
-            't' => ForwardCharacterMotion::Till,
-            'F' => ForwardCharacterMotion::FindBackward,
-            'T' => ForwardCharacterMotion::TillBackward,
-            _ => return None,
-        };
-        self.pending_character_motion = Some(PendingCharacterMotion {
-            kind,
-            count: self.repeater.take().unwrap_or(1),
-        });
-        self.waiting_command = Some(c.to_string());
-        Some(KeyAction::None)
-    }
-
-    fn pending_character_motion_invalid(&mut self) -> Option<KeyAction> {
-        self.pending_character_motion = None;
-        self.waiting_command = None;
-        self.repeater = None;
-        self.set_legacy_message(Some("invalid character motion".to_string()));
-        Some(KeyAction::None)
-    }
-
-    fn handle_operator_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
-        let Event::Key(KeyEvent {
-            code, modifiers, ..
-        }) = ev
-        else {
-            return None;
-        };
-
-        if *code == KeyCode::Esc {
-            if self.pending_operator.take().is_some() {
-                self.waiting_command = None;
-                self.repeater = None;
-                return Some(KeyAction::None);
-            }
-            return None;
-        }
-
-        let KeyCode::Char(c) = code else {
-            return if self.pending_operator.is_some() {
-                self.pending_operator_invalid()
-            } else {
-                None
-            };
-        };
-
-        if let Some(pending) = self.pending_operator.take() {
-            self.waiting_command = None;
-            if !matches!(*modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) {
-                return self.pending_operator_invalid();
-            }
-            return self.handle_pending_operator(pending, *c);
-        }
-
-        if *modifiers != KeyModifiers::NONE {
-            return None;
-        }
-
-        let operator = match c {
-            'd' => EditOperator::Delete,
-            'c' => EditOperator::Change,
-            'y' => EditOperator::Yank,
-            _ => return None,
-        };
-
-        let operator_count = self.repeater.take().unwrap_or(1);
-        self.pending_operator = Some(PendingOperator::new(operator, operator_count));
-        self.waiting_command = Some(c.to_string());
-        Some(KeyAction::None)
-    }
-
-    fn handle_pending_operator(&mut self, pending: PendingOperator, c: char) -> Option<KeyAction> {
-        match pending.step {
-            PendingOperatorStep::Operator => match c {
-                '0'..='9' if c != '0' || pending.motion_count.is_some() => {
-                    let digit = c.to_digit(10).unwrap_or(0) as u16;
-                    let motion_count = pending
-                        .motion_count
-                        .unwrap_or(0)
-                        .saturating_mul(10)
-                        .saturating_add(digit);
-                    self.waiting_command =
-                        Some(format!("{}{}", pending.operator.as_str(), motion_count));
-                    self.pending_operator = Some(PendingOperator {
-                        motion_count: Some(motion_count),
-                        ..pending
-                    });
-                    Some(KeyAction::None)
-                }
-                'd' if pending.operator == EditOperator::Delete => Some(KeyAction::Single(
-                    Action::DeleteCurrentLines(pending.count()),
-                )),
-                'c' if pending.operator == EditOperator::Change => Some(KeyAction::Single(
-                    Action::ChangeCurrentLines(pending.count()),
-                )),
-                'c' if pending.operator == EditOperator::Comment => Some(KeyAction::Single(
-                    Action::ToggleCommentLines(pending.count()),
-                )),
-                'q' if pending.operator == EditOperator::Format => self
-                    .operator_action_for_linewise_range(
-                        pending.operator,
-                        Some(self.current_line_range(pending.count(), false)),
-                        "no line under cursor",
-                    ),
-                'y' if pending.operator == EditOperator::Yank => {
-                    Some(KeyAction::Single(Action::YankCurrentLines(pending.count())))
-                }
-                'u' if pending.operator == EditOperator::Lowercase => self
-                    .operator_action_for_range(
-                        pending.operator,
-                        Some(self.current_line_range(pending.count(), false)),
-                        "no text under cursor",
-                    ),
-                'U' if pending.operator == EditOperator::Uppercase => self
-                    .operator_action_for_range(
-                        pending.operator,
-                        Some(self.current_line_range(pending.count(), false)),
-                        "no text under cursor",
-                    ),
-                '~' if pending.operator == EditOperator::ToggleCase => self
-                    .operator_action_for_range(
-                        pending.operator,
-                        Some(self.current_line_range(pending.count(), false)),
-                        "no text under cursor",
-                    ),
-                'g' => {
-                    self.waiting_command = Some(format!("{}g", pending.operator.as_str()));
-                    self.pending_operator = Some(PendingOperator {
-                        step: PendingOperatorStep::GPrefix,
-                        ..pending
-                    });
-                    Some(KeyAction::None)
-                }
-                'w' => self.operator_action_for_range(
-                    pending.operator,
-                    self.word_motion_range(
-                        pending.count(),
-                        pending.operator == EditOperator::Change,
-                        false,
-                    ),
-                    "no word under cursor",
-                ),
-                'W' => self.operator_action_for_range(
-                    pending.operator,
-                    self.word_motion_range(
-                        pending.count(),
-                        pending.operator == EditOperator::Change,
-                        true,
-                    ),
-                    "no word under cursor",
-                ),
-                'h' => self.operator_action_for_range(
-                    pending.operator,
-                    self.horizontal_motion_range(pending.count(), true),
-                    "no text before cursor",
-                ),
-                'l' => self.operator_action_for_range(
-                    pending.operator,
-                    self.horizontal_motion_range(pending.count(), false),
-                    "no text under cursor",
-                ),
-                'b' => self.operator_action_for_range(
-                    pending.operator,
-                    self.previous_word_motion_range(pending.count(), false),
-                    "no word under cursor",
-                ),
-                'B' => self.operator_action_for_range(
-                    pending.operator,
-                    self.previous_word_motion_range(pending.count(), true),
-                    "no word under cursor",
-                ),
-                'e' => self.operator_action_for_range(
-                    pending.operator,
-                    self.end_word_motion_range(pending.count(), false),
-                    "no word under cursor",
-                ),
-                'E' => self.operator_action_for_range(
-                    pending.operator,
-                    self.end_word_motion_range(pending.count(), true),
-                    "no word under cursor",
-                ),
-                '{' | '}' => {
-                    let range =
-                        MotionResolver::new(self.current_buffer(), self.cursor_text_position())
-                            .paragraph_range(pending.count(), c == '{');
-                    self.operator_action_for_boundary_range(
-                        pending.operator,
-                        range,
-                        "no paragraph under cursor",
-                    )
-                }
-                '(' | ')' => {
-                    let range =
-                        MotionResolver::new(self.current_buffer(), self.cursor_text_position())
-                            .sentence_range(pending.count(), c == '(');
-                    self.operator_action_for_boundary_range(
-                        pending.operator,
-                        range,
-                        "no sentence under cursor",
-                    )
-                }
-                '$' => self.operator_action_for_range(
-                    pending.operator,
-                    Some(self.line_end_motion_range(pending.count())),
-                    "no text under cursor",
-                ),
-                '0' => self.operator_action_for_range(
-                    pending.operator,
-                    self.line_start_motion_range(false),
-                    "no text under cursor",
-                ),
-                '^' => self.operator_action_for_range(
-                    pending.operator,
-                    self.line_start_motion_range(true),
-                    "no text under cursor",
-                ),
-                'G' => {
-                    let target = if pending.motion_count.is_some() || pending.operator_count > 1 {
-                        usize::from(pending.count().saturating_sub(1))
-                            .min(self.last_navigable_line())
-                    } else {
-                        self.last_navigable_line()
-                    };
-                    self.operator_action_for_linewise_range(
-                        pending.operator,
-                        Some(self.file_linewise_motion_range(target, pending.operator)),
-                        "no line under cursor",
-                    )
-                }
-                'j' => self.operator_action_for_linewise_range(
-                    pending.operator,
-                    self.vertical_motion_range(pending.count(), false),
-                    "no line below cursor",
-                ),
-                'k' => self.operator_action_for_linewise_range(
-                    pending.operator,
-                    self.vertical_motion_range(pending.count(), true),
-                    "no line above cursor",
-                ),
-                '%' => self.operator_action_for_warning_range(
-                    pending.operator,
-                    self.matchit_motion_range(MatchDirection::Forward),
-                    "match not found",
-                ),
-                'f' => {
-                    self.waiting_command = Some(format!("{}f", pending.operator.as_str()));
-                    self.pending_operator = Some(PendingOperator {
-                        step: PendingOperatorStep::FindForward,
-                        ..pending
-                    });
-                    Some(KeyAction::None)
-                }
-                't' => {
-                    self.waiting_command = Some(format!("{}t", pending.operator.as_str()));
-                    self.pending_operator = Some(PendingOperator {
-                        step: PendingOperatorStep::TillForward,
-                        ..pending
-                    });
-                    Some(KeyAction::None)
-                }
-                'F' => {
-                    self.waiting_command = Some(format!("{}F", pending.operator.as_str()));
-                    self.pending_operator = Some(PendingOperator {
-                        step: PendingOperatorStep::FindBackward,
-                        ..pending
-                    });
-                    Some(KeyAction::None)
-                }
-                'T' => {
-                    self.waiting_command = Some(format!("{}T", pending.operator.as_str()));
-                    self.pending_operator = Some(PendingOperator {
-                        step: PendingOperatorStep::TillBackward,
-                        ..pending
-                    });
-                    Some(KeyAction::None)
-                }
-                'i' => {
-                    self.waiting_command = Some(format!("{}i", pending.operator.as_str()));
-                    self.pending_operator = Some(PendingOperator {
-                        step: PendingOperatorStep::TextObjectScope(TextObjectScope::Inner),
-                        ..pending
-                    });
-                    Some(KeyAction::None)
-                }
-                'a' => {
-                    self.waiting_command = Some(format!("{}a", pending.operator.as_str()));
-                    self.pending_operator = Some(PendingOperator {
-                        step: PendingOperatorStep::TextObjectScope(TextObjectScope::Around),
-                        ..pending
-                    });
-                    Some(KeyAction::None)
-                }
-                '[' | ']' => {
-                    self.waiting_command = Some(format!("{}{}", pending.operator.as_str(), c));
-                    self.pending_operator = Some(PendingOperator {
-                        step: PendingOperatorStep::StructuralMotion { backward: c == '[' },
-                        ..pending
-                    });
-                    Some(KeyAction::None)
-                }
-                _ => self.pending_operator_invalid(),
-            },
-            PendingOperatorStep::GPrefix => match c {
-                'c' => {
-                    let range = self.comment_text_object_range();
-                    self.operator_action_for_linewise_range(
-                        pending.operator,
-                        range,
-                        "comment block not found",
-                    )
-                }
-                'g' => {
-                    let target = if pending.motion_count.is_some() || pending.operator_count > 1 {
-                        usize::from(pending.count().saturating_sub(1))
-                            .min(self.last_navigable_line())
-                    } else {
-                        0
-                    };
-                    self.operator_action_for_linewise_range(
-                        pending.operator,
-                        Some(self.file_linewise_motion_range(target, pending.operator)),
-                        "no line under cursor",
-                    )
-                }
-                'q' if pending.operator == EditOperator::Format => self
-                    .operator_action_for_linewise_range(
-                        pending.operator,
-                        Some(self.current_line_range(pending.count(), false)),
-                        "no line under cursor",
-                    ),
-                'e' => self.operator_action_for_range(
-                    pending.operator,
-                    self.previous_end_word_motion_range(pending.count(), false),
-                    "no word under cursor",
-                ),
-                'E' => self.operator_action_for_range(
-                    pending.operator,
-                    self.previous_end_word_motion_range(pending.count(), true),
-                    "no word under cursor",
-                ),
-                _ => self.pending_operator_invalid(),
-            },
-            PendingOperatorStep::FindForward => {
-                self.last_character_motion = Some((ForwardCharacterMotion::Find, c));
-                self.operator_action_for_warning_range(
-                    pending.operator,
-                    self.find_forward_motion_range(c, pending.count()),
-                    "character not found",
-                )
-            }
-            PendingOperatorStep::TillForward => {
-                self.last_character_motion = Some((ForwardCharacterMotion::Till, c));
-                self.operator_action_for_warning_range(
-                    pending.operator,
-                    self.till_forward_motion_range(c, pending.count()),
-                    "character not found",
-                )
-            }
-            PendingOperatorStep::FindBackward => {
-                self.last_character_motion = Some((ForwardCharacterMotion::FindBackward, c));
-                self.operator_action_for_warning_range(
-                    pending.operator,
-                    self.find_backward_motion_range(c, pending.count()),
-                    "character not found",
-                )
-            }
-            PendingOperatorStep::TillBackward => {
-                self.last_character_motion = Some((ForwardCharacterMotion::TillBackward, c));
-                self.operator_action_for_warning_range(
-                    pending.operator,
-                    self.till_backward_motion_range(c, pending.count()),
-                    "character not found",
-                )
-            }
-            PendingOperatorStep::StructuralMotion { backward } => {
-                let Some(kind) = structural_motion_kind(c) else {
-                    return self.pending_operator_invalid();
-                };
-                let range = self.syntax_motion_range(kind, backward, pending.count());
-                self.operator_action_for_navigation_range(
-                    pending.operator,
-                    range,
-                    structural_motion_label(c),
-                )
-            }
-            PendingOperatorStep::TextObjectScope(scope) => {
-                if let Some(kind) = SyntaxObjectKind::for_text_object_key(c) {
-                    let Some(object) = self.syntax_text_object(scope, kind) else {
-                        return self.operator_action_for_range(
-                            pending.operator,
-                            None,
-                            "text object not found",
-                        );
-                    };
-                    return if object.linewise {
-                        let range = self.linewise_text_object_range(object.range);
-                        self.operator_action_for_linewise_range(
-                            pending.operator,
-                            Some(range),
-                            "text object not found",
-                        )
-                    } else {
-                        self.operator_action_for_range(
-                            pending.operator,
-                            Some(object.range),
-                            "text object not found",
-                        )
-                    };
-                }
-                let Some(kind) = text_object_kind_for_key(c) else {
-                    return self.pending_operator_invalid();
-                };
-                self.operator_action_for_range(
-                    pending.operator,
-                    self.text_object_range_with_count(scope, kind, pending.count()),
-                    "text object not found",
-                )
-            }
-        }
-    }
-
-    fn pending_operator_invalid(&mut self) -> Option<KeyAction> {
-        self.pending_operator = None;
-        self.waiting_command = None;
-        self.repeater = None;
-        self.set_legacy_message(Some("invalid operator motion".to_string()));
-        Some(KeyAction::None)
-    }
-
-    fn operator_action_for_range(
-        &mut self,
-        operator: EditOperator,
-        range: Option<TextRange>,
-        error: &str,
-    ) -> Option<KeyAction> {
-        self.pending_operator = None;
-        self.waiting_command = None;
-        let Some(range) = range else {
-            self.set_legacy_message(Some(error.to_string()));
-            return Some(KeyAction::None);
-        };
-
-        let action = match operator {
-            EditOperator::Delete => Action::DeleteTextRange(range),
-            EditOperator::Change => Action::ChangeTextRange(range),
-            EditOperator::Yank => Action::YankTextRange(range),
-            EditOperator::Comment => Action::ToggleCommentRange(range),
-            EditOperator::Format => Action::FormatTextRange(range),
-            EditOperator::Lowercase => Action::TransformTextRange {
-                range,
-                transform: CaseTransform::Lower,
-            },
-            EditOperator::Uppercase => Action::TransformTextRange {
-                range,
-                transform: CaseTransform::Upper,
-            },
-            EditOperator::ToggleCase => Action::TransformTextRange {
-                range,
-                transform: CaseTransform::Toggle,
-            },
-        };
-        self.repeater = None;
-        Some(KeyAction::Single(action))
-    }
-
-    fn operator_action_for_navigation_range(
-        &mut self,
-        operator: EditOperator,
-        range: Option<TextRange>,
-        target: &str,
-    ) -> Option<KeyAction> {
-        if range.is_none() {
-            self.pending_operator = None;
-            self.waiting_command = None;
-            if self.last_error.is_none() {
-                self.set_navigation_boundary_warning(target);
-            }
-            return Some(KeyAction::None);
-        }
-        self.operator_action_for_range(operator, range, "")
-    }
-
-    fn operator_action_for_warning_range(
-        &mut self,
-        operator: EditOperator,
-        range: Option<TextRange>,
-        warning: &str,
-    ) -> Option<KeyAction> {
-        if range.is_none() {
-            self.pending_operator = None;
-            self.waiting_command = None;
-            self.set_routine_warning(Some(warning.to_string()));
-            return Some(KeyAction::None);
-        }
-        self.operator_action_for_range(operator, range, "")
-    }
-
-    fn operator_action_for_linewise_range(
-        &mut self,
-        operator: EditOperator,
-        range: Option<TextRange>,
-        error: &str,
-    ) -> Option<KeyAction> {
-        self.pending_operator = None;
-        self.waiting_command = None;
-        let Some(range) = range else {
-            self.set_legacy_message(Some(error.to_string()));
-            return Some(KeyAction::None);
-        };
-
-        let action = match operator {
-            EditOperator::Delete => Action::DeleteLinewiseRange(range),
-            EditOperator::Change => Action::ChangeLinewiseRange(range),
-            EditOperator::Yank => Action::YankLinewiseRange(range),
-            EditOperator::Comment => Action::ToggleCommentRange(range),
-            EditOperator::Format => Action::FormatTextRange(range),
-            EditOperator::Lowercase => Action::TransformTextRange {
-                range,
-                transform: CaseTransform::Lower,
-            },
-            EditOperator::Uppercase => Action::TransformTextRange {
-                range,
-                transform: CaseTransform::Upper,
-            },
-            EditOperator::ToggleCase => Action::TransformTextRange {
-                range,
-                transform: CaseTransform::Toggle,
-            },
-        };
-        self.repeater = None;
-        Some(KeyAction::Single(action))
-    }
-
-    fn operator_action_for_boundary_range(
-        &mut self,
-        operator: EditOperator,
-        range: Option<(TextRange, bool)>,
-        error: &str,
-    ) -> Option<KeyAction> {
-        match range {
-            Some((range, true)) => {
-                self.operator_action_for_linewise_range(operator, Some(range), error)
-            }
-            Some((range, false)) => self.operator_action_for_range(operator, Some(range), error),
-            None => self.operator_action_for_range(operator, None, error),
-        }
     }
 
     fn cursor_text_position(&self) -> TextPosition {
@@ -21333,12 +20471,6 @@ impl Editor {
             .word_target(count, backward, end, big_word)
     }
 
-    fn previous_word_motion_range(&self, count: u16, big_word: bool) -> Option<TextRange> {
-        let start = self.word_motion_target(count, true, false, big_word)?;
-        let end = self.cursor_text_position();
-        (start != end).then(|| TextRange::new(start, end))
-    }
-
     fn previous_end_word_motion_range(&self, count: u16, big_word: bool) -> Option<TextRange> {
         let cursor = self.cursor_text_position();
         let start = self
@@ -21387,49 +20519,6 @@ impl Editor {
             .saturating_add(1);
         let end = self.current_buffer().char_idx_to_position(end_index);
         (start != end).then(|| TextRange::new(start, end))
-    }
-
-    fn horizontal_motion_range(&self, count: u16, backward: bool) -> Option<TextRange> {
-        let line = self.buffer_line();
-        let cursor = self.cx;
-        let target = if backward {
-            cursor.saturating_sub(usize::from(count))
-        } else {
-            cursor
-                .saturating_add(usize::from(count))
-                .min(self.length_for_line(line))
-        };
-        if cursor == target {
-            return None;
-        }
-
-        let start = self.grapheme_to_char_on_line(cursor.min(target), line);
-        let end = self.grapheme_to_char_on_line(cursor.max(target), line);
-        Some(TextRange::new(
-            TextPosition::new(line, start),
-            TextPosition::new(line, end),
-        ))
-    }
-
-    fn file_linewise_motion_range(&self, target: usize, operator: EditOperator) -> TextRange {
-        let current = self.buffer_line();
-        let first_line = current.min(target);
-        let last_line = current.max(target);
-        let end = if last_line < self.current_buffer().len() {
-            TextPosition::new(last_line + 1, 0)
-        } else {
-            TextPosition::new(last_line, self.line_character_len(last_line))
-        };
-        let start = if operator == EditOperator::Delete
-            && first_line > 0
-            && last_line == self.current_buffer().len()
-        {
-            let previous_line = first_line - 1;
-            TextPosition::new(previous_line, self.line_character_len(previous_line))
-        } else {
-            TextPosition::new(first_line, 0)
-        };
-        TextRange::new(start, end)
     }
 
     fn line_character_len(&self, line: usize) -> usize {
@@ -21486,28 +20575,6 @@ impl Editor {
         (start != end).then(|| TextRange::new(start, end))
     }
 
-    fn vertical_motion_range(&self, count: u16, backward: bool) -> Option<TextRange> {
-        let current = self.buffer_line();
-        let target = if backward {
-            current.checked_sub(usize::from(count))?
-        } else {
-            current
-                .saturating_add(usize::from(count))
-                .min(self.last_navigable_line())
-        };
-        if target == current {
-            return None;
-        }
-        let start_line = current.min(target);
-        let last_line = current.max(target);
-        let end = if last_line < self.current_buffer().len() {
-            TextPosition::new(last_line + 1, 0)
-        } else {
-            TextPosition::new(last_line, self.line_character_len(last_line))
-        };
-        Some(TextRange::new(TextPosition::new(start_line, 0), end))
-    }
-
     fn forward_character_match(&self, target: char, count: u16) -> Option<TextPosition> {
         MotionResolver::new(self.current_buffer(), self.cursor_text_position())
             .character_match(target, count, false)
@@ -21516,32 +20583,6 @@ impl Editor {
     fn backward_character_match(&self, target: char, count: u16) -> Option<TextPosition> {
         MotionResolver::new(self.current_buffer(), self.cursor_text_position())
             .character_match(target, count, true)
-    }
-
-    fn find_forward_motion_range(&self, target: char, count: u16) -> Option<TextRange> {
-        let start = self.cursor_text_position();
-        let target = self.forward_character_match(target, count)?;
-        let end = TextPosition::new(target.line, target.character.saturating_add(1));
-        Some(TextRange::new(start, end))
-    }
-
-    fn till_forward_motion_range(&self, target: char, count: u16) -> Option<TextRange> {
-        let start = self.cursor_text_position();
-        let end = self.forward_character_match(target, count)?;
-        Some(TextRange::new(start, end))
-    }
-
-    fn find_backward_motion_range(&self, target: char, count: u16) -> Option<TextRange> {
-        let end = self.cursor_text_position();
-        let start = self.backward_character_match(target, count)?;
-        Some(TextRange::new(start, end))
-    }
-
-    fn till_backward_motion_range(&self, target: char, count: u16) -> Option<TextRange> {
-        let end = self.cursor_text_position();
-        let target = self.backward_character_match(target, count)?;
-        let start = TextPosition::new(target.line, target.character.saturating_add(1));
-        Some(TextRange::new(start, end))
     }
 
     fn forward_character_target(
@@ -21741,16 +20782,6 @@ impl Editor {
         let destination = self.current_buffer().char_idx_to_position(destination);
         self.move_to_text_position(destination);
         self.commit_transaction(self.cursor_snapshot())
-    }
-
-    fn text_object_range_with_count(
-        &self,
-        scope: TextObjectScope,
-        kind: TextObjectKind,
-        count: u16,
-    ) -> Option<TextRange> {
-        MotionResolver::new(self.current_buffer(), self.cursor_text_position())
-            .text_object_with_count(scope, kind, count)
     }
 
     fn word_under_cursor(&self) -> Option<String> {
@@ -22243,9 +21274,7 @@ impl Editor {
                 self.capture_last_visual_selection();
             }
             self.selection = None;
-            self.pending_visual_text_object_scope = None;
-            self.pending_operator = None;
-            self.pending_character_motion = None;
+            self.file_vim.cancel_pending();
 
             let pending_select_action = self.pending_select_action.clone();
             if let Some(select_action) = pending_select_action {
@@ -22512,14 +21541,14 @@ impl Editor {
                 )?;
             }
             Action::RepeatCharSearch(count) => {
-                let Some((kind, target)) = self.last_character_motion else {
+                let Some((kind, target)) = self.file_vim.state.last_character_motion() else {
                     self.set_legacy_message(Some("no previous character search".to_string()));
                     return Ok(Some((true, false)));
                 };
                 self.move_to_forward_character(target, *count, kind, buffer)?;
             }
             Action::RepeatCharSearchOpposite(count) => {
-                let Some((kind, target)) = self.last_character_motion else {
+                let Some((kind, target)) = self.file_vim.state.last_character_motion() else {
                     self.set_legacy_message(Some("no previous character search".to_string()));
                     return Ok(Some((true, false)));
                 };
@@ -22651,9 +21680,7 @@ impl Editor {
             Action::EnterSearch(direction) => {
                 *add_to_history = false;
                 self.selection = None;
-                self.pending_visual_text_object_scope = None;
-                self.pending_operator = None;
-                self.pending_character_motion = None;
+                self.file_vim.cancel_pending();
                 self.begin_search(*direction);
                 self.render(buffer)?;
             }
@@ -22812,6 +21839,7 @@ impl Editor {
                 }
                 self.render(buffer)?;
             }
+            Action::VimletInput(_) => unreachable!("handled before native action dispatch"),
             Action::ChangeTextRange(range) => {
                 let start = range.start;
                 if self.begin_change_range(*range, "change text object", false) {
@@ -23017,16 +22045,15 @@ impl Editor {
             | Action::StartLowercaseOperator(count)
             | Action::StartUppercaseOperator(count)
             | Action::StartToggleCaseOperator(count) => {
-                let operator = match action {
-                    Action::StartCommentOperator(_) => EditOperator::Comment,
-                    Action::StartFormatOperator(_) => EditOperator::Format,
-                    Action::StartLowercaseOperator(_) => EditOperator::Lowercase,
-                    Action::StartUppercaseOperator(_) => EditOperator::Uppercase,
-                    Action::StartToggleCaseOperator(_) => EditOperator::ToggleCase,
+                let (operator, prefix) = match action {
+                    Action::StartCommentOperator(_) => (vimlet::Operator::Comment, "gc"),
+                    Action::StartFormatOperator(_) => (vimlet::Operator::Format, "gq"),
+                    Action::StartLowercaseOperator(_) => (vimlet::Operator::Lowercase, "gu"),
+                    Action::StartUppercaseOperator(_) => (vimlet::Operator::Uppercase, "gU"),
+                    Action::StartToggleCaseOperator(_) => (vimlet::Operator::ToggleCase, "g~"),
                     _ => unreachable!(),
                 };
-                self.pending_operator = Some(PendingOperator::new(operator, *count));
-                self.waiting_command = Some(operator.as_str().to_string());
+                self.start_file_operator(operator, *count, prefix);
             }
             Action::ToggleCommentLines(count) => {
                 let start_line = self.buffer_line();
@@ -23360,11 +22387,11 @@ impl Editor {
             }
             Action::RepeatLastChange => {
                 *add_to_history = false;
-                self.replay_last_semantic_change(buffer, runtime).await?;
+                self.repeat_file_vim(0, buffer, runtime).await?;
             }
             Action::PlayMacro(register) => {
                 *add_to_history = false;
-                self.play_macro(*register, buffer, runtime).await?;
+                self.play_macro(*register, 1, buffer, runtime).await?;
             }
             Action::SetMark(mark) => {
                 *add_to_history = false;
@@ -23380,17 +22407,7 @@ impl Editor {
                         self.set_legacy_message(Some("previous jump is not set".to_string()));
                     }
                 } else {
-                    let current_buffer_id = self.current_buffer().id();
-                    let anchor = if mark.is_ascii_lowercase() {
-                        self.local_marks
-                            .get(&current_buffer_id)
-                            .and_then(|marks| marks.get(mark))
-                            .cloned()
-                    } else if mark.is_ascii_uppercase() {
-                        self.global_marks.get(mark).cloned()
-                    } else {
-                        self.special_marks.get(&(current_buffer_id, *mark)).cloned()
-                    };
+                    let anchor = self.named_mark(*mark).cloned();
                     let Some(mut anchor) = anchor else {
                         self.set_legacy_message(Some(format!("mark {mark} is not set")));
                         return Ok(Some((true, false)));
@@ -23605,10 +22622,16 @@ impl Editor {
                 if started_transaction {
                     self.begin_transaction("insert line below");
                 }
-                self.replace_range(
-                    TextRange::insertion(TextPosition::new(line + 1, 0)),
-                    &format!("{inserted_prefix}\n"),
-                );
+                let next_line = TextPosition::new(line + 1, 0);
+                let document = self.current_buffer();
+                let start = document.char_idx_to_position(document.position_to_char_idx(next_line));
+                // At unterminated EOF the separator belongs before the new line's indentation.
+                let text = if start.line == line {
+                    format!("\n{inserted_prefix}")
+                } else {
+                    format!("{inserted_prefix}\n")
+                };
+                self.replace_range(TextRange::insertion(start), &text);
                 self.cy += 1;
                 self.cx = grapheme_len(inserted_prefix);
                 self.mode = Mode::Insert;
@@ -24659,45 +23682,17 @@ impl Editor {
                     self.config.relative_line_numbers = Some(*enabled);
                     self.render(buffer)?;
                 }
-                Action::MoveToNextWord => {
-                    let line = self.buffer_line();
-                    let char_cx = self.next_word_search_char_on_line(self.cx, line);
-                    let next_word = self.current_buffer().find_next_word((char_cx, line));
-
-                    if let Some((x, y)) = next_word {
-                        self.cx = self.char_to_grapheme_on_line(x, y);
-                        if self.is_within_viewport(y) {
-                            self.cy = y - self.vtop;
-                        } else {
-                            self.go_to_line(y + 1, buffer, runtime, GoToLinePosition::Top)
-                                .await?;
-                        }
-                        self.finish_cursor_motion(buffer, false)?;
-                    }
-                }
-                Action::MoveToPreviousWord => {
-                    let line = self.buffer_line();
-                    let char_cx = self.grapheme_to_char_on_line(self.cx, line);
-                    let previous_word = self.current_buffer().find_prev_word((char_cx, line));
-
-                    if let Some((x, y)) = previous_word {
-                        self.cx = self.char_to_grapheme_on_line(x, y);
-                        if self.is_within_viewport(y) {
-                            self.cy = y - self.vtop;
-                        } else {
-                            self.go_to_line(y + 1, buffer, runtime, GoToLinePosition::Top)
-                                .await?;
-                        }
-                        self.finish_cursor_motion(buffer, false)?;
-                    }
-                }
-                Action::MoveToNextBigWord
+                Action::MoveToNextWord
+                | Action::MoveToPreviousWord
+                | Action::MoveToNextBigWord
                 | Action::MoveToNextWordEnd
                 | Action::MoveToPreviousWordEnd
                 | Action::MoveToNextBigWordEnd
                 | Action::MoveToPreviousBigWord
                 | Action::MoveToPreviousBigWordEnd => {
                     let (backward, end, big_word) = match action {
+                        Action::MoveToNextWord => (false, false, false),
+                        Action::MoveToPreviousWord => (true, false, false),
                         Action::MoveToNextBigWord => (false, false, true),
                         Action::MoveToNextWordEnd => (false, true, false),
                         Action::MoveToPreviousWordEnd => (true, true, false),
@@ -24878,6 +23873,10 @@ impl Editor {
                 }
                 Action::CommitSearch => {
                     add_to_history = false;
+                    if self.file_vim.search.is_some() {
+                        self.finish_file_search(true, buffer, runtime).await?;
+                        return Ok(false);
+                    }
                     let Some(session) = self.active_search.clone() else {
                         return Ok(false);
                     };
@@ -24932,6 +23931,10 @@ impl Editor {
                 }
                 Action::CancelSearch => {
                     add_to_history = false;
+                    if self.file_vim.search.is_some() {
+                        self.finish_file_search(false, buffer, runtime).await?;
+                        return Ok(false);
+                    }
                     self.cancel_active_search();
                     self.render(buffer)?;
                 }
@@ -25812,6 +24815,16 @@ impl Editor {
                         // Just ignore the action
                     }
                 }
+                Action::Yank
+                | Action::Delete
+                | Action::ChangeSelection
+                | Action::InsertBlock
+                | Action::AppendBlock
+                    if self.mode == Mode::VisualBlock && self.selection.is_some() =>
+                {
+                    self.run_file_visual_action(action, buffer, runtime).await?;
+                }
+                Action::AppendBlock => {}
                 Action::Yank => {
                     if self.selection.is_some() && self.yank(DEFAULT_REGISTER) {
                         // self.render(buffer)?;
@@ -27190,7 +26203,20 @@ impl Editor {
         if register == DEFAULT_REGISTER {
             self.write_system_clipboard(&content.text);
         }
+        self.import_macro_register(register, &content);
         self.registers.insert(register, content);
+    }
+
+    fn import_macro_register(&mut self, name: char, content: &Content) {
+        if name.is_ascii_alphanumeric() {
+            if let Ok(events) = Self::macro_events_from_notation(&content.text) {
+                let keys = events.iter().filter_map(Self::file_macro_key).collect();
+                self.file_vim
+                    .session
+                    .registers_mut()
+                    .set(name, vimlet::Register::from_keys(keys));
+            }
+        }
     }
 
     fn set_default_register(&mut self, content: Content) {
@@ -29920,6 +28946,17 @@ impl Editor {
         self.anchor_at_char(char_index, affinity)
     }
 
+    fn named_mark(&self, mark: char) -> Option<&EditAnchor> {
+        let buffer = self.current_buffer().id();
+        if mark.is_ascii_lowercase() {
+            self.local_marks.get(&buffer)?.get(&mark)
+        } else if mark.is_ascii_uppercase() {
+            self.global_marks.get(&mark)
+        } else {
+            self.special_marks.get(&(buffer, mark))
+        }
+    }
+
     fn set_named_mark(&mut self, mark: char) {
         let anchor = self.cursor_anchor(AnchorAffinity::Right);
         if mark.is_ascii_lowercase() {
@@ -30017,9 +29054,7 @@ impl Editor {
         } else {
             start_position
         });
-        self.pending_visual_text_object_scope = None;
-        self.pending_operator = None;
-        self.pending_character_motion = None;
+        self.file_vim.cancel_pending();
         self.refresh_cursor_goal();
         self.selection_start = Some(anchor);
         self.update_selection_end(cursor);
@@ -30873,30 +29908,6 @@ impl Editor {
         true
     }
 
-    fn select_linewise_text_range(&mut self, range: TextRange) -> bool {
-        let first_line = if range.start.character > 0 {
-            range.start.line.saturating_add(1)
-        } else {
-            range.start.line
-        };
-        let last_line = if range.end.character == 0 && range.end.line > first_line {
-            range.end.line - 1
-        } else {
-            range.end.line
-        };
-        if last_line < first_line {
-            return false;
-        }
-
-        let start = Point::new(0, first_line);
-        let end = Point::new(0, last_line);
-        self.mode = Mode::VisualLine;
-        self.selection_start = Some(start);
-        self.set_selection(start, end);
-        self.move_to_text_position(TextPosition::new(last_line, 0));
-        true
-    }
-
     fn previous_text_position(
         &self,
         position: TextPosition,
@@ -30915,11 +29926,25 @@ impl Editor {
     }
 
     fn commit_transaction(&mut self, after_cursor: CursorSnapshot) -> bool {
-        let committed = self
-            .current_buffer_mut()
+        let mut playback = self.macro_playback.take();
+        let previous_edit = playback
+            .as_ref()
+            .and_then(|macro_run| macro_run.previous_edit.as_deref());
+        let buffer = self.current_buffer_mut();
+        let committed = buffer
             .undo_history
-            .commit_transaction(after_cursor);
-        self.current_buffer_mut().refresh_dirty();
+            .commit_with_previous_user_edit(after_cursor, previous_edit);
+        buffer.refresh_dirty();
+        if let Some(macro_run) = &mut playback {
+            if committed {
+                macro_run.previous_edit = buffer
+                    .undo_history
+                    .latest_transaction()
+                    .filter(|edit| edit.origin == EditOrigin::User)
+                    .map(|edit| edit.id.clone());
+            }
+        }
+        self.macro_playback = playback;
         committed
     }
 
@@ -31240,7 +30265,11 @@ impl Editor {
         let duplicate_file_count = snapshot_duplicate_file_count(snapshot);
         let divergences = detect_disk_divergence(snapshot);
         let buffer_map = self.restore_session_layout(snapshot);
+        *self.file_vim = Default::default();
         self.registers = snapshot.registers.clone();
+        for (&name, content) in &snapshot.registers {
+            self.import_macro_register(name, content);
+        }
         let saved_window_jumps = if snapshot.window_jumps.is_empty() {
             vec![SessionWindowJumps {
                 window_index: self.window_manager.active_window_id(),
@@ -38759,10 +37788,7 @@ mod test {
     async fn agent_composer_never_uses_picker_history_or_records_prompt_input() {
         drain_plugin_requests();
         let mut editor = test_editor(/*width*/ 80, /*height*/ 14);
-        editor.macro_recording = Some(MacroRecording {
-            register: 'q',
-            events: Vec::new(),
-        });
+        editor.start_macro_recording('q');
         editor
             .preferences
             .record_picker_query("picker:802", "legacy agent prompt")
@@ -38808,10 +37834,8 @@ mod test {
             .unwrap();
 
         assert!(editor.current_dialog.is_none());
-        assert!(editor
-            .macro_recording
-            .as_ref()
-            .is_some_and(|recording| recording.events.is_empty()));
+        editor.finish_macro_recording();
+        assert_eq!(editor.registers[&'q'].text, "");
         assert!(editor.last_semantic_change.is_none());
         assert!(editor.picker_history("picker:802").is_empty());
         assert!(!format!("{:?}", editor.actions).contains("include all unsaved changes"));
@@ -43045,7 +42069,7 @@ builtin = "rust"
     }
 
     #[tokio::test]
-    async fn visual_block_replay_preserves_terminal_frame_and_primary_cursor() {
+    async fn visual_block_insert_publishes_secondary_rows_on_escape() {
         let mut harness = RenderedCursorHarness::new("one\ntwo\nthree\nfour", (0, 0));
 
         harness
@@ -43061,27 +42085,16 @@ builtin = "rust"
         harness.press_char('I').await;
         harness.press_char('X').await;
 
-        let committed_terminal_frame = harness
-            .editor
-            .previous_render_buffer
-            .clone()
-            .expect("the primary block insertion should be rendered");
-        let primary_cursor = harness.editor.cursor_snapshot();
-
-        harness
-            .editor
-            .execute(
-                &Action::InsertBlock,
-                &mut harness.buffer,
-                &mut harness.runtime,
-            )
-            .await
-            .unwrap();
-
+        assert_eq!(
+            harness.editor.current_buffer().contents(),
+            "Xone\ntwo\nthree\nfour"
+        );
+        harness.escape().await;
         assert_eq!(
             harness.editor.current_buffer().contents(),
             "Xone\nXtwo\nXthree\nXfour"
         );
+        harness.assert_cursor((0, 0), "returning to the first selected column");
         assert_eq!(
             harness
                 .editor
@@ -43089,13 +42102,7 @@ builtin = "rust"
                 .as_ref()
                 .unwrap()
                 .cells,
-            committed_terminal_frame.cells,
-            "hidden block replay must not claim its scratch frame was written to the terminal"
-        );
-        assert_eq!(
-            harness.editor.cursor_snapshot(),
-            primary_cursor,
-            "block replay must return to the cursor used for the primary insertion"
+            harness.buffer.cells
         );
     }
 
@@ -43252,8 +42259,8 @@ builtin = "rust"
     #[tokio::test]
     async fn bundled_insert_keys_exit_immediately_at_the_entry_cursor() {
         let cases = [
-            ('i', "hello", (2, 0), (2, 0)),
-            ('I', "    hello", (8, 0), (4, 0)),
+            ('i', "hello", (2, 0), (1, 0)),
+            ('I', "    hello", (8, 0), (3, 0)),
             ('a', "hello", (2, 0), (2, 0)),
             ('A', "hello", (2, 0), (4, 0)),
             ('o', "    one\nnext", (2, 0), (0, 1)),
@@ -44823,7 +43830,7 @@ builtin = "rust"
         let generation_before_motion = editor.render_generation;
 
         editor
-            .play_macro('a', &mut render_buffer, &mut runtime)
+            .play_macro('a', 1, &mut render_buffer, &mut runtime)
             .await
             .unwrap();
 

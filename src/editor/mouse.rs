@@ -64,6 +64,12 @@ pub(super) struct MouseSelectionState {
     visual_owner: Option<MouseSelectionOwner>,
 }
 
+impl MouseSelectionState {
+    pub(super) fn returns_to_insert(&self) -> bool {
+        self.return_to_insert.is_some()
+    }
+}
+
 impl Editor {
     fn mouse_owner_matches(&self, owner: MouseSelectionOwner) -> bool {
         self.window_manager.active_stable_window_id() == Some(owner.window)

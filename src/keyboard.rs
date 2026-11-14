@@ -213,6 +213,29 @@ fn describe_key(key: KeyEvent) -> String {
     )
 }
 
+pub(crate) fn modal_key(key: KeyEvent) -> Option<vimlet::Key> {
+    use vimlet::Key;
+    Some(match key.code {
+        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Key::Ctrl(c.to_ascii_lowercase())
+        }
+        KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::ALT) => return None,
+        KeyCode::Char('\n') | KeyCode::Enter => Key::Enter,
+        KeyCode::Char(c) => Key::Char(c),
+        KeyCode::Esc => Key::Escape,
+        KeyCode::Backspace => Key::Backspace,
+        KeyCode::Delete => Key::Delete,
+        KeyCode::Left => Key::Left,
+        KeyCode::Right => Key::Right,
+        KeyCode::Up => Key::Up,
+        KeyCode::Down => Key::Down,
+        KeyCode::Home => Key::Home,
+        KeyCode::End => Key::End,
+        KeyCode::Tab => Key::Tab,
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

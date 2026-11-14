@@ -70,7 +70,8 @@ impl Editor {
                         | Mode::Visual
                         | Mode::VisualLine
                         | Mode::VisualBlock
-                ) | Action::RepeatLastChange
+                ) | Action::VimletInput(_)
+                    | Action::RepeatLastChange
                     | Action::SelectNextOccurrence
                     | Action::AddCursorUp
                     | Action::AddCursorDown
@@ -244,9 +245,7 @@ impl Editor {
                 self.pending_semantic_change = None;
                 self.waiting_key_action = None;
                 self.waiting_command = None;
-                self.pending_macro_action = None;
                 self.pending_mark_action = None;
-                self.pending_replace = false;
                 self.repeater = None;
                 self.clear_keymap_hints();
                 self.edit_batch.depth = 1;
@@ -391,7 +390,7 @@ impl Editor {
             self.begin_edit_batch();
         }
         let result = self
-            .execute_action_inner(action, buffer, runtime, tracking)
+            .execute_file_or_native_action(action, buffer, runtime, tracking)
             .await;
         if barrier {
             self.edit_batch.suspended -= 1;
@@ -576,7 +575,6 @@ mod tests {
         h.keys(inserted).await;
 
         let before = h.counts();
-        let replay_start = h.editor.actions.len();
         h.keys("\u{1b}").await;
         h.assert_one_publication(before);
 
@@ -585,18 +583,15 @@ mod tests {
             .map(|line| format!("{inserted}{line}"))
             .collect::<String>();
         assert_eq!(h.editor.current_buffer().contents(), expected);
-        assert_eq!(
-            h.editor.actions[replay_start..]
-                .iter()
-                .filter(|action| matches!(action, Action::InsertString(text) if text == inserted))
-                .count(),
-            2,
-            "each secondary row should use one bounded insertion"
-        );
-        assert_eq!(
-            (h.editor.cx, h.editor.buffer_line()),
-            (inserted.len() - 1, 0)
-        );
+        let transaction = h
+            .editor
+            .current_buffer()
+            .undo_history
+            .latest_transaction()
+            .unwrap();
+        assert_eq!(transaction.edits.iter().filter(|edit| matches!(edit, crate::undo::TextEdit::Replace { new_text: text, .. } if text == inserted)).count(), 3,
+            "each selected row is one insertion in the same transaction");
+        assert_eq!((h.editor.cx, h.editor.buffer_line()), (0, 0));
 
         h.keys("u").await;
         assert_eq!(h.editor.current_buffer().contents(), source);
@@ -821,8 +816,8 @@ mod tests {
             )
             .await
             .unwrap();
-        h.editor.pending_macro_action = Some(PendingMacroAction::Play);
-        h.editor.pending_replace = true;
+        h.editor
+            .start_file_operator(vimlet::Operator::Change, 1, "c");
         h.editor.repeater = Some(12);
         let ordinary = Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
         assert!(!h.editor.retain_replay_input(ordinary.clone()));
@@ -899,7 +894,7 @@ mod tests {
             .is_err());
         assert_eq!(h.editor.edit_batch.depth, 0);
         assert_eq!(h.editor.edit_batch.suspended, 0);
-        assert_eq!(h.editor.macro_replay_depth, 0);
+        assert!(h.editor.macro_playback.is_none());
         assert!(h.editor.edit_batch.changed.is_empty());
         h.keys("iY\u{1b}").await;
         assert!(h.editor.current_buffer().contents().starts_with("Yx"));

@@ -2212,6 +2212,128 @@ async fn comment_invalid_template_fails_without_changing_the_buffer() {
 }
 
 #[tokio::test]
+async fn change_word_and_dot_each_have_a_file_undo_entry() {
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "one two".to_string()),
+        default_key_config(),
+    );
+    type_normal_keys(&mut harness, "cwX").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+    type_normal_keys(&mut harness, "w.").await;
+    harness.assert_buffer_contents("X X");
+    assert!(harness.is_normal());
+    assert!(harness.is_dirty());
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents("X two");
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents("one two");
+    assert!(!harness.is_dirty());
+}
+
+#[tokio::test]
+async fn counted_dot_overrides_the_word_change_count_in_one_transaction() {
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "one two three four five".to_owned()),
+        default_key_config(),
+    );
+    type_normal_keys(&mut harness, "cwX").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+    type_normal_keys(&mut harness, "w2.").await;
+    harness.assert_buffer_contents("X X four five");
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents("X two three four five");
+}
+
+#[tokio::test]
+async fn operator_search_dot_reuses_the_query_from_the_change() {
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "abcEND defEND zz".into()),
+        default_key_config(),
+    );
+    type_normal_keys(&mut harness, "c/END").await;
+    command_key(&mut harness, KeyCode::Enter).await;
+    type_normal_keys(&mut harness, "X").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+    type_normal_keys(&mut harness, "/def").await;
+    command_key(&mut harness, KeyCode::Enter).await;
+    type_normal_keys(&mut harness, ".").await;
+    harness.assert_buffer_contents("XEND XEND zz");
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents("XEND defEND zz");
+}
+
+#[tokio::test]
+async fn file_operator_search_rejects_a_changed_buffer_before_applying_the_result() {
+    let mut harness =
+        EditorHarness::with_config(Buffer::new(None, "one two".into()), default_key_config());
+    type_normal_keys(&mut harness, "d/two").await;
+    harness
+        .execute_action(Action::InsertText {
+            x: 0,
+            y: 0,
+            content: Content::charwise("new ".into()),
+        })
+        .await
+        .unwrap();
+    command_key(&mut harness, KeyCode::Enter).await;
+    harness.assert_buffer_contents("new one two");
+    assert!(harness.is_normal());
+    assert_eq!(
+        harness.last_error(),
+        Some("buffer changed during operator search")
+    );
+    type_normal_keys(&mut harness, "0dw").await;
+    harness.assert_buffer_contents("one two");
+}
+
+#[tokio::test]
+async fn file_word_changes_publish_to_lsp_and_rebase_marks() {
+    let path = temp_file_path("vimlet-word-change");
+    let lsp = RecordingLsp::default();
+    let events = lsp.events();
+    let mut editor = Editor::test_with_size(
+        Box::new(lsp),
+        80,
+        24,
+        default_key_config(),
+        Theme::default(),
+        vec![Buffer::new(Some(path.clone()), "one two three".into())],
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+    type_normal_keys(&mut harness, "wwma0cwX").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+    type_normal_keys(&mut harness, "w.`a").await;
+    harness.assert_buffer_contents("X X three");
+    harness.assert_cursor_at(4, 0);
+    assert!(events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| matches!(event, LspEvent::DidChange(file) if file == &path)));
+}
+
+#[tokio::test]
+async fn file_block_delete_repeats_the_original_width_at_a_new_column() {
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "abcdefg\nABCDEFG\n1234567\nzyxwvut".into()),
+        default_key_config(),
+    );
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "jldjjll.").await;
+    harness.assert_buffer_contents("cdefg\nCDEFG\n12567\nzyvut");
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents("cdefg\nCDEFG\n1234567\nzyxwvut");
+}
+
+#[tokio::test]
 async fn dot_repeats_a_direct_change_at_the_current_cursor() {
     let buffer = Buffer::new(None, "abc\ndef".to_string());
     let mut harness = EditorHarness::with_config(buffer, default_key_config());
@@ -2321,6 +2443,8 @@ async fn counted_replace_and_dot_recompute_at_the_new_cursor() {
     let mut harness = EditorHarness::with_config(buffer, default_key_config());
 
     type_normal_keys(&mut harness, "3rXj.").await;
+    harness.assert_buffer_contents("XXXd\nefgh");
+    type_normal_keys(&mut harness, "0.").await;
 
     harness.assert_buffer_contents("XXXd\nXXXh");
 }
@@ -2424,6 +2548,16 @@ async fn counted_macro_playback_runs_the_register_repeatedly() {
 
     type_normal_keys(&mut harness, "qaxjq2@a").await;
 
+    harness.assert_buffer_contents("bc\nef\nhi");
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents("bc\ndef\nghi");
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('r'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
     harness.assert_buffer_contents("bc\nef\nhi");
 }
 
@@ -6574,7 +6708,7 @@ async fn test_delete_inner_and_around_quotes() {
     }
 
     type_normal_keys(&mut harness, "da\"").await;
-    harness.assert_buffer_contents("let s = ;");
+    harness.assert_buffer_contents("let s =;");
 }
 
 #[tokio::test]
@@ -7195,7 +7329,7 @@ async fn test_insert_at_line_start() {
 }
 
 #[tokio::test]
-async fn test_insert_key_escape_without_insert_stays_on_original_character() {
+async fn escape_after_empty_insert_moves_to_previous_character() {
     let mut config = Config::default();
     config.keys.normal.insert(
         "i".to_string(),
@@ -7217,8 +7351,11 @@ async fn test_insert_key_escape_without_insert_stays_on_original_character() {
         .unwrap();
 
     harness.assert_mode(Mode::Normal);
-    harness.assert_cursor_at(1, 0);
-    assert_eq!(harness.render_cursor_position(), Some(start));
+    harness.assert_cursor_at(0, 0);
+    assert_eq!(
+        harness.render_cursor_position(),
+        Some((start.0 - 1, start.1))
+    );
 }
 
 #[tokio::test]
@@ -8510,7 +8647,7 @@ async fn visual_paste_replaces_whole_document_from_system_clipboard() {
     harness.assert_mode(Mode::Normal);
     assert_eq!(
         clipboard_text.lock().unwrap().as_deref(),
-        Some(content.as_str())
+        Some(format!("{content}\n").as_str())
     );
 
     harness.execute_action(Action::Undo).await.unwrap();
@@ -12267,6 +12404,48 @@ async fn test_change_to_end_of_line() {
     harness.assert_mode(Mode::Insert);
     harness.type_text("Universe").await.unwrap();
     harness.assert_buffer_contents("Hello Universe");
+}
+
+#[tokio::test]
+async fn file_operator_uses_mapped_motion_but_find_consumes_the_literal_key() {
+    let mut config = default_key_config();
+    config
+        .keys
+        .normal
+        .insert("z".into(), KeyAction::Single(Action::MoveToNextWord));
+    let mut harness =
+        EditorHarness::with_config(Buffer::new(None, "one two z tail".into()), config);
+    type_normal_keys(&mut harness, "dz").await;
+    harness.assert_buffer_contents("two z tail");
+    type_normal_keys(&mut harness, "dfz").await;
+    harness.assert_buffer_contents(" tail");
+}
+
+#[tokio::test]
+async fn moving_in_file_insert_mode_starts_a_new_undo_group() {
+    let mut harness =
+        EditorHarness::with_config(Buffer::new(None, "abc".into()), default_key_config());
+    type_normal_keys(&mut harness, "iXY").await;
+    command_key(&mut harness, KeyCode::Left).await;
+    type_normal_keys(&mut harness, "!").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+    harness.assert_buffer_contents("X!Yabc");
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents("XYabc");
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents("abc");
+}
+
+#[tokio::test]
+async fn file_dot_survives_undo_and_a_failed_mark_target() {
+    let mut harness =
+        EditorHarness::with_config(Buffer::new(None, "abc def".into()), default_key_config());
+    type_normal_keys(&mut harness, "xu").await;
+    harness.assert_buffer_contents("abc def");
+    type_normal_keys(&mut harness, "d`z.").await;
+    harness.assert_buffer_contents("bc def");
+    type_normal_keys(&mut harness, "wma0d`a").await;
+    harness.assert_buffer_contents("def");
 }
 
 #[tokio::test]

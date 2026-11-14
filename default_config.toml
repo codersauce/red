@@ -601,6 +601,7 @@ Esc = { EnterMode = "Normal" }
 # TODO: "r" = "ReplaceBlock"
 
 [keys.visual_block]
+"A" = "AppendBlock"
 
 [keys.visual_line]
 

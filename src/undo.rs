@@ -451,6 +451,14 @@ impl UndoHistory {
     /// Returns `true` only when history advanced. Empty transactions are discarded and
     /// sibling branches remain available.
     pub fn commit_transaction(&mut self, after_cursor: CursorSnapshot) -> bool {
+        self.commit_with_previous_user_edit(after_cursor, None)
+    }
+
+    pub(crate) fn commit_with_previous_user_edit(
+        &mut self,
+        after_cursor: CursorSnapshot,
+        previous_id: Option<&str>,
+    ) -> bool {
         self.active_insert_end = None;
         let Some(mut transaction) = self.active_transaction.take() else {
             return false;
@@ -463,6 +471,21 @@ impl UndoHistory {
         transaction.after_revision = self.next_revision;
         self.next_revision += 1;
         self.current_revision = transaction.after_revision;
+        // Macro playback can pause between committed actions. Join only the matching
+        // user edit at the tip, so a save, undo branch or unrelated edit keeps its boundary.
+        if let Some(previous) = self.current.map(|index| &mut self.nodes[index]) {
+            if previous_id == Some(previous.transaction.id.as_str())
+                && previous.children.is_empty()
+                && transaction.origin == EditOrigin::User
+                && previous.transaction.origin == EditOrigin::User
+                && previous.transaction.after_revision != self.saved_revision
+            {
+                previous.transaction.edits.append(&mut transaction.edits);
+                previous.transaction.after_cursor = transaction.after_cursor;
+                previous.transaction.after_revision = transaction.after_revision;
+                return true;
+            }
+        }
         let parent = self.current;
         let index = self.nodes.len();
         self.nodes.push(UndoNode {

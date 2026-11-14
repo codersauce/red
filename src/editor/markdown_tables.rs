@@ -234,9 +234,7 @@ impl super::Editor {
             start.min(line)..start.max(line) + 1
         } else if self.is_insert()
             || self.is_search()
-            || self.pending_operator.is_some()
-            || self.pending_replace
-            || self.pending_character_motion.is_some()
+            || self.file_vim.pending()
             || self.markdown_hidden_search_match(window, line)
         {
             line..line + 1

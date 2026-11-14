@@ -266,18 +266,15 @@ fn keyboard_repeat_drain_excludes_counts_operators_and_macro_state() {
         &key('j'),
         &KeyAction::Repeating(2, Box::new(motion.clone()))
     ));
-    editor.pending_operator = Some(PendingOperator::new(EditOperator::Delete, 1));
+    editor.start_file_operator(vimlet::Operator::Delete, 1, "d");
     assert!(!editor.should_drain_repeated_motion(&key('j'), &motion));
-    editor.pending_operator = None;
-    editor.macro_recording = Some(MacroRecording {
-        register: 'q',
-        events: Vec::new(),
-    });
+    editor.file_vim.cancel_pending();
+    editor.start_macro_recording('q');
     assert!(!editor.should_drain_repeated_motion(&key('j'), &motion));
-    editor.macro_recording = None;
-    editor.macro_replay_depth = 1;
+    editor.finish_macro_recording();
+    editor.macro_playback = Some(super::FileMacroPlayback::default());
     assert!(!editor.should_drain_repeated_motion(&key('j'), &motion));
-    editor.macro_replay_depth = 0;
+    editor.macro_playback = None;
     editor.replaying_semantic_change = true;
     assert!(!editor.should_drain_repeated_motion(&key('j'), &motion));
 }
