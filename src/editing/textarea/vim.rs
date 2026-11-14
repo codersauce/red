@@ -14,7 +14,7 @@ use ropey::Rope;
 use vimlet::{
     Action, AppliedEdit, Binding, BindingContext, ByteOffset, Command, DocumentVersion,
     DocumentView, HistoryCommand, HostOperation, HostOutcome, HostResult, Input, Key,
-    MotionResolver, OperationKind, Operator, Replacement, ResolvedRange, Selection, Shape, Step,
+    MotionResolver, OperationKind, Operator, Replacement, ResolvedRange, Selection, Step,
     TargetRequest, TerminalGeometry, TextSource, Transaction,
 };
 
@@ -320,27 +320,7 @@ impl TextArea {
                 ..
             } => {
                 let resolver = MotionResolver::from_view(self.view(&rope, &geometry));
-                let a = resolver.column(selection.anchor.0);
-                let b = resolver.column(selection.cursor.0);
-                let first = rope.byte_to_line(selection.anchor.0.min(selection.cursor.0));
-                let last = rope.byte_to_line(selection.anchor.0.max(selection.cursor.0));
-                let mut ranges = Vec::new();
-                for line in first..=last {
-                    let start = rope.line_to_byte(line);
-                    let end = rope.line_end(start);
-                    if resolver.column(end) <= a.min(b) {
-                        continue;
-                    }
-                    let left = resolver.at_column(start, a.min(b));
-                    let right = resolver.at_column(start, a.max(b));
-                    ranges.push(vimlet::TextRange::new(left, resolver.next(right).min(end)));
-                }
-                return HostOutcome::Target(ResolvedRange {
-                    ranges,
-                    shape: Shape::Block {
-                        width: a.abs_diff(b) + 1,
-                    },
-                });
+                return HostOutcome::Target(resolver.block_range(*selection));
             }
             OperationKind::Resolve {
                 request:

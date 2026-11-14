@@ -140,7 +140,7 @@ unicode-linebreak = "0.1"
 unicode-segmentation = "1.12.0"
 unicode-width = "0.2"
 uuid = { version = "1.12.0", features = ["v4", "v5"] }
-vimlet = { git = "https://github.com/codersauce/vimlet.git", rev = "5a9928e3601ab7b2af92f9893e66f2f13203eedd", features = ["ropey"] }
+vimlet = { version = "0.2", features = ["ropey"] }
 
 [dev-dependencies]
 base64 = "0.22.1"

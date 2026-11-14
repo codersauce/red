@@ -1,7 +1,7 @@
 //! Resolve file searches, syntax queries and rectangular selections against the active buffer.
 
 use crate::editor::{Editor, Mode, RenderBuffer, Runtime};
-use vimlet::{ByteOffset, EditTarget, HostOutcome, HostResult, OperationKind, Shape, TextSource};
+use vimlet::{ByteOffset, EditTarget, HostOutcome, HostResult, OperationKind, Shape};
 
 // These two ASCII bytes identify the same syntax target when dot runs at a new cursor.
 pub(in crate::editor) fn syntax_target(prefix: u8, key: char) -> EditTarget {
@@ -17,30 +17,7 @@ impl Editor {
             tabstop: self.active_tab_width(),
         };
         let resolver = vimlet::MotionResolver::from_view(self.file_view(&rope, &geometry));
-        let first_line = rope.byte_to_line(selection.anchor.0.min(selection.cursor.0));
-        let last_line = rope.byte_to_line(selection.anchor.0.max(selection.cursor.0));
-        let a = resolver.column(selection.anchor.0);
-        let b = resolver.column(selection.cursor.0);
-        let left = a.min(b);
-        let right = a.max(b);
-        let ranges = (first_line..=last_line)
-            .map(|line| {
-                let start = rope.line_to_byte(line);
-                let end = rope.line_end(start);
-                if resolver.column(end) <= left {
-                    return vimlet::TextRange::new(end, end);
-                }
-                let from = resolver.at_column(start, left);
-                let to = resolver.next(resolver.at_column(start, right)).min(end);
-                vimlet::TextRange::new(from, to)
-            })
-            .collect();
-        HostOutcome::Target(vimlet::ResolvedRange {
-            ranges,
-            shape: Shape::Block {
-                width: right - left + 1,
-            },
-        })
+        HostOutcome::Target(resolver.block_range(selection))
     }
 
     pub(in crate::editor) fn finish_file_search<'a>(
