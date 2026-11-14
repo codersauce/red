@@ -223,6 +223,7 @@ mod tests {
     use super::{MotionResolver, TextObjectKind, TextObjectScope};
     use crate::{buffer::Buffer, undo::TextPosition};
     use unicode_segmentation::UnicodeSegmentation;
+    use unicode_segmentation::UnicodeSegmentation;
 
     #[test]
     fn shared_word_motion_preserves_change_whitespace_and_grapheme_groups() {
@@ -677,6 +678,13 @@ mod tests {
             let buffer = Buffer::new(None, text.to_string());
             let characters = text.chars().collect::<Vec<_>>();
             for cursor in 0..=characters.len() {
+                // Vimlet resolves text objects at the final grapheme when the
+                // caller supplies the line-end insertion point.
+                let last_start = text
+                    .grapheme_indices(true)
+                    .last()
+                    .map_or(0, |(byte, _)| text[..byte].chars().count());
+                let normal_cursor = cursor.min(last_start);
                 let resolver = MotionResolver::new(&buffer, TextPosition::new(0, cursor));
                 for scope in [TextObjectScope::Inner, TextObjectScope::Around] {
                     for (opening, closing) in [('(', ')'), ('[', ']')] {
@@ -687,8 +695,8 @@ mod tests {
                                 stack.push(index);
                             } else if character == closing {
                                 if let Some(start) = stack.pop() {
-                                    if start <= cursor
-                                        && cursor <= index
+                                    if start <= normal_cursor
+                                        && normal_cursor <= index
                                         && expected.is_none_or(|(best, _)| start > best)
                                     {
                                         expected = Some((start, index));
