@@ -39,6 +39,7 @@ mod edit_history;
 mod explore_ui;
 mod file_vim;
 mod file_watch;
+mod indentation;
 mod inline_actions;
 mod inline_agent_outcomes;
 mod inline_changes;
@@ -80,6 +81,8 @@ mod update;
 mod workspace_search;
 mod workspace_session;
 
+use crate::tab_stops::TabStops;
+use indentation::Indentation;
 use std::{
     borrow::Cow,
     cell::RefCell,
@@ -4152,6 +4155,7 @@ pub struct Editor {
 
     /// Indentation rules per file type
     indentation: HashMap<String, Indentation>,
+    default_indentation: Indentation,
 
     /// Pending render commands from plugins
     render_commands: VecDeque<RenderCommand>,
@@ -5272,36 +5276,6 @@ impl HistoryEntry {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Indentation {
-    shift_width: usize,
-    soft_tab_stop: usize,
-    tab_width: usize,
-    expand_tab: bool,
-}
-
-impl Indentation {
-    fn new(shift_width: usize, soft_tab_stop: usize, expand_tab: bool) -> Self {
-        Self {
-            shift_width,
-            soft_tab_stop,
-            tab_width: shift_width,
-            expand_tab,
-        }
-    }
-
-    fn whitespace_for_columns(self, columns: usize) -> String {
-        if self.expand_tab {
-            return " ".repeat(columns);
-        }
-
-        let tab_width = self.tab_width.max(1);
-        let tabs = columns / tab_width;
-        let spaces = columns % tab_width;
-        format!("{}{}", "\t".repeat(tabs), " ".repeat(spaces))
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
 struct GeneratedIndent {
     buffer_id: BufferId,
     line: usize,
@@ -5468,7 +5442,7 @@ impl Editor {
             &config_dir,
         )?);
         let highlighter = Highlighter::with_registry(&self.theme, Arc::clone(&registry))?;
-        let indentation = Self::configured_indentation(&loaded.config);
+        let (indentation, default_indentation) = Self::configured_indentation(&loaded.config);
         let previous_routing = crate::lsp::LspManager::new(self.config.lsp.clone());
         let updated_routing = crate::lsp::LspManager::new(loaded.config.lsp.clone());
         let changed_servers = self
@@ -5595,6 +5569,9 @@ impl Editor {
         self.syntax_textobjects.reset(Arc::clone(&registry));
         self.syntax_indentation.reset(Arc::clone(&registry));
         self.indentation = indentation;
+        self.default_indentation = default_indentation;
+        self.config.indentation = loaded.config.indentation;
+        self.layout_cache.borrow_mut().clear();
         self.highlight_cache.clear();
         self.bracket_match_cache = None;
         self.workspace_manager
@@ -5870,7 +5847,7 @@ impl Editor {
         let syntax_textobjects = SyntaxTextObjectService::new(registry);
 
         let plugin_registry = PluginRegistry::new();
-        let indentation = Self::configured_indentation(&config);
+        let (indentation, default_indentation) = Self::configured_indentation(&config);
 
         let mut window_manager = WindowManager::new(0, (width, height));
         let wrap = config.wrap.unwrap_or(true);
@@ -6069,6 +6046,7 @@ impl Editor {
             agent_continuity_workspace: None,
             agent_continuity_adopted_age: None,
             indentation,
+            default_indentation,
             render_commands: VecDeque::new(),
             overlay_manager: plugin::OverlayManager::new(),
             decoration_manager: plugin::DecorationManager::default(),
@@ -7436,78 +7414,95 @@ impl Editor {
         (reserved_top, reserved_bottom)
     }
 
-    fn indentation(&self) -> Indentation {
+    fn indentation(&self) -> &Indentation {
         self.indentation_for_buffer_index(self.buffer_manager.active_index())
     }
 
-    fn configured_indentation(config: &Config) -> HashMap<String, Indentation> {
-        let mut indentation = HashMap::from_iter(
-            [
-                ("rs", 4),
-                ("js", 2),
-                ("jsx", 2),
-                ("mjs", 2),
-                ("cjs", 2),
-                ("ts", 2),
-                ("tsx", 2),
-                ("json", 2),
-                ("jsonc", 2),
-                ("toml", 2),
-                ("yaml", 2),
-                ("yml", 2),
-                ("sh", 2),
-                ("bash", 2),
-                ("zsh", 2),
-                ("fish", 4),
-            ]
-            .map(|(file_type, shift_width)| {
-                (
-                    file_type.to_string(),
-                    Indentation::new(shift_width, shift_width, true),
-                )
-            }),
-        );
-        for (language, definition) in &config.languages {
-            if let Some(width) = definition.indent_width {
-                let settings = Indentation::new(width, width, true);
-                indentation.insert(language.clone(), settings);
-                for extension in &definition.extensions {
-                    indentation.insert(extension.trim_start_matches('.').to_string(), settings);
-                }
+    fn configured_indentation(config: &Config) -> (HashMap<String, Indentation>, Indentation) {
+        let widths = HashMap::from([
+            ("rs", 4),
+            ("rust", 4),
+            ("js", 2),
+            ("javascript", 2),
+            ("jsx", 2),
+            ("mjs", 2),
+            ("cjs", 2),
+            ("ts", 2),
+            ("typescript", 2),
+            ("tsx", 2),
+            ("json", 2),
+            ("jsonc", 2),
+            ("toml", 2),
+            ("yaml", 2),
+            ("yml", 2),
+            ("sh", 2),
+            ("bash", 2),
+            ("zsh", 2),
+            ("fish", 4),
+        ]);
+        let mut indentation = HashMap::new();
+        let mut languages = config.languages.iter().collect::<Vec<_>>();
+        languages.sort_unstable_by_key(|(id, _)| *id);
+        for (language, definition) in languages {
+            if definition.indent_width.is_none() && definition.indentation == Default::default() {
+                continue;
             }
+            let options = config.indentation.overlay(&definition.indentation);
+            let baseline = definition
+                .indent_width
+                .or_else(|| widths.get(language.as_str()).copied())
+                .or_else(|| {
+                    definition.extensions.iter().find_map(|ext| {
+                        widths
+                            .get(ext.trim_start_matches('.').to_ascii_lowercase().as_str())
+                            .copied()
+                    })
+                })
+                .unwrap_or(4);
+            let settings = Indentation::resolve(baseline, &options);
+            for extension in &definition.extensions {
+                indentation.insert(
+                    extension.trim_start_matches('.').to_ascii_lowercase(),
+                    settings.clone(),
+                );
+            }
+            indentation.insert(language.clone(), settings);
         }
-        indentation
+        for (kind, width) in widths {
+            indentation
+                .entry(kind.to_owned())
+                .or_insert_with(|| Indentation::resolve(width, &config.indentation));
+        }
+        (indentation, Indentation::resolve(4, &config.indentation))
     }
 
-    fn indentation_for_buffer_index(&self, buffer_index: usize) -> Indentation {
+    fn indentation_for_buffer_index(&self, buffer_index: usize) -> &Indentation {
         if let Some(language) = self.highlight_language_id_for_buffer_index(buffer_index) {
-            if let Some(indentation) = self.indentation.get(&language) {
-                return *indentation;
+            if let Some(indentation) = self.indentation.get(&language).filter(|_| {
+                self.config
+                    .languages
+                    .get(&language)
+                    .is_some_and(|definition| {
+                        definition.indent_width.is_some()
+                            || definition.indentation != Default::default()
+                    })
+            }) {
+                return indentation;
             }
         }
-        let file_type = self
-            .buffer_manager
+        self.buffer_manager
             .get(buffer_index)
-            .and_then(|buffer| buffer.file_type());
-
-        let Some(file_type) = file_type.as_deref() else {
-            return Indentation::new(4, 4, true);
-        };
-
-        self.indentation
-            .get(file_type)
-            .copied()
-            .unwrap_or_else(|| Indentation::new(4, 4, true))
+            .and_then(|buffer| buffer.file_type())
+            .and_then(|file_type| self.indentation.get(&file_type))
+            .unwrap_or(&self.default_indentation)
     }
 
-    fn tab_width_for_buffer_index(&self, buffer_index: usize) -> usize {
-        self.indentation_for_buffer_index(buffer_index)
-            .tab_width
-            .max(1)
+    fn tab_stops_for_buffer_index(&self, buffer_index: usize) -> &TabStops {
+        &self.indentation_for_buffer_index(buffer_index).tab_stops
     }
 
-    fn active_tab_width(&self) -> usize {
-        self.tab_width_for_buffer_index(self.buffer_manager.active_index())
+    fn active_tab_stops(&self) -> &TabStops {
+        self.tab_stops_for_buffer_index(self.buffer_manager.active_index())
     }
 
     fn relative_line_numbers_enabled(&self) -> bool {
@@ -7517,10 +7512,7 @@ impl Editor {
     fn break_indent_options_for_buffer_index(&self, buffer_index: usize) -> BreakIndentOptions {
         BreakIndentOptions {
             enabled: self.config.breakindent.unwrap_or(true),
-            tab_width: self
-                .indentation_for_buffer_index(buffer_index)
-                .tab_width
-                .max(1),
+            tab_width: self.tab_stops_for_buffer_index(buffer_index).clone(),
         }
     }
 
@@ -7582,7 +7574,7 @@ impl Editor {
         let display_col = grapheme_to_column_with_tabs(
             line.trim_end_matches('\n'),
             buf_x,
-            self.tab_width_for_buffer_index(window.buffer_index),
+            self.tab_stops_for_buffer_index(window.buffer_index),
         );
         let layout = self.layout_for_window(window);
         let segment = layout.segment_for_cursor(buf_y, display_col)?;
@@ -7657,7 +7649,7 @@ impl Editor {
             content_width: self.window_content_width(window),
             content_height: self.window_content_height(window),
             line_count_override,
-            break_indent,
+            break_indent: break_indent.clone(),
             inline_prediction: prediction.map(|suggestion| suggestion.snapshot.generation),
             markdown_tables: self.markdown_tables_enabled(window),
             markdown_reveal: self.markdown_reveal_range(window),
@@ -7701,7 +7693,7 @@ impl Editor {
         let mut layout = display_layout::layout_lines_with_tables(
             &lines,
             line_count,
-            layout_config,
+            layout_config.clone(),
             tables.as_deref(),
             key.markdown_reveal.as_ref(),
             concealments.as_deref(),
@@ -7768,8 +7760,7 @@ impl Editor {
                     buffer.get(segment.line).unwrap_or_default()
                 };
                 let text = text.trim_end_matches(['\r', '\n']);
-                let indent_width =
-                    leading_whitespace_display_width(text, indentation.tab_width.max(1));
+                let indent_width = leading_whitespace_display_width(text, &indentation.tab_stops);
                 if segment.first_segment {
                     append_viewport_indentation_key(
                         &mut indentation_key,
@@ -8049,7 +8040,7 @@ impl Editor {
     fn line_display_width(&self) -> usize {
         if let Some(line) = self.viewport_line(self.cy) {
             let line = line.trim_end_matches('\n');
-            return display_width_with_tabs(line, self.active_tab_width());
+            return display_width_with_tabs(line, self.active_tab_stops());
         }
         0
     }
@@ -8352,7 +8343,7 @@ impl Editor {
         };
 
         let x = self.gutter_width()
-            + display_width_with_tabs(line.trim_end_matches('\n'), self.active_tab_width())
+            + display_width_with_tabs(line.trim_end_matches('\n'), self.active_tab_stops())
             + 5;
 
         // otherwise, clear the line
@@ -8507,7 +8498,7 @@ impl Editor {
             return grapheme_to_column_with_tabs(
                 trim_line_ending(&line),
                 self.cx,
-                self.active_tab_width(),
+                self.active_tab_stops(),
             );
         }
 
@@ -8519,7 +8510,7 @@ impl Editor {
     }
 
     fn line_goal_limit(&self, line: &str) -> usize {
-        let line_width = display_width_with_tabs(line, self.active_tab_width());
+        let line_width = display_width_with_tabs(line, self.active_tab_stops());
         if self.is_insert() {
             line_width
         } else {
@@ -8531,11 +8522,11 @@ impl Editor {
         match goal {
             CursorGoal::DisplayCol(display_col) | CursorGoal::ScreenCol { display_col, .. } => {
                 let required_width = display_col.saturating_add(usize::from(!self.is_insert()));
-                let tab_width = self.active_tab_width();
+                let tab_width = self.active_tab_stops();
                 let mut width = 0;
                 for grapheme in line.graphemes(true) {
                     width += if grapheme == "\t" {
-                        tab_width - (width % tab_width)
+                        tab_width.advance(width)
                     } else {
                         display_width(grapheme)
                     };
@@ -8558,7 +8549,7 @@ impl Editor {
         match goal {
             CursorGoal::DisplayCol(display_col) | CursorGoal::ScreenCol { display_col, .. } => {
                 let max_cursor_x = self.max_cursor_x_for_line_length(grapheme_len(line));
-                column_to_grapheme_with_tabs(line, display_col, self.active_tab_width())
+                column_to_grapheme_with_tabs(line, display_col, self.active_tab_stops())
                     .min(max_cursor_x)
             }
             CursorGoal::LineEnd => self.max_cursor_x_for_line_length(grapheme_len(line)),
@@ -8579,7 +8570,7 @@ impl Editor {
         let line_index = self.buffer_line();
         let line = self.current_line_contents()?;
         let line = trim_line_ending(&line);
-        let display_col = grapheme_to_column_with_tabs(line, self.cx, self.active_tab_width());
+        let display_col = grapheme_to_column_with_tabs(line, self.cx, self.active_tab_stops());
         let window = self.window_manager.active_window()?;
         let layout = self.layout_for_window(window);
         layout.segment_for_cursor(line_index, display_col).cloned()
@@ -8605,7 +8596,7 @@ impl Editor {
                 line_index,
                 usize::MAX,
                 0,
-                self.active_tab_width(),
+                self.active_tab_stops(),
             );
         }
         let line = trim_line_ending(&line);
@@ -8661,7 +8652,7 @@ impl Editor {
                 line_index,
                 usize::MAX,
                 0,
-                self.active_tab_width(),
+                self.active_tab_stops(),
             );
         }
         let break_indent =
@@ -9092,7 +9083,7 @@ impl Editor {
                 grapheme_to_column_with_tabs(
                     trim_line_ending(&line),
                     self.cx,
-                    self.active_tab_width(),
+                    self.active_tab_stops(),
                 )
             })
             .unwrap_or(self.cx);
@@ -9343,7 +9334,7 @@ impl Editor {
             .graphemes(true)
             .enumerate()
             .find_map(|(index, grapheme)| {
-                let col = grapheme_to_column_with_tabs(line, index, self.active_tab_width());
+                let col = grapheme_to_column_with_tabs(line, index, self.active_tab_stops());
                 (col >= segment.start_col
                     && col < segment.end_col
                     && !segment.hides_source_column(col)
@@ -9389,11 +9380,13 @@ impl Editor {
     fn recompute_window_cursor_goals(&mut self) {
         let buffers = &self.buffer_manager;
         let tab_widths = (0..buffers.len())
-            .map(|buffer_index| self.tab_width_for_buffer_index(buffer_index))
+            .map(|buffer_index| self.tab_stops_for_buffer_index(buffer_index).clone())
             .collect::<Vec<_>>();
         for window in self.window_manager.windows_mut() {
             let buffer_y = window.vtop + window.cy;
-            let tab_width = tab_widths.get(window.buffer_index).copied().unwrap_or(4);
+            let tab_width = tab_widths
+                .get(window.buffer_index)
+                .unwrap_or(&self.default_indentation.tab_stops);
             let display_col = buffers
                 .get(window.buffer_index)
                 .and_then(|buffer| buffer.get(buffer_y))
@@ -13376,7 +13369,7 @@ impl Editor {
                 PluginRequest::GetCursorDisplayColumn { request_id } => {
                     let display_col = if let Some(line) = self.current_line_contents() {
                         let line = line.trim_end_matches('\n');
-                        grapheme_to_column_with_tabs(line, self.cx, self.active_tab_width())
+                        grapheme_to_column_with_tabs(line, self.cx, self.active_tab_stops())
                     } else {
                         self.cx
                     };
@@ -13415,7 +13408,7 @@ impl Editor {
                     if let Some(line) = self.viewport_line(y.saturating_sub(self.vtop)) {
                         let line = line.trim_end_matches('\n');
                         self.cx =
-                            column_to_grapheme_with_tabs(line, column, self.active_tab_width());
+                            column_to_grapheme_with_tabs(line, column, self.active_tab_stops());
                     }
                     let viewport_height = self.vheight().max(1);
                     // Adjust viewport if needed
@@ -20901,10 +20894,6 @@ impl Editor {
         &line[..end]
     }
 
-    fn leading_indentation(line: &str) -> usize {
-        Self::leading_indentation_text(line).chars().count()
-    }
-
     fn indentation_columns_for_line(&self, line: usize) -> usize {
         let indentation = self.indentation();
         let contents = self.current_buffer().contents_snapshot();
@@ -20924,7 +20913,7 @@ impl Editor {
             .chars()
             .take_while(|character| character.is_whitespace())
             .collect::<String>();
-        display_width_with_tabs(&prefix, indentation.tab_width.max(1))
+        display_width_with_tabs(&prefix, &indentation.tab_stops)
     }
 
     fn indentation_decision_for_line(&mut self, line: usize) -> IndentDecision {
@@ -20936,7 +20925,7 @@ impl Editor {
         line: usize,
         reason: crate::syntax_indent::IndentReason,
     ) -> IndentDecision {
-        let indentation = self.indentation();
+        let indentation = self.indentation().clone();
         let language =
             self.highlight_language_id_for_buffer_index(self.buffer_manager.active_index());
         let document = self.current_buffer().contents();
@@ -20951,8 +20940,8 @@ impl Editor {
                     language,
                     source: &document,
                     line,
-                    shift_width: indentation.shift_width,
-                    tab_width: indentation.tab_width,
+                    shift_width: &|column| indentation.shift_width_at(column),
+                    tab_width: &indentation.tab_stops,
                     reason,
                 });
             if decision != IndentDecision::Keep {
@@ -20963,14 +20952,19 @@ impl Editor {
             language.as_deref(),
             &document,
             line,
-            indentation.shift_width,
-            indentation.tab_width,
+            |column| indentation.shift_width_at(column),
+            &indentation.tab_stops,
         )
     }
 
     /// Applies a display-column indentation target and preserves the cursor's
     /// offset into non-whitespace content when the target is the active line.
-    fn apply_indentation_to_line(&mut self, line: usize, decision: IndentDecision) -> usize {
+    fn apply_indentation_to_line(
+        &mut self,
+        line: usize,
+        decision: IndentDecision,
+        autoindent: bool,
+    ) -> usize {
         let IndentDecision::Columns(columns) = decision else {
             return self.indentation_columns_for_line(line);
         };
@@ -20978,7 +20972,9 @@ impl Editor {
             return 0;
         };
         let old_indentation = Self::leading_indentation_text(&contents).to_string();
-        let new_indentation = self.indentation().whitespace_for_columns(columns);
+        let new_indentation =
+            self.indentation()
+                .update_indent(&old_indentation, columns, autoindent);
         let old_graphemes = grapheme_len(&old_indentation);
         let cursor_offset =
             (self.buffer_line() == line).then(|| self.cx.saturating_sub(old_graphemes));
@@ -21042,9 +21038,9 @@ impl Editor {
             IndentDecision::Keep => return,
         };
 
-        let tab_width = self.indentation().tab_width.max(1);
+        let tab_width = self.active_tab_stops().clone();
         let anchor_columns =
-            display_width_with_tabs(Self::leading_indentation_text(anchor), tab_width);
+            display_width_with_tabs(Self::leading_indentation_text(anchor), &tab_width);
         let source = starts_document.then(|| self.current_buffer().contents());
         let buffer_id = self.current_buffer().id();
         let revision = self.current_buffer().revision();
@@ -21060,7 +21056,7 @@ impl Editor {
                 }
 
                 let source_columns =
-                    display_width_with_tabs(Self::leading_indentation_text(line), tab_width);
+                    display_width_with_tabs(Self::leading_indentation_text(line), &tab_width);
                 let columns = if source_columns >= anchor_columns {
                     destination_columns.saturating_add(source_columns - anchor_columns)
                 } else {
@@ -21091,7 +21087,7 @@ impl Editor {
             .collect::<Vec<_>>();
 
         for (line, columns) in lines_to_indent {
-            self.apply_indentation_to_line(line, IndentDecision::Columns(columns));
+            self.apply_indentation_to_line(line, IndentDecision::Columns(columns), false);
         }
     }
 
@@ -21132,10 +21128,6 @@ impl Editor {
         true
     }
 
-    fn current_line_indentation(&self) -> usize {
-        Self::leading_indentation(&self.current_line_contents().unwrap_or_default())
-    }
-
     fn indent_selection(&mut self, count: u16) -> Option<usize> {
         let selection = self.selection?;
         let first_line = selection.y0.min(selection.y1);
@@ -21146,21 +21138,9 @@ impl Editor {
     }
 
     fn indent_line_range(&mut self, first_line: usize, last_line: usize, count: u16) -> bool {
-        let indentation = self.indentation();
-        let columns = indentation
-            .shift_width
-            .saturating_mul(usize::from(count.max(1)));
-        let prefix = indentation.whitespace_for_columns(columns);
-
         self.begin_transaction("indent selection");
         for line in first_line..=last_line {
-            let Some(contents) = self.current_buffer().get(line) else {
-                continue;
-            };
-            if trim_line_ending(&contents).is_empty() {
-                continue;
-            }
-            self.replace_range(TextRange::insertion(TextPosition::new(line, 0)), &prefix);
+            self.shift_line_indentation(line, count, true);
         }
         self.move_to_text_position(TextPosition::new(first_line, 0));
         self.selection = None;
@@ -21178,36 +21158,36 @@ impl Editor {
     }
 
     fn unindent_line_range(&mut self, first_line: usize, last_line: usize, count: u16) -> bool {
-        let indentation = self.indentation();
-        let columns = indentation
-            .shift_width
-            .saturating_mul(usize::from(count.max(1)));
-
         self.begin_transaction("unindent selection");
         for line in first_line..=last_line {
-            let Some(contents) = self.current_buffer().get(line) else {
-                continue;
-            };
-            let old_indentation = Self::leading_indentation_text(&contents).to_string();
-            if old_indentation.is_empty() {
-                continue;
-            }
-            let old_columns =
-                display_width_with_tabs(&old_indentation, indentation.tab_width.max(1));
-            let new_indentation =
-                indentation.whitespace_for_columns(old_columns.saturating_sub(columns));
-            self.replace_range(
-                TextRange::new(
-                    TextPosition::new(line, 0),
-                    TextPosition::new(line, old_indentation.chars().count()),
-                ),
-                &new_indentation,
-            );
+            self.shift_line_indentation(line, count, false);
         }
         self.move_to_text_position(TextPosition::new(first_line, 0));
         self.selection = None;
         self.selection_start = None;
         self.commit_transaction(self.cursor_snapshot())
+    }
+
+    fn shift_line_indentation(&mut self, line: usize, count: u16, right: bool) {
+        let Some(contents) = self.current_buffer().get(line) else {
+            return;
+        };
+        if trim_line_ending(&contents).is_empty() {
+            return;
+        }
+        let indent = Self::leading_indentation_text(&contents);
+        let settings = self.indentation();
+        let column = display_width_with_tabs(indent, &settings.tab_stops);
+        let target = settings.shift(column, count, right);
+        if target != column {
+            self.apply_indentation_to_line(line, IndentDecision::Columns(target), false);
+        }
+    }
+
+    fn autoindent_prefix(&self, source_line: usize) -> String {
+        let contents = self.current_buffer().get(source_line).unwrap_or_default();
+        self.indentation()
+            .autoindent(Self::leading_indentation_text(&contents))
     }
 
     #[inline(never)]
@@ -21789,7 +21769,7 @@ impl Editor {
                 if should_reindent {
                     let decision =
                         self.indentation_decision(line, crate::syntax_indent::IndentReason::Typed);
-                    self.apply_indentation_to_line(line, decision);
+                    self.apply_indentation_to_line(line, decision, false);
                 }
                 if !c.is_whitespace() {
                     self.auto_wrap_current_comment_line();
@@ -21872,23 +21852,20 @@ impl Editor {
                 } else {
                     *range
                 };
-                let indentation = self
-                    .current_buffer()
-                    .get(line)
-                    .map(|contents| Self::leading_indentation(&contents))
-                    .unwrap_or(0);
+                let indentation = self.autoindent_prefix(line);
+                let cursor = indentation.chars().count();
                 if self.begin_change_range(range, "change lines", true) {
-                    if indentation > 0 {
+                    if !indentation.is_empty() {
                         self.replace_range(
                             TextRange::insertion(TextPosition::new(line, 0)),
-                            &" ".repeat(indentation),
+                            &indentation,
                         );
                     }
                     self.notify_change(runtime).await?;
                 }
                 self.execute(&Action::EnterMode(Mode::Insert), buffer, runtime)
                     .await?;
-                self.move_to_insert_text_position(TextPosition::new(line, indentation));
+                self.move_to_insert_text_position(TextPosition::new(line, cursor));
                 self.render(buffer)?;
             }
             Action::YankLinewiseRange(range) => {
@@ -21913,21 +21890,22 @@ impl Editor {
             }
             Action::ChangeCurrentLines(count) => {
                 let range = self.current_line_range(*count, false);
-                let indentation = self.current_line_indentation();
                 let line = range.start.line;
+                let indentation = self.autoindent_prefix(line);
+                let cursor = indentation.chars().count();
                 if self.begin_change_range(range, "change lines", true) {
-                    if indentation > 0 {
+                    if !indentation.is_empty() {
                         self.replace_range(
                             TextRange::insertion(TextPosition::new(line, 0)),
-                            &" ".repeat(indentation),
+                            &indentation,
                         );
-                        self.move_to_insert_text_position(TextPosition::new(line, indentation));
+                        self.move_to_insert_text_position(TextPosition::new(line, cursor));
                     }
                     self.notify_change(runtime).await?;
                 }
                 self.execute(&Action::EnterMode(Mode::Insert), buffer, runtime)
                     .await?;
-                self.move_to_insert_text_position(TextPosition::new(line, indentation));
+                self.move_to_insert_text_position(TextPosition::new(line, cursor));
                 self.render(buffer)?;
             }
             Action::DeleteToLineEnd(count) => {
@@ -22205,7 +22183,7 @@ impl Editor {
                     self.begin_transaction("insert newline");
                 }
                 let source_line = self.buffer_line();
-                let fallback_columns = self.indentation_columns_for_line(source_line);
+                let fallback_indent = self.autoindent_prefix(source_line);
                 self.cleanup_generated_indent();
 
                 let current_line = self.current_line_contents().unwrap_or_default();
@@ -22249,7 +22227,6 @@ impl Editor {
                 };
 
                 let line = self.buffer_line();
-                let fallback_indent = self.indentation().whitespace_for_columns(fallback_columns);
                 let (replacement, inserted_prefix) = if split_pair {
                     (
                         format!(
@@ -22290,10 +22267,10 @@ impl Editor {
 
                 let target_line = line + 1;
                 let decision = self.indentation_decision_for_line(target_line);
-                let target_columns = self.apply_indentation_to_line(target_line, decision);
+                let target_columns = self.apply_indentation_to_line(target_line, decision, true);
                 if split_pair {
                     let closer = self.indentation_decision_for_line(target_line + 1);
-                    self.apply_indentation_to_line(target_line + 1, closer);
+                    self.apply_indentation_to_line(target_line + 1, closer, true);
                 }
                 self.mark_generated_indent(target_line, target_columns);
                 self.notify_change(runtime).await?;
@@ -22597,7 +22574,7 @@ impl Editor {
             Action::InsertLineBelowCursor => {
                 let leading_columns = self.indentation_columns_for_line(self.buffer_line());
                 let line = self.buffer_line();
-                let fallback_indent = self.indentation().whitespace_for_columns(leading_columns);
+                let fallback_indent = self.autoindent_prefix(line);
                 let comment_prefix = self
                     .config
                     .commenting
@@ -22638,7 +22615,7 @@ impl Editor {
                 self.insert_entry_cursor = Some(self.cursor_snapshot());
                 let target_line = line + 1;
                 let decision = self.indentation_decision_for_line(target_line);
-                let target_columns = self.apply_indentation_to_line(target_line, decision);
+                let target_columns = self.apply_indentation_to_line(target_line, decision, true);
                 self.mark_generated_indent(target_line, target_columns);
                 self.notify_change(runtime).await?;
                 self.refresh_cursor_goal();
@@ -22651,21 +22628,16 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::InsertLineAtCursor => {
-                // if the current line is empty, let's use the indentation from the line above
-                let leading_columns = if let Some(contents) = self.current_line_contents() {
-                    if contents.is_empty() {
-                        let previous_line = self.buffer_line().saturating_sub(1);
-                        self.indentation_columns_for_line(previous_line)
-                    } else {
-                        self.indentation_columns_for_line(self.buffer_line())
-                    }
-                } else {
-                    let previous_line = self.buffer_line().saturating_sub(1);
-                    self.indentation_columns_for_line(previous_line)
-                };
-
                 let line = self.buffer_line();
-                let fallback_indent = self.indentation().whitespace_for_columns(leading_columns);
+                let source_line = if self
+                    .current_line_contents()
+                    .is_none_or(|contents| contents.is_empty())
+                {
+                    line.saturating_sub(1)
+                } else {
+                    line
+                };
+                let fallback_indent = self.autoindent_prefix(source_line);
                 let comment_prefix = self
                     .config
                     .commenting
@@ -22689,7 +22661,7 @@ impl Editor {
                 self.mode = Mode::Insert;
                 self.insert_entry_cursor = Some(self.cursor_snapshot());
                 let decision = self.indentation_decision_for_line(line);
-                let target_columns = self.apply_indentation_to_line(line, decision);
+                let target_columns = self.apply_indentation_to_line(line, decision, true);
                 self.mark_generated_indent(line, target_columns);
                 self.notify_change(runtime).await?;
                 self.refresh_cursor_goal();
@@ -22746,37 +22718,54 @@ impl Editor {
                 if self.cx > 0 {
                     if let Some(line) = self.current_line_contents() {
                         let line = line.trim_end_matches('\n');
-                        let prefix = line.graphemes(true).take(self.cx).collect::<String>();
+                        let cursor = grapheme_to_char(line, self.cx);
+                        let prefix = char_prefix(line, cursor);
+                        let text = prefix.trim_end_matches([' ', '\t']);
+                        let settings = self.indentation();
                         let line_num = self.buffer_line();
-                        if prefix.chars().all(char::is_whitespace) {
-                            let indentation = self.indentation();
-                            let current_column =
-                                display_width_with_tabs(&prefix, indentation.tab_width.max(1));
-                            let stop = indentation.soft_tab_stop.max(1);
-                            let target_column = current_column.saturating_sub(1) / stop * stop;
-                            let replacement = indentation.whitespace_for_columns(target_column);
+                        let stops = (text.len() < prefix.len())
+                            .then(|| {
+                                let column = display_width_with_tabs(prefix, &settings.tab_stops);
+                                settings
+                                    .backspace_stops(text.is_empty(), column.saturating_sub(1))
+                                    .map(|stops| (column, stops))
+                            })
+                            .flatten();
+                        if let Some((column, stops)) = stops {
+                            let mut start = display_width_with_tabs(text, &settings.tab_stops);
+                            let target = stops.at_or_before(column.saturating_sub(1)).max(start);
+                            let mut keep = text.len();
+                            for byte in prefix[keep..].bytes() {
+                                let next = if byte == b'\t' {
+                                    settings.tab_stops.next(start)
+                                } else {
+                                    start + 1
+                                };
+                                if next > target {
+                                    break;
+                                }
+                                start = next;
+                                keep += 1;
+                            }
+                            let replacement = settings.whitespace(start, target);
+                            let kept = &prefix[..keep];
                             self.replace_range(
                                 TextRange::new(
-                                    TextPosition::new(line_num, 0),
-                                    TextPosition::new(line_num, prefix.chars().count()),
+                                    TextPosition::new(line_num, kept.chars().count()),
+                                    TextPosition::new(line_num, cursor),
                                 ),
                                 &replacement,
                             );
-                            self.cx = grapheme_len(&replacement);
-                        } else {
-                            let prev_grapheme_idx = self.cx - 1;
-                            if let Some((start_char, end_char)) =
-                                grapheme_char_range(line, prev_grapheme_idx)
-                            {
-                                self.replace_range(
-                                    TextRange::new(
-                                        TextPosition::new(line_num, start_char),
-                                        TextPosition::new(line_num, end_char),
-                                    ),
-                                    "",
-                                );
-                                self.cx = prev_grapheme_idx;
-                            }
+                            self.cx = grapheme_len(kept) + grapheme_len(&replacement);
+                        } else if let Some((start, end)) = grapheme_char_range(line, self.cx - 1) {
+                            self.replace_range(
+                                TextRange::new(
+                                    TextPosition::new(line_num, start),
+                                    TextPosition::new(line_num, end),
+                                ),
+                                "",
+                            );
+                            self.cx -= 1;
                         }
 
                         self.notify_change(runtime).await?;
@@ -23792,33 +23781,37 @@ impl Editor {
                     }
                 }
                 Action::InsertTab => {
-                    let indentation = self.indentation();
-                    let cx = self.cx;
+                    let settings = self.indentation();
                     let line = self.buffer_line();
                     let contents = self.current_line_contents().unwrap_or_default();
-                    let contents = contents.trim_end_matches(&['\r', '\n'][..]);
-                    let current_column =
-                        grapheme_to_column_with_tabs(contents, cx, indentation.tab_width.max(1));
-                    let stop = indentation.soft_tab_stop.max(1);
-                    let target_column = (current_column / stop + 1) * stop;
-                    let inserted_columns = target_column - current_column;
-                    let inserted = if indentation.expand_tab {
-                        " ".repeat(inserted_columns)
+                    let contents = trim_line_ending(&contents);
+                    let cursor = grapheme_to_char(contents, self.cx);
+                    let prefix = char_prefix(contents, cursor);
+                    let text = prefix.trim_end_matches([' ', '\t']);
+                    let column = display_width_with_tabs(prefix, &settings.tab_stops);
+                    let stops = settings.editing_stops(text.is_empty(), column);
+                    let start = if !settings.expand_tab && stops.is_some() {
+                        text
                     } else {
-                        "\t".to_string()
+                        prefix
                     };
-                    let char_cx = self.grapheme_to_char_on_line(cx, line);
+                    let start_column = display_width_with_tabs(start, &settings.tab_stops);
+                    let target = stops.as_ref().unwrap_or(&settings.tab_stops).next(column);
+                    let inserted = settings.whitespace(start_column, target);
                     let started_transaction = !self.transaction_active();
                     if started_transaction {
                         self.begin_transaction("insert tab");
                     }
                     self.replace_range(
-                        TextRange::insertion(TextPosition::new(line, char_cx)),
+                        TextRange::new(
+                            TextPosition::new(line, start.chars().count()),
+                            TextPosition::new(line, cursor),
+                        ),
                         &inserted,
                     );
                     self.generated_indent = None;
                     self.notify_change(runtime).await?;
-                    self.cx += grapheme_len(&inserted);
+                    self.cx = grapheme_len(start) + grapheme_len(&inserted);
                     self.refresh_cursor_goal();
                     if started_transaction {
                         self.commit_transaction(self.cursor_snapshot());
@@ -25070,14 +25063,8 @@ impl Editor {
                     }
                 }
                 Action::IndentLine => {
-                    let indent = self.indentation();
-                    let line = self.buffer_line();
-
                     self.begin_transaction("indent line");
-                    self.replace_range(
-                        TextRange::insertion(TextPosition::new(line, 0)),
-                        &" ".repeat(indent.shift_width),
-                    );
+                    self.shift_line_indentation(self.buffer_line(), 1, true);
                     self.commit_transaction(self.cursor_snapshot());
                     self.notify_change(runtime).await?;
                     self.render(buffer)?;
@@ -25092,18 +25079,8 @@ impl Editor {
                     .await?;
                 }
                 Action::UnindentLine => {
-                    let spaces = self.current_line_indentation();
-                    let chars_to_remove = std::cmp::min(spaces, self.indentation().shift_width);
-                    let line = self.buffer_line();
-
                     self.begin_transaction("unindent line");
-                    self.replace_range(
-                        TextRange::new(
-                            TextPosition::new(line, 0),
-                            TextPosition::new(line, chars_to_remove),
-                        ),
-                        "",
-                    );
+                    self.shift_line_indentation(self.buffer_line(), 1, false);
                     self.commit_transaction(self.cursor_snapshot());
                     self.notify_change(runtime).await?;
                     self.render(buffer)?;
@@ -29446,7 +29423,7 @@ impl Editor {
         let source = trim_line_ending(&original_line);
         if self.cx != grapheme_len(source)
             || syntax.continuation_prefix(source).is_none()
-            || display_width_with_tabs(source, self.active_tab_width()) <= width
+            || display_width_with_tabs(source, self.active_tab_stops()) <= width
         {
             return false;
         }
@@ -29460,7 +29437,7 @@ impl Editor {
             )
         };
         let original = self.current_buffer().text_in_range(range);
-        let formatted = reflow_text(&original, width, self.active_tab_width(), |line| {
+        let formatted = reflow_text(&original, width, self.active_tab_stops(), |line| {
             syntax.reflow_line(line).unwrap_or_else(|| plain_line(line))
         });
         if formatted == original {
@@ -29584,7 +29561,7 @@ impl Editor {
         let formatted = reflow_text(
             &original,
             self.comment_text_width(),
-            self.active_tab_width(),
+            self.active_tab_stops(),
             |line| {
                 syntax
                     .as_ref()
@@ -31305,7 +31282,7 @@ impl Editor {
         let buffer_line = self.buffer_line();
         let line = self.current_line_contents().unwrap_or_default();
         let line = line.trim_end_matches('\n');
-        let display_col = grapheme_to_column_with_tabs(line, self.cx, self.active_tab_width());
+        let display_col = grapheme_to_column_with_tabs(line, self.cx, self.active_tab_stops());
 
         // Image scrolling stores the visible image row in skipcol. Showing the
         // source again must not treat that row index as a horizontal offset.
@@ -32453,7 +32430,7 @@ impl Editor {
                 self.lsp
                     .format_document_with_options(
                         &file,
-                        indentation.tab_width,
+                        indentation.shift_width,
                         indentation.expand_tab,
                     )
                     .await
@@ -32938,7 +32915,12 @@ impl Editor {
         let indentation = self.indentation();
         match self
             .lsp
-            .format_range_with_options(&file, range, indentation.tab_width, indentation.expand_tab)
+            .format_range_with_options(
+                &file,
+                range,
+                indentation.shift_width,
+                indentation.expand_tab,
+            )
             .await
         {
             Ok(request_id) if request_id > 0 => {
@@ -33010,7 +32992,7 @@ impl Editor {
         let indentation = self.indentation();
         let request_id = self
             .lsp
-            .format_document_with_options(&file, indentation.tab_width, indentation.expand_tab)
+            .format_document_with_options(&file, indentation.shift_width, indentation.expand_tab)
             .await?;
         if request_id > 0 {
             self.pending_lsp_edit_requests.insert(request_id, pending);
@@ -33322,7 +33304,7 @@ impl Editor {
         let indentation = self.indentation();
         let request = self
             .lsp
-            .format_document_with_options(&file, indentation.tab_width, indentation.expand_tab)
+            .format_document_with_options(&file, indentation.shift_width, indentation.expand_tab)
             .await;
         let request_id = match request {
             Ok(request_id) => request_id,
@@ -37897,6 +37879,43 @@ mod test {
             .await
             .unwrap();
         editor.service_background(buffer, runtime).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tab_options_reload_per_buffer_and_keep_the_widths_independent() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+tabstop = 8
+shiftwidth = 0
+expandtab = false
+
+[languages.rust]
+shiftwidth = 2
+
+[languages.javascript]
+tabstop = 6
+"#,
+        )
+        .unwrap();
+        let mut editor = test_editor(80, 12);
+        editor.buffer_manager[0] = Buffer::new(Some("first.rs".into()), "\t界".into());
+        let other = editor
+            .buffer_manager
+            .add_buffer(Buffer::new(Some("second.js".into()), "\t界".into()));
+        editor.set_language_reload_source(path, vec!["languages.rust.tabstop=10".into()]);
+        editor.reload_languages().await.unwrap();
+
+        let rust = editor.indentation_for_buffer_index(0);
+        assert_eq!(
+            (rust.tab_width, rust.shift_width, rust.expand_tab),
+            (10, 2, false)
+        );
+        assert_eq!(grapheme_to_column_with_tabs("\t界", 2, &rust.tab_stops), 12);
+        let js = editor.indentation_for_buffer_index(other);
+        assert_eq!((js.tab_width, js.shift_width, js.expand_tab), (6, 6, false));
     }
 
     #[tokio::test]
@@ -44593,7 +44612,7 @@ builtin = "rust"
                             grapheme_to_column_with_tabs(
                                 trim_line_ending(text),
                                 column,
-                                editor.active_tab_width(),
+                                editor.active_tab_stops(),
                             )
                         })
                         .unwrap_or(column);
@@ -44739,7 +44758,7 @@ builtin = "rust"
                     .map(|text| {
                         display_width_with_tabs(
                             Editor::leading_indentation_text(text),
-                            editor.indentation().tab_width.max(1),
+                            editor.active_tab_stops(),
                         )
                     })
                     .unwrap_or_default();
@@ -52803,7 +52822,7 @@ while True:
             editor.sync_to_window();
             let (initial_screen_x, expected_screen_y) = editor.render_cursor_position().unwrap();
             let initial_display_col =
-                grapheme_to_column_with_tabs(contents, initial_x, editor.active_tab_width());
+                grapheme_to_column_with_tabs(contents, initial_x, editor.active_tab_stops());
             let content_screen_x = initial_screen_x - initial_display_col;
             let expected_position = (content_screen_x + expected_display_col, expected_screen_y);
             let mut render_buffer = RenderBuffer::new(20, 5, &Style::default());
@@ -52910,7 +52929,7 @@ while True:
             editor.sync_to_window();
             let (initial_screen_x, expected_screen_y) = editor.render_cursor_position().unwrap();
             let initial_display_col =
-                grapheme_to_column_with_tabs(contents, initial_x, editor.active_tab_width());
+                grapheme_to_column_with_tabs(contents, initial_x, editor.active_tab_stops());
             let content_screen_x = initial_screen_x - initial_display_col;
             let mut render_buffer = RenderBuffer::new(20, 5, &Style::default());
             let mut runtime = Runtime::new();
@@ -52953,7 +52972,7 @@ while True:
         editor.sync_to_window();
         let (initial_screen_x, expected_screen_y) = editor.render_cursor_position().unwrap();
         let initial_display_col =
-            grapheme_to_column_with_tabs(contents, editor.cx, editor.active_tab_width());
+            grapheme_to_column_with_tabs(contents, editor.cx, editor.active_tab_stops());
         let content_screen_x = initial_screen_x - initial_display_col;
         let expected_position = (content_screen_x + 4, expected_screen_y);
         let mut render_buffer = RenderBuffer::new(20, 5, &Style::default());

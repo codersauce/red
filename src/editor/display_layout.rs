@@ -10,6 +10,7 @@
 //! concealment change would produce incorrect cursor and hit-test positions even when
 //! the underlying text looks similar.
 
+use crate::tab_stops::TabStops;
 use std::ops::Range;
 
 use unicode_segmentation::UnicodeSegmentation as _;
@@ -98,17 +99,17 @@ pub(super) fn inline_comment_block(
 /// How wrapped continuation rows are indented, mirroring vim's
 /// 'breakindent' option: continuations start with a blank virtual indent
 /// matching the line's leading whitespace.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BreakIndentOptions {
     pub enabled: bool,
-    pub tab_width: usize,
+    pub tab_width: TabStops,
 }
 
 impl Default for BreakIndentOptions {
     fn default() -> Self {
         Self {
             enabled: true,
-            tab_width: 4,
+            tab_width: 4.into(),
         }
     }
 }
@@ -118,26 +119,29 @@ impl BreakIndentOptions {
     pub fn disabled() -> Self {
         Self {
             enabled: false,
-            tab_width: 4,
+            tab_width: 4.into(),
         }
     }
 }
 
-pub fn leading_whitespace_display_width(line: &str, tab_width: usize) -> usize {
-    leading_whitespace_display_width_up_to(line, tab_width, usize::MAX)
+pub fn leading_whitespace_display_width(line: &str, tab_width: impl Into<TabStops>) -> usize {
+    leading_whitespace_display_width_up_to(line, &tab_width.into(), usize::MAX)
 }
 
-fn leading_whitespace_display_width_up_to(line: &str, tab_width: usize, max_width: usize) -> usize {
+fn leading_whitespace_display_width_up_to(
+    line: &str,
+    tab_width: &TabStops,
+    max_width: usize,
+) -> usize {
     if max_width == 0 {
         return 0;
     }
 
-    let tab_width = tab_width.max(1);
     let mut width = 0;
     for ch in line.chars() {
         let next = match ch {
             ' ' => 1,
-            '\t' => tab_width - (width % tab_width),
+            '\t' => tab_width.advance(width),
             ch if ch.is_whitespace() => char_display_width(ch).max(1),
             _ => break,
         };
@@ -149,13 +153,13 @@ fn leading_whitespace_display_width_up_to(line: &str, tab_width: usize, max_widt
     width
 }
 
-fn break_indent_width(line: &str, width: usize, options: BreakIndentOptions) -> usize {
+fn break_indent_width(line: &str, width: usize, options: &BreakIndentOptions) -> usize {
     if !options.enabled {
         return 0;
     }
     leading_whitespace_display_width_up_to(
         line,
-        options.tab_width,
+        &options.tab_width,
         width.saturating_sub(BREAK_INDENT_MIN_TEXT_WIDTH),
     )
 }
@@ -592,7 +596,7 @@ impl DisplayLayout {
         }
         let cursor_col = crate::unicode_utils::display_width_with_tabs(
             &line[..cursor_byte],
-            config.break_indent.tab_width,
+            &config.break_indent.tab_width,
         );
         let Some(mut anchor) = self.segment_for_cursor(line_index, cursor_col).cloned() else {
             return self;
@@ -731,7 +735,7 @@ impl DisplayLayout {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct LayoutConfig {
     pub content_width: usize,
     pub height: usize,
@@ -755,7 +759,7 @@ fn image_rows_with_declaration(
     image_rows: &[LineSegment],
     show_declaration: bool,
     line_skipcol: usize,
-    config: LayoutConfig,
+    config: &LayoutConfig,
 ) -> Vec<LineSegment> {
     let mut segments = Vec::new();
     let text_rows = if show_declaration && line_skipcol == 0 {
@@ -765,7 +769,7 @@ fn image_rows_with_declaration(
                 line_index,
                 config.content_width,
                 0,
-                config.break_indent,
+                config.break_indent.clone(),
             )
         } else {
             nowrap_line_segment(
@@ -773,7 +777,7 @@ fn image_rows_with_declaration(
                 line_index,
                 config.content_width,
                 config.vleft,
-                config.break_indent.tab_width,
+                &config.break_indent.tab_width,
             )
         };
         let count = text.len();
@@ -844,7 +848,7 @@ pub(super) fn layout_lines_with_tables(
                     image_rows,
                     images.is_some_and(|images| images.raw_lines.contains(&line_index)),
                     line_skipcol,
-                    config,
+                    &config,
                 )
             } else if let Some(table) = tables.and_then(|tables| tables.line(line_index, reveal)) {
                 table
@@ -873,7 +877,7 @@ pub(super) fn layout_lines_with_tables(
                     line_index,
                     config.content_width,
                     line_skipcol,
-                    config.break_indent,
+                    config.break_indent.clone(),
                     config.height - row,
                     &concealment,
                 )
@@ -883,7 +887,7 @@ pub(super) fn layout_lines_with_tables(
                     line_index,
                     config.content_width,
                     config.vleft,
-                    config.break_indent.tab_width,
+                    &config.break_indent.tab_width,
                 )
             };
 
@@ -957,11 +961,11 @@ fn wrap_line_segments_with_limit(
         return segments;
     }
 
-    let indent = break_indent_width(line, width, break_indent);
+    let indent = break_indent_width(line, width, &break_indent);
     // Width available for text on continuation rows.
     let continuation_width = (width - indent).max(1);
 
-    let tab_width = break_indent.tab_width.max(1);
+    let tab_width = &break_indent.tab_width;
     let mut start_col = 0;
     let mut start_grapheme = 0;
     let mut start_byte = 0;
@@ -979,7 +983,7 @@ fn wrap_line_segments_with_limit(
             continuation_width
         };
         let raw_width = if grapheme == "\t" {
-            tab_width - (col % tab_width)
+            tab_width.advance(col)
         } else {
             display_width(grapheme)
         };
@@ -1075,7 +1079,7 @@ fn wrap_line_segments_with_limit(
             .enumerate()
             .scan(0, |col, (index, (byte_offset, grapheme))| {
                 let width = if grapheme == "\t" {
-                    tab_width - (*col % tab_width)
+                    tab_width.advance(*col)
                 } else {
                     display_width(grapheme)
                 };
@@ -1117,9 +1121,9 @@ pub(super) fn nowrap_line_segment(
     line_index: usize,
     width: usize,
     vleft: usize,
-    tab_width: usize,
+    tab_width: impl Into<TabStops>,
 ) -> Vec<LineSegment> {
-    let tab_width = tab_width.max(1);
+    let tab_width = tab_width.into();
     let requested_end = vleft.saturating_add(width);
     let mut start = None;
     let mut end = None;
@@ -1128,7 +1132,7 @@ pub(super) fn nowrap_line_segment(
 
     for (grapheme_index, (byte_offset, grapheme)) in line.grapheme_indices(true).enumerate() {
         let grapheme_width = if grapheme == "\t" {
-            tab_width - (col % tab_width)
+            tab_width.advance(col)
         } else {
             display_width(grapheme)
         };
@@ -1190,7 +1194,7 @@ mod tests {
             break_indent: BreakIndentOptions::disabled(),
         };
         let lines = vec!["foo()\n".into(), "after\n".into()];
-        let layout = layout_lines(&lines, 2, config).with_inline_prediction(
+        let layout = layout_lines(&lines, 2, config.clone()).with_inline_prediction(
             0,
             "foo()",
             3,
@@ -1224,7 +1228,8 @@ mod tests {
             break_indent: BreakIndentOptions::disabled(),
         };
         let lines = vec!["a界z\n".into(), "after\n".into()];
-        let original = layout_lines(&lines, 2, config).with_inline_comments(&[(1, "note")], 5, 12);
+        let original =
+            layout_lines(&lines, 2, config.clone()).with_inline_comments(&[(1, "note")], 5, 12);
         let original_comment = original.inline_comments[0].row;
         let layout = original.with_inline_prediction(0, "a界z", "a界".len(), "12\n😀", config);
         assert!(layout
@@ -1348,7 +1353,7 @@ mod tests {
         let line = format!("\t\t{}", "x".repeat(40));
         let options = BreakIndentOptions {
             enabled: true,
-            tab_width: 4,
+            tab_width: 4.into(),
         };
         let segments = wrap_line_segments(&line, 0, 30, 0, options);
 

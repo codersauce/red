@@ -469,7 +469,7 @@ impl Editor {
         direction: VerticalCursorDirection,
     ) -> Option<CharRange> {
         let last_line = self.current_buffer().len();
-        let tab_width = self.active_tab_width();
+        let tab_width = self.active_tab_stops();
         let mut line_index = origin_line;
 
         loop {

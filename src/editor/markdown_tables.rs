@@ -3,6 +3,7 @@
 //! Parsing is cached by document revision; geometry is cached independently of
 //! the viewport. Neither phase edits Markdown or participates in undo history.
 
+use crate::tab_stops::TabStops;
 use std::{
     collections::{BTreeMap, HashMap},
     ops::Range,
@@ -158,7 +159,7 @@ pub(super) struct TableLayout {
 pub(super) struct CachedTables {
     revision: u64,
     parsed: MarkdownTables,
-    layouts: HashMap<(usize, usize, bool, bool), Arc<TableLayout>>,
+    layouts: HashMap<(usize, TabStops, bool, bool), Arc<TableLayout>>,
 }
 
 impl super::Editor {
@@ -201,18 +202,20 @@ impl super::Editor {
         }
         let key = (
             self.window_content_width(window),
-            self.tab_width_for_buffer_index(window.buffer_index),
+            self.tab_stops_for_buffer_index(window.buffer_index).clone(),
             window.wrap,
             self.config.window_borders_ascii,
         );
         if cached.layouts.len() >= 4 && !cached.layouts.contains_key(&key) {
             cached.layouts.clear();
         }
+        let (width, _, wrap, ascii) = key;
+        let tab_width = self.tab_stops_for_buffer_index(window.buffer_index);
         Some(
             cached
                 .layouts
                 .entry(key)
-                .or_insert_with(|| Arc::new(cached.parsed.layout(key.0, key.1, key.2, key.3)))
+                .or_insert_with(|| Arc::new(cached.parsed.layout(width, tab_width, wrap, ascii)))
                 .clone(),
         )
     }
@@ -287,7 +290,7 @@ impl super::Editor {
         };
         let column = display_width_with_tabs(
             &prefix,
-            self.tab_width_for_buffer_index(window.buffer_index),
+            self.tab_stops_for_buffer_index(window.buffer_index),
         );
         !table_line.rows.iter().any(|row| {
             row.projection.as_ref().is_some_and(|projection| {
@@ -629,7 +632,13 @@ impl MarkdownTables {
         result
     }
 
-    pub fn layout(&self, width: usize, tab_width: usize, wrap: bool, ascii: bool) -> TableLayout {
+    pub fn layout(
+        &self,
+        width: usize,
+        tab_width: &TabStops,
+        wrap: bool,
+        ascii: bool,
+    ) -> TableLayout {
         let mut layout = TableLayout::default();
         for table in &self.tables {
             let columns = table.alignments.len();
@@ -760,13 +769,13 @@ fn merge_cell_graphemes(cell: &mut Cell) {
 struct SourceColumns(Vec<(usize, usize)>);
 
 impl SourceColumns {
-    fn new(text: &str, tab_width: usize) -> Self {
+    fn new(text: &str, tab_width: &TabStops) -> Self {
         let mut columns = Vec::new();
         let mut column = 0;
         for (byte, grapheme) in text.grapheme_indices(true) {
             columns.push((byte, column));
             column += if grapheme == "\t" {
-                tab_width.max(1) - column % tab_width.max(1)
+                tab_width.advance(column)
             } else {
                 display_width(grapheme)
             };
@@ -806,7 +815,7 @@ fn project_row(
     row: &TableRow,
     widths: &[usize],
     alignments: &[Alignment],
-    tab_width: usize,
+    tab_width: &TabStops,
     ascii: bool,
 ) -> Vec<LineSegment> {
     let source_columns = SourceColumns::new(&row.text, tab_width);
@@ -999,7 +1008,7 @@ fn project_delimiter(
     line: usize,
     text: &str,
     widths: &[usize],
-    tab_width: usize,
+    tab_width: &TabStops,
     ascii: bool,
 ) -> LineSegment {
     let source_columns = SourceColumns::new(text, tab_width);
@@ -1231,7 +1240,7 @@ mod tests {
     fn aligns_columns_without_rewriting_source_spacing() {
         let source = "| Item | Count |\n| --- | ---: |\n| Apples|12 |\n|Oranges | 3|\n";
         let tables = MarkdownTables::parse(source);
-        let layout = tables.layout(80, 4, true, false);
+        let layout = tables.layout(80, &4.into(), true, false);
         assert_eq!(layout.lines.len(), 4);
         assert!(layout.lines.values().all(|line| line.rows.len() == 1));
         assert_eq!(plain(&layout.lines[&0].rows[0]), "│ Item    │ Count │");
@@ -1243,7 +1252,7 @@ mod tests {
     #[test]
     fn borders_and_padding_are_reachable_by_keyboard_and_mouse() {
         let source = "| A | B |\n| --- | --- |\n| Cat | Dog |\n";
-        let layout = MarkdownTables::parse(source).layout(60, 4, true, false);
+        let layout = MarkdownTables::parse(source).layout(60, &4.into(), true, false);
         for (line, columns) in [
             (0, vec![0, 1, 2, 3, 6, 7, 8, 9, 12]),
             (1, (0..13).collect()),
@@ -1268,7 +1277,7 @@ mod tests {
     #[test]
     fn reveals_entire_intersecting_table_only() {
         let source = "A | B\n--- | ---\none | two\n\nC | D\n--- | ---\nthree | four\n";
-        let layout = MarkdownTables::parse(source).layout(40, 4, true, false);
+        let layout = MarkdownTables::parse(source).layout(40, &4.into(), true, false);
         assert!(layout.line(0, Some(&(2..3))).is_none());
         assert!(layout.line(1, Some(&(2..3))).is_none());
         assert!(layout.line(4, Some(&(2..3))).is_some());
@@ -1293,14 +1302,14 @@ mod tests {
     #[test]
     fn maps_wrapped_unicode_cells_and_hidden_markup_to_source() {
         let source = "Name | Description\n--- | ---\n**界🙂** | a longer [link](https://example.com) with `a\\|b` &amp; text\n";
-        let layout = MarkdownTables::parse(source).layout(25, 4, true, false);
+        let layout = MarkdownTables::parse(source).layout(25, &4.into(), true, false);
         let rows = &layout.lines[&2].rows;
         assert!(rows.len() > 1);
         for row in rows {
             assert!(display_width(&plain(row)) <= 25, "{}", plain(row));
         }
         let source_line = source.lines().nth(2).unwrap();
-        let columns = SourceColumns::new(source_line, 4);
+        let columns = SourceColumns::new(source_line, &4.into());
         for (byte, _) in source_line.grapheme_indices(true) {
             let column = columns.at(byte);
             assert_eq!(
@@ -1343,7 +1352,7 @@ mod tests {
         let source_column = display_width(&source_line[..last_emoji]);
 
         for width in [24, 80, 40] {
-            let layout = tables.layout(width, 4, true, false);
+            let layout = tables.layout(width, &4.into(), true, false);
             let rows = &layout.lines[&2].rows;
             assert!(
                 rows.len() > 32,
@@ -1374,7 +1383,7 @@ mod tests {
     #[test]
     fn keeps_missing_cells_empty_and_handles_crlf_and_ascii_borders() {
         let source = "| A | B |\r\n| --- | --- |\r\n| one |\r\n";
-        let layout = MarkdownTables::parse(source).layout(40, 4, true, true);
+        let layout = MarkdownTables::parse(source).layout(40, &4.into(), true, true);
         assert_eq!(plain(&layout.lines[&2].rows[0]), "| one |     |");
         assert_eq!(plain(&layout.lines[&1].rows[0]), "+-----+-----+");
     }
@@ -1382,7 +1391,7 @@ mod tests {
     #[test]
     fn joins_graphemes_split_by_inline_markup() {
         let source = "A | B\n--- | ---\na**\u{301}** | 👩**\u{200d}**💻\n";
-        let layout = MarkdownTables::parse(source).layout(30, 4, true, false);
+        let layout = MarkdownTables::parse(source).layout(30, &4.into(), true, false);
         let rendered = plain(&layout.lines[&2].rows[0]);
         assert!(rendered.contains("a\u{301}"), "{rendered}");
         assert!(rendered.contains("👩\u{200d}💻"), "{rendered}");

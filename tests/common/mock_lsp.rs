@@ -25,7 +25,7 @@ pub enum LspEvent {
     RequestDiagnostics(String),
     Hover(String),
     GotoDefinition(String),
-    FormatDocument(String),
+    FormatDocument(String, usize, bool),
     CodeAction {
         file: String,
         range: Range,
@@ -421,17 +421,21 @@ impl LspClient for RecordingLsp {
     }
 
     async fn format_document(&mut self, file: &str) -> Result<i64, LspError> {
-        self.record(LspEvent::FormatDocument(file.to_string()));
-        Ok(45)
+        self.format_document_with_options(file, 4, true).await
     }
 
     async fn format_document_with_options(
         &mut self,
         file: &str,
-        _tab_size: usize,
-        _insert_spaces: bool,
+        tab_size: usize,
+        insert_spaces: bool,
     ) -> Result<i64, LspError> {
-        self.format_document(file).await
+        self.record(LspEvent::FormatDocument(
+            file.to_string(),
+            tab_size,
+            insert_spaces,
+        ));
+        Ok(45)
     }
 
     async fn document_symbols(&mut self, file: &str) -> Result<i64, LspError> {

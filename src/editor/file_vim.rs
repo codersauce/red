@@ -6,7 +6,7 @@ mod targets;
 
 pub(super) use targets::syntax_target;
 
-use super::{Action, Editor, Mode, RenderBuffer, Runtime};
+use super::{Action, Editor, Mode, RenderBuffer, Runtime, TabStops};
 use vimlet::{
     Binding, ByteOffset, Command, DocumentVersion, DocumentView, EditTarget, EditingState,
     HostOperation, HostOutcome, HostResult, Input, Key, OperationKind, Operator, Session, Shape,
@@ -42,6 +42,18 @@ impl FileVim {
     }
 }
 
+struct FileGeometry(TabStops);
+
+impl vimlet::Geometry for FileGeometry {
+    fn width(&self, grapheme: &str, column: usize) -> usize {
+        if grapheme == "\t" {
+            self.0.advance(column)
+        } else {
+            crate::unicode_utils::display_width(grapheme).max(1)
+        }
+    }
+}
+
 impl Editor {
     pub(super) fn file_version(&self) -> DocumentVersion {
         let buffer = self.current_buffer();
@@ -61,7 +73,7 @@ impl Editor {
     fn file_view<'a>(
         &self,
         rope: &'a ropey::Rope,
-        geometry: &'a vimlet::TerminalGeometry,
+        geometry: &'a dyn vimlet::Geometry,
     ) -> DocumentView<'a> {
         let mut view = DocumentView::new(rope, self.file_version(), self.file_cursor_byte());
         view.geometry = geometry;
@@ -266,9 +278,7 @@ impl Editor {
         // transaction, while this invocation retains the outstanding Vimlet operation.
         let mut vim = std::mem::take(&mut self.file_vim);
         let rope = self.current_buffer().contents_snapshot();
-        let geometry = vimlet::TerminalGeometry {
-            tabstop: self.active_tab_width(),
-        };
+        let geometry = FileGeometry(self.active_tab_stops().clone());
         let view = self.file_view(&rope, &geometry);
         let literal = vim.state.pending_character_motion();
         let pending = vim.state.has_pending_input();
@@ -348,9 +358,7 @@ impl Editor {
             };
             let accepted = outcome != HostOutcome::Rejected;
             let rope = self.current_buffer().contents_snapshot();
-            let geometry = vimlet::TerminalGeometry {
-                tabstop: self.active_tab_width(),
-            };
+            let geometry = FileGeometry(self.active_tab_stops().clone());
             let view = self.file_view(&rope, &geometry);
             let result = HostResult {
                 operation: op.id,

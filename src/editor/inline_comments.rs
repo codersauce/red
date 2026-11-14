@@ -1513,7 +1513,7 @@ impl Editor {
                 segment.end_col
                     >= display_width_with_tabs(
                         trim_line_ending(&line),
-                        self.tab_width_for_buffer_index(window.buffer_index),
+                        self.tab_stops_for_buffer_index(window.buffer_index),
                     )
             });
         let last = segment.line == end && last_segment;

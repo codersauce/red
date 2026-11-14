@@ -98,6 +98,19 @@ disable_ai = false
 # Master switch for language-server diagnostics in the editor UI.
 show_diagnostics = true
 
+# Optional tab and indentation overrides. Unset widths use Red's existing
+# language defaults. The same options are available under [languages.<id>].
+# tabstop = 8            # Display width of a literal tab.
+# shiftwidth = 4         # Indent step. Zero follows tabstop.
+# softtabstop = -1       # Insert Tab / Backspace step. Negative follows shiftwidth.
+# expandtab = true       # Write spaces for newly generated indentation.
+# smarttab = false       # Use shiftwidth for Tab / Backspace in leading whitespace.
+# shiftround = false     # Shift to an indentation boundary.
+# copyindent = false     # Copy the previous line's indentation characters.
+# preserveindent = false # Retain existing indentation characters when shifting.
+# vartabstop = [4, 8]    # Hard stop widths; the final width repeats.
+# varsofttabstop = [4, 8] # Soft stop widths; the final width repeats.
+
 # Check once per day and install a newer stable Red release in the background.
 # Running sessions keep their version until restarted. Set mode to "notify" to
 # only announce new releases, or "off" to disable automatic checks; :update

@@ -5,6 +5,46 @@ extension and shebang detection, comment templates, indentation, and language-se
 routing. Definitions can live in your configuration or in an installable
 external plugin package.
 
+## Configure tabs and indentation
+
+Set options in `~/.config/red/config.toml`. Place global settings before any
+table headers. Override individual settings under `[languages.<id>]`.
+
+```toml
+tabstop = 8
+shiftwidth = 4
+softtabstop = -1
+expandtab = true
+
+[languages.go]
+expandtab = false
+```
+
+| Option | Behavior |
+| --- | --- |
+| `tabstop` | Distance between hard tab stops. An existing tab advances to the next stop measured from the start of its line. |
+| `shiftwidth` | Columns per indentation level. Zero follows the hard tab width. |
+| `softtabstop` | Insert-mode Tab and Backspace step. A negative value follows `shiftwidth`. Zero uses hard stops for Tab and deletes a single character on Backspace. |
+| `expandtab` | Generate spaces when true. When false, use tabs where they fit and spaces to reach the exact column. |
+| `smarttab` | Use `shiftwidth` for Tab and Backspace in leading whitespace. |
+| `shiftround` | Round shifts to indentation boundaries. |
+| `copyindent` | Preserve the source line's tabs and spaces when copying indentation onto a new line. |
+| `preserveindent` | Retain existing leading whitespace where it fits when changing indentation. |
+| `vartabstop` | Override uniform hard stops with a list of positive widths. For example, `[4, 8]` stops at offsets 4, 12, 20, and so on. |
+| `varsofttabstop` | Override uniform soft stops with a list of positive widths. The last width repeats and an empty list restores uniform stops. |
+
+Positive widths can be up to 9999 columns. Red starts with its existing language
+defaults and spaces enabled. A language's
+legacy `indent_width` supplies the baseline for all three widths. Explicit
+global options override that baseline, and explicit per-language options take
+precedence over global options. An override containing only these tab options
+inherits the rest of an installed language pack's definition.
+
+Use `red -c languages.rust.tabstop=8 src/main.rs` to override a value for one
+invocation. Use `:languages reload` to apply config changes to open buffers.
+LSP formatters receive the effective shift width at the start of the line and
+the `expandtab` value.
+
 ## Add a language in your configuration
 
 Add a table to `~/.config/red/config.toml`:

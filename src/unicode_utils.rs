@@ -11,6 +11,7 @@
 //! fail only for combining marks, CJK text, or emoji, so callers should never rely on
 //! coincident numeric values.
 
+use crate::tab_stops::TabStops;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
 use unicode_width::UnicodeWidthStr;
@@ -65,7 +66,7 @@ pub(crate) fn delete_last_word(text: &mut String) {
 }
 
 /// Calculate terminal display width while expanding tabs to the next tab stop.
-pub fn display_width_with_tabs(s: &str, tab_width: usize) -> usize {
+pub fn display_width_with_tabs(s: &str, tab_width: impl Into<TabStops>) -> usize {
     display_width_with_tabs_from_column(s, 0, tab_width)
 }
 
@@ -91,16 +92,16 @@ pub fn is_printable_ascii(s: &str) -> bool {
 pub fn display_width_with_tabs_from_column(
     s: &str,
     start_column: usize,
-    tab_width: usize,
+    tab_width: impl Into<TabStops>,
 ) -> usize {
     if is_printable_ascii(s) {
         return s.len();
     }
-    let tab_width = tab_width.max(1);
+    let tab_width = tab_width.into();
     let mut column = start_column;
     for grapheme in s.graphemes(true) {
         if grapheme == "\t" {
-            column += tab_width - (column % tab_width);
+            column = tab_width.next(column);
         } else if grapheme.chars().all(char::is_control) {
             // Terminal control sequences do not occupy display cells.
         } else {
@@ -384,15 +385,19 @@ pub fn grapheme_to_column(line: &str, grapheme_idx: usize) -> usize {
 }
 
 /// Calculate a grapheme's display column while expanding tabs.
-pub fn grapheme_to_column_with_tabs(line: &str, grapheme_idx: usize, tab_width: usize) -> usize {
+pub fn grapheme_to_column_with_tabs(
+    line: &str,
+    grapheme_idx: usize,
+    tab_width: impl Into<TabStops>,
+) -> usize {
     if let Some(column) = printable_ascii_coordinate(line, grapheme_idx, /*reverse*/ false) {
         return column;
     }
-    let tab_width = tab_width.max(1);
+    let tab_width = tab_width.into();
     let mut column = 0;
     for grapheme in line.graphemes(true).take(grapheme_idx) {
         column += if grapheme == "\t" {
-            tab_width - (column % tab_width)
+            tab_width.advance(column)
         } else {
             display_width(grapheme)
         };
@@ -418,17 +423,21 @@ pub fn column_to_grapheme(line: &str, target_column: usize) -> usize {
 }
 
 /// Find the grapheme containing a display column while expanding tabs.
-pub fn column_to_grapheme_with_tabs(line: &str, target_column: usize, tab_width: usize) -> usize {
+pub fn column_to_grapheme_with_tabs(
+    line: &str,
+    target_column: usize,
+    tab_width: impl Into<TabStops>,
+) -> usize {
     if let Some(grapheme) = printable_ascii_coordinate(line, target_column, /*reverse*/ true) {
         return grapheme;
     }
-    let tab_width = tab_width.max(1);
+    let tab_width = tab_width.into();
     let mut current_column = 0;
     let mut grapheme_count = 0;
 
     for (idx, grapheme) in line.graphemes(true).enumerate() {
         let grapheme_width = if grapheme == "\t" {
-            tab_width - (current_column % tab_width)
+            tab_width.advance(current_column)
         } else {
             display_width(grapheme)
         };

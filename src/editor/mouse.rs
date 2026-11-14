@@ -195,7 +195,7 @@ impl Editor {
         let x = column_to_grapheme_with_tabs(
             trim_line_ending(&line),
             display_col,
-            self.tab_width_for_buffer_index(window.buffer_index),
+            self.tab_stops_for_buffer_index(window.buffer_index),
         );
         Point::new(x, segment.line.min(buffer.last_navigable_line()))
     }

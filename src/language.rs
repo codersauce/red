@@ -50,10 +50,18 @@ pub fn merge_package_languages(
     package_root: &Path,
 ) {
     for (id, definition) in &manifest.languages {
-        if config.languages.contains_key(id) {
+        let user = config.languages.get(id);
+        if user.is_some_and(|user| {
+            let mut other = user.clone();
+            other.indentation = Default::default();
+            other != Default::default() || user.indentation == Default::default()
+        }) {
             continue;
         }
         let mut definition = definition.clone();
+        if let Some(user) = user {
+            definition.indentation = definition.indentation.overlay(&user.indentation);
+        }
         let grammar_path = manifest.grammar_path(package_root, id, &definition);
         if let Some(grammar) = definition.grammar.as_mut() {
             grammar.path = grammar_path;
@@ -388,6 +396,48 @@ fn inspect_native_grammar(path: &Path) -> Result<(PathBuf, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tab_options_override_package_indentation_without_replacing_the_language() {
+        let manifest: PluginPackageManifest = toml::from_str(
+            r#"
+[plugin]
+id = "go"
+name = "Go"
+version = "1.0.0"
+red_api = "*"
+
+[languages.go]
+extensions = ["go"]
+tabstop = 8
+expandtab = false
+
+[languages.go.grammar]
+builtin = "rust"
+
+[languages.go.lsp]
+command = "gopls"
+"#,
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config
+            .languages
+            .insert("go".into(), toml::from_str("shiftwidth = 2").unwrap());
+
+        merge_package_languages(&mut config, &manifest, Path::new("."));
+
+        let go = &config.languages["go"];
+        assert_eq!(go.extensions, ["go"]);
+        assert_eq!(go.lsp.as_ref().unwrap().command.as_deref(), Some("gopls"));
+        assert_eq!(
+            go.grammar.as_ref().unwrap().builtin.as_deref(),
+            Some("rust")
+        );
+        assert_eq!(go.indentation.tabstop, Some(8));
+        assert_eq!(go.indentation.shiftwidth, Some(2));
+        assert_eq!(go.indentation.expandtab, Some(false));
+    }
 
     #[test]
     fn empty_language_lsp_commands_are_quarantined_without_rejecting_valid_languages() {
