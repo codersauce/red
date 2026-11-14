@@ -679,7 +679,7 @@ mod tests {
             // Vimlet resolves a line-end insertion point at the final grapheme.
             let last_start = text
                 .grapheme_indices(true)
-                .last()
+                .next_back()
                 .map_or(0, |(byte, _)| text[..byte].chars().count());
             for cursor in 0..=characters.len() {
                 let normal_cursor = cursor.min(last_start);
