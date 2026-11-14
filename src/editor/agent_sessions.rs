@@ -1,7 +1,9 @@
 //! Editor ownership and callback routing for persisted Agent sessions.
 
 use super::*;
-use crate::codex::{AgentSessionListRequest, AgentSessionPreviewRequest};
+use crate::agent_backend::types::{
+    SessionPage, SessionPreview, SessionPreviewRequest, SessionQuery,
+};
 
 /// Unknown or obsolete tool catalogs must be replaced by a fresh Red thread.
 pub(super) fn session_switch_command(
@@ -16,10 +18,10 @@ pub(super) fn session_switch_command(
     }
 }
 
-pub(super) fn session_result_payload(result: &Result<Value, String>) -> Value {
+pub(super) fn session_result_payload(result: &Result<SessionPage, String>) -> Value {
     match result {
         Ok(value) => {
-            let mut value = value.clone();
+            let mut value = serde_json::to_value(value).expect("agent payloads serialize");
             value["error"] = json!("");
             value
         }
@@ -27,10 +29,10 @@ pub(super) fn session_result_payload(result: &Result<Value, String>) -> Value {
     }
 }
 
-pub(super) fn session_preview_payload(result: &Result<Value, String>) -> Value {
+pub(super) fn session_preview_payload(result: &Result<SessionPreview, String>) -> Value {
     match result {
         Ok(value) => {
-            let mut value = value.clone();
+            let mut value = serde_json::to_value(value).expect("agent payloads serialize");
             value["error"] = json!("");
             value
         }
@@ -43,7 +45,7 @@ impl Editor {
         &mut self,
         runtime: &mut Runtime,
         request_id: RequestId,
-        request: AgentSessionListRequest,
+        request: SessionQuery,
     ) -> anyhow::Result<()> {
         if self.agent_manager.is_task_finished() {
             let _ = self
@@ -83,7 +85,7 @@ impl Editor {
         &mut self,
         runtime: &mut Runtime,
         request_id: RequestId,
-        request: AgentSessionPreviewRequest,
+        request: SessionPreviewRequest,
     ) -> anyhow::Result<()> {
         if self.agent_manager.is_task_finished() {
             let _ = self
@@ -143,9 +145,21 @@ mod tests {
 
     #[test]
     fn session_callback_adds_empty_error_without_renaming_fields() {
-        let payload = session_result_payload(&Ok(json!({
-            "sessions": [{"id": "one", "updated_at": 42, "is_red": true}]
-        })));
+        let payload = session_result_payload(&Ok(SessionPage {
+            sessions: vec![crate::agent_backend::types::SessionSummary {
+                id: "one".into(),
+                cwd: "/workspace".into(),
+                label: "One".into(),
+                detail: String::new(),
+                snippet: String::new(),
+                source: "Red".into(),
+                time_group: "Recent".into(),
+                is_red: true,
+                resumable: true,
+                updated_at: 42,
+            }],
+            more: false,
+        }));
         assert_eq!(payload["sessions"][0]["updated_at"], 42);
         assert_eq!(payload["sessions"][0]["is_red"], true);
         assert_eq!(payload["error"], "");
@@ -153,9 +167,11 @@ mod tests {
 
     #[test]
     fn preview_callback_preserves_the_latest_exchange() {
-        let payload = session_preview_payload(&Ok(json!({
-            "session_id":"one", "prompt":"Question", "response":"Answer"
-        })));
+        let payload = session_preview_payload(&Ok(SessionPreview {
+            session_id: "one".into(),
+            prompt: "Question".into(),
+            response: "Answer".into(),
+        }));
         assert_eq!(payload["prompt"], "Question");
         assert_eq!(payload["response"], "Answer");
         assert_eq!(payload["error"], "");

@@ -34,14 +34,18 @@ use tokio::{
     time::timeout,
 };
 
-mod activity;
+#[cfg(test)]
+pub(crate) mod golden_support;
 mod history;
 mod models;
 mod sessions;
 mod tool_error;
-pub use models::{AgentModelInfo, AgentModelSelection, ModelRequest};
-pub use sessions::{AgentSessionListRequest, AgentSessionPreviewRequest, AgentSessionScope};
+mod translate;
 
+use crate::agent_backend::types::{
+    Activity, ModelInfo, ModelQuery, ModelResult, ModelSelection, RestoredHistory, SessionPage,
+    SessionPreview, SessionQuery,
+};
 use crate::agent_tools::{editor_tool_schemas, EditorToolCall, EditorToolRequest};
 use crate::config::AgentCodexFeature;
 use crate::inline_assist::InlineAssistResult;
@@ -142,19 +146,19 @@ pub enum CodexCommand {
     /// Queries the model catalog or updates one conversation's next-turn settings.
     ModelRequest {
         request_id: i64,
-        request: ModelRequest,
+        request: ModelQuery,
     },
     /// Lists persisted interactive Codex conversations without creating a thread.
     SessionList {
         request_id: i64,
-        request: AgentSessionListRequest,
+        request: SessionQuery,
     },
     /// Reads the latest persisted exchange without resuming or mutating a thread.
     SessionPreview { request_id: i64, session_id: String },
     /// Starts a conversation with an explicitly selected model.
     NewSessionWithModel {
         cwd: PathBuf,
-        selection: AgentModelSelection,
+        selection: ModelSelection,
     },
     /// Starts an isolated, ephemeral inline-edit thread and immediately submits a request.
     InlineAssist {
@@ -249,24 +253,24 @@ pub enum CodexEvent {
     /// Result for a private plugin model request.
     ModelRequestCompleted {
         request_id: i64,
-        result: std::result::Result<Value, String>,
+        result: std::result::Result<ModelResult, String>,
     },
     /// Result for Red's private persisted-session picker request.
     SessionListCompleted {
         request_id: i64,
-        result: std::result::Result<Value, String>,
+        result: std::result::Result<SessionPage, String>,
     },
     /// Side-effect-free latest-exchange preview for the session picker.
     SessionPreviewCompleted {
         request_id: i64,
-        result: std::result::Result<Value, String>,
+        result: std::result::Result<SessionPreview, String>,
     },
     /// A running turn was routed to a different model without changing its next-turn settings.
     SessionModelRerouted { session_id: String, model: String },
     /// Authoritative next-turn settings for a user-visible conversation.
     SessionModelChanged {
         session_id: String,
-        model_info: AgentModelInfo,
+        model_info: ModelInfo,
     },
     /// User-visible prose from an inline turn, retained separately from its result.
     InlineAnswerDelta { request_id: String, text: String },
@@ -316,8 +320,8 @@ pub enum CodexEvent {
     SessionRestored {
         /// Codex thread identifier.
         session_id: String,
-        /// Thread payload returned by `thread/resume`.
-        thread: Value,
+        /// Model-visible history of the rejoined thread.
+        thread: RestoredHistory,
     },
     /// A persisted thread could not be rejoined.
     SessionRestoreFailed {
@@ -344,8 +348,8 @@ pub enum CodexEvent {
     Activity {
         /// Owning session.
         session_id: String,
-        /// Bounded app-server update payload.
-        update: Value,
+        /// Bounded, human-readable progress for one step of the turn.
+        update: Activity,
     },
     /// Active turn reached a terminal success state.
     Completed {
@@ -481,7 +485,7 @@ pub trait CodexToolHost: Send + 'static {
 
 #[derive(Debug)]
 struct Session {
-    model_info: Option<AgentModelInfo>,
+    model_info: Option<ModelInfo>,
     cwd: PathBuf,
     active_turn: Option<String>,
     pending_interrupt_turn_id: Option<String>,
@@ -508,7 +512,7 @@ enum SessionKind {
 #[derive(Debug)]
 enum ThreadRequest {
     Agent {
-        selection: Option<AgentModelSelection>,
+        selection: Option<ModelSelection>,
         cwd: PathBuf,
         launch: SessionLaunch,
     },
@@ -579,7 +583,7 @@ enum Pending {
         source_session_id: String,
         session_id: String,
         source_thread: Value,
-        model_info: Option<AgentModelInfo>,
+        model_info: Option<ModelInfo>,
     },
     Config {
         request: ThreadRequest,
@@ -1420,7 +1424,7 @@ async fn handle_message<H: CodexToolHost>(
                 && matches!(session.kind, SessionKind::Agent)
         }) {
             if let Some(update) =
-                activity::item_update(&params["item"], method == "item/completed", &session.cwd)
+                translate::activity(&params["item"], method == "item/completed", &session.cwd)
             {
                 events
                     .send(CodexEvent::Activity {
@@ -1627,7 +1631,7 @@ async fn handle_response(
         session_id,
     } = request
     {
-        let result = sessions::session_preview(&session_id, &message);
+        let result = translate::session_preview(&session_id, &message);
         events
             .send(CodexEvent::SessionPreviewCompleted { request_id, result })
             .await
@@ -1707,7 +1711,7 @@ async fn handle_response(
         events
             .send(CodexEvent::SessionRestored {
                 session_id: session_id.clone(),
-                thread: source_thread,
+                thread: translate::restored_history(&source_thread),
             })
             .await
             .ok();
@@ -1954,7 +1958,7 @@ async fn handle_response(
                 sessions.insert(
                     session_id.clone(),
                     Session {
-                        model_info: AgentModelInfo::from_response(&message["result"]),
+                        model_info: translate::model_info(&message["result"]),
                         cwd,
                         active_turn: None,
                         pending_interrupt_turn_id: None,
@@ -1992,7 +1996,10 @@ async fn handle_response(
                             .is_some_and(|turns| !turns.is_empty())
                         {
                             events
-                                .send(CodexEvent::SessionRestored { session_id, thread })
+                                .send(CodexEvent::SessionRestored {
+                                    session_id,
+                                    thread: translate::restored_history(&thread),
+                                })
                                 .await
                                 .ok();
                         } else {
@@ -2016,7 +2023,7 @@ async fn handle_response(
                             events
                                 .send(CodexEvent::SessionRestored {
                                     session_id,
-                                    thread: source_thread,
+                                    thread: translate::restored_history(&source_thread),
                                 })
                                 .await
                                 .ok();
@@ -3333,7 +3340,7 @@ mod tests {
                 panic!("expected activity")
             };
             assert_eq!(session_id, "agent");
-            assert_eq!(update["status"], expected);
+            assert_eq!(serde_json::to_value(update).unwrap()["status"], expected);
         }
         assert!(received.try_recv().is_err());
     }

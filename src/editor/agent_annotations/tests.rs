@@ -176,26 +176,23 @@ async fn resumed_annotation_links_reopen_source_files_with_their_original_ids() 
     std::fs::write(&annotated, "first\nsecond\n").unwrap();
     let mut editor = fixture(root.path());
     let id = Uuid::new_v4();
-    let output = json!({
-        "ok": true,
-        "path": "annotated.rs",
-        "annotations": [{
-            "id": id.to_string(),
-            "href": format!("red://annotation/{id}"),
-            "start_line": 1,
-            "end_line": 1,
-            "message": "Recovered annotation"
-        }]
-    });
-    let thread = json!({"turns": [{"id": "restored-turn", "items": [{
-        "id": "annotation-call",
-        "type": "dynamicToolCall",
-        "tool": "add_annotations",
-        "arguments": {"path": "annotated.rs", "expected_revision": 0},
-        "status": "completed",
-        "success": true,
-        "contentItems": [{"type": "inputText", "text": output.to_string()}]
-    }]}]});
+    let thread = crate::agent_backend::types::RestoredHistory {
+        truncated: false,
+        turns: vec![crate::agent_backend::types::RestoredTurn {
+            id: Some("restored-turn".into()),
+            items: vec![crate::agent_backend::types::RestoredItem::Annotations(
+                crate::agent_backend::types::AnnotationChange::Added {
+                    path: Some("annotated.rs".into()),
+                    annotations: vec![crate::agent_backend::types::AnnotationDraft {
+                        id: id.to_string(),
+                        start_line: Some(1),
+                        end_line: Some(1),
+                        message: Some("Recovered annotation".into()),
+                    }],
+                },
+            )],
+        }],
+    };
 
     editor
         .agent_manager

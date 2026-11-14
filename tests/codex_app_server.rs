@@ -7,6 +7,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use red::agent_backend::types::RestoredItem;
 use red::{
     agent_tools::EditorToolRequest,
     codex::{start_codex, CodexCommand, CodexEvent, CodexProcessSpec, CodexToolHost},
@@ -334,7 +335,7 @@ for line in sys.stdin:
 
 #[tokio::test]
 async fn direct_app_server_lists_searches_and_continues_sessions_for_red() {
-    use red::codex::{AgentSessionListRequest, AgentSessionScope};
+    use red::agent_backend::types::{SessionQuery, SessionScope};
 
     let _serial = MOCK_CODEX_TEST_LOCK.lock().await;
     let directory = tempfile::tempdir().unwrap();
@@ -353,9 +354,9 @@ async fn direct_app_server_lists_searches_and_continues_sessions_for_red() {
     bridge
         .send(CodexCommand::SessionList {
             request_id: 41,
-            request: AgentSessionListRequest {
+            request: SessionQuery {
                 cwd: std::path::PathBuf::from("/workspace"),
-                scope: AgentSessionScope::Red,
+                scope: SessionScope::Red,
                 query: String::new(),
                 exclude_session_id: Some("current".into()),
                 search_contents: false,
@@ -368,6 +369,7 @@ async fn direct_app_server_lists_searches_and_continues_sessions_for_red() {
             request_id: 41,
             result: Ok(result),
         } => {
+            let result = serde_json::to_value(result).unwrap();
             let ids = result["sessions"]
                 .as_array()
                 .unwrap()
@@ -387,9 +389,9 @@ async fn direct_app_server_lists_searches_and_continues_sessions_for_red() {
     bridge
         .send(CodexCommand::SessionList {
             request_id: 42,
-            request: AgentSessionListRequest {
+            request: SessionQuery {
                 cwd: std::path::PathBuf::from("/workspace"),
-                scope: AgentSessionScope::Workspace,
+                scope: SessionScope::Workspace,
                 query: "NEEDLE".into(),
                 exclude_session_id: None,
                 search_contents: false,
@@ -402,6 +404,7 @@ async fn direct_app_server_lists_searches_and_continues_sessions_for_red() {
             request_id: 42,
             result: Ok(result),
         } => {
+            let result = serde_json::to_value(result).unwrap();
             // Titles match quickly and ignoring case, without a text search.
             assert_eq!(result["sessions"].as_array().unwrap().len(), 1);
             assert_eq!(result["sessions"][0]["id"], "needle-title");
@@ -414,9 +417,9 @@ async fn direct_app_server_lists_searches_and_continues_sessions_for_red() {
     bridge
         .send(CodexCommand::SessionList {
             request_id: 47,
-            request: AgentSessionListRequest {
+            request: SessionQuery {
                 cwd: std::path::PathBuf::from("/workspace"),
-                scope: AgentSessionScope::Workspace,
+                scope: SessionScope::Workspace,
                 query: "NEEDLE".into(),
                 exclude_session_id: None,
                 search_contents: true,
@@ -429,6 +432,7 @@ async fn direct_app_server_lists_searches_and_continues_sessions_for_red() {
             request_id: 47,
             result: Ok(result),
         } => {
+            let result = serde_json::to_value(result).unwrap();
             assert_eq!(result["sessions"].as_array().unwrap().len(), 2);
             assert_eq!(result["sessions"][0]["id"], "needle-title");
             assert_eq!(result["sessions"][0]["snippet"], "the needle itself");
@@ -441,9 +445,9 @@ async fn direct_app_server_lists_searches_and_continues_sessions_for_red() {
     bridge
         .send(CodexCommand::SessionList {
             request_id: 46,
-            request: AgentSessionListRequest {
+            request: SessionQuery {
                 cwd: std::path::PathBuf::from("/workspace"),
-                scope: AgentSessionScope::All,
+                scope: SessionScope::All,
                 query: "many".into(),
                 exclude_session_id: None,
                 // Titles fill the list, but the text search still runs.
@@ -457,6 +461,7 @@ async fn direct_app_server_lists_searches_and_continues_sessions_for_red() {
             request_id: 46,
             result: Ok(result),
         } => {
+            let result = serde_json::to_value(result).unwrap();
             assert_eq!(result["sessions"].as_array().unwrap().len(), 200);
             assert_eq!(result["sessions"][0]["id"], "many-in-text");
             assert_eq!(result["sessions"][1]["id"], "many-0");
@@ -477,6 +482,7 @@ async fn direct_app_server_lists_searches_and_continues_sessions_for_red() {
             request_id: 43,
             result: Ok(result),
         } => {
+            let result = serde_json::to_value(result).unwrap();
             assert_eq!(result["session_id"], "foreign");
             assert_eq!(result["prompt"], "Later question");
             assert_eq!(result["response"], "Later answer");
@@ -512,7 +518,7 @@ async fn direct_app_server_lists_searches_and_continues_sessions_for_red() {
         CodexEvent::SessionPreviewCompleted {
             request_id: 45,
             result: Ok(result),
-        } => assert_eq!(result["response"], "Earlier answer"),
+        } => assert_eq!(result.response, "Earlier answer"),
         event => panic!("unexpected legacy preview: {event:?}"),
     }
 
@@ -909,11 +915,14 @@ async fn resume_persisted_thread(legacy: bool) {
     match event {
         CodexEvent::SessionRestored { session_id, thread } => {
             assert_eq!(session_id, "thread-red");
-            assert_eq!(thread["turns"].as_array().unwrap().len(), 1);
-            assert_eq!(thread["turns"][0]["items"][1]["text"], "earlier answer");
+            assert_eq!(thread.turns.len(), 1);
+            assert!(matches!(
+                &thread.turns[0].items[1],
+                RestoredItem::Agent { text, .. } if text == "earlier answer"
+            ));
             // Summaries drop the tool calls that carry annotations, so the
             // paged fallback must not claim a complete history.
-            assert_eq!(thread.get("historyTruncated").is_some(), !legacy);
+            assert_eq!(thread.truncated, !legacy);
         }
         other => panic!("expected restored session, got {other:?}"),
     }
@@ -1128,7 +1137,7 @@ for line in sys.stdin:
 
 #[tokio::test]
 async fn direct_app_server_lists_and_changes_conversation_models() {
-    use red::codex::{AgentModelSelection, ModelRequest};
+    use red::agent_backend::types::{ModelQuery, ModelSelection};
     let _serial = MOCK_CODEX_TEST_LOCK.lock().await;
     let directory = tempfile::tempdir().unwrap();
     let host = RecordingHost {
@@ -1143,7 +1152,7 @@ async fn direct_app_server_lists_and_changes_conversation_models() {
     bridge
         .send(CodexCommand::ModelRequest {
             request_id: 1,
-            request: ModelRequest::List,
+            request: ModelQuery::List,
         })
         .await
         .unwrap();
@@ -1152,6 +1161,7 @@ async fn direct_app_server_lists_and_changes_conversation_models() {
             request_id: 1,
             result: Ok(result),
         } => {
+            let result = serde_json::to_value(result).unwrap();
             assert_eq!(
                 result["models"]
                     .as_array()
@@ -1167,7 +1177,7 @@ async fn direct_app_server_lists_and_changes_conversation_models() {
     bridge
         .send(CodexCommand::NewSessionWithModel {
             cwd: directory.path().to_path_buf(),
-            selection: AgentModelSelection {
+            selection: ModelSelection {
                 model: "first".into(),
                 effort: Some("high".into()),
             },
@@ -1190,9 +1200,9 @@ async fn direct_app_server_lists_and_changes_conversation_models() {
     bridge
         .send(CodexCommand::ModelRequest {
             request_id: 2,
-            request: ModelRequest::Set {
+            request: ModelQuery::Set {
                 session_id: "model-thread".into(),
-                selection: AgentModelSelection {
+                selection: ModelSelection {
                     model: "second".into(),
                     effort: Some("low".into()),
                 },
@@ -1216,9 +1226,9 @@ async fn direct_app_server_lists_and_changes_conversation_models() {
     bridge
         .send(CodexCommand::ModelRequest {
             request_id: 3,
-            request: ModelRequest::Set {
+            request: ModelQuery::Set {
                 session_id: "model-thread".into(),
-                selection: AgentModelSelection {
+                selection: ModelSelection {
                     model: "rejected".into(),
                     effort: Some("low".into()),
                 },
@@ -1249,7 +1259,7 @@ async fn direct_app_server_lists_and_changes_conversation_models() {
 
 #[tokio::test]
 async fn direct_app_server_previews_workspace_model_without_creating_a_thread() {
-    use red::codex::ModelRequest;
+    use red::agent_backend::types::ModelQuery;
     let _serial = MOCK_CODEX_TEST_LOCK.lock().await;
     let directory = tempfile::tempdir().unwrap();
     let executable = directory.path().join("codex-default-model");
@@ -1303,7 +1313,7 @@ for line in sys.stdin:
         bridge
             .send(CodexCommand::ModelRequest {
                 request_id,
-                request: ModelRequest::ReadDefault {
+                request: ModelQuery::ReadDefault {
                     cwd: directory.path().join(mode),
                 },
             })
@@ -1314,6 +1324,7 @@ for line in sys.stdin:
                 request_id: actual,
                 result: Ok(result),
             } => {
+                let result = serde_json::to_value(result).unwrap();
                 assert_eq!(actual, request_id);
                 assert_eq!(
                     result["model_info"],
@@ -1327,7 +1338,7 @@ for line in sys.stdin:
         bridge
             .send(CodexCommand::ModelRequest {
                 request_id: 4,
-                request: ModelRequest::ReadDefault {
+                request: ModelQuery::ReadDefault {
                     cwd: directory.path().join(mode),
                 },
             })

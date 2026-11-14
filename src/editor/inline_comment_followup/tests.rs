@@ -384,14 +384,14 @@ async fn ask_agent_opens_the_composer_without_sending_or_creating_history() {
     assert!(matches!(
         worker.recv().await,
         Some(crate::codex::CodexCommand::ModelRequest {
-            request: crate::codex::ModelRequest::List,
+            request: crate::agent_backend::types::ModelQuery::List,
             ..
         })
     ));
     assert!(matches!(
         worker.recv().await,
         Some(crate::codex::CodexCommand::ModelRequest {
-            request: crate::codex::ModelRequest::ReadDefault { .. },
+            request: crate::agent_backend::types::ModelQuery::ReadDefault { .. },
             ..
         })
     ));

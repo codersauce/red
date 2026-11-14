@@ -2297,13 +2297,13 @@ impl RedHost {
             },
             "AgentReadDefaultModel" => PluginRequest::AgentModelRequest {
                 request_id,
-                request: crate::codex::ModelRequest::ReadDefault {
+                request: crate::agent_backend::types::ModelQuery::ReadDefault {
                     cwd: crate::utils::get_workspace_path(),
                 },
             },
             "AgentListModels" => PluginRequest::AgentModelRequest {
                 request_id,
-                request: crate::codex::ModelRequest::List,
+                request: crate::agent_backend::types::ModelQuery::List,
             },
             "AgentListSessions" => {
                 let cwd = args
@@ -2311,9 +2311,9 @@ impl RedHost {
                     .and_then(Value::as_str)
                     .map_or_else(|| PathBuf::from("."), PathBuf::from);
                 let scope = match args.get(1).and_then(Value::as_str).unwrap_or("red") {
-                    "red" => crate::codex::AgentSessionScope::Red,
-                    "workspace" => crate::codex::AgentSessionScope::Workspace,
-                    "all" => crate::codex::AgentSessionScope::All,
+                    "red" => crate::agent_backend::types::SessionScope::Red,
+                    "workspace" => crate::agent_backend::types::SessionScope::Workspace,
+                    "all" => crate::agent_backend::types::SessionScope::All,
                     value => anyhow::bail!("unknown Agent session scope `{value}`"),
                 };
                 let query = args.get(2).map(value_to_string).unwrap_or_default();
@@ -2325,7 +2325,7 @@ impl RedHost {
                     .map(str::to_string);
                 PluginRequest::AgentSessionRequest {
                     request_id,
-                    request: crate::codex::AgentSessionListRequest {
+                    request: crate::agent_backend::types::SessionQuery {
                         cwd,
                         scope,
                         query,
@@ -2349,7 +2349,7 @@ impl RedHost {
                     .to_string();
                 PluginRequest::AgentSessionPreview {
                     request_id,
-                    request: crate::codex::AgentSessionPreviewRequest { cwd, session_id },
+                    request: crate::agent_backend::types::SessionPreviewRequest { cwd, session_id },
                 }
             }
             "AgentSetModel" => {
@@ -2364,7 +2364,7 @@ impl RedHost {
                     .ok_or_else(|| anyhow::anyhow!("AgentSetModel requires a model selection"))?;
                 PluginRequest::AgentModelRequest {
                     request_id,
-                    request: crate::codex::ModelRequest::Set {
+                    request: crate::agent_backend::types::ModelQuery::Set {
                         session_id,
                         selection: serde_json::from_value(selection)?,
                     },
@@ -5422,8 +5422,8 @@ mod tests {
                 }
                 PluginRequest::AgentModelRequest {
                     request:
-                        crate::codex::ModelRequest::ReadDefault { .. }
-                        | crate::codex::ModelRequest::List,
+                        crate::agent_backend::types::ModelQuery::ReadDefault { .. }
+                        | crate::agent_backend::types::ModelQuery::List,
                     ..
                 } => {}
                 PluginRequest::UpdateTextPanel { id, blocks } => {
@@ -9793,7 +9793,10 @@ mod tests {
                 request,
             } => {
                 assert_eq!(request.cwd, PathBuf::from("/workspace"));
-                assert_eq!(request.scope, crate::codex::AgentSessionScope::Red);
+                assert_eq!(
+                    request.scope,
+                    crate::agent_backend::types::SessionScope::Red
+                );
                 assert!(request.query.is_empty());
                 request_id
             }
@@ -9843,7 +9846,10 @@ mod tests {
                 request_id,
                 request,
             } => {
-                assert_eq!(request.scope, crate::codex::AgentSessionScope::Red);
+                assert_eq!(
+                    request.scope,
+                    crate::agent_backend::types::SessionScope::Red
+                );
                 assert_eq!(request.query, "needle");
                 request_id
             }
@@ -9929,7 +9935,10 @@ mod tests {
                 request_id,
                 request,
             } => {
-                assert_eq!(request.scope, crate::codex::AgentSessionScope::Workspace);
+                assert_eq!(
+                    request.scope,
+                    crate::agent_backend::types::SessionScope::Workspace
+                );
                 assert_eq!(request.query, "needle");
                 request_id
             }
@@ -10210,7 +10219,10 @@ mod tests {
                 request,
             } => {
                 assert_eq!(request.cwd, PathBuf::from("/other"));
-                assert_eq!(request.scope, crate::codex::AgentSessionScope::Red);
+                assert_eq!(
+                    request.scope,
+                    crate::agent_backend::types::SessionScope::Red
+                );
                 assert!(request.query.is_empty());
                 request_id
             }
@@ -10282,7 +10294,10 @@ mod tests {
                 request_id,
                 request,
             } => {
-                assert_eq!(request.scope, crate::codex::AgentSessionScope::Workspace);
+                assert_eq!(
+                    request.scope,
+                    crate::agent_backend::types::SessionScope::Workspace
+                );
                 assert_eq!(request.query, "needle");
                 request_id
             }
@@ -12564,7 +12579,7 @@ mod tests {
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::AgentModelRequest {
                 request_id,
-                request: crate::codex::ModelRequest::ReadDefault { cwd },
+                request: crate::agent_backend::types::ModelQuery::ReadDefault { cwd },
             } => {
                 assert_eq!(cwd, crate::utils::get_workspace_path());
                 request_id
@@ -12680,7 +12695,7 @@ mod tests {
         let request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::AgentModelRequest {
                 request_id,
-                request: crate::codex::ModelRequest::Set { session_id, .. },
+                request: crate::agent_backend::types::ModelQuery::Set { session_id, .. },
             } => {
                 assert!(session_id.is_empty());
                 request_id
@@ -12764,7 +12779,7 @@ mod tests {
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::AgentModelRequest {
                 request_id,
-                request: crate::codex::ModelRequest::List,
+                request: crate::agent_backend::types::ModelQuery::List,
             } => request_id,
             _ => panic!("expected model catalog request"),
         }
@@ -13029,7 +13044,7 @@ mod tests {
             PluginRequest::AgentModelRequest {
                 request_id,
                 request:
-                    crate::codex::ModelRequest::Set {
+                    crate::agent_backend::types::ModelQuery::Set {
                         session_id,
                         selection,
                     },
@@ -13094,7 +13109,7 @@ mod tests {
         let request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::AgentModelRequest {
                 request_id,
-                request: crate::codex::ModelRequest::Set { session_id, .. },
+                request: crate::agent_backend::types::ModelQuery::Set { session_id, .. },
             } => {
                 assert!(session_id.is_empty());
                 request_id
