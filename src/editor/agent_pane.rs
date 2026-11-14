@@ -432,6 +432,9 @@ impl AgentPaneLifecycle {
         self.stop_failed = false;
         if let Some(prompt) = retry {
             self.retry_tail = Some(std::mem::take(&mut self.in_flight_tail));
+            // Resend what was dispatched, not the label the pane shows.
+            self.wire_overrides
+                .insert(prompt.id.clone(), std::mem::take(&mut self.in_flight_wire));
             self.queue.push_front(prompt);
             self.paused = false;
             return self.advance();
@@ -1290,6 +1293,20 @@ mod tests {
         let wire = dispatched(&pane.restored("s1"));
         assert!(wire[0].starts_with("Codex stopped unexpectedly"));
         assert!(wire[0].contains("Continue from where you stopped"));
+    }
+
+    #[test]
+    fn a_continue_lost_before_codex_saw_it_is_resent_in_full() {
+        let mut pane = crashed_mid_turn();
+        pane.resolve_interruption(AgentInterruptionChoice::Continue, "");
+        let first = dispatched(&pane.restored("s1"));
+        assert!(first[0].starts_with("Codex stopped unexpectedly"));
+        assert_eq!(pane.session_lost(true), [AgentPaneEffect::StartSession]);
+        let retry = dispatched(&pane.session_created("s2"));
+        assert!(
+            retry[0].ends_with(&first[0]),
+            "the retry must carry the full instruction: {retry:?}"
+        );
     }
 
     #[test]
