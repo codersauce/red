@@ -261,7 +261,7 @@ impl Editor {
         self.keyboard_shortcuts = None;
         self.mode = Mode::Normal;
         self.waiting_key_action = None;
-        self.command.clear();
+        self.command = Default::default();
         if let Some(panel) = session.original_panel_focus {
             self.panel_manager.restore_panel_focus(&panel);
         }

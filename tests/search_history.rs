@@ -248,3 +248,32 @@ async fn submitted_searches_persist_but_cancelled_and_empty_drafts_do_not() {
         assert_eq!(reopened.commandline_text(), expected);
     }
 }
+
+#[tokio::test]
+async fn middle_of_line_search_edits_preview_and_cancel_restore_origin() {
+    let mut harness = with_history("zero\nalpha\nbeta", &[]);
+    start(&mut harness, '/').await;
+    paste(&mut harness, "alha").await;
+    key(&mut harness, KeyCode::Left).await;
+    key(&mut harness, KeyCode::Left).await;
+    key(&mut harness, KeyCode::Char('p')).await;
+    assert_eq!(harness.commandline_text(), "alpha");
+    harness.assert_cursor_at(0, 1);
+    key(&mut harness, KeyCode::Esc).await;
+    harness.assert_cursor_at(0, 0);
+    harness.assert_mode(Mode::Normal);
+}
+
+#[tokio::test]
+async fn command_caret_edits_the_draft_and_escape_preserves_the_buffer() {
+    let mut harness = with_history("original", &[]);
+    key(&mut harness, KeyCode::Char(':')).await;
+    paste(&mut harness, "ab界").await;
+    key(&mut harness, KeyCode::Left).await;
+    key(&mut harness, KeyCode::Char('X')).await;
+    assert_eq!(harness.commandline_text(), "abX界");
+    assert_eq!(harness.render_cursor_position(), Some((4, 23)));
+    key(&mut harness, KeyCode::Esc).await;
+    harness.assert_mode(Mode::Normal);
+    harness.assert_buffer_contents("original");
+}

@@ -3335,7 +3335,7 @@ impl Editor {
         let pattern = self
             .active_search
             .as_ref()
-            .map(|search| search.draft.as_str())
+            .map(|search| search.draft.text())
             .filter(|draft| !draft.is_empty())
             .or_else(|| {
                 (self.config.search.hlsearch
@@ -4254,7 +4254,7 @@ impl Editor {
         let pattern = self
             .active_search
             .as_ref()
-            .map(|search| search.draft.as_str())
+            .map(|search| search.draft.text())
             .filter(|pattern| !pattern.is_empty())
             .or_else(|| (!self.search_term.is_empty()).then_some(self.search_term.as_str()))?
             .to_string();
@@ -4449,16 +4449,7 @@ impl Editor {
             return;
         }
 
-        let text = if self.is_command() {
-            &self.command
-        } else {
-            self.active_search_text().unwrap_or(&self.search_term)
-        };
-        let prefix = if self.is_command() {
-            ":"
-        } else {
-            self.search_commandline_prefix()
-        };
+        let (prefix, text, _) = self.prompt_view();
         let cmdline = format!("{}{}", prefix, text);
         buffer.set_text(0, y, &cmdline, &style);
         let badge = notification_badge(self.notifications.counts(Instant::now()), width, false);
@@ -4548,7 +4539,7 @@ impl Editor {
 
         if self.has_term() {
             Some((
-                display_width(self.term()) + 1,
+                self.prompt_view().2,
                 (self.size.1 as usize).saturating_sub(1),
             ))
         } else {

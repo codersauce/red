@@ -236,6 +236,18 @@ pub(crate) fn modal_key(key: KeyEvent) -> Option<vimlet::Key> {
     })
 }
 
+pub(crate) fn prompt_key(event: &crossterm::event::Event) -> Option<vimlet::Key> {
+    use crossterm::event::{Event, KeyEventKind};
+    match event {
+        Event::Paste(text) => Some(vimlet::Key::Text(text.clone())),
+        Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
+            KeyCode::BackTab => Some(vimlet::Key::Named("BackTab".into())),
+            _ => modal_key(*key),
+        },
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

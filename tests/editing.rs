@@ -2250,7 +2250,9 @@ async fn operator_search_dot_reuses_the_query_from_the_change() {
         Buffer::new(None, "abcEND defEND zz".into()),
         default_key_config(),
     );
-    type_normal_keys(&mut harness, "c/END").await;
+    type_normal_keys(&mut harness, "c/ED").await;
+    command_key(&mut harness, KeyCode::Left).await;
+    type_normal_keys(&mut harness, "N").await;
     command_key(&mut harness, KeyCode::Enter).await;
     type_normal_keys(&mut harness, "X").await;
     command_key(&mut harness, KeyCode::Esc).await;

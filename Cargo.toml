@@ -140,7 +140,7 @@ unicode-linebreak = "0.1"
 unicode-segmentation = "1.12.0"
 unicode-width = "0.2"
 uuid = { version = "1.12.0", features = ["v4", "v5"] }
-vimlet = { version = "0.2", features = ["ropey"] }
+vimlet = { version = "0.2.1", features = ["ropey"] }
 
 [dev-dependencies]
 base64 = "0.22.1"

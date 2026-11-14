@@ -4288,9 +4288,9 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vimlet"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "129dbe9ec13660f7626eb1c7f32d2dde8f092b8234a77852b7c1a2813dfccf7b"
+checksum = "728b23a6d9c7338b710a0a09911b37b4a645cf5ad769c9ff9f515700a77fadb2"
 dependencies = [
  "ropey",
  "unicode-segmentation",

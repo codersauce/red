@@ -6,7 +6,7 @@
 //! [`Component::is_sensitive_input`] so
 //! performance traces do not include their contents.
 
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::Event;
 
 use crate::{
     config::KeyAction,
@@ -14,12 +14,14 @@ use crate::{
     keyboard::is_word_backspace,
     plugin::ComposerHandle,
     theme::{Style, Theme},
-    unicode_utils::{display_width, grapheme_len, grapheme_to_byte, truncate_display_width},
+    unicode_utils::{display_width, grapheme_len, truncate_display_width},
 };
 
 use super::{
     dialog::{BorderStyle, Dialog, SurfaceRole},
-    first_prompt_line, Component, PromptBuffer,
+    first_prompt_line,
+    prompt_buffer::PROMPT_MAX_BYTES,
+    Component,
 };
 
 type SubmitAction = Box<dyn Fn(String) -> Action + Send>;
@@ -28,7 +30,7 @@ type SubmitAction = Box<dyn Fn(String) -> Action + Send>;
 /// replacement is one keystroke, while cursor motion and paste remain Unicode-safe.
 pub struct InputPrompt {
     dialog: Dialog,
-    prompt: PromptBuffer,
+    prompt: vimlet::CommandLine,
     selected: bool,
     masked: bool,
     submit: SubmitAction,
@@ -45,9 +47,11 @@ impl InputPrompt {
         submit: impl Fn(String) -> Action + Send + 'static,
     ) -> Self {
         let title = title.into();
-        let value = initial.into();
+        let mut value = first_prompt_line(&initial.into());
+        value.truncate(value.floor_char_boundary(PROMPT_MAX_BYTES.min(value.len())));
         let selected = !value.is_empty();
-        let prompt = PromptBuffer::new(&value);
+        let prompt = vimlet::CommandLine::new(vimlet::PromptKind::Field, value)
+            .expect("single-line initial value");
         let width = editor.vwidth().saturating_sub(2).clamp(1, 60);
         let x = editor.vwidth().saturating_sub(width + 2) / 2;
         let y = editor.vheight().saturating_sub(3) / 2;
@@ -100,15 +104,6 @@ impl InputPrompt {
         prompt.callback_handle = Some(handle);
         prompt
     }
-
-    fn insert(&mut self, text: &str) {
-        let text = first_prompt_line(text);
-        if self.selected {
-            self.prompt.clear();
-            self.selected = false;
-        }
-        self.prompt.insert(&text);
-    }
 }
 
 impl Component for InputPrompt {
@@ -132,6 +127,10 @@ impl Component for InputPrompt {
         actions
     }
 
+    fn is_sensitive_input(&self) -> bool {
+        self.masked
+    }
+
     fn composer_handle(&self) -> Option<ComposerHandle> {
         self.callback_handle
     }
@@ -153,9 +152,9 @@ impl Component for InputPrompt {
         self.dialog.draw(buffer)?;
         let text = self.prompt.text();
         let visible = if self.masked {
-            "*".repeat(grapheme_len(&text).min(self.dialog.width))
+            "*".repeat(grapheme_len(text).min(self.dialog.width))
         } else {
-            truncate_display_width(&text, self.dialog.width)
+            truncate_display_width(text, self.dialog.width)
         };
         let style = if self.selected {
             self.theme.selected_style(
@@ -171,93 +170,71 @@ impl Component for InputPrompt {
     }
 
     fn handle_event(&mut self, ev: &Event) -> Option<KeyAction> {
-        if matches!(ev, Event::Key(key) if key.kind == KeyEventKind::Release) {
-            return None;
+        use vimlet::{Key, PromptKind, PromptOutcome};
+        let key = match ev {
+            Event::Key(key)
+                if key.kind != crossterm::event::KeyEventKind::Release
+                    && is_word_backspace(*key) =>
+            {
+                Key::Ctrl('w')
+            }
+            _ => match crate::keyboard::prompt_key(ev)? {
+                Key::Ctrl('a') => Key::Home,
+                Key::Text(text) => Key::Text(first_prompt_line(&text)),
+                key => key,
+            },
+        };
+        let inserted_len = match &key {
+            Key::Text(text) => text.len(),
+            Key::Char(ch) if !ch.is_control() => ch.len_utf8(),
+            _ => 0,
+        };
+        if inserted_len
+            > PROMPT_MAX_BYTES.saturating_sub(if self.selected {
+                0
+            } else {
+                self.prompt.text().len()
+            })
+        {
+            return Some(KeyAction::Single(Action::Refresh));
         }
-        match ev {
-            Event::Paste(text) => {
-                self.insert(text);
+        if self.selected
+            && (inserted_len > 0 || matches!(key, Key::Backspace | Key::Delete | Key::Ctrl('w')))
+        {
+            self.selected = false;
+            self.prompt = vimlet::CommandLine::empty(PromptKind::Field);
+        }
+        match self.prompt.handle(key) {
+            PromptOutcome::Cancelled => Some(self.cancel_action()),
+            PromptOutcome::Accepted(value) => {
+                let value = value.trim();
+                if value.is_empty() {
+                    return Some(self.cancel_action());
+                }
+                let submit = (self.submit)(value.to_owned());
+                let actions = if self.callback_handle.is_some() {
+                    vec![submit, Action::CloseDialog]
+                } else {
+                    vec![Action::CloseDialog, submit]
+                };
+                Some(KeyAction::Multiple(actions))
+            }
+            PromptOutcome::Edited | PromptOutcome::Moved | PromptOutcome::Consumed => {
+                self.selected = false;
                 Some(KeyAction::Single(Action::Refresh))
             }
-            Event::Key(key) => match (key.code, key.modifiers) {
-                (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                    Some(self.cancel_action())
-                }
-                (KeyCode::Enter, _) => {
-                    let value = self.prompt.text().trim().to_string();
-                    if value.is_empty() {
-                        return Some(self.cancel_action());
-                    }
-                    let submit = (self.submit)(value);
-                    if self.callback_handle.is_some() {
-                        return Some(KeyAction::Multiple(vec![submit, Action::CloseDialog]));
-                    }
-                    Some(KeyAction::Multiple(vec![Action::CloseDialog, submit]))
-                }
-                (KeyCode::Left, _) => {
-                    self.selected = false;
-                    self.prompt
-                        .set_cursor(self.prompt.cursor().saturating_sub(1));
-                    Some(KeyAction::Single(Action::Refresh))
-                }
-                (KeyCode::Right, _) => {
-                    self.selected = false;
-                    self.prompt
-                        .set_cursor(self.prompt.cursor().saturating_add(1));
-                    Some(KeyAction::Single(Action::Refresh))
-                }
-                (KeyCode::Home, _) | (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
-                    self.selected = false;
-                    self.prompt.set_cursor(0);
-                    Some(KeyAction::Single(Action::Refresh))
-                }
-                (KeyCode::End, _) | (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
-                    self.selected = false;
-                    self.prompt.set_cursor(grapheme_len(&self.prompt.text()));
-                    Some(KeyAction::Single(Action::Refresh))
-                }
-                (KeyCode::Backspace, _) => {
-                    if self.selected {
-                        self.prompt.clear();
-                        self.selected = false;
-                    } else if is_word_backspace(*key) {
-                        self.prompt.delete_previous_word();
-                    } else {
-                        self.prompt.backspace();
-                    }
-                    Some(KeyAction::Single(Action::Refresh))
-                }
-                (KeyCode::Delete, _) => {
-                    if self.selected {
-                        self.prompt.clear();
-                        self.selected = false;
-                    } else {
-                        self.prompt.delete();
-                    }
-                    Some(KeyAction::Single(Action::Refresh))
-                }
-                (KeyCode::Char(character), modifiers)
-                    if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
-                    self.insert(&character.to_string());
-                    Some(KeyAction::Single(Action::Refresh))
-                }
-                _ => None,
-            },
             _ => None,
         }
     }
 
     fn cursor_position(&self) -> Option<(usize, usize)> {
+        let prefix = &self.prompt.text()[..self.prompt.caret().0];
         let offset = if self.masked {
-            self.prompt
-                .cursor()
-                .min(self.dialog.width.saturating_sub(1))
+            grapheme_len(prefix)
         } else {
-            let value = self.prompt.text();
-            let prefix = &value[..grapheme_to_byte(&value, self.prompt.cursor())];
-            display_width(prefix).min(self.dialog.width.saturating_sub(1))
-        };
+            display_width(prefix)
+        }
+        .min(self.dialog.width.saturating_sub(1));
         let x = self.dialog.x + 1 + offset;
         Some((x, self.dialog.y + 1))
     }
@@ -278,7 +255,7 @@ impl InputPrompt {
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
     use super::*;
     use crate::{buffer::Buffer, config::Config, lsp::LspManager, theme::Theme};
@@ -312,7 +289,9 @@ mod tests {
 
             let mut prompt = InputPrompt::secret(&editor, "Secret", Action::Print);
             prompt.handle_event(&Event::Paste("one 👨‍👩‍👧e\u{301} rest".into()));
-            prompt.prompt.set_cursor(6);
+            for _ in 0..5 {
+                prompt.handle_event(&key(KeyCode::Left));
+            }
             prompt.handle_event(&Event::Key(KeyEvent::new_with_kind(
                 KeyCode::Backspace,
                 modifiers,
@@ -320,10 +299,10 @@ mod tests {
             )));
             assert_eq!(prompt.prompt.text(), "one 👨‍👩‍👧e\u{301} rest");
             prompt.handle_event(&shortcut);
-            assert_eq!(prompt.prompt.text(), "one  rest");
-            assert_eq!(prompt.prompt.cursor(), 4);
-            assert!(prompt.prompt.undo());
-            assert_eq!(prompt.prompt.text(), "one 👨‍👩‍👧e\u{301} rest");
+            assert_eq!(prompt.prompt.text(), "one 👨‍👩‍👧 rest");
+            assert_eq!(prompt.prompt.caret().0, "one 👨‍👩‍👧".len());
+            assert!(prompt.is_sensitive_input());
+            assert!(!format!("{:?}", prompt.prompt).contains("rest"));
         }
     }
 
@@ -346,7 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn single_line_input_edits_the_shared_unnamed_prompt_buffer() {
+    fn single_line_input_replaces_the_selected_default() {
         let editor = editor();
         let mut prompt = InputPrompt::new(&editor, "Rename symbol", "old", Action::Print);
 
@@ -355,8 +334,6 @@ mod tests {
         prompt.handle_event(&key(KeyCode::Backspace));
 
         assert_eq!(prompt.prompt.text(), "👨‍👩‍👧nae");
-        assert!(prompt.prompt.buffer().file.is_none());
-        assert!(prompt.prompt.buffer().undo_history.node_count() > 0);
         assert_eq!(
             prompt.handle_event(&key(KeyCode::Enter)),
             Some(KeyAction::Multiple(vec![
@@ -375,12 +352,12 @@ mod tests {
         prompt.handle_event(&Event::Paste("\u{301}".to_string()));
 
         assert_eq!(prompt.prompt.text(), "a\u{301}X");
-        assert_eq!(prompt.prompt.cursor(), 1);
+        assert_eq!(prompt.prompt.caret().0, 3);
 
         prompt.handle_event(&key(KeyCode::Char('Z')));
 
         assert_eq!(prompt.prompt.text(), "a\u{301}ZX");
-        assert_eq!(prompt.prompt.cursor(), 2);
+        assert_eq!(prompt.prompt.caret().0, 4);
     }
 
     #[test]
@@ -436,6 +413,7 @@ mod tests {
             prompt.handle_event(&key(KeyCode::Enter)),
             Some(KeyAction::Single(Action::CloseDialog))
         );
+        let mut prompt = InputPrompt::new(&editor, "Rename symbol", "old", Action::Print);
         assert_eq!(
             prompt.handle_event(&key(KeyCode::Esc)),
             Some(KeyAction::Single(Action::CloseDialog))

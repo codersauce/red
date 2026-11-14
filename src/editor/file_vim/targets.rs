@@ -45,10 +45,10 @@ impl Editor {
             let OperationKind::Resolve { count, .. } = op.kind else {
                 unreachable!()
             };
-            let pattern = if session.draft.is_empty() {
+            let pattern = if session.draft.text().is_empty() {
                 self.search_term.clone()
             } else {
-                session.draft
+                session.draft.text().to_owned()
             };
             let outcome = if commit && !pattern.is_empty() {
                 self.record_search_history(&pattern);
