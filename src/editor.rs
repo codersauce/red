@@ -8182,9 +8182,6 @@ impl Editor {
         let revision = buffer.revision();
         let file = buffer.file.clone();
         let language_id = self.highlight_language_id_for_buffer_index(buffer_index);
-        let requires_document_prefix = self
-            .highlighter
-            .requires_document_prefix(language_id.as_deref());
         let line_count = buffer.len();
         if vtop >= line_count {
             return Ok(Vec::new());
@@ -8214,7 +8211,14 @@ impl Editor {
             } else {
                 8
             };
-            let mut parse_start = if requires_document_prefix {
+            // A Fish slice starting inside a multiline quote can color the rest of
+            // the script as a string. Keep the prefix when it fits the parse budget.
+            let use_document_prefix = self
+                .highlighter
+                .requires_document_prefix(language_id.as_deref())
+                || (language_id.as_deref() == Some("fish")
+                    && buffer.line_range_byte_len(0, viewport_end) <= MAX_HIGHLIGHT_SLICE_BYTES);
+            let mut parse_start = if use_document_prefix {
                 0
             } else {
                 vtop.saturating_sub(margin)
@@ -8227,7 +8231,7 @@ impl Editor {
             let mut parse_end = (vtop + height + margin).min(line_count);
 
             if buffer.line_range_byte_len(parse_start, parse_end) > MAX_HIGHLIGHT_SLICE_BYTES {
-                parse_start = if requires_document_prefix { 0 } else { vtop };
+                parse_start = if use_document_prefix { 0 } else { vtop };
                 parse_end = viewport_end;
                 if buffer.line_range_byte_len(parse_start, parse_end) > MAX_HIGHLIGHT_SLICE_BYTES {
                     self.highlight_cache.remove(&buffer_index);
@@ -43175,6 +43179,28 @@ builtin = "rust"
         let mut editor = Editor::with_size(lsp, 120, 22, config, theme, vec![buffer]).unwrap();
         editor.viewport_highlight_spans(0, 300, 20).unwrap();
         assert_eq!(editor.highlight_cache[&0].start_line, 280);
+    }
+
+    #[test]
+    fn fish_viewport_after_a_multiline_string_highlights_the_command_and_its_argument() {
+        let mut editor = rust_test_editor(1, 100, 10);
+        let source = format!(
+            "set query 'query {{\n{}}}'\nrun_task \"$path\"\n",
+            "    field\n".repeat(12)
+        );
+        editor.buffer_manager[0] = Buffer::new(Some("script.fish".into()), source);
+
+        // A four-line lookback from run_task would start inside the query.
+        let spans = editor.viewport_highlight_spans(0, 14, 4).unwrap();
+        for (token, start, scope) in [("run_task", 0, "function"), ("\"$path\"", 9, "string")] {
+            let color = editor.theme.get_style(scope).unwrap().fg;
+            assert!(
+                spans.iter().any(|span| span.start == start
+                    && span.end == start + token.len()
+                    && span.style.fg == color),
+                "{token} should use the {scope} color"
+            );
+        }
     }
 
     #[test]
