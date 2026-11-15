@@ -89,6 +89,8 @@ def main():
         ("xterm Ctrl+Enter", "xterm", [b"\x1b[27;5;13~"], "code=Enter modifiers=KeyModifiers(CONTROL)", None),
         ("fragmented CSI-u", "legacy", [b"\x1b[13;", b"3u"], "code=Enter modifiers=KeyModifiers(ALT)", None),
         ("fragmented xterm", "legacy", [b"\x1b[27;", b"2;13~"], "code=Enter modifiers=KeyModifiers(SHIFT)", None),
+        ("split background reply", "legacy", [b"\x1b]1", b"1;rgb:1e1e/1e1e/2e2e\x1b\\\r"], "code=Enter", None),
+        ("standalone Alt+]", "legacy", [b"\x1b]"], "code=other key (hidden) modifiers=KeyModifiers(ALT)", None),
         ("key repeat", "kitty", [b"\x1b[13;1:2u"], "kind=Repeat", None),
         ("key release", "kitty", [b"\x1b[13;1:3u"], "kind=Release", None),
         ("automatic Kitty negotiation", "auto", [b"\r"], "code=Enter", b"\x1b[?1u\x1b[?1;2c"),

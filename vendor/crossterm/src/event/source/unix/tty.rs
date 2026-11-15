@@ -1,5 +1,6 @@
+use super::Parser;
 use std::os::unix::prelude::AsRawFd;
-use std::{collections::VecDeque, io, os::unix::net::UnixStream, time::Duration};
+use std::{io, os::unix::net::UnixStream, time::Duration};
 
 use signal_hook::low_level::pipe;
 
@@ -9,7 +10,7 @@ use filedescriptor::{poll, pollfd, POLLIN};
 
 #[cfg(feature = "event-stream")]
 use crate::event::sys::Waker;
-use crate::event::{source::EventSource, sys::unix::parse::parse_event, InternalEvent};
+use crate::event::{source::EventSource, InternalEvent};
 use crate::terminal::sys::file_descriptor::{tty_fd, FileDesc};
 
 /// Holds a prototypical Waker and a receiver we can wait on when doing select().
@@ -116,12 +117,12 @@ impl EventSource for UnixInternalEventSource {
             make_pollfd(&self.wake_pipe.receiver),
         ];
 
-        while timeout.leftover().map_or(true, |t| !t.is_zero()) {
+        loop {
             // check if there are buffered events from the last read
             if let Some(event) = self.parser.next() {
                 return Ok(Some(event));
             }
-            match poll(&mut fds, timeout.leftover()) {
+            match poll(&mut fds, self.parser.poll_timeout(timeout.leftover())) {
                 Err(filedescriptor::Error::Poll(e)) | Err(filedescriptor::Error::Io(e)) => {
                     match e.kind() {
                         // retry on EINTR
@@ -138,21 +139,12 @@ impl EventSource for UnixInternalEventSource {
                 Ok(_) => (),
             };
             if fds[0].revents & POLLIN != 0 {
-                loop {
-                    let read_count = read_complete(&self.tty, &mut self.tty_buffer)?;
-                    if read_count > 0 {
-                        self.parser.advance(
-                            &self.tty_buffer[..read_count],
-                            read_count == TTY_BUFFER_SIZE,
-                        );
-                    }
-
+                let count = read_complete(&self.tty, &mut self.tty_buffer)?;
+                if count > 0 {
+                    self.parser
+                        .advance(&self.tty_buffer[..count], count == TTY_BUFFER_SIZE);
                     if let Some(event) = self.parser.next() {
                         return Ok(Some(event));
-                    }
-
-                    if read_count == 0 {
-                        break;
                     }
                 }
             }
@@ -184,88 +176,14 @@ impl EventSource for UnixInternalEventSource {
                     "Poll operation was woken up by `Waker::wake`",
                 ));
             }
+            if timeout.elapsed() {
+                return Ok(self.parser.next());
+            }
         }
-        Ok(None)
     }
 
     #[cfg(feature = "event-stream")]
     fn waker(&self) -> Waker {
         self.wake_pipe.waker.clone()
-    }
-}
-
-//
-// Following `Parser` structure exists for two reasons:
-//
-//  * mimic anes Parser interface
-//  * move the advancing, parsing, ... stuff out of the `try_read` method
-//
-#[derive(Debug)]
-struct Parser {
-    buffer: Vec<u8>,
-    internal_events: VecDeque<InternalEvent>,
-}
-
-impl Default for Parser {
-    fn default() -> Self {
-        Parser {
-            // This buffer is used for -> 1 <- ANSI escape sequence. Are we
-            // aware of any ANSI escape sequence that is bigger? Can we make
-            // it smaller?
-            //
-            // Probably not worth spending more time on this as "there's a plan"
-            // to use the anes crate parser.
-            buffer: Vec::with_capacity(256),
-            // TTY_BUFFER_SIZE is 1_024 bytes. How many ANSI escape sequences can
-            // fit? What is an average sequence length? Let's guess here
-            // and say that the average ANSI escape sequence length is 8 bytes. Thus
-            // the buffer size should be 1024/8=128 to avoid additional allocations
-            // when processing large amounts of data.
-            //
-            // There's no need to make it bigger, because when you look at the `try_read`
-            // method implementation, all events are consumed before the next TTY_BUFFER
-            // is processed -> events pushed.
-            internal_events: VecDeque::with_capacity(128),
-        }
-    }
-}
-
-impl Parser {
-    fn advance(&mut self, buffer: &[u8], more: bool) {
-        for (idx, byte) in buffer.iter().enumerate() {
-            let more = idx + 1 < buffer.len() || more;
-
-            self.buffer.push(*byte);
-
-            // Preserve Alt+] unless the bytes introduce an OSC 11 background reply.
-            let more = if self.buffer == b"\x1b]" {
-                buffer[idx + 1..].starts_with(b"11;")
-            } else {
-                more
-            };
-            match parse_event(&self.buffer, more) {
-                Ok(Some(ie)) => {
-                    self.internal_events.push_back(ie);
-                    self.buffer.clear();
-                }
-                Ok(None) => {
-                    // Event can't be parsed, because we don't have enough bytes for
-                    // the current sequence. Keep the buffer and process next bytes.
-                }
-                Err(_) => {
-                    // Event can't be parsed (not enough parameters, parameter is not a number, ...).
-                    // Clear the buffer and continue with another sequence.
-                    self.buffer.clear();
-                }
-            }
-        }
-    }
-}
-
-impl Iterator for Parser {
-    type Item = InternalEvent;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.internal_events.pop_front()
     }
 }
