@@ -136,12 +136,13 @@ fn char_code_to_event(code: KeyCode) -> KeyEvent {
 }
 
 // OSC 11 describes a color, not the terminal's light/dark appearance.
+pub(crate) const BACKGROUND_REPORT_PREFIX: &[u8] = b"\x1b]11;";
+
 fn discard_background_report(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
-    const PREFIX: &[u8] = b"\x1b]11;";
-    if PREFIX.starts_with(buffer) {
+    if BACKGROUND_REPORT_PREFIX.starts_with(buffer) {
         return Ok(None);
     }
-    if buffer.starts_with(PREFIX)
+    if buffer.starts_with(BACKGROUND_REPORT_PREFIX)
         && buffer.len() < 64
         && !buffer.ends_with(b"\x07")
         && !buffer.ends_with(b"\x1b\\")
